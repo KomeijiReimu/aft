@@ -1438,6 +1438,7 @@ fn remote_execution_header_without_a_job_id_keeps_its_existing_text() {
         return_paths: Vec::new(),
         returned_files: None,
         return_first_seq: None,
+        return_staging: Default::default(),
     };
     assert_eq!(
         remote_execution_note(&remote),
@@ -2990,6 +2991,7 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
         return_paths: Vec::new(),
         returned_files: None,
         return_first_seq: None,
+        return_staging: Default::default(),
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
     write_task_at(&layout, &metadata).unwrap();
@@ -4299,6 +4301,7 @@ fn persist_accepted_with_snapshot_cap(
         return_paths: Vec::new(),
         returned_files: None,
         return_first_seq: None,
+        return_staging: Default::default(),
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
     write_task_at(&layout, &metadata).unwrap();
@@ -6662,6 +6665,7 @@ fn remote_phase_comes_from_acceptance_started_or_output() {
         return_paths: Vec::new(),
         returned_files: None,
         return_first_seq: None,
+        return_staging: Default::default(),
     };
     assert_eq!(RemotePhase::of(&remote), RemotePhase::Submitting);
     remote.job_id = Some(id());
@@ -6783,6 +6787,7 @@ fn remote_phase_note_says_submitting_then_queued_until_started() {
         return_paths: Vec::new(),
         returned_files: None,
         return_first_seq: None,
+        return_staging: Default::default(),
     });
     let now = 1_042_900;
     // Before acceptance the runner has not confirmed it copied the inputs.
@@ -7239,6 +7244,7 @@ async fn reattach_limit_counts_from_a_late_draining_resubmission() {
         return_paths: Vec::new(),
         returned_files: None,
         return_first_seq: None,
+        return_staging: Default::default(),
     });
     let minutes_left = |budget: &ReattachBudget| {
         budget

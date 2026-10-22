@@ -854,6 +854,13 @@ pub(crate) struct RemoteTask {
     /// survive the restart but the runner still replays them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_first_seq: Option<u64>,
+    /// Staging files and directories created for the returned files and
+    /// not yet placed or removed. A restart removes them from here.
+    #[serde(
+        default,
+        skip_serializing_if = "super::return_files::StagingRecord::is_empty"
+    )]
+    pub return_staging: super::return_files::StagingRecord,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1181,6 +1188,10 @@ impl TaskSink {
                 state.metadata.project_root.clone(),
             )
         };
+        // Staged bytes do not survive a restart: remove the files an earlier
+        // AFT process staged, from the places it recorded. A restart before
+        // the manifest attaches again from the first chunk to stage afresh.
+        super::return_files::remove_recorded_staging(&remote.return_staging, &task.task_id);
         let returns = if !remote.return_paths.is_empty() && remote.returned_files.is_none() {
             Some(super::return_files::ReturnReceiver::new(
                 remote.return_paths.clone(),
@@ -1300,6 +1311,9 @@ impl TaskSink {
                     .publish_metadata(&state.metadata, sink.task.hard_kill_renewable);
                 return Err(error);
             }
+        }
+        if !remote.return_staging.is_empty() {
+            sink.commit(|r| r.return_staging = Default::default())?;
         }
         Ok(sink)
     }
@@ -1586,6 +1600,7 @@ impl OutputSink for TaskSink {
                 submission.reattached |= accepted.attached;
             }
             r.return_first_seq = None;
+            r.return_staging = Default::default();
             r.job_id = Some(accepted.job_id);
             r.queue_position = Some(accepted.queue_position);
             r.accepted = true;
@@ -1694,17 +1709,20 @@ impl OutputSink for TaskSink {
         self.progress(seq, None, offset + bytes.len() as u64)
     }
     fn return_chunk(&mut self, chunk: &ReturnChunk) -> io::Result<()> {
-        let Some(returns) = self.returns.as_mut() else {
+        let Some(mut returns) = self.returns.take() else {
             return self.unknown_output(chunk.seq, &[]);
         };
-        let first = !returns.received_chunk();
-        returns.chunk(chunk);
-        if first {
+        if !returns.received_chunk() {
             // Saved before the cursor can pass the chunk, so a restart knows
             // where to attach to receive the files again.
             let seq = chunk.seq;
-            self.commit(|r| r.return_first_seq = Some(seq))?;
+            if let Err(error) = self.commit(|r| r.return_first_seq = Some(seq)) {
+                self.returns = Some(returns);
+                return Err(error);
+            }
         }
+        returns.chunk(chunk, &mut |staging| self.record_staging(staging));
+        self.returns = Some(returns);
         let unknown_len = self.output_progress.unknown_len;
         self.progress(chunk.seq, None, unknown_len)
     }
@@ -1712,7 +1730,9 @@ impl OutputSink for TaskSink {
         let report = match self.unsaved_return_report.take() {
             Some(report) => report,
             None => match self.returns.take() {
-                Some(mut returns) => returns.manifest(manifest),
+                Some(mut returns) => {
+                    returns.manifest(manifest, &mut |staging| self.record_staging(staging))
+                }
                 None => return self.unknown_output(manifest.seq, &[]),
             },
         };
@@ -1720,6 +1740,8 @@ impl OutputSink for TaskSink {
         let saved = report.clone();
         let result = self.commit(|r| {
             r.returned_files = Some(report);
+            // Every staging file was placed or removed with the report.
+            r.return_staging = Default::default();
             r.last_seq = Some(seq);
         });
         if result.is_err() {
@@ -1753,6 +1775,7 @@ impl OutputSink for TaskSink {
             }
             if let Some(report) = unreported {
                 r.returned_files = Some(report);
+                r.return_staging = Default::default();
             }
             r.job_id = Some(record.job_id);
             r.terminal = Some(record.clone());
@@ -1829,6 +1852,16 @@ impl TaskSink {
             ));
         }
         Ok(())
+    }
+
+    /// Save staging files and directories in the task record before the
+    /// receiver creates them.
+    fn record_staging(&mut self, staging: &super::return_files::StagingRecord) -> io::Result<()> {
+        let staging = staging.clone();
+        self.commit(|r| {
+            r.return_staging.files.extend(staging.files);
+            r.return_staging.dirs.extend(staging.dirs);
+        })
     }
 
     fn truncate_output(&mut self, before_seq: u64, undelivered: bool) -> io::Result<()> {
@@ -2262,6 +2295,7 @@ impl BgTaskRegistry {
             return_paths: launch.return_paths.clone(),
             returned_files: None,
             return_first_seq: None,
+            return_staging: Default::default(),
         });
         metadata.pipeline_segments = single_top_level_pipeline(command)
             .map(|p| p.segments.into_iter().map(|s| s.label).collect())

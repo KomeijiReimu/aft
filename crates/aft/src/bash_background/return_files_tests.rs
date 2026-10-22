@@ -87,8 +87,10 @@ mod receiving {
             ReturnReceiver::new(return_vector_paths(name), cap, root, root, "task-1").unwrap();
         for record in return_vector_records(name) {
             match record {
-                StreamRecord::ReturnChunk(chunk) => receiver.chunk(&chunk),
-                StreamRecord::ReturnManifest(manifest) => return receiver.manifest(&manifest),
+                StreamRecord::ReturnChunk(chunk) => receiver.chunk(&chunk, &mut |_| Ok(())),
+                StreamRecord::ReturnManifest(manifest) => {
+                    return receiver.manifest(&manifest, &mut |_| Ok(()))
+                }
                 _ => {}
             }
         }
@@ -284,7 +286,7 @@ mod receiving {
                 .unwrap();
         for record in return_vector_records(name) {
             if let StreamRecord::ReturnChunk(chunk) = record {
-                receiver.chunk(&chunk);
+                receiver.chunk(&chunk, &mut |_| Ok(()));
             }
         }
         let report = receiver.without_manifest();
@@ -293,5 +295,89 @@ mod receiving {
                 reason: NotReturned::NoReport
             }));
         assert_eq!(files_under(&root), Vec::<String>::new());
+    }
+
+    #[test]
+    fn staging_file_sits_beside_its_destination_and_is_recorded_before_it_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let name = "three-chunks-short-last";
+        let mut receiver =
+            ReturnReceiver::new(return_vector_paths(name), 1 << 20, &root, &root, "task-1")
+                .unwrap();
+        let recorded = std::cell::RefCell::new(Vec::new());
+        let mut record = |staging: &StagingRecord| {
+            for file in &staging.files {
+                assert!(
+                    !file.exists(),
+                    "{file:?} was created before it was recorded"
+                );
+            }
+            recorded.borrow_mut().push(staging.clone());
+            Ok(())
+        };
+        let mut manifest = None;
+        for stream_record in return_vector_records(name) {
+            match stream_record {
+                StreamRecord::ReturnChunk(chunk) => receiver.chunk(&chunk, &mut record),
+                StreamRecord::ReturnManifest(found) => manifest = Some(found),
+                _ => {}
+            }
+        }
+        let staging = root.join("dist/.aft-return-task-1-0.part");
+        assert_eq!(
+            *recorded.borrow(),
+            [StagingRecord {
+                files: vec![staging.clone()],
+                dirs: vec![root.join("dist")],
+            }],
+            "one staging file, in the destination's own directory"
+        );
+        assert_eq!(fs::read(&staging).unwrap(), b"0123456789");
+        assert_eq!(files_under(&root), ["dist/.aft-return-task-1-0.part"]);
+        let report = receiver.manifest(&manifest.unwrap(), &mut record);
+        assert_eq!(report[0].outcome, ReturnOutcome::Returned { bytes: 10 });
+        assert_eq!(files_under(&root), ["dist/app.bin"]);
+    }
+
+    #[test]
+    fn a_failed_path_leaves_no_directory_it_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let report = receive("refuse-digest-mismatch", &root);
+        assert!(matches!(
+            report[0].outcome,
+            ReturnOutcome::NotReturned { .. }
+        ));
+        assert!(
+            !root.join("dist").exists(),
+            "the staging directory is removed"
+        );
+    }
+
+    #[test]
+    fn recorded_staging_is_removed_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let created = root.join("out/deep");
+        fs::create_dir_all(&created).unwrap();
+        let staged = created.join(".aft-return-task-1-0.part");
+        fs::write(&staged, b"partial").unwrap();
+        let kept_dir = root.join("kept");
+        fs::create_dir(&kept_dir).unwrap();
+        let not_ours = kept_dir.join("notes.txt");
+        fs::write(&not_ours, b"user file").unwrap();
+        let record = StagingRecord {
+            files: vec![staged.clone(), not_ours.clone()],
+            dirs: vec![root.join("out"), created.clone(), kept_dir.clone()],
+        };
+        remove_recorded_staging(&record, "task-1");
+        assert!(!staged.exists());
+        assert!(
+            !root.join("out").exists(),
+            "emptied directories are removed"
+        );
+        assert_eq!(fs::read(&not_ours).unwrap(), b"user file");
+        assert!(kept_dir.exists(), "a directory with other files stays");
     }
 }

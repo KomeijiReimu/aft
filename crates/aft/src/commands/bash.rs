@@ -778,7 +778,7 @@ fn attach_return_paths(
                 "return_paths refused: {shown}: {reason}; the command did not run"
             )));
         }
-        match resolve_destination(&root, &workdir.join(path), false) {
+        match resolve_destination(&root, &workdir.join(path)) {
             Ok(_) => {}
             Err(NotReturned::LocalWrite { error }) => {
                 return Err(refused(format!(
