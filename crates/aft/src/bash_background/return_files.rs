@@ -341,8 +341,11 @@ pub(crate) fn remove_recorded_staging(record: &StagingRecord, task_id: &str) {
     }
 }
 
-/// Remove a directory AFT created, when it is still empty and its path still
-/// resolves to itself: a component swapped for a symlink since then leaves it.
+/// Remove a directory AFT created, only when its path still resolves to
+/// itself, so a path already redirected through a symlink is left alone. The
+/// removal itself goes by path, so this narrows rather than closes a race;
+/// at worst it removes an empty directory. A failed removal, including for a
+/// directory that is not empty, is ignored.
 #[cfg_attr(not(unix), allow(dead_code))]
 fn remove_empty_dir(dir: &std::path::Path) {
     if std::fs::canonicalize(dir).is_ok_and(|resolved| resolved == dir) {
