@@ -223,6 +223,10 @@ pub(crate) enum Script {
     QueueWaitOwner {
         holder: Uuid,
     },
+    /// Answer the run with this published chunked-return vector's records,
+    /// after an acceptance when the vector has none. A replay vector starts
+    /// past seq 0, so empty output stands in for the seqs before it.
+    ReturnVector(&'static str),
 }
 
 pub(crate) struct Daemon {
@@ -359,6 +363,34 @@ pub(crate) async fn daemon_with_capabilities(
                 },
                 FrameType::Request => {
                     match body["method"].as_str().unwrap() {
+                        "exec.run" if matches!(script, Script::ReturnVector(_)) => {
+                            let Script::ReturnVector(name) = script else { unreachable!() };
+                            let records = super::return_vectors::return_vector_records(name);
+                            if !matches!(records.first(), Some(StreamRecord::Accepted(_))) {
+                                replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), 1))).unwrap()));
+                            }
+                            // A replay vector starts after the records the caller
+                            // already had; stand in for them with empty output.
+                            let first_seq = records.iter().find_map(|record| match record {
+                                StreamRecord::Started(started) => Some(started.seq),
+                                StreamRecord::Output(output) => Some(output.seq),
+                                StreamRecord::ReturnChunk(chunk) => Some(chunk.seq),
+                                StreamRecord::ReturnManifest(manifest) => Some(manifest.seq),
+                                _ => None,
+                            }).unwrap_or(0);
+                            let mut records = records.into_iter();
+                            if let Some(accepted) = records.as_slice().first().filter(|record| matches!(record, StreamRecord::Accepted(_))).cloned() {
+                                records.next();
+                                replies.push(reply(FrameType::StreamData, serde_json::to_value(accepted).unwrap()));
+                            }
+                            for seq in 0..first_seq {
+                                replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Output(Output::new(seq, OutputStream::Stdout, BytePayload(Vec::new())))).unwrap()));
+                            }
+                            for record in records {
+                                replies.push(reply(FrameType::StreamData, serde_json::to_value(record).unwrap()));
+                            }
+                            replies.push(Frame::build_with_version(header.ver, FrameType::StreamEnd, header.flags, header.channel, header.epoch, header.corr, vec![]).unwrap());
+                        }
                         "exec.run" | "exec.attach" => {
                             let attaching = body["method"] == "exec.attach";
                             if !attaching { runs += 1; }

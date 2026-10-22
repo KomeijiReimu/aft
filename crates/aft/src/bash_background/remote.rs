@@ -841,6 +841,19 @@ pub(crate) struct RemoteTask {
     /// waited behind an earlier job of this same session in the same workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_holder: Option<WorkspaceHolder>,
+    /// Files the caller asked the runner to copy back, relative to the
+    /// task's workdir (`return_paths`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub return_paths: Vec<String>,
+    /// The outcome for each of `return_paths`, saved once the runner's
+    /// manifest was handled or the job ended without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returned_files: Option<Vec<super::return_files::ReturnedPath>>,
+    /// The seq of the job's first returned-file chunk. A restart before the
+    /// manifest attaches again from here, because the staged bytes did not
+    /// survive the restart but the runner still replays them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_first_seq: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1028,9 +1041,20 @@ impl RemoteTask {
     }
 
     fn point(&self) -> Option<ResumePoint> {
+        // Returned files are staged only in memory and private files that a
+        // restart discards, so resume before their first chunk until the
+        // manifest has been handled.
+        let last_seq = match (
+            self.return_first_seq,
+            &self.returned_files,
+            &self.gap_recovery,
+        ) {
+            (Some(first), None, None) => self.last_seq.min(first.checked_sub(1)),
+            _ => self.last_seq,
+        };
         Some(ResumePoint {
             job_id: self.job_id?,
-            last_seq: self.last_seq,
+            last_seq,
             gap_recovery: self.gap_recovery.clone(),
         })
     }
@@ -1114,6 +1138,12 @@ struct TaskSink {
     /// land another metadata write in that window.
     #[cfg(test)]
     before_checkpoint_write: Option<Box<dyn FnMut() + Send>>,
+    /// Stages the job's returned-file chunks until the runner's manifest
+    /// arrives, then places the files that verify.
+    returns: Option<super::return_files::ReturnReceiver>,
+    /// A handled manifest's report whose save failed, saved when the
+    /// consumer delivers the manifest again.
+    unsaved_return_report: Option<Vec<super::return_files::ReturnedPath>>,
 }
 
 /// Longest time the saved output cursor of a running remote task may lag the
@@ -1136,14 +1166,32 @@ const PROGRESS_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 impl TaskSink {
     fn new(registry: &BgTaskRegistry, task: Arc<BgTask>) -> io::Result<Self> {
-        let remote = task
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("task lock poisoned"))?
-            .metadata
-            .remote
-            .clone()
-            .ok_or_else(|| io::Error::other("remote record absent"))?;
+        let (remote, workdir, project_root) = {
+            let state = task
+                .state
+                .lock()
+                .map_err(|_| io::Error::other("task lock poisoned"))?;
+            (
+                state
+                    .metadata
+                    .remote
+                    .clone()
+                    .ok_or_else(|| io::Error::other("remote record absent"))?,
+                state.metadata.workdir.clone(),
+                state.metadata.project_root.clone(),
+            )
+        };
+        let returns = if !remote.return_paths.is_empty() && remote.returned_files.is_none() {
+            Some(super::return_files::ReturnReceiver::new(
+                remote.return_paths.clone(),
+                exec::return_max_bytes(),
+                &workdir,
+                project_root.as_deref().unwrap_or(&workdir),
+                &task.task_id,
+            )?)
+        } else {
+            None
+        };
         let stdout = open_task_artifact_for_remote(&task, TaskArtifact::Stdout)?;
         let stderr = open_task_artifact_for_remote(&task, TaskArtifact::Stderr)?;
         // Discard bytes beyond the saved checkpoint, but never extend a short
@@ -1194,6 +1242,8 @@ impl TaskSink {
             progress_clock: None,
             #[cfg(test)]
             before_checkpoint_write: None,
+            returns,
+            unsaved_return_report: None,
         };
         let losses: Vec<_> = [
             (RemoteOutputStream::Stdout, stdout_len, remote.stdout_len),
@@ -1527,10 +1577,15 @@ pub(super) fn persist_terminal_artifacts(paths: &TaskPaths, metadata: &mut Persi
 #[cfg(unix)]
 impl OutputSink for TaskSink {
     fn accepted(&mut self, accepted: &Accepted) -> io::Result<()> {
+        // A resubmitted job returns its files afresh.
+        if let Some(returns) = self.returns.as_mut() {
+            returns.reset();
+        }
         self.commit(|r| {
             if let Some(submission) = r.submission.as_mut() {
                 submission.reattached |= accepted.attached;
             }
+            r.return_first_seq = None;
             r.job_id = Some(accepted.job_id);
             r.queue_position = Some(accepted.queue_position);
             r.accepted = true;
@@ -1638,10 +1693,55 @@ impl OutputSink for TaskSink {
         }
         self.progress(seq, None, offset + bytes.len() as u64)
     }
+    fn return_chunk(&mut self, chunk: &ReturnChunk) -> io::Result<()> {
+        let Some(returns) = self.returns.as_mut() else {
+            return self.unknown_output(chunk.seq, &[]);
+        };
+        let first = !returns.received_chunk();
+        returns.chunk(chunk);
+        if first {
+            // Saved before the cursor can pass the chunk, so a restart knows
+            // where to attach to receive the files again.
+            let seq = chunk.seq;
+            self.commit(|r| r.return_first_seq = Some(seq))?;
+        }
+        let unknown_len = self.output_progress.unknown_len;
+        self.progress(chunk.seq, None, unknown_len)
+    }
+    fn return_manifest(&mut self, manifest: &ReturnManifest) -> io::Result<()> {
+        let report = match self.unsaved_return_report.take() {
+            Some(report) => report,
+            None => match self.returns.take() {
+                Some(mut returns) => returns.manifest(manifest),
+                None => return self.unknown_output(manifest.seq, &[]),
+            },
+        };
+        let seq = manifest.seq;
+        let saved = report.clone();
+        let result = self.commit(|r| {
+            r.returned_files = Some(report);
+            r.last_seq = Some(seq);
+        });
+        if result.is_err() {
+            // The files are already placed. The consumer delivers this
+            // manifest again, and the same report is saved then.
+            self.unsaved_return_report = Some(saved);
+        }
+        result
+    }
     fn terminal(&mut self, record: &TerminalRecord, verdict: &Verdict) -> io::Result<()> {
         #[cfg(test)]
         let clock = tests::task_draining_clock(&self.task);
         let jitter = retry_jitter_for_task(&self.task);
+        // A job that ran but sent no manifest returned nothing. A refusal
+        // before start may be retried, so it leaves the request open.
+        let unreported = (!matches!(verdict, Verdict::RunLocally { .. }))
+            .then(|| {
+                self.returns
+                    .take()
+                    .map(|mut returns| returns.without_manifest())
+            })
+            .flatten();
         self.commit(|r| {
             let resubmit_refusal = r.submission.as_ref().is_some_and(|s| s.resuming)
                 && matches!(verdict, Verdict::RunLocally { .. });
@@ -1650,6 +1750,9 @@ impl OutputSink for TaskSink {
             if resubmit_refusal {
                 r.submission.as_mut().unwrap().refusal = Some(record.clone());
                 return;
+            }
+            if let Some(report) = unreported {
+                r.returned_files = Some(report);
             }
             r.job_id = Some(record.job_id);
             r.terminal = Some(record.clone());
@@ -2156,6 +2259,9 @@ impl BgTaskRegistry {
             retry: None,
             output_incomplete: None,
             workspace_holder: None,
+            return_paths: launch.return_paths.clone(),
+            returned_files: None,
+            return_first_seq: None,
         });
         metadata.pipeline_segments = single_top_level_pipeline(command)
             .map(|p| p.segments.into_iter().map(|s| s.label).collect())
@@ -2289,6 +2395,7 @@ impl BgTaskRegistry {
                     siblings: launch.params.siblings,
                     weight_hint: requested_vcpus,
                     network: launch.requested_network.then_some(Network::Outbound),
+                    return_paths: launch.return_paths,
                     ..Default::default()
                 },
             )
@@ -3635,6 +3742,15 @@ impl BgTaskRegistry {
             "ran locally on {}: remote refused: {reason}",
             local_os_name()
         ));
+        if metadata
+            .remote
+            .as_ref()
+            .is_some_and(|remote| !remote.return_paths.is_empty())
+        {
+            let note = state.metadata.execution_note.as_mut().unwrap();
+            note.push('\n');
+            note.push_str(super::return_files::LOCAL_RUN_NOTE);
+        }
         if let Some(changes) = metadata
             .remote
             .as_ref()
@@ -5044,13 +5160,22 @@ fn append_output_loss(metadata: &mut PersistedTask) {
 pub(crate) fn remote_report(
     metadata: &crate::bash_background::persistence::PersistedTask,
 ) -> Option<String> {
-    let terminal = metadata.remote.as_ref()?.terminal.as_ref()?;
+    let remote = metadata.remote.as_ref()?;
+    let terminal = remote.terminal.as_ref()?;
     if matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. })
         || terminal.ran == Some(Ran::None)
     {
         return None;
     }
-    render_terminal_report(terminal)
+    let returned = remote
+        .returned_files
+        .as_deref()
+        .filter(|paths| !paths.is_empty())
+        .map(super::return_files::render_report);
+    match (returned, render_terminal_report(terminal)) {
+        (Some(returned), Some(report)) => Some(format!("{returned}\n{report}")),
+        (returned, report) => returned.or(report),
+    }
 }
 
 /// [`remote_report`] for one terminal record.
@@ -5252,6 +5377,7 @@ fn proves_no_start(error: &exec::Error) -> bool {
                 | subc_client_rs::CallError::CapabilityAmbiguous { .. }
                 | subc_client_rs::CallError::InvalidCapabilityIdentifier { .. }
         ) | exec::Error::Protocol(_)
+            | exec::Error::MissingCapability { .. }
     )
 }
 

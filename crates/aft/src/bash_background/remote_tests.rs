@@ -220,6 +220,7 @@ pub(crate) fn launch(connection: PathBuf) -> crate::bash_background::RemoteLaunc
         requested_vcpus: None,
         requested_network: false,
         configured_env_names: Vec::new(),
+        return_paths: Vec::new(),
         params: exec::FrozenParams {
             remote_exec: Some(exec::policy::RemoteExecPolicy {
                 enabled: true,
@@ -1434,6 +1435,9 @@ fn remote_execution_header_without_a_job_id_keeps_its_existing_text() {
         retry: None,
         output_incomplete: None,
         workspace_holder: None,
+        return_paths: Vec::new(),
+        returned_files: None,
+        return_first_seq: None,
     };
     assert_eq!(
         remote_execution_note(&remote),
@@ -2983,6 +2987,9 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
         retry: None,
         output_incomplete: None,
         workspace_holder: None,
+        return_paths: Vec::new(),
+        returned_files: None,
+        return_first_seq: None,
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
     write_task_at(&layout, &metadata).unwrap();
@@ -4289,6 +4296,9 @@ fn persist_accepted_with_snapshot_cap(
         retry: None,
         output_incomplete: None,
         workspace_holder: None,
+        return_paths: Vec::new(),
+        returned_files: None,
+        return_first_seq: None,
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
     write_task_at(&layout, &metadata).unwrap();
@@ -6649,6 +6659,9 @@ fn remote_phase_comes_from_acceptance_started_or_output() {
         retry: None,
         output_incomplete: None,
         workspace_holder: None,
+        return_paths: Vec::new(),
+        returned_files: None,
+        return_first_seq: None,
     };
     assert_eq!(RemotePhase::of(&remote), RemotePhase::Submitting);
     remote.job_id = Some(id());
@@ -6767,6 +6780,9 @@ fn remote_phase_note_says_submitting_then_queued_until_started() {
         retry: None,
         output_incomplete: None,
         workspace_holder: None,
+        return_paths: Vec::new(),
+        returned_files: None,
+        return_first_seq: None,
     });
     let now = 1_042_900;
     // Before acceptance the runner has not confirmed it copied the inputs.
@@ -7220,6 +7236,9 @@ async fn reattach_limit_counts_from_a_late_draining_resubmission() {
         }),
         output_incomplete: None,
         workspace_holder: None,
+        return_paths: Vec::new(),
+        returned_files: None,
+        return_first_seq: None,
     });
     let minutes_left = |budget: &ReattachBudget| {
         budget
@@ -13059,4 +13078,258 @@ async fn submission_review_current_never_accepted_allows_local_fallback() {
     let task = restarted.task(&task_id).unwrap();
     assert!(read_task(&task.paths.json).unwrap().local_fallback_started);
     assert_eq!(submission_runs(&daemon).len(), 1);
+}
+
+/// A runner that offers chunked file return beside ordinary runs.
+const RETURN_CLAIMS: &[&str] = &["exec-remote/v1", "exec-remote-return/v2"];
+
+async fn return_daemon(vector: &'static str) -> crate::exec_remote::wire_tests::Daemon {
+    crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::ReturnVector(vector),
+        RETURN_CLAIMS,
+        1,
+    )
+    .await
+}
+
+fn return_call(paths: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "command": "make dist", "runon": "linux", "wait": true,
+        "foreground_orchestrate": true, "compressed": false,
+        "return_paths": paths,
+    })
+}
+
+#[tokio::test]
+async fn runon_return_paths_places_verified_files_and_lists_every_path() {
+    // One path returned, one missing on the server, in one job.
+    let daemon = return_daemon("failed-missing").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let (reply, _) = orchestrated_reply(
+        &ctx,
+        &daemon,
+        return_call(&["dist/hello.txt", "dist/absent.txt"]),
+    )
+    .await;
+    assert!(reply.success, "{reply:?}");
+    let output = reply.data["output"].as_str().unwrap();
+    let report = "Files requested back from the server (return_paths):\n  \
+                  dist/hello.txt: returned (5 bytes)\n  \
+                  dist/absent.txt: not returned (no such file on the server)";
+    assert!(output.contains(report), "{output}");
+    // The job id stays in the result header, with the copy-back list below.
+    let header = output.lines().next().unwrap();
+    assert!(header.contains(&format!("job {}", id())), "{output}");
+    assert!(
+        output.find(&format!("job {}", id())).unwrap() < output.find(report).unwrap(),
+        "{output}"
+    );
+    assert_eq!(
+        fs::read(dir.path().join("dist/hello.txt")).unwrap(),
+        b"hello"
+    );
+    assert!(!dir.path().join("dist/absent.txt").exists());
+    let leftovers: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".aft-return-")
+        })
+        .collect();
+    assert!(leftovers.is_empty(), "staging files left: {leftovers:?}");
+    // The request names the paths and always the cap.
+    let runs = exec_runs(&daemon);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs[0]["return_paths"],
+        serde_json::json!(["dist/hello.txt", "dist/absent.txt"])
+    );
+    assert_eq!(runs[0]["return_chunked"], true);
+    assert_eq!(runs[0]["return_max_bytes"], 10_485_760);
+    // The completion notice prints the same saved report.
+    let task_id = reply.data["task_id"].as_str().unwrap();
+    let saved = read_task(&ctx.bash_background().task(task_id).unwrap().paths.json).unwrap();
+    assert!(
+        remote::remote_report(&saved).unwrap().starts_with(report),
+        "{saved:?}"
+    );
+}
+
+#[tokio::test]
+async fn runon_return_paths_expired_replay_reports_expired_without_output_loss() {
+    let daemon = return_daemon("replay-expired").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let (reply, _) = orchestrated_reply(
+        &ctx,
+        &daemon,
+        return_call(&["dist/app.bin", "dist/absent.txt"]),
+    )
+    .await;
+    assert!(reply.success, "{reply:?}");
+    let output = reply.data["output"].as_str().unwrap();
+    assert!(
+        output.contains(
+            "  dist/app.bin: not returned (the server no longer keeps this job's files)\n  \
+             dist/absent.txt: not returned (no such file on the server)"
+        ),
+        "{output}"
+    );
+    assert!(!output.contains("output lost"), "{output}");
+    assert!(!dir.path().join("dist").exists());
+    let attaches = daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, body)| body["method"] == "exec.attach")
+        .count();
+    assert_eq!(attaches, 0, "the chunk gap is accepted, not recovered");
+}
+
+#[tokio::test]
+async fn runon_return_paths_digest_mismatch_keeps_the_existing_file() {
+    let daemon = return_daemon("refuse-digest-mismatch").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    fs::create_dir(dir.path().join("dist")).unwrap();
+    fs::write(dir.path().join("dist/app.bin"), b"older build").unwrap();
+    let (reply, _) = orchestrated_reply(&ctx, &daemon, return_call(&["dist/app.bin"])).await;
+    assert!(reply.success, "{reply:?}");
+    let output = reply.data["output"].as_str().unwrap();
+    assert!(
+        output.contains(
+            "  dist/app.bin: not returned (the copy failed verification (digest_mismatch); nothing was written)"
+        ),
+        "{output}"
+    );
+    assert_eq!(
+        fs::read(dir.path().join("dist/app.bin")).unwrap(),
+        b"older build"
+    );
+}
+
+#[tokio::test]
+async fn runon_return_paths_without_the_return_capability_refuses_before_submit() {
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let marker = dir.path().join("local-spawn-proof");
+    let mut call = return_call(&["dist/app.bin"]);
+    call["command"] = serde_json::json!(format!("touch '{}'", marker.display()));
+    let (reply, _) = orchestrated_reply(&ctx, &daemon, call).await;
+    assert!(!reply.success, "{reply:?}");
+    let message = reply.data["message"].as_str().unwrap();
+    assert!(
+        message.contains(
+            "return_paths is unavailable: the build server doesn't offer copying files back yet (missing exec-remote-return/v2)"
+        ),
+        "{message}"
+    );
+    assert!(exec_runs(&daemon).is_empty(), "nothing may be submitted");
+    assert!(!marker.exists(), "a refused runon never runs locally");
+}
+
+#[test]
+fn runon_return_paths_outside_the_project_are_refused_before_anything_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+    let marker = dir.path().join("local-spawn-proof");
+    let cases: [(serde_json::Value, Option<&str>, &str); 4] = [
+        (
+            serde_json::json!(["../outside.txt"]),
+            Some("linux"),
+            "must not use ..",
+        ),
+        (
+            serde_json::json!(["link/out.txt"]),
+            Some("linux"),
+            "return_paths refused: link/out.txt",
+        ),
+        (
+            serde_json::json!([outside.path().join("x").display().to_string()]),
+            Some("linux"),
+            "must be relative to workdir",
+        ),
+        (
+            serde_json::json!(["dist/app.bin"]),
+            None,
+            "return_paths needs runon",
+        ),
+    ];
+    for (paths, runon, expected) in cases {
+        let mut params = serde_json::json!({
+            "command": format!("touch '{}'", marker.display()),
+            "workdir": dir.path(),
+            "return_paths": paths,
+        });
+        if let Some(runon) = runon {
+            params["runon"] = serde_json::json!(runon);
+        }
+        let request = orchestrated_request(params);
+        let response = crate::bash_background::with_remote_policy(
+            Some(launch(dir.path().join("no-daemon"))),
+            || crate::commands::bash::handle(&request, &ctx),
+        );
+        assert!(!response.success, "{response:?}");
+        assert_eq!(
+            response.data["code"], "return_paths_refused",
+            "{response:?}"
+        );
+        let message = response.data["message"].as_str().unwrap();
+        assert!(message.contains(expected), "{expected}: {message}");
+    }
+    assert!(!marker.exists(), "a refused call never runs");
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn local_fallback_with_return_paths_says_the_files_stayed_in_place() {
+    // Prefix routing (not runon) may still fall back to a local run when the
+    // runner refuses before start. A task that asked for files back says
+    // they were written here and nothing was copied.
+    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::KnownRefused,
+        RETURN_CLAIMS,
+        1,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    ensure_git_fixture(dir.path());
+    let registry = registry();
+    let mut policy = launch(daemon.connection.clone());
+    policy.return_paths = vec!["out.txt".into()];
+    let task = registry
+        .spawn_remote(
+            policy,
+            SpawnPlan::Unsandboxed,
+            "printf local > out.txt",
+            resolve_posix_shell(),
+            "session".into(),
+            dir.path().into(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
+            dir.path().into(),
+            crate::bash_background::TaskSlot::Background { max: 10 },
+            true,
+            false,
+            Some(dir.path().into()),
+        )
+        .unwrap();
+    let done = terminal(&registry, &task).await;
+    assert_eq!(exec_runs(&daemon).len(), 1);
+    assert_eq!(fs::read(dir.path().join("out.txt")).unwrap(), b"local");
+    assert!(
+        done.output_preview
+            .contains(crate::bash_background::registry::return_files::LOCAL_RUN_NOTE),
+        "{}",
+        done.output_preview
+    );
 }

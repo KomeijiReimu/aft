@@ -601,6 +601,7 @@ fn request_copies_shell_inputs_without_executor_metadata() {
         weight_hint: Some(16),
         queue_wait_limit_s: Some(0),
         network: None,
+        return_paths: Vec::new(),
     };
     let request = build_request(
         &worktree,
