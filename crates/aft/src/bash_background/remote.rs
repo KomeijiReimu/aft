@@ -1198,6 +1198,10 @@ impl TaskSink {
                 exec::return_max_bytes(),
                 &workdir,
                 project_root.as_deref().unwrap_or(&workdir),
+                worktree_root_containing(&workdir, exec::DirectoryKind::WorkingDirectory)
+                    .ok()
+                    .flatten()
+                    .as_deref(),
                 &task.task_id,
             )?)
         } else {
@@ -5201,20 +5205,31 @@ pub(crate) fn remote_report(
     {
         return None;
     }
-    let returned = remote
-        .returned_files
-        .as_deref()
-        .filter(|paths| !paths.is_empty())
-        .map(super::return_files::render_report);
-    match (returned, render_terminal_report(terminal)) {
+    let returned_files = remote.returned_files.as_deref().unwrap_or_default();
+    // A file that was copied back is not also listed as left on the server.
+    let copied_back: Vec<&str> = returned_files
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.outcome,
+                super::return_files::ReturnOutcome::Returned { .. }
+            )
+        })
+        .filter_map(|entry| entry.checkout_path.as_deref())
+        .collect();
+    let returned = (!returned_files.is_empty())
+        .then(|| super::return_files::render_report(returned_files));
+    match (returned, render_terminal_report(terminal, &copied_back)) {
         (Some(returned), Some(report)) => Some(format!("{returned}\n{report}")),
         (returned, report) => returned.or(report),
     }
 }
 
-/// [`remote_report`] for one terminal record.
+/// [`remote_report`] for one terminal record. `copied_back` names files,
+/// relative to the checkout as the runner reports them, that were copied back
+/// to this machine; they are left out of the "NOT copied back" lists.
 #[cfg(unix)]
-fn render_terminal_report(terminal: &TerminalRecord) -> Option<String> {
+fn render_terminal_report(terminal: &TerminalRecord, copied_back: &[&str]) -> Option<String> {
     // Paths come from another machine; escaping keeps one per line.
     fn path(path: &str) -> String {
         path.escape_default().to_string()
@@ -5225,12 +5240,19 @@ fn render_terminal_report(terminal: &TerminalRecord) -> Option<String> {
     let mut blocks: Vec<String> = Vec::new();
     let mut unreported: Vec<&str> = Vec::new();
 
-    match terminal.workspace_changes.as_deref() {
-        Some([]) => {}
+    let left_on_server = |paths: &'_ [String]| -> Vec<String> {
+        paths
+            .iter()
+            .filter(|path| !copied_back.contains(&path.as_str()))
+            .cloned()
+            .collect()
+    };
+    match terminal.workspace_changes.as_deref().map(left_on_server) {
+        Some(changes) if changes.is_empty() => {}
         Some(changes) => {
             let mut block =
                 String::from("These files changed on the server and were NOT copied back:");
-            for changed in changes {
+            for changed in &changes {
                 block.push_str(&format!("\n  {}", path(changed)));
             }
             blocks.push(block);
@@ -5279,11 +5301,13 @@ fn render_terminal_report(terminal: &TerminalRecord) -> Option<String> {
     }
 
     match &terminal.untracked_files {
-        Some(untracked) if !untracked.paths.is_empty() || untracked.truncated => {
+        Some(untracked)
+            if !left_on_server(&untracked.paths).is_empty() || untracked.truncated =>
+        {
             let mut block = String::from(
                 "These untracked files were created on the server and were NOT copied back:",
             );
-            for created in &untracked.paths {
+            for created in &left_on_server(&untracked.paths) {
                 block.push_str(&format!("\n  {}", path(created)));
             }
             if untracked.truncated {

@@ -227,6 +227,9 @@ pub(crate) enum Script {
     /// after an acceptance when the vector has none. A replay vector starts
     /// past seq 0, so empty output stands in for the seqs before it.
     ReturnVector(&'static str),
+    /// Like `ReturnVector`, but the terminal record reports these
+    /// checkout-relative paths as both changed and new untracked files.
+    ReturnVectorReporting(&'static str, &'static [&'static str]),
 }
 
 pub(crate) struct Daemon {
@@ -363,8 +366,8 @@ pub(crate) async fn daemon_with_capabilities(
                 },
                 FrameType::Request => {
                     match body["method"].as_str().unwrap() {
-                        "exec.run" if matches!(script, Script::ReturnVector(_)) => {
-                            let Script::ReturnVector(name) = script else { unreachable!() };
+                        "exec.run" if matches!(script, Script::ReturnVector(_) | Script::ReturnVectorReporting(..)) => {
+                            let (Script::ReturnVector(name) | Script::ReturnVectorReporting(name, _)) = script else { unreachable!() };
                             let records = super::return_vectors::return_vector_records(name);
                             if !matches!(records.first(), Some(StreamRecord::Accepted(_))) {
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), 1))).unwrap()));
@@ -386,7 +389,12 @@ pub(crate) async fn daemon_with_capabilities(
                             for seq in 0..first_seq {
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Output(Output::new(seq, OutputStream::Stdout, BytePayload(Vec::new())))).unwrap()));
                             }
-                            for record in records {
+                            for mut record in records {
+                                if let (Script::ReturnVectorReporting(_, reported), StreamRecord::Terminal(terminal)) = (script, &mut record) {
+                                    let reported: Vec<String> = reported.iter().map(|path| path.to_string()).collect();
+                                    terminal.workspace_changes = Some(reported.clone());
+                                    terminal.untracked_files = Some(UntrackedFiles::new(reported));
+                                }
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(record).unwrap()));
                             }
                             replies.push(Frame::build_with_version(header.ver, FrameType::StreamEnd, header.flags, header.channel, header.epoch, header.corr, vec![]).unwrap());

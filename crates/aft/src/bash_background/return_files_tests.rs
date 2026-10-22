@@ -34,14 +34,17 @@ fn requested_paths_are_relative_files_listed_once_and_at_most_64() {
 fn report_lists_each_path_once_with_its_size_or_reason() {
     let report = render_report(&[
         ReturnedPath {
+            checkout_path: None,
             path: "dist/app.bin".into(),
             outcome: ReturnOutcome::Returned { bytes: 430_112 },
         },
         ReturnedPath {
+            checkout_path: None,
             path: "dist/one.txt".into(),
             outcome: ReturnOutcome::Returned { bytes: 1 },
         },
         ReturnedPath {
+            checkout_path: None,
             path: "dist/absent.txt".into(),
             outcome: ReturnOutcome::NotReturned {
                 reason: NotReturned::Runner {
@@ -50,6 +53,7 @@ fn report_lists_each_path_once_with_its_size_or_reason() {
             },
         },
         ReturnedPath {
+            checkout_path: None,
             path: "dist/large.bin".into(),
             outcome: ReturnOutcome::NotReturned {
                 reason: NotReturned::Runner {
@@ -84,7 +88,7 @@ mod receiving {
         let vector = return_vector(name);
         let cap = vector["cap_bytes"].as_u64().unwrap();
         let mut receiver =
-            ReturnReceiver::new(return_vector_paths(name), cap, root, root, "task-1").unwrap();
+            ReturnReceiver::new(return_vector_paths(name), cap, root, root, None, "task-1").unwrap();
         for record in return_vector_records(name) {
             match record {
                 StreamRecord::ReturnChunk(chunk) => receiver.chunk(&chunk, &mut |_| Ok(())),
@@ -282,7 +286,7 @@ mod receiving {
         let root = fs::canonicalize(dir.path()).unwrap();
         let name = "failed-missing";
         let mut receiver =
-            ReturnReceiver::new(return_vector_paths(name), 1 << 20, &root, &root, "task-1")
+            ReturnReceiver::new(return_vector_paths(name), 1 << 20, &root, &root, None, "task-1")
                 .unwrap();
         for record in return_vector_records(name) {
             if let StreamRecord::ReturnChunk(chunk) = record {
@@ -303,7 +307,7 @@ mod receiving {
         let root = fs::canonicalize(dir.path()).unwrap();
         let name = "three-chunks-short-last";
         let mut receiver =
-            ReturnReceiver::new(return_vector_paths(name), 1 << 20, &root, &root, "task-1")
+            ReturnReceiver::new(return_vector_paths(name), 1 << 20, &root, &root, None, "task-1")
                 .unwrap();
         let recorded = std::cell::RefCell::new(Vec::new());
         let mut record = |staging: &StagingRecord| {

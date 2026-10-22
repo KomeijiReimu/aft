@@ -21,6 +21,11 @@ pub(crate) const MAX_RETURN_PATHS: usize = 64;
 pub(crate) struct ReturnedPath {
     /// The path as the caller wrote it, relative to the command's workdir.
     pub path: String,
+    /// The same path relative to the checkout, with `/` separators, as the
+    /// runner names the files it reports as changed. `None` when the workdir
+    /// is not in a checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_path: Option<String>,
     pub outcome: ReturnOutcome,
 }
 
@@ -316,7 +321,7 @@ mod receiver {
     use std::fs;
     use std::io::{self, Seek, SeekFrom, Write};
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    use std::path::{Path, PathBuf};
+    use std::path::{Component, Path, PathBuf};
 
     /// Saves staging files and directories in the task record before the
     /// receiver creates them, so a restart can remove them.
@@ -341,6 +346,9 @@ mod receiver {
         /// The resolved project root. Every destination, and the directory
         /// of its staging file, must resolve inside it.
         root: PathBuf,
+        /// The resolved checkout the runner's workspace reports are relative
+        /// to, when the workdir is in one.
+        checkout_root: Option<PathBuf>,
         /// `None` once a stream check failed; every path is then discarded.
         assembler: Option<ReturnAssembler>,
         stream_error: Option<String>,
@@ -360,6 +368,7 @@ mod receiver {
             cap_bytes: u64,
             cwd: &Path,
             project_root: &Path,
+            checkout_root: Option<&Path>,
             task_id: &str,
         ) -> io::Result<Self> {
             Ok(Self {
@@ -371,6 +380,7 @@ mod receiver {
                 task_id: task_id.to_string(),
                 cwd: cwd.to_path_buf(),
                 root: fs::canonicalize(project_root)?,
+                checkout_root: checkout_root.map(Path::to_path_buf),
                 stream_error: None,
                 created_dirs: Vec::new(),
                 received_chunk: false,
@@ -560,8 +570,26 @@ mod receiver {
         fn entry(&self, index: usize, outcome: ReturnOutcome) -> ReturnedPath {
             ReturnedPath {
                 path: self.paths[index].clone(),
+                checkout_path: self.checkout_path(index),
                 outcome,
             }
+        }
+
+        /// The requested path relative to the checkout, with `/` separators:
+        /// the form the runner uses for the files it reports as changed.
+        fn checkout_path(&self, index: usize) -> Option<String> {
+            let checkout = self.checkout_root.as_deref()?;
+            let cwd = fs::canonicalize(&self.cwd).unwrap_or_else(|_| self.cwd.clone());
+            let relative = cwd.strip_prefix(checkout).ok()?;
+            let parts: Vec<String> = relative
+                .components()
+                .chain(Path::new(&self.paths[index]).components())
+                .filter_map(|component| match component {
+                    Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+                    _ => None,
+                })
+                .collect();
+            Some(parts.join("/"))
         }
 
         /// Move a verified file to its destination, replacing it within the
