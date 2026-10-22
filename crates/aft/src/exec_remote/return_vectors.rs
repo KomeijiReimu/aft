@@ -101,6 +101,7 @@ struct ReturnSink {
     manifests: Vec<u64>,
     lost: Vec<u64>,
     gaps: usize,
+    skipped: Vec<(u64, u64)>,
     verdicts: Vec<super::Verdict>,
 }
 
@@ -128,6 +129,10 @@ impl super::OutputSink for ReturnSink {
     }
     fn return_manifest(&mut self, manifest: &super::types::ReturnManifest) -> std::io::Result<()> {
         self.manifests.push(manifest.seq);
+        Ok(())
+    }
+    fn return_gap_skipped(&mut self, first: u64, last: u64) -> std::io::Result<()> {
+        self.skipped.push((first, last));
         Ok(())
     }
     fn terminal(
@@ -172,6 +177,7 @@ fn expired_replay_accepts_the_chunk_gap_before_its_manifest() {
     assert!(sink.chunks.is_empty());
     assert_eq!(sink.gaps, 0, "the chunk gap is not an output gap");
     assert!(sink.lost.is_empty(), "no output is reported lost");
+    assert_eq!(sink.skipped, [(3, 5)], "the skipped seqs are disclosed");
     assert_eq!(sink.verdicts, [super::Verdict::Exited { code: 0 }]);
 }
 
@@ -182,6 +188,7 @@ fn retained_replay_delivers_chunks_then_manifest_in_seq_order() {
     assert_eq!(sink.chunks, [3, 4, 5]);
     assert_eq!(sink.manifests, [6]);
     assert_eq!(sink.gaps, 0);
+    assert!(sink.skipped.is_empty());
 }
 
 #[test]
@@ -200,4 +207,81 @@ fn missing_chunks_before_a_manifest_that_returns_bytes_need_recovery() {
     );
     assert!(sink.manifests.is_empty());
     assert_eq!(sink.gaps, 1);
+}
+
+/// A fresh run's records: acceptance, output at seq 0, then `rest`.
+fn live_stream(rest: Vec<StreamRecord>) -> (Result<(), super::Error>, ReturnSink) {
+    use super::types::{Accepted, BytePayload, Output, OutputStream};
+    let mut consumer = super::StreamConsumer::new();
+    let mut sink = ReturnSink::default();
+    let job_id = "0192a64a-1234-7000-8000-000000000001".parse().unwrap();
+    let head = [
+        StreamRecord::Accepted(Accepted::new(job_id, 1)),
+        StreamRecord::Output(Output::new(
+            0,
+            OutputStream::Stdout,
+            BytePayload(b"a".to_vec()),
+        )),
+    ];
+    for record in head.into_iter().chain(rest) {
+        let bytes = serde_json::to_vec(&record).unwrap();
+        if let Err(error) = consumer.consume_bytes(&bytes, &mut sink) {
+            return (Err(error), sink);
+        }
+    }
+    (consumer.finish().map(|_| ()), sink)
+}
+
+/// A manifest at `seq` whose only path expired, and the terminal after it.
+fn expired_manifest_and_terminal(seq: u64) -> Vec<StreamRecord> {
+    use super::types::*;
+    let job_id = "0192a64a-1234-7000-8000-000000000001".parse().unwrap();
+    let entry =
+        ReturnManifestEntry::failed("dist/app.bin", ReturnPathsFailureCause::Expired).with_size(10);
+    vec![
+        StreamRecord::ReturnManifest(ReturnManifest::new(
+            job_id,
+            seq,
+            vec![entry],
+            0,
+            RETURN_CHUNKED_MAX_BYTES_CAP,
+        )),
+        StreamRecord::Terminal(TerminalRecord::new(
+            job_id,
+            Outcome::Exit { code: 0 },
+            1,
+            0,
+            0,
+        )),
+    ]
+}
+
+#[test]
+fn output_lost_inside_the_skipped_gap_is_disclosed_not_hidden() {
+    // Seq 1 was output and seqs 2 and 3 were chunks; none arrived. Nothing
+    // received tells them apart, so the gap is skipped and reported.
+    let (result, sink) = live_stream(expired_manifest_and_terminal(4));
+    result.unwrap();
+    assert_eq!(sink.skipped, [(1, 3)]);
+    assert_eq!(sink.manifests, [4]);
+}
+
+#[test]
+fn output_received_inside_the_gap_keeps_ordinary_gap_recovery() {
+    // Seq 2 arrived but seq 1 did not: the hole is before output, not
+    // directly before the manifest, so it is never skipped.
+    use super::types::{BytePayload, Output, OutputStream};
+    let mut rest = vec![StreamRecord::Output(Output::new(
+        2,
+        OutputStream::Stdout,
+        BytePayload(b"c".to_vec()),
+    ))];
+    rest.extend(expired_manifest_and_terminal(4));
+    let (result, sink) = live_stream(rest);
+    assert!(
+        matches!(result, Err(super::Error::RecoveryRequired { .. })),
+        "{result:?}"
+    );
+    assert!(sink.skipped.is_empty());
+    assert!(sink.manifests.is_empty());
 }
