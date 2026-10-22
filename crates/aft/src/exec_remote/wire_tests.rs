@@ -235,6 +235,9 @@ pub(crate) enum Script {
     /// Refuse the run with ck-motor's pinned final refusal for return_paths
     /// on a runner that does not copy files back.
     ReturnPathsUnsupported,
+    /// Like `ReturnVector`, but nothing is sent, not even the acceptance,
+    /// until `Daemon::acceptance_gate` is notified.
+    GatedReturnVector(&'static str),
 }
 
 pub(crate) struct Daemon {
@@ -396,8 +399,8 @@ pub(crate) async fn daemon_with_capabilities(
                             }
                             replies.push(Frame::build_with_version(header.ver, FrameType::StreamEnd, header.flags, header.channel, header.epoch, header.corr, vec![]).unwrap());
                         }
-                        "exec.run" if matches!(script, Script::ReturnVector(_) | Script::ReturnVectorReporting(..)) => {
-                            let (Script::ReturnVector(name) | Script::ReturnVectorReporting(name, _)) = script else { unreachable!() };
+                        "exec.run" if matches!(script, Script::ReturnVector(_) | Script::ReturnVectorReporting(..) | Script::GatedReturnVector(_)) => {
+                            let (Script::ReturnVector(name) | Script::ReturnVectorReporting(name, _) | Script::GatedReturnVector(name)) = script else { unreachable!() };
                             let records = super::return_vectors::return_vector_records(name);
                             if !matches!(records.first(), Some(StreamRecord::Accepted(_))) {
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), 1))).unwrap()));
@@ -426,6 +429,18 @@ pub(crate) async fn daemon_with_capabilities(
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(record).unwrap()));
                             }
                             replies.push(Frame::build_with_version(header.ver, FrameType::StreamEnd, header.flags, header.channel, header.epoch, header.corr, vec![]).unwrap());
+                            if matches!(script, Script::GatedReturnVector(_)) {
+                                // Hold every record, acceptance included, until the test releases them.
+                                let frames = std::mem::take(&mut replies);
+                                let writer = writer.clone();
+                                let gate = server_acceptance_gate.clone();
+                                producers.push(tokio::spawn(async move {
+                                    gate.notified().await;
+                                    for frame in frames {
+                                        let _ = subc_transport::write_frame(&mut *writer.lock().await, &frame).await;
+                                    }
+                                }));
+                            }
                         }
                         "exec.run" | "exec.attach" => {
                             let attaching = body["method"] == "exec.attach";
