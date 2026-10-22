@@ -13682,3 +13682,119 @@ async fn return_paths_unsupported_never_falls_back_even_for_prefix_routing() {
         done.output_preview
     );
 }
+
+#[tokio::test]
+async fn runon_return_paths_restart_during_gap_recovery_rewinds_to_the_first_chunk() {
+    // Chunks 1 and 2 of the file arrive, chunk 3 does not, then the manifest
+    // and terminal do: the terminal proof is saved for gap recovery. After a
+    // restart the staged bytes are gone, so recovery must attach from the
+    // first chunk, not from the gap, while keeping the saved terminal proof.
+    let daemon = return_daemon("three-chunks-short-last").await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let original = registry();
+    let db = Arc::new(Mutex::new(crate::db::open(&root.join("aft.db")).unwrap()));
+    original.set_harness(crate::harness::Harness::Runner);
+    original.set_db_pool(db.clone());
+    let layout = allocate_task_layout(&root, "session").unwrap();
+    let task_id = layout.paths.task_id.clone();
+    let mut metadata = PersistedTask::starting(
+        task_id.clone(),
+        "session".into(),
+        "make dist".into(),
+        root.clone(),
+        Some(root.clone()),
+        Some(30000),
+        true,
+        false,
+    );
+    metadata.status = BgTaskStatus::Running;
+    metadata.harness = Some("runner".into());
+    metadata.execution_note = Some("ran remotely on ck-motor".into());
+    let mut remote: RemoteTask = serde_json::from_value(serde_json::json!({
+        "harness": "broca", "session": "session", "stdout_len": 0,
+        "stderr_len": 0, "cancel_requested": false,
+    }))
+    .unwrap();
+    remote.explicit_runon = true;
+    remote.connection_file = Some(daemon.connection.clone());
+    remote.return_paths = vec!["dist/app.bin".into()];
+    metadata.remote = Some(remote);
+    let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
+    write_task_at(&layout, &metadata).unwrap();
+    original.dual_write_task(&layout.paths, &metadata);
+    original
+        .insert_rehydrated_task(metadata, layout.paths.clone(), false)
+        .unwrap();
+    let task = original.task(&task_id).unwrap();
+    task.state.lock().unwrap().io_handles = Some(handles);
+    let mut sink = TaskSink::new(&original, task.clone()).unwrap();
+    let mut consumer = exec::StreamConsumer::new();
+    consumer
+        .consume(StreamRecord::Accepted(Accepted::new(id(), 1)), &mut sink)
+        .unwrap();
+    consumer
+        .consume(
+            StreamRecord::Output(Output::new(
+                0,
+                OutputStream::Stdout,
+                BytePayload(Vec::new()),
+            )),
+            &mut sink,
+        )
+        .unwrap();
+    let mut gap = None;
+    for record in
+        crate::exec_remote::return_vectors::return_vector_records("three-chunks-short-last")
+    {
+        if matches!(&record, StreamRecord::ReturnChunk(chunk) if chunk.seq == 3) {
+            continue;
+        }
+        if let Err(error) = consumer.consume(record, &mut sink) {
+            gap = Some(error);
+        }
+    }
+    assert!(
+        matches!(gap, Some(exec::Error::RecoveryRequired { .. })),
+        "{gap:?}"
+    );
+    let saved = read_task_at(&layout).unwrap();
+    let remote = saved.remote.as_ref().unwrap();
+    assert_eq!(remote.return_first_seq, Some(1));
+    assert_eq!(remote.last_seq, Some(2), "the cursor stops at the gap");
+    assert!(remote.gap_recovery.is_some(), "the terminal proof is saved");
+    // A crash leaves the staged bytes behind; the restart removes them.
+    std::mem::forget(sink.returns.take());
+    drop(sink);
+    drop(consumer);
+    original.inner.shutdown.store(true, Ordering::SeqCst);
+    drop(task);
+    drop(original);
+
+    let restarted = registry();
+    restarted.set_harness(crate::harness::Harness::Runner);
+    restarted.set_db_pool(db);
+    restarted.replay_session(&root, "session").unwrap();
+    let done = terminal(&restarted, &task_id).await;
+    let attaches: Vec<_> = daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, body)| body["method"] == "exec.attach")
+        .map(|(_, body)| body["params"]["from_seq"].clone())
+        .collect();
+    assert_eq!(
+        attaches.first(),
+        Some(&serde_json::json!(1)),
+        "recovery attaches from the first chunk, not the gap: {attaches:?}"
+    );
+    assert_eq!(done.exit_code, Some(0), "{}", done.output_preview);
+    assert_eq!(fs::read(root.join("dist/app.bin")).unwrap(), b"0123456789");
+    assert!(
+        done.output_preview
+            .contains("  dist/app.bin: returned (10 bytes)"),
+        "{}",
+        done.output_preview
+    );
+}

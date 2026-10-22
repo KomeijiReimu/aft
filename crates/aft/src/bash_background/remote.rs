@@ -1068,13 +1068,12 @@ impl RemoteTask {
     fn point(&self) -> Option<ResumePoint> {
         // Returned files are staged only in memory and private files that a
         // restart discards, so resume before their first chunk until the
-        // manifest has been handled.
-        let last_seq = match (
-            self.return_first_seq,
-            &self.returned_files,
-            &self.gap_recovery,
-        ) {
-            (Some(first), None, None) => self.last_seq.min(first.checked_sub(1)),
+        // manifest has been handled. This holds during gap recovery too: the
+        // saved terminal proof stays with the resume point, and the records
+        // buffered above the gap stay pending, while the chunks before the
+        // gap are fetched again.
+        let last_seq = match (self.return_first_seq, &self.returned_files) {
+            (Some(first), None) => self.last_seq.min(first.checked_sub(1)),
             _ => self.last_seq,
         };
         Some(ResumePoint {
