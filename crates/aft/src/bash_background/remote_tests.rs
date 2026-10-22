@@ -13381,7 +13381,7 @@ async fn runon_return_paths_copied_files_are_not_listed_as_left_on_the_server() 
 }
 
 #[test]
-fn copied_back_filtering_applies_to_linux_runner_jobs_only() {
+fn copied_back_files_leave_the_changed_list_on_linux_and_windows_runners() {
     use crate::bash_background::registry::return_files::{ReturnOutcome, ReturnedPath};
     let mut terminal = TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 1, 0, 0);
     terminal.workspace_changes = Some(vec!["dist/hello.txt".into(), "other.txt".into()]);
@@ -13391,15 +13391,13 @@ fn copied_back_filtering_applies_to_linux_runner_jobs_only() {
     }))
     .unwrap();
     remote.accepted = true;
-    remote.terminal = Some(terminal.clone());
+    remote.terminal = Some(terminal);
     remote.return_paths = vec!["dist/hello.txt".into()];
     remote.returned_files = Some(vec![ReturnedPath {
         path: "dist/hello.txt".into(),
         checkout_path: Some("dist/hello.txt".into()),
         outcome: ReturnOutcome::Returned { bytes: 5 },
     }]);
-    let files = "Files requested back from the server (return_paths):\n  \
-                 dist/hello.txt: returned (5 bytes)";
     let mut metadata = PersistedTask::starting(
         "task".into(),
         "session".into(),
@@ -13410,36 +13408,23 @@ fn copied_back_filtering_applies_to_linux_runner_jobs_only() {
         true,
         false,
     );
-    let cases = [
-        (None, None, true),
-        (Some(Platform::Linux), Some(Platform::Linux), true),
-        (Some(Platform::Windows), Some(Platform::Windows), false),
-        (Some(Platform::Windows), None, false),
-    ];
-    for (requested, accepted, filtered) in cases {
+    // ck-motor names changed files the same way on both runners.
+    for platform in [None, Some(Platform::Linux), Some(Platform::Windows)] {
         let mut remote = remote.clone();
-        remote.requested_platform = requested.clone();
-        remote.accepted_platform = accepted.clone();
+        remote.requested_platform = platform.clone();
+        remote.accepted_platform = platform.clone();
         metadata.remote = Some(remote);
         let report = remote_report(&metadata).unwrap();
-        let expected = if filtered {
-            format!(
-                "{files}\n{}",
-                render_terminal_report(&terminal, &["dist/hello.txt"]).unwrap()
-            )
-        } else {
-            // A Windows runner's report is printed exactly as it was sent.
-            format!(
-                "{files}\n{}",
-                render_terminal_report(&terminal, &[]).unwrap()
-            )
-        };
-        assert_eq!(report, expected, "{requested:?} / {accepted:?}");
-        assert_eq!(
-            report.contains("NOT copied back:\n  dist/hello.txt\n"),
-            !filtered,
-            "{report}"
+        assert!(
+            report.starts_with(
+                "Files requested back from the server (return_paths):\n  \
+                 dist/hello.txt: returned (5 bytes)\n\
+                 These files changed on the server and were NOT copied back:\n  \
+                 other.txt\n"
+            ),
+            "{platform:?}: {report}"
         );
+        assert_eq!(report.matches("dist/hello.txt").count(), 1, "{report}");
     }
 }
 

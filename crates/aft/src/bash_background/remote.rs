@@ -5207,22 +5207,14 @@ pub(crate) fn remote_report(
     }
     let returned_files = remote.returned_files.as_deref().unwrap_or_default();
     // A file that was copied back is not also listed as left on the server.
-    // ck-motor's Linux runner takes `workspace_changes` from `git status
-    // --porcelain -z --untracked-files=all` at the checkout root: paths
-    // relative to that root with `/` separators, renames as their
-    // destination, untracked files included. Windows jobs build the list
-    // another way whose base is not confirmed, so their report is left as
-    // the runner sent it.
-    let linux_job = matches!(
-        remote
-            .accepted_platform
-            .as_ref()
-            .or(remote.requested_platform.as_ref()),
-        None | Some(Platform::Linux)
-    );
+    // ck-motor reports `workspace_changes` relative to the checkout root with
+    // `/` separators on every platform. On Linux the list comes from `git
+    // status --porcelain -z --untracked-files=all` (renames as their
+    // destination, untracked files included); on Windows it lists every
+    // changed file inside the checkout, git-ignored ones too. Both name a
+    // returned file by its checkout-relative path, so the same filter applies.
     let copied_back: Vec<&str> = returned_files
         .iter()
-        .filter(|_| linux_job)
         .filter(|entry| {
             matches!(
                 entry.outcome,
