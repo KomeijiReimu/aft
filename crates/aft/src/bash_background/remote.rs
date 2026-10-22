@@ -70,8 +70,13 @@ fn retry_waited_ms(remote: &RemoteTask) -> Option<u64> {
 /// The refusal text for a remote job. When the runner refused it for waiting
 /// behind this session's own earlier job in the same workspace, say so and
 /// name that job and its task instead of quoting the runner's queue report.
+/// When no runner that would take the job can copy files back, say that
+/// instead of suggesting a retry, which ck-motor refuses the same way.
 fn remote_refusal_message(reason: &str, detail: Option<&str>, remote: &RemoteTask) -> String {
     let message = match &remote.workspace_holder {
+        _ if return_paths_unsupported(reason, detail) => {
+            RETURN_PATHS_UNSUPPORTED_MESSAGE.to_string()
+        }
         Some(holder) if reason == "queue_wait_exceeded" => format!(
             "runon refused: your earlier job {} in this workspace is still running (task {}); this command waited behind it until the runner's queue wait limit passed and was not run; wait for task {} to end (bash_status shows it), then retry",
             holder.job_id, holder.task_id, holder.task_id
@@ -85,6 +90,19 @@ fn remote_refusal_message(reason: &str, detail: Option<&str>, remote: &RemoteTas
         Some(job_id) => format!("{message}; remote job {job_id}"),
         None => message,
     }
+}
+
+/// ck-motor's final refusal of a job with `return_paths` whose runner (any
+/// Windows runner, or an older Linux one) does not copy files back: refused
+/// before start as `request_rejected` with exactly this detail. It decides
+/// this from the runner's Hello before sending the run, and an unchanged
+/// retry gets the same answer.
+const RETURN_PATHS_UNSUPPORTED_DETAIL: &str = "return_paths_unsupported";
+
+const RETURN_PATHS_UNSUPPORTED_MESSAGE: &str = "runon refused: return_paths is not supported on the runner that would take this job; the command was not run; an unchanged retry is refused the same way";
+
+fn return_paths_unsupported(reason: &str, detail: Option<&str>) -> bool {
+    reason == "request_rejected" && detail == Some(RETURN_PATHS_UNSUPPORTED_DETAIL)
 }
 
 /// The job IDs a `queue_wait_exceeded` refusal detail names as running, when
@@ -3731,8 +3749,12 @@ impl BgTaskRegistry {
         let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
         let metadata = state.metadata.clone();
         // Automatic prefix routing may fall back; an explicit remote demand
-        // must fail before any local launch state or process is created.
-        if metadata.remote.as_ref().is_some_and(|r| r.explicit_runon) {
+        // must fail before any local launch state or process is created. A
+        // refusal of return_paths is final too: running the command here
+        // would not copy back the files it was asked for.
+        if metadata.remote.as_ref().is_some_and(|r| r.explicit_runon)
+            || return_paths_unsupported(reason, refusal_detail)
+        {
             drop(state);
             drop(db);
             return self.refuse_remote_executor(task, reason, refusal_detail);
@@ -3896,7 +3918,7 @@ impl BgTaskRegistry {
     ) -> Result<(), String> {
         // Decide before even restoring a local launch plan: this also covers
         // a refusal persisted just before the previous AFT process stopped.
-        if remote.explicit_runon {
+        if remote.explicit_runon || return_paths_unsupported(reason, refusal_detail) {
             return self.refuse_remote_executor(task, reason, refusal_detail);
         }
         let restore = (|| {

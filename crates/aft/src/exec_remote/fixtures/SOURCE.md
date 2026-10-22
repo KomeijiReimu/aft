@@ -46,3 +46,13 @@ streams, per-path failures, retained and expired replays, and every stream
 refusal `ReturnAssembler` raises. Tests check each `.jcs` against its
 `.sha256` before decoding it with the locked crate, then feed it to the same
 receiver the remote bash task uses to place returned files.
+
+`motor/return-paths-unsupported.json` is the terminal record ck-motor sends
+when a job with `return_paths` would go to a runner that does not copy files
+back (any Windows runner, or an older Linux runner), written to ck-motor's
+stated shape: refused before start with reason `request_rejected`,
+`refusal_detail` exactly `return_paths_unsupported`, `ran: "none"`, and no
+`retry_after_ms`. ck-motor decides this from the runner's Hello before sending
+the run, and the refusal is final. It is not a published crate vector; it pins
+the record AFT maps to its "return_paths is not supported on the runner"
+refusal.

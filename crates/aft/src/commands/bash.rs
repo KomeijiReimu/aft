@@ -749,6 +749,14 @@ fn attach_return_paths(
                 .into(),
         ));
     };
+    // ck-motor's Windows runners do not copy files back, and the demand
+    // already names the platform, so refuse before anything is submitted.
+    if launch.requested_platform == Some(crate::exec_remote::types::Platform::Windows) {
+        return Err(refused(
+            "return_paths refused: return_paths is not supported on Windows runners; the command did not run"
+                .into(),
+        ));
+    }
     check_requested_paths(&params.return_paths).map_err(|message| {
         refused(format!(
             "return_paths refused: {message}; the command did not run"

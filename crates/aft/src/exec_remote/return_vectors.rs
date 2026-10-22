@@ -254,3 +254,22 @@ fn output_received_inside_the_gap_keeps_ordinary_gap_recovery() {
     assert_eq!(sink.gaps, 1);
     assert!(sink.manifests.is_empty(), "the manifest waits for the hole");
 }
+
+#[test]
+fn motor_return_paths_unsupported_terminal_is_a_final_refusal_before_start() {
+    use super::types::*;
+    let record: StreamRecord =
+        serde_json::from_str(include_str!("fixtures/motor/return-paths-unsupported.json")).unwrap();
+    let StreamRecord::Terminal(terminal) = record else {
+        panic!("the pinned record is a terminal")
+    };
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert_eq!(terminal.retry_after_ms, None);
+    assert_eq!(
+        super::grade(&terminal),
+        super::Verdict::RunLocally {
+            reason: RefusalReason::RequestRejected,
+            refusal_detail: Some("return_paths_unsupported".into()),
+        }
+    );
+}

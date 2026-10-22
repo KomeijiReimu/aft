@@ -232,6 +232,9 @@ pub(crate) enum Script {
     /// checkout-relative paths as changed, as ck-motor's Linux runner does
     /// (its list includes untracked files; it sends no separate list).
     ReturnVectorReporting(&'static str, &'static [&'static str]),
+    /// Refuse the run with ck-motor's pinned final refusal for return_paths
+    /// on a runner that does not copy files back.
+    ReturnPathsUnsupported,
 }
 
 pub(crate) struct Daemon {
@@ -368,6 +371,11 @@ pub(crate) async fn daemon_with_capabilities(
                 },
                 FrameType::Request => {
                     match body["method"].as_str().unwrap() {
+                        "exec.run" if matches!(script, Script::ReturnPathsUnsupported) => {
+                            let terminal: Value = serde_json::from_str(include_str!("fixtures/motor/return-paths-unsupported.json")).unwrap();
+                            replies.push(reply(FrameType::StreamData, terminal));
+                            replies.push(Frame::build_with_version(header.ver, FrameType::StreamEnd, header.flags, header.channel, header.epoch, header.corr, vec![]).unwrap());
+                        }
                         "exec.attach" if matches!(script, Script::ReturnVector(_)) => {
                             // Replay the vector from the requested seq, as a
                             // runner that still keeps the job's files does.

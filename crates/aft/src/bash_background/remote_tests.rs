@@ -13582,3 +13582,103 @@ async fn runon_return_paths_restart_before_the_manifest_replays_chunks_and_place
     let saved = read_task_at(&layout).unwrap();
     assert!(saved.remote.unwrap().return_staging.is_empty());
 }
+
+#[test]
+fn runon_windows_with_return_paths_is_refused_before_anything_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let marker = dir.path().join("local-spawn-proof");
+    let request = orchestrated_request(serde_json::json!({
+        "command": format!("touch '{}'", marker.display()),
+        "workdir": dir.path(),
+        "runon": "windows",
+        "return_paths": ["dist/app.exe"],
+    }));
+    let response = crate::bash_background::with_remote_policy(
+        Some(launch(dir.path().join("no-daemon"))),
+        || crate::commands::bash::handle(&request, &ctx),
+    );
+    assert!(!response.success, "{response:?}");
+    assert_eq!(
+        response.data["code"], "return_paths_refused",
+        "{response:?}"
+    );
+    assert_eq!(
+        response.data["message"],
+        "return_paths refused: return_paths is not supported on Windows runners; the command did not run"
+    );
+    assert!(!marker.exists(), "a refused call never runs");
+}
+
+#[tokio::test]
+async fn runon_return_paths_unsupported_by_the_runner_is_final_and_never_runs_locally() {
+    // ck-motor advertises chunked return, but the runner that would take the
+    // job (a Windows runner or an older Linux one) cannot copy files back.
+    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::ReturnPathsUnsupported,
+        RETURN_CLAIMS,
+        1,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let marker = dir.path().join("local-spawn-proof");
+    let mut call = return_call(&["dist/app.bin"]);
+    call["command"] = serde_json::json!(format!("touch '{}'", marker.display()));
+    let (reply, _) = orchestrated_reply(&ctx, &daemon, call).await;
+    assert!(!reply.success, "{reply:?}");
+    assert_eq!(reply.data["code"], "remote_unavailable", "{reply:?}");
+    // The refusal names the job like every other runon outcome.
+    assert_eq!(
+        reply.data["message"],
+        format!("{RETURN_PATHS_UNSUPPORTED_MESSAGE}; remote job {}", id())
+    );
+    assert_eq!(
+        exec_runs(&daemon).len(),
+        1,
+        "the refusal is final, never retried"
+    );
+    assert!(!marker.exists(), "never a local run");
+}
+
+#[tokio::test]
+async fn return_paths_unsupported_never_falls_back_even_for_prefix_routing() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::ReturnPathsUnsupported,
+        RETURN_CLAIMS,
+        1,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    ensure_git_fixture(dir.path());
+    let registry = registry();
+    let mut policy = launch(daemon.connection.clone());
+    policy.return_paths = vec!["out.txt".into()];
+    let task = registry
+        .spawn_remote(
+            policy,
+            SpawnPlan::Unsandboxed,
+            "printf local > out.txt",
+            resolve_posix_shell(),
+            "session".into(),
+            dir.path().into(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
+            dir.path().into(),
+            crate::bash_background::TaskSlot::Background { max: 10 },
+            true,
+            false,
+            Some(dir.path().into()),
+        )
+        .unwrap();
+    let done = terminal(&registry, &task).await;
+    assert_eq!(exec_runs(&daemon).len(), 1);
+    assert!(!dir.path().join("out.txt").exists(), "never a local run");
+    assert!(
+        done.output_preview
+            .contains(RETURN_PATHS_UNSUPPORTED_MESSAGE),
+        "{}",
+        done.output_preview
+    );
+}
