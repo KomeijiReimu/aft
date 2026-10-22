@@ -13394,3 +13394,159 @@ async fn runon_return_paths_copied_files_are_not_listed_as_left_on_the_server() 
     );
     assert!(!output.contains("sub/dist/hello.txt"), "{output}");
 }
+
+#[tokio::test]
+async fn runon_return_paths_restart_before_the_manifest_replays_chunks_and_places_once() {
+    let daemon = return_daemon("three-chunks-short-last").await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let original = registry();
+    let db = Arc::new(Mutex::new(crate::db::open(&root.join("aft.db")).unwrap()));
+    original.set_harness(crate::harness::Harness::Runner);
+    original.set_db_pool(db.clone());
+    let layout = allocate_task_layout(&root, "session").unwrap();
+    let task_id = layout.paths.task_id.clone();
+    let mut metadata = PersistedTask::starting(
+        task_id.clone(),
+        "session".into(),
+        "make dist".into(),
+        root.clone(),
+        Some(root.clone()),
+        Some(30000),
+        true,
+        false,
+    );
+    metadata.status = BgTaskStatus::Running;
+    metadata.harness = Some("runner".into());
+    metadata.execution_note = Some("ran remotely on ck-motor".into());
+    metadata.remote = Some(RemoteTask {
+        submission: None,
+        accepted_platform: None,
+        explicit_runon: true,
+        connection_file: Some(daemon.connection.clone()),
+        harness: "broca".into(),
+        session: "session".into(),
+        requested_platform: None,
+        requested_vcpus: None,
+        requested_network: false,
+        granted_network: false,
+        accepted: false,
+        started: None,
+        job_id: None,
+        last_seq: None,
+        gap_recovery: None,
+        undelivered_output: Vec::new(),
+        stdout_len: 0,
+        stderr_len: 0,
+        unknown_len: 0,
+        cancel_requested: false,
+        cancel_pending: false,
+        owner_pause_cancel: None,
+        terminal: None,
+        pre_start_refusal: None,
+        fallback_digest: None,
+        env_not_forwarded: None,
+        queue_position: None,
+        output_received: false,
+        retry: None,
+        output_incomplete: None,
+        workspace_holder: None,
+        return_paths: vec!["dist/app.bin".into()],
+        returned_files: None,
+        return_first_seq: None,
+        return_staging: Default::default(),
+        return_gap: None,
+    });
+    let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
+    write_task_at(&layout, &metadata).unwrap();
+    original.dual_write_task(&layout.paths, &metadata);
+    original
+        .insert_rehydrated_task(metadata, layout.paths.clone(), false)
+        .unwrap();
+    let task = original.task(&task_id).unwrap();
+    task.state.lock().unwrap().io_handles = Some(handles);
+    let mut sink = TaskSink::new(&original, task.clone()).unwrap();
+    let mut consumer = exec::StreamConsumer::new();
+    consumer
+        .consume(StreamRecord::Accepted(Accepted::new(id(), 1)), &mut sink)
+        .unwrap();
+    consumer
+        .consume(
+            StreamRecord::Output(Output::new(
+                0,
+                OutputStream::Stdout,
+                BytePayload(Vec::new()),
+            )),
+            &mut sink,
+        )
+        .unwrap();
+    // Only the first of the file's three chunks arrives before the restart.
+    let first_chunk =
+        crate::exec_remote::return_vectors::return_vector_records("three-chunks-short-last")
+            .into_iter()
+            .find(|record| matches!(record, StreamRecord::ReturnChunk(_)))
+            .unwrap();
+    consumer.consume(first_chunk, &mut sink).unwrap();
+    // Checkpoint the cursor past the chunk, so only the saved first-chunk
+    // seq can bring the chunk back after the restart.
+    sink.checkpoint_progress().unwrap();
+    let staging = root.join(format!("dist/.aft-return-{task_id}-0.part"));
+    assert_eq!(fs::read(&staging).unwrap(), b"0123");
+    let saved = read_task_at(&layout).unwrap();
+    let remote = saved.remote.as_ref().unwrap();
+    assert_eq!(remote.return_first_seq, Some(1));
+    assert_eq!(
+        remote.last_seq,
+        Some(1),
+        "the saved cursor is past the chunk"
+    );
+    assert_eq!(remote.return_staging.files, [staging.clone()]);
+    assert_eq!(remote.return_staging.dirs, [root.join("dist")]);
+    // A crash leaves the staging file behind: its receiver never cleans up.
+    std::mem::forget(sink.returns.take());
+    drop(sink);
+    drop(consumer);
+    original.inner.shutdown.store(true, Ordering::SeqCst);
+    drop(task);
+    drop(original);
+
+    let restarted = registry();
+    restarted.set_harness(crate::harness::Harness::Runner);
+    restarted.set_db_pool(db);
+    restarted.replay_session(&root, "session").unwrap();
+    let done = terminal(&restarted, &task_id).await;
+    let log = daemon.log.lock().unwrap();
+    let attaches: Vec<_> = log
+        .iter()
+        .filter(|(_, body)| body["method"] == "exec.attach")
+        .map(|(_, body)| body["params"]["from_seq"].clone())
+        .collect();
+    assert_eq!(
+        attaches,
+        [serde_json::json!(1)],
+        "one attach, from the first chunk"
+    );
+    assert!(!log.iter().any(|(_, body)| body["method"] == "exec.run"));
+    assert_eq!(fs::read(root.join("dist/app.bin")).unwrap(), b"0123456789");
+    assert_eq!(
+        done.output_preview.matches("dist/app.bin:").count(),
+        1,
+        "{}",
+        done.output_preview
+    );
+    assert!(
+        done.output_preview
+            .contains("  dist/app.bin: returned (10 bytes)"),
+        "{}",
+        done.output_preview
+    );
+    assert!(!staging.exists(), "the stale staging file is gone");
+    let dist: Vec<_> = fs::read_dir(root.join("dist"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect();
+    assert_eq!(dist, ["app.bin"]);
+    let saved = read_task_at(&layout).unwrap();
+    assert!(saved.remote.unwrap().return_staging.is_empty());
+}

@@ -225,7 +225,8 @@ pub(crate) enum Script {
     },
     /// Answer the run with this published chunked-return vector's records,
     /// after an acceptance when the vector has none. A replay vector starts
-    /// past seq 0, so empty output stands in for the seqs before it.
+    /// past seq 0, so empty output stands in for the seqs before it. An
+    /// attach replays the vector's records from the requested seq.
     ReturnVector(&'static str),
     /// Like `ReturnVector`, but the terminal record reports these
     /// checkout-relative paths as both changed and new untracked files.
@@ -366,6 +367,26 @@ pub(crate) async fn daemon_with_capabilities(
                 },
                 FrameType::Request => {
                     match body["method"].as_str().unwrap() {
+                        "exec.attach" if matches!(script, Script::ReturnVector(_)) => {
+                            // Replay the vector from the requested seq, as a
+                            // runner that still keeps the job's files does.
+                            let Script::ReturnVector(name) = script else { unreachable!() };
+                            let from = body["params"]["from_seq"].as_u64().unwrap();
+                            for record in super::return_vectors::return_vector_records(name) {
+                                let seq = match &record {
+                                    StreamRecord::Accepted(_) => continue,
+                                    StreamRecord::Started(started) => Some(started.seq),
+                                    StreamRecord::Output(output) => Some(output.seq),
+                                    StreamRecord::ReturnChunk(chunk) => Some(chunk.seq),
+                                    StreamRecord::ReturnManifest(manifest) => Some(manifest.seq),
+                                    _ => None,
+                                };
+                                if seq.is_none_or(|seq| seq >= from) {
+                                    replies.push(reply(FrameType::StreamData, serde_json::to_value(record).unwrap()));
+                                }
+                            }
+                            replies.push(Frame::build_with_version(header.ver, FrameType::StreamEnd, header.flags, header.channel, header.epoch, header.corr, vec![]).unwrap());
+                        }
                         "exec.run" if matches!(script, Script::ReturnVector(_) | Script::ReturnVectorReporting(..)) => {
                             let (Script::ReturnVector(name) | Script::ReturnVectorReporting(name, _)) = script else { unreachable!() };
                             let records = super::return_vectors::return_vector_records(name);
