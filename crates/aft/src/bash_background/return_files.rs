@@ -354,10 +354,10 @@ fn remove_empty_dir(dir: &std::path::Path) {
     }
 }
 
-#[cfg(all(unix, test))]
-pub(crate) use receiver::with_copy_for_test;
 #[cfg(unix)]
 pub(crate) use receiver::ReturnReceiver;
+#[cfg(all(unix, test))]
+pub(crate) use receiver::{with_before_publish_for_test, with_copy_for_test, STOPPED_FOR_TEST};
 
 #[cfg(unix)]
 mod receiver {
@@ -633,10 +633,10 @@ mod receiver {
         ///   private control folder, which no sandboxed command can write,
         ///   into the destination directory: the rename replaces the
         ///   destination's directory entry, never anything it points to;
-        /// - on another filesystem a new destination is created exclusively,
-        ///   without following a symlink, and written through its handle; an
-        ///   existing file there is kept, because replacing it would need a
-        ///   name in the project that could be swapped;
+        /// - on another filesystem the bytes are copied into a recorded temp
+        ///   file created exclusively in the destination directory, which is
+        ///   then renamed over the destination within that directory, so the
+        ///   destination is replaced in one step or not at all;
         /// - afterwards the destination must be the file written (same
         ///   device and inode), or the path is reported as not returned.
         fn place(
@@ -677,7 +677,7 @@ mod receiver {
                     error: "the private staging file changed before placement".into(),
                 });
             }
-            let (directory, name) = self.open_destination_dir(index, record)?;
+            let (directory, directory_path, name) = self.open_destination_dir(index, record)?;
             let existing = stat_at(directory.as_raw_fd(), &name).map_err(local)?;
             if existing
                 .as_ref()
@@ -705,12 +705,15 @@ mod receiver {
                 .map_err(local)?;
                 staged_stat
             } else {
-                if existing.is_some() {
-                    return Err(NotReturned::LocalWrite {
-                        error: "the file here is on another filesystem than AFT's private staging folder, so it was kept".into(),
-                    });
-                }
-                self.copy_into_new(staged, directory.as_raw_fd(), &name)?
+                self.copy_and_publish(
+                    index,
+                    staged,
+                    &directory,
+                    &directory_path,
+                    &name,
+                    mode,
+                    record,
+                )?
             };
             match stat_at(directory.as_raw_fd(), &name).map_err(local)? {
                 Some(entry) if same_file(&entry, &placed) => Ok(()),
@@ -720,41 +723,60 @@ mod receiver {
             }
         }
 
-        /// Create `name` exclusively in `directory`, without following a
-        /// symlink, and copy the staged bytes into it through its handle.
-        fn copy_into_new(
+        /// Copy the staged bytes to the destination on another filesystem and
+        /// publish them in one step: write a recorded temp file, created
+        /// exclusively through the destination directory's handle without
+        /// following a symlink, set its mode and sync it through its own
+        /// handle, then rename it over `name` within that directory.
+        ///
+        /// The temp name sits in a directory sandboxed commands can write, so
+        /// one could swap it before the rename. That can at worst put a link
+        /// or another file at the destination, a path the same command could
+        /// already write directly; nothing outside the project is opened or
+        /// changed, and the identity check after the rename then reports the
+        /// path as not returned.
+        #[allow(clippy::too_many_arguments)]
+        fn copy_and_publish(
             &self,
+            index: usize,
             staged: &Staged,
-            directory: RawFd,
+            directory: &OwnedFd,
+            directory_path: &Path,
             name: &OsStr,
+            mode: u32,
+            record: &mut Recorder<'_>,
         ) -> Result<libc::stat, NotReturned> {
-            let mut out = create_exclusive_at(directory, name).map_err(|error| {
-                if error.kind() == io::ErrorKind::AlreadyExists {
-                    NotReturned::LocalWrite {
-                        error: "a file appeared at this path while it was placed".into(),
-                    }
-                } else {
-                    local(error)
-                }
-            })?;
+            let temp = OsString::from(staging_name(&self.task_id, index));
+            // Saved before the temp file exists, so a restart can remove it.
+            record(&StagingRecord {
+                files: vec![directory_path.join(&temp)],
+                dirs: Vec::new(),
+            })
+            .map_err(local)?;
+            let mut out = create_exclusive_at(directory.as_raw_fd(), &temp).map_err(local)?;
             let written = fstat(out.as_raw_fd()).map_err(local)?;
-            let copied = (|| {
+            let published = (|| {
                 let mut source = staged.file.try_clone()?;
                 source.seek(SeekFrom::Start(0))?;
                 let mut buffer = Vec::new();
                 source.read_to_end(&mut buffer)?;
                 out.write_all(&buffer)?;
-                out.set_permissions(fs::Permissions::from_mode(0o644))?;
-                out.sync_all()
+                out.set_permissions(fs::Permissions::from_mode(mode))?;
+                out.sync_all()?;
+                before_publish_for_test(&directory_path.join(&temp))?;
+                rename_at(directory.as_raw_fd(), &temp, directory.as_raw_fd(), name)
             })();
-            if let Err(error) = copied {
-                // Remove only the entry created here, never one put in its place.
-                if stat_at(directory, name)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|entry| same_file(&entry, &written))
-                {
-                    let _ = unlink_at(directory, name);
+            if let Err(error) = published {
+                if !stopped_for_test(&error) {
+                    // Remove only the temp file created here, never an entry
+                    // put in its place.
+                    if stat_at(directory.as_raw_fd(), &temp)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|entry| same_file(&entry, &written))
+                    {
+                        let _ = unlink_at(directory.as_raw_fd(), &temp);
+                    }
                 }
                 return Err(local(error));
             }
@@ -763,12 +785,13 @@ mod receiver {
 
         /// Open the destination's directory from the project root, one
         /// component at a time and following no symlink, creating missing
-        /// directories after recording them. Returns it and the file name.
+        /// directories after recording them. Returns it, its path and the
+        /// file name.
         fn open_destination_dir(
             &mut self,
             index: usize,
             record: &mut Recorder<'_>,
-        ) -> Result<(OwnedFd, OsString), NotReturned> {
+        ) -> Result<(OwnedFd, PathBuf, OsString), NotReturned> {
             let parent = resolve_parent(&self.root, &self.cwd.join(&self.paths[index]))?;
             let relative = parent
                 .existing
@@ -807,7 +830,7 @@ mod receiver {
                 directory =
                     open_directory_at(directory.as_raw_fd(), part).map_err(not_a_directory)?;
             }
-            Ok((directory, parent.file_name))
+            Ok((directory, path, parent.file_name))
         }
 
         fn discard(&mut self, index: usize) {
@@ -869,6 +892,51 @@ mod receiver {
         let result = run();
         COPY_FOR_TEST.with(|copy| copy.set(false));
         result
+    }
+
+    #[cfg(test)]
+    type BeforePublish = Box<dyn FnMut(&Path) -> io::Result<()>>;
+
+    #[cfg(test)]
+    thread_local! {
+        static BEFORE_PUBLISH: std::cell::RefCell<Option<BeforePublish>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The error a test hook returns to simulate AFT stopping just before the
+    /// other-filesystem rename: the temp file is left as a crash leaves it.
+    #[cfg(test)]
+    pub(crate) const STOPPED_FOR_TEST: &str = "AFT stopped before publishing (test)";
+
+    /// Run `hook` with the temp file's path just before the rename that
+    /// publishes it, for tests.
+    #[cfg(test)]
+    pub(crate) fn with_before_publish_for_test<T>(
+        hook: impl FnMut(&Path) -> io::Result<()> + 'static,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        BEFORE_PUBLISH.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        let result = run();
+        BEFORE_PUBLISH.with(|slot| *slot.borrow_mut() = None);
+        result
+    }
+
+    fn before_publish_for_test(_temp: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_PUBLISH.with(|slot| slot.borrow_mut().take()) {
+            let mut hook = hook;
+            let result = hook(_temp);
+            BEFORE_PUBLISH.with(|slot| *slot.borrow_mut() = Some(hook));
+            return result;
+        }
+        Ok(())
+    }
+
+    fn stopped_for_test(_error: &io::Error) -> bool {
+        #[cfg(test)]
+        return _error.to_string() == STOPPED_FOR_TEST;
+        #[cfg(not(test))]
+        false
     }
 
     fn copy_for_test() -> bool {

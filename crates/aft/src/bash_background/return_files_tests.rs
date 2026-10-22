@@ -399,13 +399,94 @@ mod receiving {
         assert_eq!(fs::read_dir(private.path()).unwrap().count(), 0);
     }
 
+    /// Feed a vector to `receiver`, saving what it records.
+    fn feed(receiver: &mut ReturnReceiver, name: &str) -> (Vec<ReturnedPath>, StagingRecord) {
+        let recorded = std::cell::RefCell::new(StagingRecord::default());
+        let mut record = |staging: &StagingRecord| {
+            let mut all = recorded.borrow_mut();
+            all.files.extend(staging.files.iter().cloned());
+            all.dirs.extend(staging.dirs.iter().cloned());
+            Ok(())
+        };
+        let mut report = None;
+        for stream_record in return_vector_records(name) {
+            match stream_record {
+                StreamRecord::ReturnChunk(chunk) => receiver.chunk(&chunk, &mut record),
+                StreamRecord::ReturnManifest(found) => {
+                    report = Some(receiver.manifest(&found, &mut record))
+                }
+                _ => {}
+            }
+        }
+        (report.unwrap(), recorded.into_inner())
+    }
+
     #[test]
-    fn another_filesystem_creates_new_files_exclusively_and_keeps_existing_ones() {
+    fn a_stop_before_publishing_leaves_the_destination_alone_and_replay_places_it() {
+        // AFT stops after writing the temp files and before renaming them.
         let dir = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(dir.path()).unwrap();
         fs::create_dir(root.join("dist")).unwrap();
         fs::write(root.join("dist/hello.txt"), b"old").unwrap();
-        let report = with_copy_for_test(|| receive("two-files-one-empty", &root));
+        let (_private_dir, private) = private_folder();
+        let name = "two-files-one-empty";
+        let mut first = receiver(name, &root, &private);
+        let (report, recorded) = with_copy_for_test(|| {
+            with_before_publish_for_test(
+                |_| Err(std::io::Error::other(STOPPED_FOR_TEST)),
+                || feed(&mut first, name),
+            )
+        });
+        assert!(report
+            .iter()
+            .all(|entry| matches!(entry.outcome, ReturnOutcome::NotReturned { .. })));
+        // A crash runs no cleanup.
+        std::mem::forget(first);
+        assert_eq!(fs::read(root.join("dist/hello.txt")).unwrap(), b"old");
+        assert!(!root.join("dist/empty.txt").exists());
+        let temps = [
+            root.join("dist").join(staging_name("task-1", 0)),
+            root.join("dist").join(staging_name("task-1", 1)),
+        ];
+        for temp in &temps {
+            assert!(temp.exists(), "{temp:?}");
+            assert!(recorded.files.contains(temp), "{temp:?} was not recorded");
+        }
+        // The restart removes everything recorded, then the replay places.
+        remove_recorded_staging(&recorded, "task-1");
+        for temp in &temps {
+            assert!(!temp.exists(), "{temp:?}");
+        }
+        let mut replay = receiver(name, &root, &private);
+        let (report, _) = with_copy_for_test(|| feed(&mut replay, name));
+        assert_eq!(report[0].outcome, ReturnOutcome::Returned { bytes: 5 });
+        assert_eq!(report[1].outcome, ReturnOutcome::Returned { bytes: 0 });
+        assert_eq!(fs::read(root.join("dist/hello.txt")).unwrap(), b"hello");
+        assert_eq!(files_under(&root), ["dist/empty.txt", "dist/hello.txt"]);
+    }
+
+    #[test]
+    fn a_temp_swapped_for_a_symlink_before_publishing_is_not_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("project");
+        fs::create_dir(&root).unwrap();
+        let outside = base.join("id_ed25519");
+        fs::write(&outside, b"secret").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+        let (_private_dir, private) = private_folder();
+        let name = "three-chunks-short-last";
+        let mut receiver = receiver(name, &root, &private);
+        let target = outside.clone();
+        let (report, _) = with_copy_for_test(|| {
+            with_before_publish_for_test(
+                move |temp| {
+                    fs::remove_file(temp)?;
+                    std::os::unix::fs::symlink(&target, temp)
+                },
+                || feed(&mut receiver, name),
+            )
+        });
         assert!(
             matches!(
                 &report[0].outcome,
@@ -415,11 +496,46 @@ mod receiving {
             ),
             "{report:?}"
         );
-        assert_eq!(fs::read(root.join("dist/hello.txt")).unwrap(), b"old");
+        assert_eq!(fs::read(&outside).unwrap(), b"secret");
+        assert_eq!(
+            fs::metadata(&outside).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn another_filesystem_replaces_an_existing_file_and_creates_a_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        fs::create_dir(root.join("dist")).unwrap();
+        fs::write(root.join("dist/hello.txt"), b"old").unwrap();
+        fs::set_permissions(
+            root.join("dist/hello.txt"),
+            fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        let report = with_copy_for_test(|| receive("two-files-one-empty", &root));
+        assert_eq!(report[0].outcome, ReturnOutcome::Returned { bytes: 5 });
         assert_eq!(report[1].outcome, ReturnOutcome::Returned { bytes: 0 });
-        let empty = fs::symlink_metadata(root.join("dist/empty.txt")).unwrap();
-        assert!(empty.file_type().is_file());
-        assert_eq!(empty.permissions().mode() & 0o7777, 0o644);
+        let mode = |path: &str| {
+            fs::symlink_metadata(root.join(path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        assert_eq!(fs::read(root.join("dist/hello.txt")).unwrap(), b"hello");
+        assert_eq!(
+            mode("dist/hello.txt"),
+            0o640,
+            "an existing file keeps its mode"
+        );
+        assert_eq!(mode("dist/empty.txt"), 0o644);
+        assert_eq!(
+            files_under(&root),
+            ["dist/empty.txt", "dist/hello.txt"],
+            "no temp left"
+        );
     }
 
     #[test]
