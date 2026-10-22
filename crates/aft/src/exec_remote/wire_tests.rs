@@ -229,7 +229,8 @@ pub(crate) enum Script {
     /// attach replays the vector's records from the requested seq.
     ReturnVector(&'static str),
     /// Like `ReturnVector`, but the terminal record reports these
-    /// checkout-relative paths as both changed and new untracked files.
+    /// checkout-relative paths as changed, as ck-motor's Linux runner does
+    /// (its list includes untracked files; it sends no separate list).
     ReturnVectorReporting(&'static str, &'static [&'static str]),
 }
 
@@ -412,9 +413,7 @@ pub(crate) async fn daemon_with_capabilities(
                             }
                             for mut record in records {
                                 if let (Script::ReturnVectorReporting(_, reported), StreamRecord::Terminal(terminal)) = (script, &mut record) {
-                                    let reported: Vec<String> = reported.iter().map(|path| path.to_string()).collect();
-                                    terminal.workspace_changes = Some(reported.clone());
-                                    terminal.untracked_files = Some(UntrackedFiles::new(reported));
+                                    terminal.workspace_changes = Some(reported.iter().map(|path| path.to_string()).collect());
                                 }
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(record).unwrap()));
                             }

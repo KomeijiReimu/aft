@@ -5207,8 +5207,22 @@ pub(crate) fn remote_report(
     }
     let returned_files = remote.returned_files.as_deref().unwrap_or_default();
     // A file that was copied back is not also listed as left on the server.
+    // ck-motor's Linux runner takes `workspace_changes` from `git status
+    // --porcelain -z --untracked-files=all` at the checkout root: paths
+    // relative to that root with `/` separators, renames as their
+    // destination, untracked files included. Windows jobs build the list
+    // another way whose base is not confirmed, so their report is left as
+    // the runner sent it.
+    let linux_job = matches!(
+        remote
+            .accepted_platform
+            .as_ref()
+            .or(remote.requested_platform.as_ref()),
+        None | Some(Platform::Linux)
+    );
     let copied_back: Vec<&str> = returned_files
         .iter()
+        .filter(|_| linux_job)
         .filter(|entry| {
             matches!(
                 entry.outcome,
@@ -5227,7 +5241,9 @@ pub(crate) fn remote_report(
 
 /// [`remote_report`] for one terminal record. `copied_back` names files,
 /// relative to the checkout as the runner reports them, that were copied back
-/// to this machine; they are left out of the "NOT copied back" lists.
+/// to this machine; they are left out of the changed-files list. The
+/// untracked-files list is printed as sent: ck-motor does not send it, and
+/// the contract does not state its path base.
 #[cfg(unix)]
 fn render_terminal_report(terminal: &TerminalRecord, copied_back: &[&str]) -> Option<String> {
     // Paths come from another machine; escaping keeps one per line.
@@ -5301,11 +5317,11 @@ fn render_terminal_report(terminal: &TerminalRecord, copied_back: &[&str]) -> Op
     }
 
     match &terminal.untracked_files {
-        Some(untracked) if !left_on_server(&untracked.paths).is_empty() || untracked.truncated => {
+        Some(untracked) if !untracked.paths.is_empty() || untracked.truncated => {
             let mut block = String::from(
                 "These untracked files were created on the server and were NOT copied back:",
             );
-            for created in &left_on_server(&untracked.paths) {
+            for created in &untracked.paths {
                 block.push_str(&format!("\n  {}", path(created)));
             }
             if untracked.truncated {

@@ -13372,14 +13372,75 @@ async fn runon_return_paths_copied_files_are_not_listed_as_left_on_the_server() 
         ),
         "{output}"
     );
+    // ck-motor sends no separate untracked list; its changed list holds them.
     assert!(
-        output.contains(
-            "These untracked files were created on the server and were NOT copied back:\n  \
-             sub/dist/absent.txt\n  sub/other.txt\n"
-        ),
+        output.contains("untracked files: not reported by the runner"),
         "{output}"
     );
     assert!(!output.contains("sub/dist/hello.txt"), "{output}");
+}
+
+#[test]
+fn copied_back_filtering_applies_to_linux_runner_jobs_only() {
+    use crate::bash_background::registry::return_files::{ReturnOutcome, ReturnedPath};
+    let mut terminal = TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 1, 0, 0);
+    terminal.workspace_changes = Some(vec!["dist/hello.txt".into(), "other.txt".into()]);
+    let mut remote: RemoteTask = serde_json::from_value(serde_json::json!({
+        "harness": "broca", "session": "session", "stdout_len": 0,
+        "stderr_len": 0, "cancel_requested": false,
+    }))
+    .unwrap();
+    remote.accepted = true;
+    remote.terminal = Some(terminal.clone());
+    remote.return_paths = vec!["dist/hello.txt".into()];
+    remote.returned_files = Some(vec![ReturnedPath {
+        path: "dist/hello.txt".into(),
+        checkout_path: Some("dist/hello.txt".into()),
+        outcome: ReturnOutcome::Returned { bytes: 5 },
+    }]);
+    let files = "Files requested back from the server (return_paths):\n  \
+                 dist/hello.txt: returned (5 bytes)";
+    let mut metadata = PersistedTask::starting(
+        "task".into(),
+        "session".into(),
+        "make dist".into(),
+        "/work".into(),
+        Some("/work".into()),
+        Some(30000),
+        true,
+        false,
+    );
+    let cases = [
+        (None, None, true),
+        (Some(Platform::Linux), Some(Platform::Linux), true),
+        (Some(Platform::Windows), Some(Platform::Windows), false),
+        (Some(Platform::Windows), None, false),
+    ];
+    for (requested, accepted, filtered) in cases {
+        let mut remote = remote.clone();
+        remote.requested_platform = requested.clone();
+        remote.accepted_platform = accepted.clone();
+        metadata.remote = Some(remote);
+        let report = remote_report(&metadata).unwrap();
+        let expected = if filtered {
+            format!(
+                "{files}\n{}",
+                render_terminal_report(&terminal, &["dist/hello.txt"]).unwrap()
+            )
+        } else {
+            // A Windows runner's report is printed exactly as it was sent.
+            format!(
+                "{files}\n{}",
+                render_terminal_report(&terminal, &[]).unwrap()
+            )
+        };
+        assert_eq!(report, expected, "{requested:?} / {accepted:?}");
+        assert_eq!(
+            report.contains("NOT copied back:\n  dist/hello.txt\n"),
+            !filtered,
+            "{report}"
+        );
+    }
 }
 
 #[tokio::test]
