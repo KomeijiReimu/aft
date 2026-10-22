@@ -32,39 +32,36 @@ fn requested_paths_are_relative_files_listed_once_and_at_most_64() {
 
 #[test]
 fn report_lists_each_path_once_with_its_size_or_reason() {
-    let report = render_report(
-        &[
-            ReturnedPath {
-                checkout_path: None,
-                path: "dist/app.bin".into(),
-                outcome: ReturnOutcome::Returned { bytes: 430_112 },
-            },
-            ReturnedPath {
-                checkout_path: None,
-                path: "dist/one.txt".into(),
-                outcome: ReturnOutcome::Returned { bytes: 1 },
-            },
-            ReturnedPath {
-                checkout_path: None,
-                path: "dist/absent.txt".into(),
-                outcome: ReturnOutcome::NotReturned {
-                    reason: NotReturned::Runner {
-                        cause: "missing".into(),
-                    },
+    let report = render_report(&[
+        ReturnedPath {
+            checkout_path: None,
+            path: "dist/app.bin".into(),
+            outcome: ReturnOutcome::Returned { bytes: 430_112 },
+        },
+        ReturnedPath {
+            checkout_path: None,
+            path: "dist/one.txt".into(),
+            outcome: ReturnOutcome::Returned { bytes: 1 },
+        },
+        ReturnedPath {
+            checkout_path: None,
+            path: "dist/absent.txt".into(),
+            outcome: ReturnOutcome::NotReturned {
+                reason: NotReturned::Runner {
+                    cause: "missing".into(),
                 },
             },
-            ReturnedPath {
-                checkout_path: None,
-                path: "dist/large.bin".into(),
-                outcome: ReturnOutcome::NotReturned {
-                    reason: NotReturned::Runner {
-                        cause: "over_cap".into(),
-                    },
+        },
+        ReturnedPath {
+            checkout_path: None,
+            path: "dist/large.bin".into(),
+            outcome: ReturnOutcome::NotReturned {
+                reason: NotReturned::Runner {
+                    cause: "over_cap".into(),
                 },
             },
-        ],
-        None,
-    );
+        },
+    ]);
     assert_eq!(
         report,
         "Files requested back from the server (return_paths):\n  \

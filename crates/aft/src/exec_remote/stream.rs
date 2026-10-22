@@ -76,11 +76,6 @@ pub trait OutputSink {
     fn return_manifest(&mut self, manifest: &ReturnManifest) -> io::Result<()> {
         self.unknown_output(manifest.seq, &[])
     }
-    /// Seqs `first` to `last` were skipped as the chunk gap of an expired
-    /// replay, just before its manifest. They may have held output too.
-    fn return_gap_skipped(&mut self, _first: u64, _last: u64) -> io::Result<()> {
-        Ok(())
-    }
     fn terminal(&mut self, record: &TerminalRecord, verdict: &Verdict) -> io::Result<()>;
 }
 
@@ -258,7 +253,7 @@ impl StreamConsumer {
             StreamRecord::ReturnManifest(manifest) => {
                 self.check_job(manifest.job_id)?;
                 let seq = manifest.seq;
-                self.skip_expired_return_chunks(&manifest, sink)?;
+                self.skip_expired_return_chunks(&manifest)?;
                 self.enqueue(seq, Pending::ReturnManifest(manifest), sink)
             }
             StreamRecord::Unknown { seq, .. } => self.consume_unknown(seq, sink),
@@ -284,15 +279,14 @@ impl StreamConsumer {
     /// still returns bytes, the missing seqs held those bytes, so the ordinary
     /// gap recovery re-attaches to fetch them.
     ///
-    /// The contract does not promise that every chunk follows every output
-    /// record, so the skipped seqs may also have held output. The sink is told
-    /// which seqs were skipped, so the result can say that output just before
-    /// the copy-back report may be incomplete.
-    fn skip_expired_return_chunks<S: OutputSink>(
-        &mut self,
-        manifest: &ReturnManifest,
-        sink: &mut S,
-    ) -> Result<(), Error> {
+    /// ck-motor assigns the seqs of every `return_chunk` and of the manifest
+    /// in the same durable save that writes the terminal record, after output
+    /// collection has ended, and forwards seqs unchanged. So they come after
+    /// every output record, and a gap directly before the manifest can only
+    /// be chunks: skipping it loses no output. A record received inside the
+    /// gap's range is not a chunk the runner dropped, so it keeps the
+    /// ordinary gap recovery.
+    fn skip_expired_return_chunks(&mut self, manifest: &ReturnManifest) -> Result<(), Error> {
         let next = self.next_seq()?;
         if manifest.total_bytes != 0
             || manifest.seq <= next
@@ -300,7 +294,6 @@ impl StreamConsumer {
         {
             return Ok(());
         }
-        sink.return_gap_skipped(next, manifest.seq - 1)?;
         if let Some(point) = self.point.as_mut() {
             point.last_seq = Some(manifest.seq - 1);
         }

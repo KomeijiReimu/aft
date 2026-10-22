@@ -102,9 +102,7 @@ fn format_cap(bytes: u64) -> String {
 /// once, returned with its size or not returned with the reason.
 // Only the Unix remote-run path prints the report.
 #[cfg_attr(not(unix), allow(dead_code))]
-/// `skipped` is the seq range an expired replay skipped before its manifest,
-/// when it skipped one.
-pub(crate) fn render_report(paths: &[ReturnedPath], skipped: Option<(u64, u64)>) -> String {
+pub(crate) fn render_report(paths: &[ReturnedPath]) -> String {
     let cap = crate::exec_remote::return_max_bytes();
     let mut block = String::from("Files requested back from the server (return_paths):");
     for entry in paths {
@@ -119,11 +117,6 @@ pub(crate) fn render_report(paths: &[ReturnedPath], skipped: Option<(u64, u64)>)
                 reason.describe(cap)
             )),
         }
-    }
-    if let Some((first, last)) = skipped {
-        block.push_str(&format!(
-            "\n  Output just before this report may be incomplete: records {first} to {last} were not sent, as in a replay after the server stopped keeping this job's files."
-        ));
     }
     block
 }
