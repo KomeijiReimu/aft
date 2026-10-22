@@ -1219,6 +1219,12 @@ impl TaskSink {
                     .ok()
                     .flatten()
                     .as_deref(),
+                // Staged bytes live in the task's private control folder,
+                // which sandboxed commands cannot write.
+                resolve_task_layout(&task.paths.session_dir, &task.task_id)?
+                    .dirs
+                    .control
+                    .clone(),
                 &task.task_id,
             )?)
         } else {

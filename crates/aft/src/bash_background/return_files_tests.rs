@@ -75,21 +75,43 @@ fn report_lists_each_path_once_with_its_size_or_reason() {
 #[cfg(unix)]
 mod receiving {
     use super::super::*;
+    use crate::bash_background::persistence::PinnedDir;
     use crate::exec_remote::return_vectors::{
         return_vector, return_vector_paths, return_vector_records, RETURN_VECTORS,
     };
     use crate::exec_remote::types::StreamRecord;
     use base64::Engine;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::sync::Arc;
+
+    /// A private staging folder outside the project, like a task's control
+    /// folder.
+    fn private_folder() -> (tempfile::TempDir, Arc<PinnedDir>) {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = Arc::new(PinnedDir::open(&fs::canonicalize(dir.path()).unwrap()).unwrap());
+        (dir, pinned)
+    }
+
+    fn receiver(name: &str, root: &Path, private: &Arc<PinnedDir>) -> ReturnReceiver {
+        let cap = return_vector(name)["cap_bytes"].as_u64().unwrap();
+        ReturnReceiver::new(
+            return_vector_paths(name),
+            cap,
+            root,
+            root,
+            None,
+            private.clone(),
+            "task-1",
+        )
+        .unwrap()
+    }
 
     /// Feed a vector's returned-file records to a receiver rooted at `root`.
     fn receive(name: &str, root: &Path) -> Vec<ReturnedPath> {
-        let vector = return_vector(name);
-        let cap = vector["cap_bytes"].as_u64().unwrap();
-        let mut receiver =
-            ReturnReceiver::new(return_vector_paths(name), cap, root, root, None, "task-1")
-                .unwrap();
+        let (_dir, private) = private_folder();
+        let mut receiver = receiver(name, root, &private);
         for record in return_vector_records(name) {
             match record {
                 StreamRecord::ReturnChunk(chunk) => receiver.chunk(&chunk, &mut |_| Ok(())),
@@ -257,28 +279,147 @@ mod receiving {
     }
 
     #[test]
-    fn symlinked_file_leading_out_of_the_project_is_refused() {
+    fn a_destination_symlink_is_refused_and_never_followed() {
+        // A symlink at the destination is not replaced or followed, whether
+        // it points outside the project or at another file inside it.
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
         let root = base.join("project");
         let outside = base.join("outside.txt");
         fs::create_dir_all(root.join("dist")).unwrap();
         fs::write(&outside, b"not ours").unwrap();
+        fs::write(root.join("kept.txt"), b"inside").unwrap();
         std::os::unix::fs::symlink(&outside, root.join("dist/hello.txt")).unwrap();
+        std::os::unix::fs::symlink(root.join("kept.txt"), root.join("dist/empty.txt")).unwrap();
         let report = receive("two-files-one-empty", &root);
-        assert_eq!(
-            report[0].outcome,
-            ReturnOutcome::NotReturned {
-                reason: NotReturned::OutsideProject
-            }
-        );
-        // The other path does not go through the link and is placed.
-        assert_eq!(report[1].outcome, ReturnOutcome::Returned { bytes: 0 });
+        for entry in &report {
+            assert_eq!(
+                entry.outcome,
+                ReturnOutcome::NotReturned {
+                    reason: NotReturned::NotRegular
+                },
+                "{}",
+                entry.path
+            );
+        }
         assert_eq!(fs::read(&outside).unwrap(), b"not ours");
-        assert!(fs::symlink_metadata(root.join("dist/hello.txt"))
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert_eq!(fs::read(root.join("kept.txt")).unwrap(), b"inside");
+        for link in ["dist/hello.txt", "dist/empty.txt"] {
+            assert!(fs::symlink_metadata(root.join(link))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+    }
+
+    #[test]
+    fn a_staging_entry_swapped_for_a_symlink_never_touches_the_outside_file() {
+        // Even if the staging entry were replaced by a symlink to an outside
+        // file before the manifest, placement works on the handle it wrote:
+        // the outside file keeps its content and mode, and nothing is placed.
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("project");
+        fs::create_dir(&root).unwrap();
+        let outside = base.join("id_ed25519");
+        fs::write(&outside, b"secret").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+        let (_private_dir, private) = private_folder();
+        let name = "three-chunks-short-last";
+        let mut receiver = receiver(name, &root, &private);
+        let mut manifest = None;
+        for record in return_vector_records(name) {
+            match record {
+                StreamRecord::ReturnChunk(chunk) => receiver.chunk(&chunk, &mut |_| Ok(())),
+                StreamRecord::ReturnManifest(found) => manifest = Some(found),
+                _ => {}
+            }
+        }
+        let staging = private.path().join(staging_name("task-1", 0));
+        fs::remove_file(&staging).unwrap();
+        std::os::unix::fs::symlink(&outside, &staging).unwrap();
+        let report = receiver.manifest(&manifest.unwrap(), &mut |_| Ok(()));
+        assert!(
+            matches!(
+                &report[0].outcome,
+                ReturnOutcome::NotReturned {
+                    reason: NotReturned::LocalWrite { .. }
+                }
+            ),
+            "{report:?}"
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"secret");
+        assert_eq!(
+            fs::metadata(&outside).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        assert!(!root.join("dist/app.bin").exists());
+        assert!(fs::symlink_metadata(root.join("dist/app.bin")).is_err());
+    }
+
+    #[test]
+    fn mode_is_set_on_the_placed_file_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        // An existing file keeps its mode; a new file gets 0644.
+        fs::create_dir(root.join("dist")).unwrap();
+        fs::write(root.join("dist/hello.txt"), b"old").unwrap();
+        fs::set_permissions(
+            root.join("dist/hello.txt"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let (_private_dir, private) = private_folder();
+        fs::set_permissions(private.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let name = "two-files-one-empty";
+        let mut receiver = receiver(name, &root, &private);
+        let mut report = None;
+        for record in return_vector_records(name) {
+            match record {
+                StreamRecord::ReturnChunk(chunk) => receiver.chunk(&chunk, &mut |_| Ok(())),
+                StreamRecord::ReturnManifest(found) => {
+                    report = Some(receiver.manifest(&found, &mut |_| Ok(())))
+                }
+                _ => {}
+            }
+        }
+        let report = report.unwrap();
+        assert_eq!(report[0].outcome, ReturnOutcome::Returned { bytes: 5 });
+        assert_eq!(report[1].outcome, ReturnOutcome::Returned { bytes: 0 });
+        let mode =
+            |path: &str| fs::metadata(root.join(path)).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(fs::read(root.join("dist/hello.txt")).unwrap(), b"hello");
+        assert_eq!(mode("dist/hello.txt"), 0o600);
+        assert_eq!(mode("dist/empty.txt"), 0o644);
+        // The private folder is untouched apart from its staged files leaving.
+        assert_eq!(
+            fs::metadata(private.path()).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        assert_eq!(fs::read_dir(private.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn another_filesystem_creates_new_files_exclusively_and_keeps_existing_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        fs::create_dir(root.join("dist")).unwrap();
+        fs::write(root.join("dist/hello.txt"), b"old").unwrap();
+        let report = with_copy_for_test(|| receive("two-files-one-empty", &root));
+        assert!(
+            matches!(
+                &report[0].outcome,
+                ReturnOutcome::NotReturned {
+                    reason: NotReturned::LocalWrite { .. }
+                }
+            ),
+            "{report:?}"
+        );
+        assert_eq!(fs::read(root.join("dist/hello.txt")).unwrap(), b"old");
+        assert_eq!(report[1].outcome, ReturnOutcome::Returned { bytes: 0 });
+        let empty = fs::symlink_metadata(root.join("dist/empty.txt")).unwrap();
+        assert!(empty.file_type().is_file());
+        assert_eq!(empty.permissions().mode() & 0o7777, 0o644);
     }
 
     #[test]
@@ -286,15 +427,8 @@ mod receiving {
         let dir = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(dir.path()).unwrap();
         let name = "failed-missing";
-        let mut receiver = ReturnReceiver::new(
-            return_vector_paths(name),
-            1 << 20,
-            &root,
-            &root,
-            None,
-            "task-1",
-        )
-        .unwrap();
+        let (_private_dir, private) = private_folder();
+        let mut receiver = receiver(name, &root, &private);
         for record in return_vector_records(name) {
             if let StreamRecord::ReturnChunk(chunk) = record {
                 receiver.chunk(&chunk, &mut |_| Ok(()));
@@ -309,19 +443,12 @@ mod receiving {
     }
 
     #[test]
-    fn staging_file_sits_beside_its_destination_and_is_recorded_before_it_exists() {
+    fn staging_file_is_private_and_recorded_before_it_exists() {
         let dir = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(dir.path()).unwrap();
         let name = "three-chunks-short-last";
-        let mut receiver = ReturnReceiver::new(
-            return_vector_paths(name),
-            1 << 20,
-            &root,
-            &root,
-            None,
-            "task-1",
-        )
-        .unwrap();
+        let (_private_dir, private) = private_folder();
+        let mut receiver = receiver(name, &root, &private);
         let recorded = std::cell::RefCell::new(Vec::new());
         let mut record = |staging: &StagingRecord| {
             for file in &staging.files {
@@ -329,6 +456,9 @@ mod receiving {
                     !file.exists(),
                     "{file:?} was created before it was recorded"
                 );
+            }
+            for dir in &staging.dirs {
+                assert!(!dir.exists(), "{dir:?} was created before it was recorded");
             }
             recorded.borrow_mut().push(staging.clone());
             Ok(())
@@ -341,20 +471,26 @@ mod receiving {
                 _ => {}
             }
         }
-        let staging = root.join("dist/.aft-return-task-1-0.part");
+        let staging = private.path().join(staging_name("task-1", 0));
         assert_eq!(
             *recorded.borrow(),
             [StagingRecord {
                 files: vec![staging.clone()],
-                dirs: vec![root.join("dist")],
+                dirs: Vec::new(),
             }],
-            "one staging file, in the destination's own directory"
+            "one staging file, in the private folder"
         );
         assert_eq!(fs::read(&staging).unwrap(), b"0123456789");
-        assert_eq!(files_under(&root), ["dist/.aft-return-task-1-0.part"]);
+        assert_eq!(
+            files_under(&root),
+            Vec::<String>::new(),
+            "nothing in the project yet"
+        );
         let report = receiver.manifest(&manifest.unwrap(), &mut record);
         assert_eq!(report[0].outcome, ReturnOutcome::Returned { bytes: 10 });
+        assert_eq!(recorded.borrow().last().unwrap().dirs, [root.join("dist")]);
         assert_eq!(files_under(&root), ["dist/app.bin"]);
+        assert!(!staging.exists());
     }
 
     #[test]

@@ -13522,7 +13522,12 @@ async fn runon_return_paths_restart_before_the_manifest_replays_chunks_and_place
     // Checkpoint the cursor past the chunk, so only the saved first-chunk
     // seq can bring the chunk back after the restart.
     sink.checkpoint_progress().unwrap();
-    let staging = root.join(format!("dist/.aft-return-{task_id}-0.part"));
+    // Received bytes are staged in the task's private control folder.
+    let staging = layout
+        .dirs
+        .control
+        .path()
+        .join(format!(".aft-return-{task_id}-0.part"));
     assert_eq!(fs::read(&staging).unwrap(), b"0123");
     let saved = read_task_at(&layout).unwrap();
     let remote = saved.remote.as_ref().unwrap();
@@ -13533,7 +13538,11 @@ async fn runon_return_paths_restart_before_the_manifest_replays_chunks_and_place
         "the saved cursor is past the chunk"
     );
     assert_eq!(remote.return_staging.files, [staging.clone()]);
-    assert_eq!(remote.return_staging.dirs, [root.join("dist")]);
+    assert!(remote.return_staging.dirs.is_empty());
+    assert!(
+        !root.join("dist").exists(),
+        "nothing in the project before the manifest"
+    );
     // A crash leaves the staging file behind: its receiver never cleans up.
     std::mem::forget(sink.returns.take());
     drop(sink);

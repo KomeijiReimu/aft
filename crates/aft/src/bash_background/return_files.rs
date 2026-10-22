@@ -56,6 +56,9 @@ pub(crate) enum NotReturned {
     OutsideProject,
     /// Staging or placing the verified file failed locally.
     LocalWrite { error: String },
+    /// A symlink or something other than a regular file is at the local
+    /// path. It is never followed or replaced.
+    NotRegular,
 }
 
 // Only the Unix remote-run path prints the report.
@@ -83,6 +86,9 @@ impl NotReturned {
             Self::NoReport => "the server sent no report for it".into(),
             Self::OutsideProject => "the local path resolves outside the project".into(),
             Self::LocalWrite { error } => format!("could not write it here: {error}"),
+            Self::NotRegular => {
+                "a symlink or a non-regular file is at this path here; it was left as it is".into()
+            }
         }
     }
 }
@@ -187,9 +193,56 @@ pub(crate) struct Destination {
     pub missing_dirs: Vec<std::path::PathBuf>,
 }
 
+/// The parent of a returned path's file: the deepest directory that exists,
+/// resolved through any symlinks and refused unless it is inside `root`
+/// (which must itself be resolved), the names of the directories below it
+/// that do not exist yet, and the file's own name.
+pub(crate) struct ResolvedParent {
+    pub existing: std::path::PathBuf,
+    pub missing: Vec<std::ffi::OsString>,
+    pub file_name: std::ffi::OsString,
+}
+
+pub(crate) fn resolve_parent(
+    root: &std::path::Path,
+    requested: &std::path::Path,
+) -> Result<ResolvedParent, NotReturned> {
+    use std::fs;
+    let file_name = requested
+        .file_name()
+        .ok_or_else(|| NotReturned::LocalWrite {
+            error: "the path has no file name".into(),
+        })?
+        .to_owned();
+    let parent = requested.parent().ok_or(NotReturned::OutsideProject)?;
+    let mut existing = parent;
+    let mut missing = Vec::new();
+    while fs::symlink_metadata(existing).is_err() {
+        missing.push(
+            existing
+                .file_name()
+                .ok_or(NotReturned::OutsideProject)?
+                .to_owned(),
+        );
+        existing = existing.parent().ok_or(NotReturned::OutsideProject)?;
+    }
+    let resolved = fs::canonicalize(existing).map_err(|_| NotReturned::OutsideProject)?;
+    if !resolved.starts_with(root) {
+        return Err(NotReturned::OutsideProject);
+    }
+    missing.reverse();
+    Ok(ResolvedParent {
+        existing: resolved,
+        missing,
+        file_name,
+    })
+}
+
 /// The local file a returned path writes: `requested` resolved through any
 /// symlinks, refused unless every existing part of it stays inside `root`
-/// (which must itself be resolved). Nothing is created here.
+/// (which must itself be resolved). Nothing is created here. This is the
+/// check made before the job is submitted; placing the file later refuses a
+/// symlink at the path itself instead of following it.
 pub(crate) fn resolve_destination(
     root: &std::path::Path,
     requested: &std::path::Path,
@@ -198,32 +251,14 @@ pub(crate) fn resolve_destination(
     let local = |error: io::Error| NotReturned::LocalWrite {
         error: error.to_string(),
     };
-    let file_name = requested
-        .file_name()
-        .ok_or_else(|| NotReturned::LocalWrite {
-            error: "the path has no file name".into(),
-        })?
-        .to_owned();
-    let parent = requested.parent().ok_or(NotReturned::OutsideProject)?;
-    // Resolve the deepest parent directory that exists, following symlinks,
-    // and refuse it unless it is inside the project.
-    let mut existing = parent;
-    let mut missing = Vec::new();
-    while fs::symlink_metadata(existing).is_err() {
-        missing.push(existing.file_name().ok_or(NotReturned::OutsideProject)?);
-        existing = existing.parent().ok_or(NotReturned::OutsideProject)?;
-    }
-    let resolved = fs::canonicalize(existing).map_err(|_| NotReturned::OutsideProject)?;
-    if !resolved.starts_with(root) {
-        return Err(NotReturned::OutsideProject);
-    }
-    let mut directory = resolved;
-    let mut missing_dirs = Vec::with_capacity(missing.len());
-    for component in missing.into_iter().rev() {
+    let parent = resolve_parent(root, requested)?;
+    let mut directory = parent.existing;
+    let mut missing_dirs = Vec::with_capacity(parent.missing.len());
+    for component in parent.missing {
         directory.push(component);
         missing_dirs.push(directory.clone());
     }
-    let target = directory.join(file_name);
+    let target = directory.join(parent.file_name);
     if !missing_dirs.is_empty() {
         return Ok(Destination {
             target,
@@ -277,7 +312,7 @@ impl StagingRecord {
     }
 }
 
-/// The name of a path's staging file: hidden, beside its destination, and
+/// The name of a path's staging file in the task's private control folder:
 /// specific to the task and the path's position in `return_paths`.
 // Only the Unix remote-run path stages returned files.
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -302,38 +337,53 @@ pub(crate) fn remove_recorded_staging(record: &StagingRecord, task_id: &str) {
         }
     }
     for dir in record.dirs.iter().rev() {
+        remove_empty_dir(dir);
+    }
+}
+
+/// Remove a directory AFT created, when it is still empty and its path still
+/// resolves to itself: a component swapped for a symlink since then leaves it.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn remove_empty_dir(dir: &std::path::Path) {
+    if std::fs::canonicalize(dir).is_ok_and(|resolved| resolved == dir) {
         // Fails, and keeps the directory, when anything is in it.
         let _ = std::fs::remove_dir(dir);
     }
 }
 
+#[cfg(all(unix, test))]
+pub(crate) use receiver::with_copy_for_test;
 #[cfg(unix)]
 pub(crate) use receiver::ReturnReceiver;
 
 #[cfg(unix)]
 mod receiver {
     use super::{
-        resolve_destination, staging_name, NotReturned, ReturnOutcome, ReturnedPath, StagingRecord,
+        remove_empty_dir, resolve_parent, staging_name, NotReturned, ReturnOutcome, ReturnedPath,
+        StagingRecord,
     };
+    use crate::bash_background::persistence::PinnedDir;
     use crate::exec_remote::types::{
         ReturnAssembler, ReturnChunk, ReturnManifest, ReturnManifestOutcome,
     };
+    use std::ffi::{CString, OsStr, OsString};
     use std::fs;
-    use std::io::{self, Seek, SeekFrom, Write};
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::io::{self, Read, Seek, SeekFrom, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Component, Path, PathBuf};
+    use std::sync::Arc;
 
     /// Saves staging files and directories in the task record before the
     /// receiver creates them, so a restart can remove them.
     pub(crate) type Recorder<'a> = dyn FnMut(&StagingRecord) -> io::Result<()> + 'a;
 
-    /// One path's bytes as received so far, in a private file beside the
-    /// file it will replace.
+    /// One path's bytes as received so far, in a file in the task's private
+    /// control folder, which no sandboxed command can write.
     struct Staged {
-        path: PathBuf,
+        name: OsString,
         file: fs::File,
-        /// The resolved destination when staging began.
-        target: PathBuf,
     }
 
     /// Receives one job's returned files and places those that verify.
@@ -343,12 +393,13 @@ mod receiver {
         task_id: String,
         /// The command's working directory; requested paths are relative to it.
         cwd: PathBuf,
-        /// The resolved project root. Every destination, and the directory
-        /// of its staging file, must resolve inside it.
+        /// The resolved project root. Every destination must resolve inside it.
         root: PathBuf,
         /// The resolved checkout the runner's workspace reports are relative
         /// to, when the workdir is in one.
         checkout_root: Option<PathBuf>,
+        /// The task's private control folder, where received bytes are staged.
+        private: Arc<PinnedDir>,
         /// `None` once a stream check failed; every path is then discarded.
         assembler: Option<ReturnAssembler>,
         stream_error: Option<String>,
@@ -356,8 +407,9 @@ mod receiver {
         /// A local staging failure for one path. That path is not placed even
         /// if the manifest verifies it.
         write_errors: Vec<Option<NotReturned>>,
-        /// Directories this receiver created, shallowest first. Those still
-        /// empty when the job's files are settled are removed again.
+        /// Directories this receiver created in the project, shallowest
+        /// first. Those still empty when the job's files are settled are
+        /// removed again.
         created_dirs: Vec<PathBuf>,
         received_chunk: bool,
     }
@@ -369,6 +421,7 @@ mod receiver {
             cwd: &Path,
             project_root: &Path,
             checkout_root: Option<&Path>,
+            private: Arc<PinnedDir>,
             task_id: &str,
         ) -> io::Result<Self> {
             Ok(Self {
@@ -381,6 +434,7 @@ mod receiver {
                 cwd: cwd.to_path_buf(),
                 root: fs::canonicalize(project_root)?,
                 checkout_root: checkout_root.map(Path::to_path_buf),
+                private,
                 stream_error: None,
                 created_dirs: Vec::new(),
                 received_chunk: false,
@@ -446,48 +500,19 @@ mod receiver {
                 .map_err(local)
         }
 
-        /// Create the path's staging file beside its destination, once.
+        /// Create the path's private staging file, once.
         fn stage(&mut self, index: usize, record: &mut Recorder<'_>) -> Result<(), NotReturned> {
             if self.staged[index].is_some() {
                 return Ok(());
             }
-            let destination = resolve_destination(&self.root, &self.cwd.join(&self.paths[index]))?;
-            let directory = destination
-                .target
-                .parent()
-                .ok_or(NotReturned::OutsideProject)?
-                .to_path_buf();
-            let path = directory.join(staging_name(&self.task_id, index));
+            let name = OsString::from(staging_name(&self.task_id, index));
             record(&StagingRecord {
-                files: vec![path.clone()],
-                dirs: destination.missing_dirs.clone(),
+                files: vec![self.private.path().join(&name)],
+                dirs: Vec::new(),
             })
             .map_err(local)?;
-            for dir in &destination.missing_dirs {
-                match fs::create_dir(dir) {
-                    Ok(()) => self.created_dirs.push(dir.clone()),
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                    Err(error) => return Err(local(error)),
-                }
-            }
-            // The staging file's own directory must be inside the project too.
-            if !fs::canonicalize(&directory)
-                .map_err(local)?
-                .starts_with(&self.root)
-            {
-                return Err(NotReturned::OutsideProject);
-            }
-            let file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
-                .map_err(local)?;
-            self.staged[index] = Some(Staged {
-                path,
-                file,
-                target: destination.target,
-            });
+            let file = self.private.open_new_file(&name).map_err(local)?;
+            self.staged[index] = Some(Staged { name, file });
             Ok(())
         }
 
@@ -592,10 +617,25 @@ mod receiver {
             Some(parts.join("/"))
         }
 
-        /// Move a verified file to its destination, replacing it within the
-        /// same directory. The destination is resolved again first and must
-        /// still be where staging began, inside the project, whatever the
-        /// runner reported.
+        /// Place a verified file at its destination.
+        ///
+        /// Every step works on open handles, never on a name a sandboxed
+        /// command in the project could swap between a check and its use:
+        /// - the destination's directory is opened component by component
+        ///   from the project root without following any symlink;
+        /// - a symlink or non-regular file already at the destination is
+        ///   refused, never followed;
+        /// - the mode is set through the staged file's own handle;
+        /// - on the same filesystem the staged file is renamed from the
+        ///   private control folder, which no sandboxed command can write,
+        ///   into the destination directory: the rename replaces the
+        ///   destination's directory entry, never anything it points to;
+        /// - on another filesystem a new destination is created exclusively,
+        ///   without following a symlink, and written through its handle; an
+        ///   existing file there is kept, because replacing it would need a
+        ///   name in the project that could be swapped;
+        /// - afterwards the destination must be the file written (same
+        ///   device and inode), or the path is reported as not returned.
         fn place(
             &mut self,
             index: usize,
@@ -605,38 +645,171 @@ mod receiver {
             // A zero-byte file has no chunks, so it has no staging file yet.
             self.stage(index, record)?;
             let staged = self.staged[index].take().unwrap();
-            let result = (|| {
-                let length = staged.file.metadata().map_err(local)?.len();
-                if length != size {
-                    return Err(NotReturned::LocalWrite {
-                        error: format!("staged {length} bytes, expected {size}"),
-                    });
-                }
-                staged.file.sync_all().map_err(local)?;
-                let now = resolve_destination(&self.root, &self.cwd.join(&self.paths[index]))?;
-                if now.target != staged.target || !now.missing_dirs.is_empty() {
-                    return Err(NotReturned::LocalWrite {
-                        error: "the destination changed while the file was arriving".into(),
-                    });
-                }
-                // Keep an existing file's permissions; a new file gets the
-                // usual owner-writable, world-readable mode, not the staging 0600.
-                let mode = fs::metadata(&staged.target)
-                    .map(|metadata| metadata.permissions().mode() & 0o7777)
-                    .unwrap_or(0o644);
-                fs::set_permissions(&staged.path, fs::Permissions::from_mode(mode))
-                    .map_err(local)?;
-                fs::rename(&staged.path, &staged.target).map_err(local)
-            })();
-            if result.is_err() {
-                let _ = fs::remove_file(&staged.path);
-            }
+            let result = self.place_staged(index, size, &staged, record);
+            // Renamed away on success; otherwise removed here.
+            let _ = unlink_at(self.private.as_raw_fd(), &staged.name);
             result
+        }
+
+        fn place_staged(
+            &mut self,
+            index: usize,
+            size: u64,
+            staged: &Staged,
+            record: &mut Recorder<'_>,
+        ) -> Result<(), NotReturned> {
+            let staged_stat = fstat(staged.file.as_raw_fd()).map_err(local)?;
+            if staged_stat.st_size as u64 != size {
+                return Err(NotReturned::LocalWrite {
+                    error: format!("staged {} bytes, expected {size}", staged_stat.st_size),
+                });
+            }
+            staged.file.sync_all().map_err(local)?;
+            // The private entry must still be the file the bytes were written to.
+            if !stat_at(self.private.as_raw_fd(), &staged.name)
+                .map_err(local)?
+                .is_some_and(|entry| same_file(&entry, &staged_stat))
+            {
+                return Err(NotReturned::LocalWrite {
+                    error: "the private staging file changed before placement".into(),
+                });
+            }
+            let (directory, name) = self.open_destination_dir(index, record)?;
+            let existing = stat_at(directory.as_raw_fd(), &name).map_err(local)?;
+            if existing
+                .as_ref()
+                .is_some_and(|entry| entry.st_mode & libc::S_IFMT != libc::S_IFREG)
+            {
+                return Err(NotReturned::NotRegular);
+            }
+            // Keep an existing file's permissions; a new file gets the usual
+            // owner-writable, world-readable mode instead of the staging 0600.
+            let mode = existing
+                .as_ref()
+                .map_or(0o644, |entry| u32::from(entry.st_mode) & 0o7777);
+            let directory_stat = fstat(directory.as_raw_fd()).map_err(local)?;
+            let placed = if directory_stat.st_dev == staged_stat.st_dev && !copy_for_test() {
+                staged
+                    .file
+                    .set_permissions(fs::Permissions::from_mode(mode))
+                    .map_err(local)?;
+                rename_at(
+                    self.private.as_raw_fd(),
+                    &staged.name,
+                    directory.as_raw_fd(),
+                    &name,
+                )
+                .map_err(local)?;
+                staged_stat
+            } else {
+                if existing.is_some() {
+                    return Err(NotReturned::LocalWrite {
+                        error: "the file here is on another filesystem than AFT's private staging folder, so it was kept".into(),
+                    });
+                }
+                self.copy_into_new(staged, directory.as_raw_fd(), &name)?
+            };
+            match stat_at(directory.as_raw_fd(), &name).map_err(local)? {
+                Some(entry) if same_file(&entry, &placed) => Ok(()),
+                _ => Err(NotReturned::LocalWrite {
+                    error: "the file at this path changed while it was placed".into(),
+                }),
+            }
+        }
+
+        /// Create `name` exclusively in `directory`, without following a
+        /// symlink, and copy the staged bytes into it through its handle.
+        fn copy_into_new(
+            &self,
+            staged: &Staged,
+            directory: RawFd,
+            name: &OsStr,
+        ) -> Result<libc::stat, NotReturned> {
+            let mut out = create_exclusive_at(directory, name).map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    NotReturned::LocalWrite {
+                        error: "a file appeared at this path while it was placed".into(),
+                    }
+                } else {
+                    local(error)
+                }
+            })?;
+            let written = fstat(out.as_raw_fd()).map_err(local)?;
+            let copied = (|| {
+                let mut source = staged.file.try_clone()?;
+                source.seek(SeekFrom::Start(0))?;
+                let mut buffer = Vec::new();
+                source.read_to_end(&mut buffer)?;
+                out.write_all(&buffer)?;
+                out.set_permissions(fs::Permissions::from_mode(0o644))?;
+                out.sync_all()
+            })();
+            if let Err(error) = copied {
+                // Remove only the entry created here, never one put in its place.
+                if stat_at(directory, name)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|entry| same_file(&entry, &written))
+                {
+                    let _ = unlink_at(directory, name);
+                }
+                return Err(local(error));
+            }
+            Ok(written)
+        }
+
+        /// Open the destination's directory from the project root, one
+        /// component at a time and following no symlink, creating missing
+        /// directories after recording them. Returns it and the file name.
+        fn open_destination_dir(
+            &mut self,
+            index: usize,
+            record: &mut Recorder<'_>,
+        ) -> Result<(OwnedFd, OsString), NotReturned> {
+            let parent = resolve_parent(&self.root, &self.cwd.join(&self.paths[index]))?;
+            let relative = parent
+                .existing
+                .strip_prefix(&self.root)
+                .map_err(|_| NotReturned::OutsideProject)?;
+            let mut directory = open_directory(&self.root).map_err(local)?;
+            for component in relative.components() {
+                let Component::Normal(part) = component else {
+                    return Err(NotReturned::OutsideProject);
+                };
+                directory =
+                    open_directory_at(directory.as_raw_fd(), part).map_err(not_a_directory)?;
+            }
+            let mut path = parent.existing.clone();
+            let missing: Vec<PathBuf> = parent
+                .missing
+                .iter()
+                .map(|part| {
+                    path.push(part);
+                    path.clone()
+                })
+                .collect();
+            if !missing.is_empty() {
+                record(&StagingRecord {
+                    files: Vec::new(),
+                    dirs: missing.clone(),
+                })
+                .map_err(local)?;
+            }
+            for (part, full) in parent.missing.iter().zip(missing) {
+                match make_directory_at(directory.as_raw_fd(), part) {
+                    Ok(()) => self.created_dirs.push(full),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(local(error)),
+                }
+                directory =
+                    open_directory_at(directory.as_raw_fd(), part).map_err(not_a_directory)?;
+            }
+            Ok((directory, parent.file_name))
         }
 
         fn discard(&mut self, index: usize) {
             if let Some(staged) = self.staged[index].take() {
-                let _ = fs::remove_file(&staged.path);
+                let _ = unlink_at(self.private.as_raw_fd(), &staged.name);
             }
         }
 
@@ -651,8 +824,14 @@ mod receiver {
         fn settle(&mut self) {
             self.discard_all();
             for dir in self.created_dirs.drain(..).rev() {
-                let _ = fs::remove_dir(dir);
+                remove_empty_dir(&dir);
             }
+        }
+    }
+
+    impl Drop for ReturnReceiver {
+        fn drop(&mut self) {
+            self.settle();
         }
     }
 
@@ -662,10 +841,157 @@ mod receiver {
         }
     }
 
-    impl Drop for ReturnReceiver {
-        fn drop(&mut self) {
-            self.settle();
+    /// A path component that is now a symlink or not a directory means the
+    /// directory changed after it was checked to be inside the project.
+    fn not_a_directory(error: io::Error) -> NotReturned {
+        match error.raw_os_error() {
+            Some(libc::ELOOP | libc::ENOTDIR) => NotReturned::OutsideProject,
+            _ => local(error),
         }
+    }
+
+    fn same_file(a: &libc::stat, b: &libc::stat) -> bool {
+        a.st_dev == b.st_dev && a.st_ino == b.st_ino
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static COPY_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Take the other-filesystem path even on one filesystem, for tests.
+    #[cfg(test)]
+    pub(crate) fn with_copy_for_test<T>(run: impl FnOnce() -> T) -> T {
+        COPY_FOR_TEST.with(|copy| copy.set(true));
+        let result = run();
+        COPY_FOR_TEST.with(|copy| copy.set(false));
+        result
+    }
+
+    fn copy_for_test() -> bool {
+        #[cfg(test)]
+        return COPY_FOR_TEST.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        false
+    }
+
+    fn c_name(name: &OsStr) -> io::Result<CString> {
+        CString::new(name.as_bytes()).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+    }
+
+    fn open_directory(path: &Path) -> io::Result<OwnedFd> {
+        let path = c_name(path.as_os_str())?;
+        // SAFETY: `path` is a NUL-terminated string that outlives the call.
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just opened and is owned by nothing else.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn open_directory_at(parent: RawFd, name: &OsStr) -> io::Result<OwnedFd> {
+        let name = c_name(name)?;
+        // SAFETY: `parent` is an open directory and `name` outlives the call.
+        let fd = unsafe {
+            libc::openat(
+                parent,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just opened and is owned by nothing else.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn make_directory_at(parent: RawFd, name: &OsStr) -> io::Result<()> {
+        let name = c_name(name)?;
+        // SAFETY: `parent` is an open directory and `name` outlives the call.
+        if unsafe { libc::mkdirat(parent, name.as_ptr(), 0o755) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn create_exclusive_at(directory: RawFd, name: &OsStr) -> io::Result<fs::File> {
+        let name = c_name(name)?;
+        // SAFETY: `directory` is an open directory and `name` outlives the call.
+        let fd = unsafe {
+            libc::openat(
+                directory,
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just opened and is owned by nothing else.
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+
+    /// The entry `name` in `directory`, not following a symlink; `None` when
+    /// there is no such entry.
+    fn stat_at(directory: RawFd, name: &OsStr) -> io::Result<Option<libc::stat>> {
+        let name = c_name(name)?;
+        let mut entry = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: the pointers are valid for the call; `entry` is written by it.
+        let result = unsafe {
+            libc::fstatat(
+                directory,
+                name.as_ptr(),
+                entry.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result != 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        // SAFETY: `fstatat` succeeded, so it initialised `entry`.
+        Ok(Some(unsafe { entry.assume_init() }))
+    }
+
+    fn fstat(fd: RawFd) -> io::Result<libc::stat> {
+        let mut entry = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `fd` is open and `entry` is written by the call.
+        if unsafe { libc::fstat(fd, entry.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fstat` succeeded, so it initialised `entry`.
+        Ok(unsafe { entry.assume_init() })
+    }
+
+    fn rename_at(from_dir: RawFd, from: &OsStr, to_dir: RawFd, to: &OsStr) -> io::Result<()> {
+        let from = c_name(from)?;
+        let to = c_name(to)?;
+        // SAFETY: both directories are open and both names outlive the call.
+        if unsafe { libc::renameat(from_dir, from.as_ptr(), to_dir, to.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn unlink_at(directory: RawFd, name: &OsStr) -> io::Result<()> {
+        let name = c_name(name)?;
+        // SAFETY: `directory` is open and `name` outlives the call.
+        if unsafe { libc::unlinkat(directory, name.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 
