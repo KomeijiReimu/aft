@@ -554,6 +554,73 @@ mod receiving {
         );
     }
 
+    /// Feed a vector, delivering the chunk at `repeat` twice, the second time
+    /// with its bytes changed by `change`.
+    fn feed_with_repeat(
+        root: &Path,
+        name: &str,
+        repeat: usize,
+        change: impl Fn(&mut Vec<u8>),
+    ) -> Vec<ReturnedPath> {
+        let (_private_dir, private) = private_folder();
+        let mut receiver = receiver(name, root, &private);
+        let mut chunks = 0;
+        for record in return_vector_records(name) {
+            match record {
+                StreamRecord::ReturnChunk(chunk) => {
+                    receiver.chunk(&chunk, &mut |_| Ok(()));
+                    if chunks == repeat {
+                        let mut again = chunk.clone();
+                        change(&mut again.data.0);
+                        receiver.chunk(&again, &mut |_| Ok(()));
+                    }
+                    chunks += 1;
+                }
+                StreamRecord::ReturnManifest(manifest) => {
+                    return receiver.manifest(&manifest, &mut |_| Ok(()))
+                }
+                _ => {}
+            }
+        }
+        panic!("{name} has no manifest")
+    }
+
+    #[test]
+    fn an_exact_replay_of_the_last_chunk_is_accepted_once() {
+        // A save that fails after a chunk was taken makes the stream deliver
+        // that chunk again; the same offset and bytes are not new data.
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        for repeat in 0..3 {
+            let report = feed_with_repeat(&root, "three-chunks-short-last", repeat, |_| {});
+            assert_eq!(
+                report[0].outcome,
+                ReturnOutcome::Returned { bytes: 10 },
+                "chunk {repeat} replayed"
+            );
+            assert_eq!(fs::read(root.join("dist/app.bin")).unwrap(), b"0123456789");
+        }
+    }
+
+    #[test]
+    fn a_replay_with_different_bytes_discards_the_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let report = feed_with_repeat(&root, "three-chunks-short-last", 1, |bytes| {
+            bytes[0] ^= 0xff;
+        });
+        assert!(
+            matches!(
+                &report[0].outcome,
+                ReturnOutcome::NotReturned {
+                    reason: NotReturned::Unverified { .. }
+                }
+            ),
+            "{report:?}"
+        );
+        assert!(!root.join("dist/app.bin").exists());
+    }
+
     #[test]
     fn a_job_without_a_manifest_returns_nothing() {
         let dir = tempfile::tempdir().unwrap();

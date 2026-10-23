@@ -370,6 +370,7 @@ mod receiver {
     use crate::exec_remote::types::{
         ReturnAssembler, ReturnChunk, ReturnManifest, ReturnManifestOutcome,
     };
+    use sha2::Digest;
     use std::ffi::{CString, OsStr, OsString};
     use std::fs;
     use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -416,6 +417,10 @@ mod receiver {
         /// removed again.
         created_dirs: Vec<PathBuf>,
         received_chunk: bool,
+        /// The last accepted chunk's path index, offset and SHA-256. If saving
+        /// the stream cursor fails after a chunk was taken, the stream
+        /// delivers that chunk again; an exact repeat is not new data.
+        last_chunk: Option<(u32, u64, [u8; 32])>,
     }
 
     impl ReturnReceiver {
@@ -442,6 +447,7 @@ mod receiver {
                 stream_error: None,
                 created_dirs: Vec::new(),
                 received_chunk: false,
+                last_chunk: None,
             })
         }
 
@@ -459,6 +465,7 @@ mod receiver {
             self.stream_error = None;
             self.write_errors = vec![None; self.paths.len()];
             self.received_chunk = false;
+            self.last_chunk = None;
         }
 
         /// Check one chunk and append its bytes to the path's staging file.
@@ -467,6 +474,13 @@ mod receiver {
             let Some(assembler) = self.assembler.as_mut() else {
                 return;
             };
+            // Only the same offset with the same bytes is a repeat. Anything
+            // else at an earlier offset goes to the assembler, which refuses
+            // it and voids the job.
+            let digest: [u8; 32] = sha2::Sha256::digest(chunk.data()).into();
+            if self.last_chunk == Some((chunk.path_index, chunk.offset, digest)) {
+                return;
+            }
             let data = match assembler.accept_chunk(chunk) {
                 Ok(data) => data,
                 Err(error) => {
@@ -477,6 +491,7 @@ mod receiver {
                     return;
                 }
             };
+            self.last_chunk = Some((chunk.path_index, chunk.offset, digest));
             // The assembler accepted the index, so it is in range.
             let index = chunk.path_index as usize;
             if self.write_errors[index].is_some() {
