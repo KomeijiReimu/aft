@@ -1099,7 +1099,11 @@ describe("Pi subc forced-drain dedup (C-#1 / C-#3)", () => {
               },
             ],
           }
-        : { success: true, acked_task_ids: ["task-pattern"] },
+        : {
+            success: true,
+            acked_task_ids: [],
+            acked_matches: [{ task_id: "task-pattern", watch_id: "watch-1", match_offset: 42 }],
+          },
     );
     const { ctx } = harness(send);
     const sendUserMessage = mock(() => {});
@@ -1118,7 +1122,7 @@ describe("Pi subc forced-drain dedup (C-#1 / C-#3)", () => {
     expect(sendUserMessage.mock.calls[0][0]).toContain('task task-pattern matched "READY"');
     expect(send.mock.calls.find((call) => call[0] === "bash_ack_completions")?.[1]).toEqual({
       session_id: "s1",
-      task_ids: ["task-pattern"],
+      matches: [{ task_id: "task-pattern", watch_id: "watch-1", match_offset: 42 }],
     });
   });
 
@@ -1443,7 +1447,8 @@ test("each_line reminder keeps bounded rows and drop recovery hint", () => {
       watch_id: "watch-lines",
       match_text: "matching lines",
       match_offset: 0,
-      context: "stdout byte 0 (x2): ERROR a\n3 matching lines dropped; Read bash_status offset=16.",
+      context:
+        'stdout byte 0 ×2: ERROR a\n3 matching lines dropped. Read them with bash_status({ task_id: "bash-lines", output_offset: 16 }).',
       once: false,
       batch: {
         lines: [{ stream: "stdout", offset: 0, end_offset: 8, text: "ERROR a", count: 2 }],
@@ -1455,9 +1460,9 @@ test("each_line reminder keeps bounded rows and drop recovery hint", () => {
     },
   ]);
   expect(reminder).toContain("task bash-lines matching lines:");
-  expect(reminder).toContain("stdout byte 0 (x2): ERROR a");
+  expect(reminder).toContain("stdout byte 0 ×2: ERROR a");
   expect(reminder).toContain(
-    '3 matching lines dropped. Read bash_status({ task_id: "bash-lines", output_offset: 16 }).',
+    '3 matching lines dropped. Read them with bash_status({ task_id: "bash-lines", output_offset: 16 }).',
   );
 });
 
@@ -1501,4 +1506,59 @@ test("each_line queue replaces snapshots without discarding another watch", asyn
   const pending = sessionBgStates.get("s-lines")?.pendingPatternMatches;
   expect(pending).toHaveLength(2);
   expect(pending?.find((entry) => entry.watch_id === "watch-a")?.batch?.dropped_lines).toBe(3);
+});
+
+test("exact pattern ack retries keep sibling watches and newer versions deliverable", async () => {
+  const old = {
+    task_id: "task-pattern",
+    session_id: "s1",
+    watch_id: "watch-one",
+    match_offset: 40,
+    match_text: "READY",
+    context: "READY old",
+    once: false,
+    reason: "pattern_match",
+  };
+  let pending = [old];
+  let confirm = false;
+  const calls: Array<{ command: string; params: Record<string, unknown> }> = [];
+  const { ctx } = harness((command, params) => {
+    calls.push({ command, params });
+    if (command === "bash_drain_completions")
+      return { success: true, bg_completions: [], pending_matches: pending };
+    return { success: true, acked_matches: confirm ? (params.matches ?? []) : [] };
+  });
+  const context = { ctx, directory: "/tmp/project", sessionID: "s1" };
+  const deliver = async () => {
+    const content = await appendToolResultBgCompletions(context, [{ type: "text", text: "tool" }]);
+    return (
+      content
+        ?.filter((item) => item.type === "text")
+        .map((item) => item.text)
+        .join("\n") ?? ""
+    );
+  };
+  expect(await deliver()).toContain("READY old");
+  expect(await deliver()).not.toContain("READY old");
+  pending = [
+    { ...old, watch_id: "watch-two", context: "READY sibling" },
+    { ...old, match_offset: 41, context: "READY newer" },
+  ];
+  confirm = true;
+  const next = await deliver();
+  expect(next).toContain("READY sibling");
+  expect(next).toContain("READY newer");
+  expect(next).not.toContain("READY old");
+  const acks = calls.filter((call) => call.command === "bash_ack_completions");
+  expect(
+    acks.some(
+      (call) =>
+        JSON.stringify(call.params.matches) ===
+        JSON.stringify([{ task_id: "task-pattern", watch_id: "watch-one", match_offset: 40 }]),
+    ),
+  ).toBe(true);
+  expect(
+    acks.some((call) => Array.isArray(call.params.matches) && call.params.matches.length === 2),
+  ).toBe(true);
+  for (const call of acks) expect(call.params.task_ids ?? []).not.toContain("task-pattern");
 });

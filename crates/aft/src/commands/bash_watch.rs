@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 
 use crate::bash_background::persistence::{BgMode, TaskArtifact};
 use crate::bash_background::registry::BgTaskSnapshot;
+use crate::bash_background::watch_lines::EACH_LINE_NEEDS_BACKGROUND;
 use crate::bash_background::{BgTaskRegistry, BgTaskStatus};
 use crate::commands::bash_orchestrate::{
     format_wait_limit, kill_deadline_sentence, worker_kill_deadline_within_handoff_margin,
@@ -311,7 +312,7 @@ pub(crate) fn handle_deferred_with_observation_only(
         return DispatchOutcome::Immediate(Response::error(
             &id,
             "invalid_request",
-            "bash_watch: deliver requires background:true; this watch waits synchronously",
+            EACH_LINE_NEEDS_BACKGROUND,
         ));
     }
     let pattern = match parse_pattern(params.pattern.as_ref()) {
@@ -912,9 +913,10 @@ mod tests {
             panic!("sync delivery must refuse immediately")
         };
         assert!(!response.success);
-        assert!(serde_json::to_string(&response)
-            .unwrap()
-            .contains("deliver requires background:true"));
+        assert_eq!(
+            serde_json::to_value(&response).unwrap()["message"],
+            r#"bash_watch: deliver: "each_line" needs background: true."#
+        );
     }
     use crate::bash_background::persistence::{create_task_layout, write_task_at, PersistedTask};
     use crate::config::Config;

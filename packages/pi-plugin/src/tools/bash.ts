@@ -29,6 +29,7 @@ import {
   TERMINAL_SCAN_INCOMPLETE_TEXT,
   taskKillDeadlineText,
   taskKillDeadlineWithinHandoffMargin,
+  WATCH_EACH_LINE_NEEDS_BACKGROUND,
   WATCH_SYNC_DEFAULTS_DESCRIPTION,
   WATCH_TIMEOUT_PARAM_DESCRIPTION,
   WATCH_UNAVAILABLE_GIVE_UP_MS,
@@ -1217,9 +1218,7 @@ export function createBashWatchTool(ctx: PluginContext) {
         !bashCfg.subagent_background &&
         isPiWorkerSession(extCtx);
       if (params.deliver !== undefined && (!coerceBoolean(params.background) || workerForcedSync)) {
-        throw new Error(
-          "invalid_request: bash_watch deliver requires background:true; this watch waits synchronously",
-        );
+        throw new Error(WATCH_EACH_LINE_NEEDS_BACKGROUND);
       }
       if (params.deliver !== undefined && params.deliver !== "each_line") {
         throw new Error("invalid_request: bash_watch deliver must be each_line");

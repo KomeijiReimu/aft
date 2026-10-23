@@ -4102,14 +4102,32 @@ impl BgTaskRegistry {
             return;
         };
         if let Some(batch) = pattern_match.batch.as_mut() {
+            let previous = row.match_batch.as_deref().and_then(|value| {
+                serde_json::from_str::<super::watch_lines::LineBatch>(value).ok()
+            });
+            let last_version = previous
+                .as_ref()
+                .and_then(|batch| batch.version)
+                .or_else(|| row.match_offset.map(|offset| offset.max(0) as u64));
             if row.pending_match {
-                if let Some(mut pending) = row.match_batch.as_deref().and_then(|value| {
-                    serde_json::from_str::<super::watch_lines::LineBatch>(value).ok()
-                }) {
+                if let Some(mut pending) = previous {
                     pending.merge(batch.clone());
                     *batch = pending;
                 }
+            } else {
+                batch.pending_id = None;
             }
+            // Streams can share a byte offset, and a final partial-line flush
+            // need not advance a cursor. Source offsets stay in lines; the
+            // outer offset is a durable, unique acknowledgement version.
+            let version = last_version
+                .map(|last| last.saturating_add(1).max(pattern_match.match_offset))
+                .unwrap_or(pattern_match.match_offset);
+            batch.version = Some(version);
+            if batch.pending_id.is_none() {
+                batch.pending_id = Some(format!("{}:{version}", pattern_match.watch_id));
+            }
+            pattern_match.match_offset = version;
             pattern_match.context = crate::subc_format::format_watch_line_batch(task_id, batch);
         }
         row.stdout_offset = stdout_offset as i64;
@@ -7693,7 +7711,7 @@ impl BgTaskRegistry {
                 }
             } else {
                 for pattern_match in &mut terminal_matches {
-                    let fresh = pattern_match.clone();
+                    let mut fresh = pattern_match.clone();
                     self.persist_watch_match(
                         &task.session_id,
                         &task_id,
@@ -7702,6 +7720,7 @@ impl BgTaskRegistry {
                         stderr_offset,
                         pty_offset,
                     );
+                    fresh.copy_delivery_identity(pattern_match);
                     self.emit_bash_pattern_match(&task.session_id, fresh);
                 }
             }
@@ -8030,7 +8049,7 @@ impl BgTaskRegistry {
             return;
         }
         for mut pattern_match in matches {
-            let fresh = pattern_match.clone();
+            let mut fresh = pattern_match.clone();
             self.persist_watch_match(
                 &task.session_id,
                 &task.task_id,
@@ -8039,6 +8058,7 @@ impl BgTaskRegistry {
                 stderr_offset,
                 pty_offset,
             );
+            fresh.copy_delivery_identity(&pattern_match);
             self.emit_bash_pattern_match(&task.session_id, fresh);
         }
         self.persist_task_watch_cursors(
@@ -13245,17 +13265,17 @@ impl BgTaskRegistry {
             {
                 let mut summary = batch.clone();
                 summary.lines.clear();
-                sender(PushFrame::BashPatternMatch(
-                    BashPatternMatchFrame::task_exit(
-                        &pattern_match.task_id,
-                        session_id,
-                        WATCH_TASK_EXIT_TEXT,
-                        crate::subc_format::format_watch_line_batch(
-                            &pattern_match.task_id,
-                            &summary,
-                        ),
-                    ),
-                ));
+                let mut frame = BashPatternMatchFrame::new(
+                    &pattern_match.task_id,
+                    session_id,
+                    &pattern_match.watch_id,
+                    &pattern_match.match_text,
+                    pattern_match.match_offset,
+                    crate::subc_format::format_watch_line_batch(&pattern_match.task_id, &summary),
+                    pattern_match.once,
+                );
+                frame.batch = Some(summary);
+                sender(PushFrame::BashPatternMatch(frame));
                 return;
             }
             let batch = pattern_match.batch.clone();
@@ -26739,6 +26759,7 @@ mod tests {
                 storage.to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.to_path_buf(),
                 10,
                 true,
@@ -26807,11 +26828,214 @@ mod tests {
         assert!(masked.ends_with("page final\n"));
     }
 
+    fn each_line_running_fixture(
+        storage: &Path,
+    ) -> (
+        BgTaskRegistry,
+        Arc<BgTask>,
+        Arc<Mutex<Vec<PushFrame>>>,
+        String,
+    ) {
+        let (registry, _, frames) = registry_with_db_and_frames(storage);
+        let task_id = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                LONG_RUNNING_COMMAND,
+                "session".into(),
+                storage.to_path_buf(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
+                storage.to_path_buf(),
+                10,
+                true,
+                false,
+                Some(storage.to_path_buf()),
+            )
+            .unwrap();
+        registry
+            .inner
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let watch = registry
+            .register_watch_delivery(
+                task_id.clone(),
+                WatchPattern::Substring("READY".into()),
+                false,
+                true,
+            )
+            .unwrap();
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+        (registry, task, frames, watch)
+    }
+
+    fn append_each_line_output(path: &Path, bytes: &[u8]) {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+    }
+
     #[test]
-    fn each_line_terminal_rate_exemption_is_one_summary_line() {
+    fn each_line_stream_offsets_do_not_collide_as_ack_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, task, frames, watch) = each_line_running_fixture(dir.path());
+        let _reap = KillTasksOnDrop(registry.clone());
+        append_each_line_output(&task.paths.stdout, b"READY a\n");
+        registry.scan_task_watch_output(&task);
+        append_each_line_output(&task.paths.stderr, b"READY b\n");
+        registry.scan_task_watch_output(&task);
+        let frames = pattern_match_frames(&frames);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].batch.as_ref().unwrap().lines[0].offset, 0);
+        assert_eq!(frames[1].batch.as_ref().unwrap().lines[0].offset, 0);
+        assert!(
+            frames[1].match_offset > frames[0].match_offset,
+            "different streams must not share an acknowledgement version"
+        );
+        assert!(registry
+            .ack_pattern_match_for_session("session", &task.task_id, &watch, frames[0].match_offset)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            registry
+                .pending_pattern_matches_for_session("session")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn each_line_final_partial_flush_advances_version_without_cursor_movement() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, task, frames, watch) = each_line_running_fixture(dir.path());
+        let _reap = KillTasksOnDrop(registry.clone());
+        append_each_line_output(&task.paths.stdout, b"READY tail");
+        append_each_line_output(&task.paths.stderr, b"READY other\n");
+        registry.scan_task_watch_output(&task);
+        let first = pattern_match_frames(&frames).pop().unwrap();
+        let cursors = registry.watch_stream_cursors(&task.task_id);
+        let mut final_match = registry
+            .take_watch_line_batches(&task.task_id, true)
+            .pop()
+            .unwrap();
+        assert_eq!(
+            final_match.batch.as_ref().unwrap().lines[0].text,
+            "READY tail"
+        );
+        registry.persist_watch_match(
+            "session",
+            &task.task_id,
+            &mut final_match,
+            cursors.0,
+            cursors.1,
+            cursors.2,
+        );
+        assert_eq!(registry.watch_stream_cursors(&task.task_id), cursors);
+        assert!(
+            final_match.match_offset > first.match_offset,
+            "a final partial line needs a new acknowledgement version even without another read"
+        );
+        assert!(registry
+            .ack_pattern_match_for_session("session", &task.task_id, &watch, first.match_offset)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn each_line_ack_version_survives_daemon_restart_before_and_after_ack() {
+        for acknowledge_first in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (registry, task, frames, watch) = each_line_running_fixture(dir.path());
+            let _reap = KillTasksOnDrop(registry.clone());
+            append_each_line_output(&task.paths.stdout, b"READY a\n");
+            registry.scan_task_watch_output(&task);
+            let first = pattern_match_frames(&frames).pop().unwrap();
+            let pending_id = first.batch.as_ref().unwrap().pending_id.clone().unwrap();
+            if acknowledge_first {
+                assert!(registry
+                    .ack_pattern_match_for_session(
+                        "session",
+                        &task.task_id,
+                        &watch,
+                        first.match_offset
+                    )
+                    .unwrap()
+                    .is_some());
+            }
+            registry.clear_task_watch_state(&task.task_id);
+            let (replayed, _, replay_frames) = registry_with_db_and_frames(dir.path());
+            let _reap_replayed = KillTasksOnDrop(replayed.clone());
+            replayed
+                .replay_session_inner(dir.path(), "session", None)
+                .unwrap();
+            replayed
+                .inner
+                .shutdown
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if !acknowledge_first {
+                let replay = pattern_match_frames(&replay_frames).pop().unwrap();
+                assert_eq!(replay.match_offset, first.match_offset);
+            }
+            let replayed_task = replayed.task_for_session(&task.task_id, "session").unwrap();
+            append_each_line_output(&task.paths.stderr, b"READY b\n");
+            replayed.scan_task_watch_output(&replayed_task);
+            let newest = pattern_match_frames(&replay_frames).pop().unwrap();
+            assert!(
+                newest.match_offset > first.match_offset,
+                "acknowledged first: {acknowledge_first}"
+            );
+            assert_eq!(
+                newest.batch.as_ref().unwrap().lines.last().unwrap().offset,
+                0
+            );
+            if acknowledge_first {
+                assert_ne!(
+                    newest.batch.as_ref().unwrap().pending_id.as_ref().unwrap(),
+                    &pending_id
+                );
+            } else {
+                assert_eq!(
+                    newest.batch.as_ref().unwrap().pending_id.as_ref().unwrap(),
+                    &pending_id
+                );
+            }
+            assert!(replayed
+                .ack_pattern_match_for_session("session", &task.task_id, &watch, first.match_offset)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn each_line_default_push_frame_stays_byte_identical() {
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, frames) = registry_with_db_and_frames(dir.path());
-        registry.record_live_delivery_session("session");
+        registry.record_live_delivery_session("session-v2");
+        registry.emit_bash_pattern_match(
+            "session-v2",
+            PatternMatch {
+                watch_id: "watch-ready".into(),
+                task_id: "bash-running".into(),
+                match_text: "READY".into(),
+                match_offset: 42,
+                context: "READY".into(),
+                once: false,
+                batch: None,
+            },
+        );
+        assert_eq!(
+            serde_json::to_string(&pattern_match_frames(&frames)[0]).unwrap(),
+            r#"{"type":"bash_pattern_match","task_id":"bash-running","session_id":"session-v2","watch_id":"watch-ready","match_text":"READY","match_offset":42,"context":"READY","once":false,"reason":"pattern_match"}"#
+        );
+    }
+
+    fn each_line_terminal_frame() -> BashPatternMatchFrame {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, frames) = registry_with_db_and_frames(dir.path());
+        registry.record_live_delivery_session("session-v2");
         let batch = super::super::watch_lines::LineBatch {
             terminal_summary: true,
             dropped_lines: 7,
@@ -26827,25 +27051,43 @@ mod tests {
             ..Default::default()
         };
         registry.emit_bash_pattern_match(
-            "session",
+            "session-v2",
             PatternMatch {
-                watch_id: "watch-a".into(),
-                task_id: "bash-lines".into(),
+                watch_id: "watch-ready".into(),
+                task_id: "bash-running".into(),
                 match_text: "matching lines".into(),
-                match_offset: 0,
+                match_offset: 123,
                 context: "ignored".into(),
                 once: false,
                 batch: Some(batch),
             },
         );
-        let frames = pattern_match_frames(&frames);
+        let mut frames = pattern_match_frames(&frames);
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].reason, "task_exit");
-        assert!(frames[0].batch.is_none());
-        assert_eq!(frames[0].context.lines().count(), 1);
-        assert!(frames[0].context.contains("7 matching lines dropped"));
-        assert!(frames[0].context.contains("stderr_offset: 123"));
-        assert!(!frames[0].context.contains("ERROR a"));
+        frames.remove(0)
+    }
+
+    #[test]
+    fn each_line_terminal_rate_exemption_is_one_summary_line() {
+        let frame = each_line_terminal_frame();
+        assert_eq!(frame.reason, "pattern_match");
+        assert_eq!(frame.watch_id, "watch-ready");
+        assert_eq!(frame.match_offset, 123);
+        assert!(frame.batch.as_ref().unwrap().lines.is_empty());
+        assert_eq!(frame.context.lines().count(), 1);
+        assert!(frame.context.contains("7 matching lines dropped"));
+        assert!(frame.context.contains("stderr_offset: 123"));
+        assert!(!frame.context.contains("ERROR a"));
+    }
+
+    #[test]
+    fn each_line_terminal_summary_frame_fixture() {
+        // Host integration tests consume the native emitter's frame, not a
+        // reconstruction that could hide a disagreement in durable identity.
+        println!(
+            "AFT_EACH_LINE_TERMINAL_FRAME={}",
+            serde_json::to_string(&each_line_terminal_frame()).unwrap()
+        );
     }
 
     #[test]

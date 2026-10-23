@@ -1,0 +1,1 @@
+- Background `bash_watch` can follow a log line by line with `deliver: "each_line"`, delivering matching lines with byte offsets and reporting drops when caps are reached (#751).

@@ -72,6 +72,16 @@ pub struct PatternMatch {
     pub batch: Option<LineBatch>,
 }
 
+impl PatternMatch {
+    pub(super) fn copy_delivery_identity(&mut self, persisted: &Self) {
+        if let (Some(live), Some(saved)) = (self.batch.as_mut(), persisted.batch.as_ref()) {
+            self.match_offset = persisted.match_offset;
+            live.pending_id = saved.pending_id.clone();
+            live.version = saved.version;
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct WatchRegistry {
     line_delivery: HashMap<String, LineDelivery>,

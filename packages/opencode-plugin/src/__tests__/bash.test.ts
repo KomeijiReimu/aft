@@ -1779,7 +1779,7 @@ describe("bash_status tool", () => {
         { taskId: "bash-lines", pattern: "ERROR", deliver: "each_line" },
         createMockSdkContext(),
       ),
-    ).rejects.toThrow("deliver requires background:true");
+    ).rejects.toThrow('bash_watch: deliver: "each_line" needs background: true.');
   });
 
   test('async bash_watch forwards string once "false" as boolean false', async () => {

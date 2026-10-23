@@ -12,6 +12,7 @@ import {
   TERMINAL_SCAN_INCOMPLETE_TEXT,
   taskKillDeadlineText,
   taskKillDeadlineWithinHandoffMargin,
+  WATCH_EACH_LINE_NEEDS_BACKGROUND,
   WATCH_SYNC_DEFAULTS_DESCRIPTION,
   WATCH_TIMEOUT_PARAM_DESCRIPTION,
   WATCH_UNAVAILABLE_GIVE_UP_MS,
@@ -175,9 +176,7 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
       const isSubagent = subagentStatus === true;
       const asyncMode = requestedAsync && !subagentForcedSync;
       if (args.deliver !== undefined && !asyncMode) {
-        throw new Error(
-          "invalid_request: bash_watch deliver requires background:true; this watch waits synchronously",
-        );
+        throw new Error(WATCH_EACH_LINE_NEEDS_BACKGROUND);
       }
       if (args.deliver !== undefined && args.deliver !== "each_line") {
         throw new Error("invalid_request: bash_watch deliver must be each_line");

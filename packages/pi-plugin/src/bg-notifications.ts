@@ -1,7 +1,14 @@
 import type { BashWatchLineBatch } from "@cortexkit/aft-bridge";
 import {
   type AftProjectTransport,
+  type BashAckTarget,
   type BgNudgeRef,
+  bashAckKey,
+  bashAckRequest,
+  bashAcksConfirmed,
+  bashAckTargetFromKey,
+  bashAckTargets,
+  bashPatternAckTarget,
   formatWatchLineBatch,
   mergeWatchLineBatches,
   resolveBridgeForNudge,
@@ -103,14 +110,14 @@ type SessionBgState = {
   consumedTaskIds: Set<string>;
   consumedTaskOrder: string[];
   /**
-   * Task IDs whose delivery is IN FLIGHT (removed from pendingCompletions /
+   * Task IDs and exact watch-version keys whose delivery is IN FLIGHT (removed from pendingCompletions /
    * pattern queues, delivery not yet resolved). Ingest skips these so a subc
    * forced drain in the removal→delivery window can't re-accept and double-deliver
    * an already-departing completion (audit C-#1). Mirrors the OpenCode twin.
    */
   deliveringTaskIds: Set<string>;
   /**
-   * Task IDs DELIVERED to the agent but whose `bash_ack_completions` has not yet
+   * Acknowledgement target keys DELIVERED to the agent but whose `bash_ack_completions` has not yet
    * confirmed (Rust still holds them and, over subc, re-nudges). Ingest skips them
    * for fresh delivery AND a forced drain RE-ACKs them (the self-terminating close
    * of the re-nudge loop, C-#3). Removed by DAEMON RECONCILIATION, not a timer:
@@ -246,9 +253,7 @@ export async function markBgCompletionDelivered(
   // that set is also used pre-delivery by markTaskWaiting.)
   const state = stateFor(drainContext.sessionID);
   markDeliveredAwaitingAck(state, [taskId]);
-  const acked = await ackCompletions(drainContext, [
-    { task_id: taskId, status: "unknown", exit_code: null, command: "" },
-  ]);
+  const acked = await ackCompletions(drainContext, [{ task_id: taskId }]);
   if (acked) confirmAcked(state, [taskId]);
 }
 
@@ -340,7 +345,10 @@ function queuePendingPatternMatch(state: SessionBgState, entry: PatternMatchEntr
   const existingIdx = state.pendingPatternMatches.findIndex(
     (match) =>
       match.task_id === normalized.task_id &&
-      (normalized.batch || match.batch ? match.watch_id === normalized.watch_id : true),
+      (match.watch_id === normalized.watch_id ||
+        (!normalized.batch &&
+          !match.batch &&
+          (normalized.reason === "task_exit" || match.reason === "task_exit"))),
   );
   if (existingIdx >= 0) {
     const existing = state.pendingPatternMatches[existingIdx];
@@ -389,6 +397,7 @@ export async function handlePushedPatternMatch(
     return;
   }
   const state = stateFor(drainContext.sessionID);
+  if (isDeliveringOrAwaitingAck(state, frame)) return;
   queuePendingPatternMatch(state, { ...frame, ackCompletionOnDelivery: true });
   await triggerWakeIfPending(drainContext, true);
 }
@@ -511,7 +520,7 @@ export async function appendToolResultBgCompletions(
   // C-#1 site 4: tool-result piggyback delivery (the reminder is returned below
   // and cannot fail here), so mark ack-target ids awaiting-ack, then confirm/keep
   // on the ack result (keep → re-ack on a later forced drain, C-#3).
-  const inTurnAckIds = completionAcks.map((completion) => completion.task_id);
+  const inTurnAckIds = completionAcks.map(bashAckKey);
   markDeliveredAwaitingAck(state, inTurnAckIds);
   const inTurnAcked = await ackCompletions(drainContext, completionAcks);
   if (inTurnAcked) confirmAcked(state, inTurnAckIds);
@@ -728,6 +737,7 @@ async function triggerWakeIfPending(
         return;
       }
       const ackTargetIds = deliveredCompletions.map((completion) => completion.task_id);
+      const ackKeys = deliveredCompletions.map(bashAckKey);
       const watchIds = deliveredPatternMatches?.map((m) => m.watch_id) ?? [];
       const watchId = watchIds.join(",") || undefined;
       logPerTaskDeliveryHop(drainContext, "inject-start", "session inject start", ackTargetIds, {
@@ -760,9 +770,9 @@ async function triggerWakeIfPending(
       });
       // Session injection completed synchronously. Only now may these task IDs
       // enter awaiting-ack state and become eligible for daemon acknowledgement.
-      markDeliveredAwaitingAck(state, ackTargetIds);
+      markDeliveredAwaitingAck(state, ackKeys);
       const acked = await ackCompletions(drainContext, deliveredCompletions);
-      if (acked) confirmAcked(state, ackTargetIds);
+      if (acked) confirmAcked(state, ackKeys);
     },
     (err, hardStopped) => {
       if (isTerminalNudgeError(err)) {
@@ -955,19 +965,15 @@ async function drainCompletions(drainContext: DrainContext): Promise<void> {
     // nudges, self-terminating); one it no longer returns was dropped daemon-side
     // → reconcile forgets it. Ingest skips awaiting-ack tasks, so re-ack never
     // double-delivers.
-    const reackTaskIds = reconcileAwaitingAck(state, drainedTaskIds);
+    const drainedAckKeys = [
+      ...drainedCompletions.map(bashAckKey),
+      ...drainedMatches.map((match) => bashAckKey(bashPatternAckTarget(match))),
+    ];
+    const reackTaskIds = reconcileAwaitingAck(state, drainedAckKeys);
     ingestDrainedBgCompletions(drainContext.sessionID, drainedCompletions);
     ingestDrainedPatternMatches(drainContext.sessionID, drainedMatches);
     if (reackTaskIds.length > 0) {
-      const reacked = await ackCompletions(
-        drainContext,
-        reackTaskIds.map((task_id) => ({
-          task_id,
-          status: "unknown",
-          exit_code: null,
-          command: "",
-        })),
-      );
+      const reacked = await ackCompletions(drainContext, reackTaskIds.map(bashAckTargetFromKey));
       if (reacked) confirmAcked(state, reackTaskIds);
     }
   } catch (err) {
@@ -989,20 +995,21 @@ async function drainCompletions(drainContext: DrainContext): Promise<void> {
 
 async function ackCompletions(
   drainContext: DrainContext,
-  completions: readonly BgCompletion[],
+  completions: readonly BashAckTarget[],
 ): Promise<boolean> {
   const taskIds = [...new Set(completions.map((completion) => completion.task_id))];
-  if (taskIds.length === 0) return true;
+  if (completions.length === 0) return true;
+  const targets = bashAckRequest(completions);
   try {
     const bridge = bridgeForDrain(drainContext);
     const params = drainContext.sessionID
-      ? { session_id: drainContext.sessionID, task_ids: taskIds }
-      : { task_ids: taskIds };
+      ? { session_id: drainContext.sessionID, ...targets }
+      : targets;
     const response = await withBgHopTimeout(
       bridge.send("bash_ack_completions", params, { timeoutMs: bgHopTimeoutMs }),
       "bash_ack_completions",
     );
-    if (response.success === false) {
+    if (!bashAcksConfirmed(response, completions)) {
       logPerTaskDeliveryHop(
         drainContext,
         "ack-error",
@@ -1082,7 +1089,7 @@ function scheduleWake(
   state: SessionBgState,
   sendWake: (
     reminder: string,
-    completions: readonly BgCompletion[],
+    completions: readonly BashAckTarget[],
     patternMatches?: readonly PatternMatchEntry[],
   ) => Promise<void>,
   onSendFailure: (err: unknown, hardStopped: boolean) => void,
@@ -1148,7 +1155,7 @@ function scheduleWake(
     // C-#1 site 1: mark ALL ack-target ids (completions + ack-on-delivery pattern
     // matches) as delivery-in-flight at the same sync tick they leave the queues,
     // before the sendWake await, so ingest skips them during delivery.
-    const ackTargetIds = completionAcks.map((completion) => completion.task_id);
+    const ackTargetIds = completionAcks.map(bashAckKey);
     markDelivering(state, ackTargetIds);
     void sendWake(reminder, completionAcks, pendingPatternMatches)
       .then(() => {
@@ -1232,7 +1239,7 @@ function ingestDrainedPatternMatches(
   const state = stateFor(sessionID);
   for (const match of matches) {
     state.outstandingTaskIds.delete(match.task_id);
-    if (isDeliveringOrAwaitingAck(state, match.task_id)) continue;
+    if (isDeliveringOrAwaitingAck(state, match)) continue;
     queuePendingPatternMatch(state, { ...match, ackCompletionOnDelivery: true });
   }
 }
@@ -1337,24 +1344,22 @@ function completionToExitPattern(
 function completionAcksForDelivery(
   completions: readonly BgCompletion[],
   patternMatches: readonly PatternMatchEntry[],
-): BgCompletion[] {
-  const acks = [...completions];
-  const ackedTaskIds = new Set(acks.map((completion) => completion.task_id));
-  for (const match of patternMatches) {
-    if (!match.ackCompletionOnDelivery || ackedTaskIds.has(match.task_id)) continue;
-    acks.push({ task_id: match.task_id, status: "unknown", exit_code: null, command: "" });
-    ackedTaskIds.add(match.task_id);
-  }
-  return acks;
+): BashAckTarget[] {
+  return bashAckTargets(completions, patternMatches);
 }
 
-/**
- * True if `taskId` has a delivery in flight or delivered-awaiting-ack — it has
- * already left a deliverable queue and will be acked, so a fresh ingest (push or
- * forced drain) must NOT re-accept it (audit C-#1 double-deliver guard).
- */
-function isDeliveringOrAwaitingAck(state: SessionBgState, taskId: string): boolean {
-  return state.deliveringTaskIds.has(taskId) || state.deliveredAwaitingAckTaskIds.has(taskId);
+/** Suppress an exact watch version, or any notice covered by a task-level acknowledgement. */
+function isDeliveringOrAwaitingAck(
+  state: SessionBgState,
+  target: string | PatternMatchEntry,
+): boolean {
+  const keys =
+    typeof target === "string"
+      ? [target]
+      : [target.task_id, bashAckKey(bashPatternAckTarget(target))];
+  return keys.some(
+    (key) => state.deliveringTaskIds.has(key) || state.deliveredAwaitingAckTaskIds.has(key),
+  );
 }
 
 /** Mark ack-target task ids as delivery-in-flight (at queue-removal, before await). */

@@ -501,6 +501,9 @@ export interface BashLongRunningPayload {
 }
 
 export interface BashWatchLineBatch {
+  pending_id?: string;
+  version?: number;
+  terminal_summary?: boolean;
   snapshot?: boolean;
   lines: { stream: string; offset: number; end_offset: number; text: string; count: number }[];
   dropped_lines: number;

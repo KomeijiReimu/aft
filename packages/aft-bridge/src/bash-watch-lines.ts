@@ -1,6 +1,8 @@
 import type { BashWatchLineBatch } from "./bridge.js";
 
 const MAX_PENDING_WATCH_LINES = 50;
+export const WATCH_EACH_LINE_NEEDS_BACKGROUND =
+  'bash_watch: deliver: "each_line" needs background: true.';
 
 /** Live pushes are deltas; durable replay is a replacement snapshot. */
 export function mergeWatchLineBatches(
@@ -8,7 +10,11 @@ export function mergeWatchLineBatches(
   next: BashWatchLineBatch,
 ): BashWatchLineBatch {
   if (next.snapshot) return next;
+  if (previous.pending_id && next.pending_id && previous.pending_id !== next.pending_id)
+    return next;
   const merged = { ...previous, lines: previous.lines.map((line) => ({ ...line })) };
+  merged.pending_id = next.pending_id ?? previous.pending_id;
+  merged.version = next.version ?? previous.version;
   let retained = merged.lines.reduce((sum, line) => sum + line.count, 0);
   for (const line of next.lines) {
     const keep = Math.min(line.count, MAX_PENDING_WATCH_LINES - retained);
@@ -47,7 +53,8 @@ export function formatWatchLineBatch(
   camelCase: boolean,
 ): string {
   const lines = batch.lines.map(
-    (line) => `${line.stream} byte ${line.offset} (x${line.count}): ${line.text}`,
+    (line) =>
+      `${line.stream} byte ${line.offset}${line.count > 1 ? ` ×${line.count}` : ""}: ${line.text}`,
   );
   if (batch.dropped_lines > 0 || batch.skipped_long_lines > 0) {
     const taskKey = camelCase ? "taskId" : "task_id";
@@ -55,10 +62,10 @@ export function formatWatchLineBatch(
     const offsetKey = camelCase ? `${cursor}Offset` : `${cursor}_offset`;
     const incomplete =
       batch.skipped_long_lines > 0
-        ? ` ${batch.skipped_long_lines} lines longer than 64 KiB skipped (scan incomplete).`
+        ? ` ${batch.skipped_long_lines} lines longer than 64 KiB were skipped, so the scan is incomplete.`
         : "";
     lines.push(
-      `${batch.dropped_lines} matching lines dropped.${incomplete} Read bash_status({ ${taskKey}: ${JSON.stringify(taskId)}, ${offsetKey}: ${batch.first_dropped_offset ?? 0} }).`,
+      `${batch.dropped_lines} matching lines dropped.${incomplete} Read them with bash_status({ ${taskKey}: ${JSON.stringify(taskId)}, ${offsetKey}: ${batch.first_dropped_offset ?? 0} }).`,
     );
   }
   return lines.join("\n");

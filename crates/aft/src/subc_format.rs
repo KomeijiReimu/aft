@@ -5456,15 +5456,20 @@ pub fn format_watch_line_batch(
 ) -> String {
     let mut text = String::new();
     for line in &batch.lines {
+        let repeats = if line.count > 1 {
+            format!(" ×{}", line.count)
+        } else {
+            String::new()
+        };
         text.push_str(&format!(
-            "{} byte {} (x{}): {}\n",
-            line.stream, line.offset, line.count, line.text
+            "{} byte {}{repeats}: {}\n",
+            line.stream, line.offset, line.text
         ));
     }
     if batch.dropped_lines > 0 || batch.skipped_long_lines > 0 {
         let incomplete = if batch.skipped_long_lines > 0 {
             format!(
-                " {} lines longer than 64 KiB skipped (scan incomplete).",
+                " {} lines longer than 64 KiB were skipped, so the scan is incomplete.",
                 batch.skipped_long_lines
             )
         } else {
@@ -5475,7 +5480,52 @@ pub fn format_watch_line_batch(
         } else {
             "output_offset"
         };
-        text.push_str(&format!("{} matching lines dropped.{incomplete} Read bash_status({{ task_id: {}, {cursor}: {} }}).\n", batch.dropped_lines, serde_json::to_string(task_id).unwrap_or_default(), batch.first_dropped_offset.unwrap_or(0)));
+        text.push_str(&format!("{} matching lines dropped.{incomplete} Read them with bash_status({{ task_id: {}, {cursor}: {} }}).\n", batch.dropped_lines, serde_json::to_string(task_id).unwrap_or_default(), batch.first_dropped_offset.unwrap_or(0)));
     }
     text.trim_end().to_string()
+}
+
+#[cfg(test)]
+mod watch_line_format_tests {
+    use super::format_watch_line_batch;
+    use crate::bash_background::watch_lines::{LineBatch, WatchLine};
+
+    #[test]
+    fn each_line_row_wording_golden() {
+        let mut batch = LineBatch {
+            lines: vec![WatchLine {
+                stream: "stdout".into(),
+                offset: 18234,
+                end_offset: 18257,
+                text: "ERROR db timeout".into(),
+                count: 1,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            format_watch_line_batch("task", &batch),
+            "stdout byte 18234: ERROR db timeout"
+        );
+        batch.lines[0].count = 3;
+        assert_eq!(
+            format_watch_line_batch("task", &batch),
+            "stdout byte 18234 ×3: ERROR db timeout"
+        );
+    }
+
+    #[test]
+    fn each_line_drop_wording_golden() {
+        let mut batch = LineBatch {
+            dropped_lines: 7,
+            first_dropped_stream: Some("stdout".into()),
+            first_dropped_offset: Some(18240),
+            ..Default::default()
+        };
+        assert_eq!(format_watch_line_batch("task", &batch),
+            "7 matching lines dropped. Read them with bash_status({ task_id: \"task\", output_offset: 18240 }).");
+        batch.skipped_long_lines = 2;
+        batch.first_dropped_stream = Some("stderr".into());
+        assert_eq!(format_watch_line_batch("task", &batch),
+            "7 matching lines dropped. 2 lines longer than 64 KiB were skipped, so the scan is incomplete. Read them with bash_status({ task_id: \"task\", stderr_offset: 18240 }).");
+    }
 }

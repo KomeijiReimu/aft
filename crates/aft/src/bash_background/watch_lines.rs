@@ -11,6 +11,8 @@ pub const MAX_LINES_PER_NOTIFICATION: usize = 50;
 pub const MAX_NOTIFICATIONS_PER_MINUTE: usize = 12;
 pub const NOTIFICATION_WINDOW: Duration = Duration::from_secs(60);
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
+pub const EACH_LINE_NEEDS_BACKGROUND: &str =
+    "bash_watch: deliver: \"each_line\" needs background: true.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchLine {
@@ -23,6 +25,10 @@ pub struct WatchLine {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LineBatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub snapshot: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

@@ -1490,6 +1490,11 @@ mod tests {
             .unwrap();
         assert!(columns.contains(&("each_line".into(), "INTEGER".into(), true, Some("0".into()))));
         assert!(columns.contains(&("match_batch".into(), "TEXT".into(), false, None)));
+        let result_source_type: String = conn.query_row(
+            "SELECT type FROM pragma_table_info('call_ledger') WHERE name = 'tool_result_source'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(result_source_type, "BLOB");
         assert_eq!(
             crate::reader_floor::read(dir.path())
                 .unwrap()
