@@ -3812,7 +3812,7 @@ impl BgTaskRegistry {
                     return None;
                 };
                 let context = row.match_context.unwrap_or_else(|| match_text.clone());
-                Some(if match_text == WATCH_TARGET_ERASED_TEXT {
+                let mut frame = if match_text == WATCH_TARGET_ERASED_TEXT {
                     BashPatternMatchFrame::watch_target_erased(
                         row.task_id,
                         session_id,
@@ -3832,7 +3832,12 @@ impl BgTaskRegistry {
                         context,
                         row.once,
                     )
-                })
+                };
+                frame.batch = row
+                    .match_batch
+                    .as_deref()
+                    .and_then(|batch| serde_json::from_str(batch).ok());
+                Some(frame)
             })
             .collect()
     }
@@ -3983,6 +3988,11 @@ impl BgTaskRegistry {
                 &spec.watch_id,
                 &spec.pattern,
                 spec.once,
+                self.inner
+                    .watch_registry
+                    .lock()
+                    .map(|registry| registry.is_each_line(&spec.watch_id))
+                    .unwrap_or(false),
                 stdout_offset,
                 stderr_offset,
                 pty_offset,
@@ -3997,6 +4007,7 @@ impl BgTaskRegistry {
         watch_id: &str,
         pattern: &WatchPattern,
         once: bool,
+        each_line: bool,
         stdout_offset: u64,
         stderr_offset: u64,
         pty_offset: u64,
@@ -4015,6 +4026,8 @@ impl BgTaskRegistry {
             pattern_kind: pattern.kind_name().to_string(),
             pattern: pattern.pattern_text().to_string(),
             once,
+            each_line,
+            match_batch: None,
             created_at: unix_millis() as i64,
             stdout_offset: stdout_offset as i64,
             stderr_offset: stderr_offset as i64,
@@ -4064,13 +4077,15 @@ impl BgTaskRegistry {
         &self,
         session_id: &str,
         task_id: &str,
-        pattern_match: &PatternMatch,
+        pattern_match: &mut PatternMatch,
         stdout_offset: u64,
         stderr_offset: u64,
         pty_offset: u64,
     ) {
         // The scanner masks the intact capture before constructing this match.
         // Save that presentation verbatim so replay does not need task secrets.
+        let (stdout_offset, stderr_offset, pty_offset) =
+            self.watch_replay_cursors(task_id, (stdout_offset, stderr_offset, pty_offset));
         let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return;
         };
@@ -4086,6 +4101,17 @@ impl BgTaskRegistry {
         ) else {
             return;
         };
+        if let Some(batch) = pattern_match.batch.as_mut() {
+            if row.pending_match {
+                if let Some(mut pending) = row.match_batch.as_deref().and_then(|value| {
+                    serde_json::from_str::<super::watch_lines::LineBatch>(value).ok()
+                }) {
+                    pending.merge(batch.clone());
+                    *batch = pending;
+                }
+            }
+            pattern_match.context = crate::subc_format::format_watch_line_batch(task_id, batch);
+        }
         row.stdout_offset = stdout_offset as i64;
         row.stderr_offset = stderr_offset as i64;
         row.pty_offset = pty_offset as i64;
@@ -4093,6 +4119,14 @@ impl BgTaskRegistry {
         row.match_text = Some(pattern_match.match_text.clone());
         row.match_offset = Some(pattern_match.match_offset as i64);
         row.match_context = Some(pattern_match.context.clone());
+        row.match_batch = pattern_match.batch.as_ref().and_then(|batch| {
+            let mut saved = batch.clone();
+            // Replay keeps all pending matching rows; the live notification
+            // at task exit contains only a one-line summary of dropped lines.
+            saved.terminal_summary = false;
+            saved.snapshot = true;
+            serde_json::to_string(&saved).ok()
+        });
         if pattern_match.once {
             // Once-watches stop scanning after the first hit but stay durable
             // until ack so a lost push can be re-delivered after restart.
@@ -4115,6 +4149,8 @@ impl BgTaskRegistry {
         stderr_offset: u64,
         pty_offset: u64,
     ) {
+        let (stdout_offset, stderr_offset, pty_offset) =
+            self.watch_replay_cursors(task_id, (stdout_offset, stderr_offset, pty_offset));
         let offsets = (stdout_offset, stderr_offset, pty_offset);
         if self
             .inner
@@ -4163,6 +4199,20 @@ impl BgTaskRegistry {
         } else {
             last.insert(task_id.to_string(), offsets);
         }
+    }
+
+    fn watch_replay_cursors(&self, task_id: &str, offsets: (u64, u64, u64)) -> (u64, u64, u64) {
+        self.inner
+            .watch_registry
+            .lock()
+            .map(|registry| {
+                (
+                    registry.replay_cursor(task_id, "stdout", offsets.0),
+                    registry.replay_cursor(task_id, "stderr", offsets.1),
+                    registry.replay_cursor(task_id, "pty", offsets.2),
+                )
+            })
+            .unwrap_or(offsets)
     }
 
     fn watch_stream_cursors(&self, task_id: &str) -> (u64, u64, u64) {
@@ -7444,6 +7494,16 @@ impl BgTaskRegistry {
         pattern: WatchPattern,
         once: bool,
     ) -> Result<String, &'static str> {
+        self.register_watch_delivery(task_id, pattern, once, false)
+    }
+
+    pub fn register_watch_delivery(
+        &self,
+        task_id: String,
+        pattern: WatchPattern,
+        once: bool,
+        each_line: bool,
+    ) -> Result<String, &'static str> {
         let task = self.task(&task_id).ok_or("task_not_found")?;
         self.record_live_delivery_session(&task.session_id);
         validate_task_id(&task_id).map_err(|_| "invalid_task_id")?;
@@ -7487,6 +7547,9 @@ impl BgTaskRegistry {
                 .lock()
                 .map_err(|_| "watch_registry_poisoned")?;
             let watch_id = registry.register(task_id.clone(), pattern.clone(), once)?;
+            if each_line {
+                registry.enable_each_line(&watch_id);
+            }
             match &mode {
                 BgMode::Pipes => {
                     let stdout_key = format!("{task_id}:stdout");
@@ -7539,6 +7602,9 @@ impl BgTaskRegistry {
             }
         }
 
+        if terminal_at_registration {
+            terminal_matches.extend(self.take_watch_line_batches(&task_id, true));
+        }
         let (stdout_offset, stderr_offset, pty_offset) = self.watch_stream_cursors(&task_id);
         // The watch row references the task row. A running task's row can be
         // missing (spawned before this registry had its aft.db handle, or a
@@ -7552,6 +7618,7 @@ impl BgTaskRegistry {
             &watch_id,
             &pattern,
             once,
+            each_line,
             stdout_offset,
             stderr_offset,
             pty_offset,
@@ -7605,6 +7672,9 @@ impl BgTaskRegistry {
                 }
             }
 
+            if !scanned_terminal {
+                terminal_matches.extend(self.take_watch_line_batches(&task_id, true));
+            }
             let (stdout_offset, stderr_offset, pty_offset) = self.watch_stream_cursors(&task_id);
             let (watch_controlled, watch_matched) = self.task_watch_state(&task_id);
             if terminal_matches.is_empty() && (!watch_controlled || watch_matched) {
@@ -7622,7 +7692,8 @@ impl BgTaskRegistry {
                     self.record_bash_watch_exit(completion, true);
                 }
             } else {
-                for pattern_match in &terminal_matches {
+                for pattern_match in &mut terminal_matches {
+                    let fresh = pattern_match.clone();
                     self.persist_watch_match(
                         &task.session_id,
                         &task_id,
@@ -7631,7 +7702,7 @@ impl BgTaskRegistry {
                         stderr_offset,
                         pty_offset,
                     );
-                    self.emit_bash_pattern_match(&task.session_id, pattern_match.clone());
+                    self.emit_bash_pattern_match(&task.session_id, fresh);
                 }
             }
             self.clear_task_watch_state(&task_id);
@@ -7781,6 +7852,101 @@ impl BgTaskRegistry {
         matches
     }
 
+    pub fn masked_status_page(
+        &self,
+        task_id: &str,
+        artifact: TaskArtifact,
+        from: u64,
+        bytes: &[u8],
+    ) -> String {
+        const MASK_CHUNK_BYTES: usize = 4 * 1024;
+        let mut text = String::new();
+        let mut start = 0;
+        while start < bytes.len() {
+            let limit = (start + MASK_CHUNK_BYTES).min(bytes.len());
+            let end = bytes[start..limit]
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map(|index| start + index + 1)
+                .unwrap_or(limit);
+            // Keep each credential-mask region below the preview cap, while
+            // every subrange still reads its full surrounding secret halo.
+            text.push_str(&self.masked_watch_range(
+                task_id,
+                artifact,
+                from + start as u64,
+                from + end as u64,
+            ));
+            start = end;
+        }
+        text
+    }
+
+    pub fn masked_watch_range(
+        &self,
+        task_id: &str,
+        artifact: TaskArtifact,
+        from: u64,
+        to: u64,
+    ) -> String {
+        let rendered = self.task(task_id).and_then(|task| {
+            let mut file = open_task_artifact(&task.paths, artifact).ok()?;
+            let len = file.len().ok()?;
+            if len >= super::buffer::DISK_LIMIT_BYTES || to > len || from > to {
+                return None;
+            }
+            let source = completion_preview::watch_preview_source_range(
+                from as usize..to as usize,
+                len as usize,
+            )?;
+            let bytes = file
+                .read_range(source.start as u64, source.len() as u64)
+                .ok()?;
+            if bytes.len() != source.len() {
+                return None;
+            }
+            Some(
+                self.render_watch_preview_window(
+                    task_id,
+                    &bytes,
+                    from as usize - source.start..to as usize - source.start,
+                    source.start == 0,
+                    source.end == len as usize,
+                )
+                .0,
+            )
+        });
+        rendered.unwrap_or_else(|| crate::log_redact::SECRET_PLACEHOLDER.to_string())
+    }
+
+    fn take_watch_line_batches(&self, task_id: &str, terminal: bool) -> Vec<PatternMatch> {
+        let mut batches = self
+            .inner
+            .watch_registry
+            .lock()
+            .map(|mut registry| registry.take_line_batches(task_id, terminal))
+            .unwrap_or_default();
+        for matched in &mut batches {
+            if let Some(batch) = matched.batch.as_mut() {
+                for line in &mut batch.lines {
+                    let artifact = match line.stream.as_str() {
+                        "stderr" => TaskArtifact::Stderr,
+                        "pty" => TaskArtifact::Pty,
+                        _ => TaskArtifact::Stdout,
+                    };
+                    // Render only retained rows, after releasing the scanner lock. The
+                    // preview reader supplies the secret halo before redacting a line.
+                    line.text = self
+                        .masked_watch_range(task_id, artifact, line.offset, line.end_offset)
+                        .trim_end_matches('\n')
+                        .to_string();
+                }
+                matched.context = crate::subc_format::format_watch_line_batch(task_id, batch);
+            }
+        }
+        batches
+    }
+
     pub(crate) fn scan_task_watch_output(&self, task: &Arc<BgTask>) {
         if self.active_watch_count(&task.task_id) == 0 {
             return;
@@ -7847,6 +8013,7 @@ impl BgTaskRegistry {
                 break;
             }
         }
+        matches.extend(self.take_watch_line_batches(&task.task_id, drain));
         let (stdout_offset, stderr_offset, pty_offset) = self.watch_stream_cursors(&task.task_id);
         if matches.is_empty() {
             // Advance durable cursors even when nothing matched so a restart
@@ -7862,16 +8029,17 @@ impl BgTaskRegistry {
             }
             return;
         }
-        for pattern_match in matches {
+        for mut pattern_match in matches {
+            let fresh = pattern_match.clone();
             self.persist_watch_match(
                 &task.session_id,
                 &task.task_id,
-                &pattern_match,
+                &mut pattern_match,
                 stdout_offset,
                 stderr_offset,
                 pty_offset,
             );
-            self.emit_bash_pattern_match(&task.session_id, pattern_match);
+            self.emit_bash_pattern_match(&task.session_id, fresh);
         }
         self.persist_task_watch_cursors(
             &task.session_id,
@@ -11790,6 +11958,9 @@ impl BgTaskRegistry {
                     );
                     continue;
                 }
+                if row.each_line && row.scanning {
+                    registry.enable_each_line(&row.watch_id);
+                }
                 if row.pending_match {
                     if let (Some(match_text), Some(match_offset), Some(context)) = (
                         row.match_text.clone(),
@@ -11803,6 +11974,10 @@ impl BgTaskRegistry {
                             match_offset: match_offset.max(0) as u64,
                             context,
                             once: row.once,
+                            batch: row
+                                .match_batch
+                                .as_deref()
+                                .and_then(|batch| serde_json::from_str(batch).ok()),
                         });
                     }
                 }
@@ -11844,7 +12019,8 @@ impl BgTaskRegistry {
         }
 
         let (stdout_offset, stderr_offset, pty_offset) = self.watch_stream_cursors(&task.task_id);
-        for pattern_match in &gap_matches {
+        gap_matches.extend(self.take_watch_line_batches(&task.task_id, terminal));
+        for pattern_match in &mut gap_matches {
             self.persist_watch_match(
                 &task.session_id,
                 &task.task_id,
@@ -11864,6 +12040,10 @@ impl BgTaskRegistry {
             );
         }
 
+        for fresh in gap_matches.iter().filter(|matched| matched.batch.is_some()) {
+            pending_to_emit.retain(|pending| pending.watch_id != fresh.watch_id);
+            pending_to_emit.push(fresh.clone());
+        }
         // Prefer a single delivery: pending re-push first, else fresh gap matches.
         let emitted_pending = !pending_to_emit.is_empty();
         let to_emit = if emitted_pending {
@@ -13058,7 +13238,28 @@ impl BgTaskRegistry {
             return;
         };
         if let Some(sender) = progress_sender.as_ref() {
-            let frame = if pattern_match.match_text == WATCH_TASK_EXIT_TEXT {
+            if let Some(batch) = pattern_match
+                .batch
+                .as_ref()
+                .filter(|batch| batch.terminal_summary)
+            {
+                let mut summary = batch.clone();
+                summary.lines.clear();
+                sender(PushFrame::BashPatternMatch(
+                    BashPatternMatchFrame::task_exit(
+                        &pattern_match.task_id,
+                        session_id,
+                        WATCH_TASK_EXIT_TEXT,
+                        crate::subc_format::format_watch_line_batch(
+                            &pattern_match.task_id,
+                            &summary,
+                        ),
+                    ),
+                ));
+                return;
+            }
+            let batch = pattern_match.batch.clone();
+            let mut frame = if pattern_match.match_text == WATCH_TASK_EXIT_TEXT {
                 BashPatternMatchFrame::task_exit(
                     pattern_match.task_id,
                     session_id.to_string(),
@@ -13076,6 +13277,7 @@ impl BgTaskRegistry {
                     pattern_match.once,
                 )
             };
+            frame.batch = batch;
             sender(PushFrame::BashPatternMatch(frame));
         }
     }
@@ -25289,6 +25491,8 @@ mod tests {
                     match_text: Some("(fail)".into()),
                     match_offset: Some(756_237),
                     match_context: Some("release output ... (fail)".into()),
+                    each_line: false,
+                    match_batch: None,
                 },
             )
             .unwrap();
@@ -26523,6 +26727,128 @@ mod tests {
     }
 
     #[test]
+    fn each_line_pending_snapshots_merge_and_partial_line_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path();
+        let (registry, db, frames) = registry_with_db_and_frames(storage);
+        let task_id = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                LONG_RUNNING_COMMAND,
+                "session".to_string(),
+                storage.to_path_buf(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                storage.to_path_buf(),
+                10,
+                true,
+                false,
+                Some(storage.to_path_buf()),
+            )
+            .unwrap();
+        let watch_id = registry
+            .register_watch_delivery(
+                task_id.clone(),
+                WatchPattern::Substring("ERROR".into()),
+                false,
+                true,
+            )
+            .unwrap();
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+        let mut output = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&task.paths.stdout)
+            .unwrap();
+        output.write_all(b"ERROR a\nER").unwrap();
+        registry.scan_task_watch_output(&task);
+        let row = crate::db::bash_watches::get_bash_pattern_watch(
+            &db.lock().unwrap(),
+            "opencode",
+            "session",
+            &task_id,
+            &watch_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(row.each_line);
+        assert_eq!(row.stdout_offset, 8, "resume before the unfinished line");
+        registry.clear_task_watch_state(&task_id);
+        registry
+            .inner
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        output.write_all(b"ROR b\n").unwrap();
+        let (replayed, _, replay_frames) = registry_with_db_and_frames(storage);
+        replayed
+            .replay_session_inner(storage, "session", None)
+            .unwrap();
+        let matches = pattern_match_frames(&replay_frames);
+        let latest = matches
+            .iter()
+            .rev()
+            .find(|frame| frame.task_id == task_id && frame.batch.is_some())
+            .unwrap();
+        let batch = latest.batch.as_ref().unwrap();
+        assert_eq!(
+            batch.lines.len(),
+            2,
+            "{batch:?}; original pushes: {:?}",
+            pattern_match_frames(&frames)
+        );
+        assert_eq!(batch.lines[0].text, "ERROR a");
+        assert_eq!(batch.lines[1].text, "ERROR b");
+        assert_eq!(batch.lines[1].offset, 8);
+        let mut page = b"page text\n".repeat(6000);
+        page.extend_from_slice(b"page final\n");
+        let from = output.metadata().unwrap().len();
+        output.write_all(&page).unwrap();
+        let masked = registry.masked_status_page(&task_id, TaskArtifact::Stdout, from, &page);
+        assert_eq!(masked.lines().count(), 6001);
+        assert!(masked.ends_with("page final\n"));
+    }
+
+    #[test]
+    fn each_line_terminal_rate_exemption_is_one_summary_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, frames) = registry_with_db_and_frames(dir.path());
+        registry.record_live_delivery_session("session");
+        let batch = super::super::watch_lines::LineBatch {
+            terminal_summary: true,
+            dropped_lines: 7,
+            first_dropped_stream: Some("stderr".into()),
+            first_dropped_offset: Some(123),
+            lines: vec![super::super::watch_lines::WatchLine {
+                stream: "stdout".into(),
+                offset: 0,
+                end_offset: 8,
+                count: 1,
+                text: "ERROR a".into(),
+            }],
+            ..Default::default()
+        };
+        registry.emit_bash_pattern_match(
+            "session",
+            PatternMatch {
+                watch_id: "watch-a".into(),
+                task_id: "bash-lines".into(),
+                match_text: "matching lines".into(),
+                match_offset: 0,
+                context: "ignored".into(),
+                once: false,
+                batch: Some(batch),
+            },
+        );
+        let frames = pattern_match_frames(&frames);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].reason, "task_exit");
+        assert!(frames[0].batch.is_none());
+        assert_eq!(frames[0].context.lines().count(), 1);
+        assert!(frames[0].context.contains("7 matching lines dropped"));
+        assert!(frames[0].context.contains("stderr_offset: 123"));
+        assert!(!frames[0].context.contains("ERROR a"));
+    }
+
+    #[test]
     fn pattern_watch_acked_match_does_not_redeliver_after_restart() {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path();
@@ -26726,6 +27052,8 @@ mod tests {
                     match_text: None,
                     match_offset: None,
                     match_context: None,
+                    each_line: false,
+                    match_batch: None,
                 },
             )
             .unwrap();

@@ -53,6 +53,8 @@ const PREVIEW_BYTES: usize = crate::bash_background::output::RUNNING_OUTPUT_PREV
 #[derive(Debug, Default, Deserialize)]
 struct BashWatchParams {
     #[serde(default)]
+    deliver: Option<Value>,
+    #[serde(default)]
     task_id: Option<String>,
     #[serde(default)]
     pattern: Option<Value>,
@@ -305,6 +307,13 @@ pub(crate) fn handle_deferred_with_observation_only(
             "bash_watch: missing taskId",
         ));
     };
+    if params.deliver.is_some() {
+        return DispatchOutcome::Immediate(Response::error(
+            &id,
+            "invalid_request",
+            "bash_watch: deliver requires background:true; this watch waits synchronously",
+        ));
+    }
     let pattern = match parse_pattern(params.pattern.as_ref()) {
         Ok(pattern) => pattern,
         Err(response) => return DispatchOutcome::Immediate(with_id(response, &id)),
@@ -894,6 +903,19 @@ fn output_tail(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn each_line_sync_watch_refuses_delivery() {
+        let project = tempfile::tempdir().unwrap();
+        let ctx = context(project.path(), project.path());
+        let req = serde_json::from_value(json!({"id":"sync-delivery", "command":"bash_watch", "task_id":"task", "deliver":"each_line"})).unwrap();
+        let DispatchOutcome::Immediate(response) = handle_deferred(&req, ctx) else {
+            panic!("sync delivery must refuse immediately")
+        };
+        assert!(!response.success);
+        assert!(serde_json::to_string(&response)
+            .unwrap()
+            .contains("deliver requires background:true"));
+    }
     use crate::bash_background::persistence::{create_task_layout, write_task_at, PersistedTask};
     use crate::config::Config;
     use crate::harness::Harness;

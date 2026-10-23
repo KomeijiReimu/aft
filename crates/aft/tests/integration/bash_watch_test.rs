@@ -255,6 +255,41 @@ fn pattern_match_emits_push_frame() {
 
 #[cfg(unix)]
 #[test]
+fn each_line_push_batches_all_lines_with_offsets() {
+    let mut aft = AftProcess::spawn();
+    let dir = configure_background(&mut aft);
+    let release = dir.path().join("each-line-release");
+    let payload = dir.path().join("each-line-output");
+    fs::write(&payload, b"ERROR a\nERROR b\nERROR b\n").unwrap();
+    let release_guard = ReleaseOnDrop::new(release.clone());
+    let command = format!(
+        "while [ ! -f {} ]; do sleep 0.05; done; cat {}",
+        shell_quote(&release.display().to_string()),
+        shell_quote(&payload.display().to_string())
+    );
+    let task_id = spawn(&mut aft, &command);
+    let response = notify(
+        &mut aft,
+        &task_id,
+        json!({"pattern":"ERROR", "deliver":"each_line", "once":false}),
+    );
+    assert_eq!(response["success"], true, "{response:?}");
+    drop(release_guard);
+    let frame = wait_for_pattern_frame(&mut aft, &task_id);
+    assert_eq!(
+        frame["batch"]["lines"].as_array().unwrap().len(),
+        2,
+        "{frame:?}"
+    );
+    assert_eq!(frame["batch"]["lines"][0]["offset"], 0);
+    assert_eq!(frame["batch"]["lines"][1]["offset"], 8);
+    assert_eq!(frame["batch"]["lines"][1]["count"], 2);
+    assert!(frame["context"].as_str().unwrap().contains("ERROR b"));
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
 fn pattern_match_offset_counts_original_bytes_before_invalid_utf8() {
     let mut aft = AftProcess::spawn();
     let dir = configure_background(&mut aft);

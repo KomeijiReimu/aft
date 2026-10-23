@@ -367,6 +367,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal cwd analysis retains at most eight folder/mode states per exit-status branch; exceeding that bound makes the folder unknown rather than removing alternatives, and no response list is shortened",
     },
     ExclusionEntry {
+        file: "bash_background/watch_lines.rs",
+        enclosing_item: "LineDelivery",
+        location_or_primitive: "MAX_LINES_PER_NOTIFICATION, MAX_NOTIFICATIONS_PER_MINUTE, MAX_LINE_BYTES",
+        reason: "Async push notifications are not command-response lists. LineBatch reports exact cap drops and the source stream/byte offset; oversized lines explicitly mark scanning incomplete.",
+    },
+    ExclusionEntry {
         file: "standalone_input.rs",
         enclosing_item: "read_bounded_line, room, push",
         location_or_primitive: "MAX_LINE_BYTES / MAX_RETAINED_BYTES / MAX_RETAINED_ITEMS / MAX_HELD_BYTES / MAX_HELD_ITEMS",

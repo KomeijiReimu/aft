@@ -1197,6 +1197,23 @@ fn format_bash_status(
         data.get("exit_code").and_then(Value::as_i64),
         data.get("status_reason").and_then(Value::as_str),
     );
+    let mut paged = false;
+    for (stream, cursor) in [("output", "outputOffset"), ("stderr", "stderrOffset")] {
+        if let Some(page) = data
+            .get(format!("{stream}_page_text"))
+            .and_then(Value::as_str)
+        {
+            text.push_str(&format!(
+                "\n{stream} page (next {cursor}: {}, has_more: {}):\n{page}",
+                data[format!("{stream}_next_offset")],
+                data[format!("{stream}_has_more")]
+            ));
+            paged = true;
+        }
+    }
+    if paged {
+        return text;
+    }
     if let Some(duration_ms) = data.get("duration_ms").and_then(Value::as_u64) {
         // Rounded to the nearest second, as the plugin displays it.
         text.push_str(&format!(" {}s", duration_ms.saturating_add(500) / 1000));
@@ -5430,4 +5447,35 @@ mod executed_outline_mode_tests {
             "{rendered}"
         );
     }
+}
+
+/// Render a bounded line batch; offsets refer to the original, unmasked stream.
+pub fn format_watch_line_batch(
+    task_id: &str,
+    batch: &crate::bash_background::watch_lines::LineBatch,
+) -> String {
+    let mut text = String::new();
+    for line in &batch.lines {
+        text.push_str(&format!(
+            "{} byte {} (x{}): {}\n",
+            line.stream, line.offset, line.count, line.text
+        ));
+    }
+    if batch.dropped_lines > 0 || batch.skipped_long_lines > 0 {
+        let incomplete = if batch.skipped_long_lines > 0 {
+            format!(
+                " {} lines longer than 64 KiB skipped (scan incomplete).",
+                batch.skipped_long_lines
+            )
+        } else {
+            String::new()
+        };
+        let cursor = if batch.first_dropped_stream.as_deref() == Some("stderr") {
+            "stderr_offset"
+        } else {
+            "output_offset"
+        };
+        text.push_str(&format!("{} matching lines dropped.{incomplete} Read bash_status({{ task_id: {}, {cursor}: {} }}).\n", batch.dropped_lines, serde_json::to_string(task_id).unwrap_or_default(), batch.first_dropped_offset.unwrap_or(0)));
+    }
+    text.trim_end().to_string()
 }

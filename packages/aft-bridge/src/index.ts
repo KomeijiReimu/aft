@@ -89,6 +89,11 @@ export {
   groupBashPermissionAsks,
   withBashPermissionLoop,
 } from "./bash-permissions.js";
+export {
+  formatBashOutputPages,
+  formatWatchLineBatch,
+  mergeWatchLineBatches,
+} from "./bash-watch-lines.js";
 // --- binary identity (no-exec cache trust) ---
 export type { BinaryIdentity, BinaryIdentityCheck } from "./binary-identity.js";
 export {
@@ -106,6 +111,7 @@ export type {
   BashLongRunningPayload,
   BashPatternMatchAck,
   BashPatternMatchFrame,
+  BashWatchLineBatch,
   BridgeClock,
   BridgeOptions,
   BridgeRequestOptions,

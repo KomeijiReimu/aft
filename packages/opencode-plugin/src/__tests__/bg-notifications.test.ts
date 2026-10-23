@@ -2701,3 +2701,66 @@ function preAdmissionRejection(message: string) {
     response: { status: 400 },
   };
 }
+
+test("each_line reminder keeps bounded rows and drop recovery hint", () => {
+  const reminder = formatPatternMatchReminder([
+    {
+      task_id: "bash-lines",
+      session_id: "s1",
+      watch_id: "watch-lines",
+      match_text: "matching lines",
+      match_offset: 0,
+      context: "stdout byte 0 (x2): ERROR a\n3 matching lines dropped; Read bash_status offset=16.",
+      once: false,
+      batch: {
+        lines: [{ stream: "stdout", offset: 0, end_offset: 8, text: "ERROR a", count: 2 }],
+        dropped_lines: 3,
+        first_dropped_offset: 16,
+        first_dropped_stream: "stdout",
+        skipped_long_lines: 0,
+      },
+    },
+  ]);
+  expect(reminder).toContain("task bash-lines matching lines:");
+  expect(reminder).toContain("stdout byte 0 (x2): ERROR a");
+  expect(reminder).toContain(
+    '3 matching lines dropped. Read bash_status({ taskId: "bash-lines", outputOffset: 16 }).',
+  );
+});
+
+test("each_line queue replaces snapshots without discarding another watch", async () => {
+  markTaskWaiting("s-lines", "bash-lines");
+  const { ctx } = harness(() => ({ success: true, acked_task_ids: [] }));
+  const base = {
+    task_id: "bash-lines",
+    session_id: "s-lines",
+    watch_id: "watch-a",
+    match_text: "matching lines",
+    match_offset: 0,
+    context: "rows",
+    once: false,
+  };
+  const batch = {
+    lines: [{ stream: "stdout", offset: 0, end_offset: 8, text: "ERROR a", count: 1 }],
+    dropped_lines: 0,
+    first_dropped_offset: null,
+    first_dropped_stream: null,
+    skipped_long_lines: 0,
+  };
+  const drain = { ctx, directory: "/tmp/project", sessionID: "s-lines", client: {} };
+  await handlePushedPatternMatch(drain, { ...base, batch });
+  await handlePushedPatternMatch(drain, {
+    ...base,
+    batch: {
+      ...batch,
+      snapshot: true,
+      dropped_lines: 3,
+      first_dropped_offset: 8,
+      first_dropped_stream: "stdout",
+    },
+  });
+  await handlePushedPatternMatch(drain, { ...base, watch_id: "watch-b", batch });
+  const pending = sessionBgStates.get("s-lines")?.pendingPatternMatches;
+  expect(pending).toHaveLength(2);
+  expect(pending?.find((entry) => entry.watch_id === "watch-a")?.batch?.dropped_lines).toBe(3);
+});

@@ -1327,10 +1327,14 @@ fn translate_bash_task_tool(bare_name: &str, args: Value) -> Translated {
     let mut map = agent_args_map(args);
     rename(&mut map, "taskId", "task_id");
     rename(&mut map, "outputMode", "output_mode");
+    rename(&mut map, "outputOffset", "output_offset");
+    rename(&mut map, "stderrOffset", "stderr_offset");
     rename(&mut map, "timeoutMs", "timeout_ms");
     if let Some(Value::Object(params)) = map.get_mut("params") {
         rename(params, "taskId", "task_id");
         rename(params, "outputMode", "output_mode");
+        rename(params, "outputOffset", "output_offset");
+        rename(params, "stderrOffset", "stderr_offset");
         rename(params, "timeoutMs", "timeout_ms");
     }
     Translated {

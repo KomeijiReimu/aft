@@ -544,6 +544,9 @@ briefly exceed the limit.
 **`bash_status`** — read-only snapshot of a background or PTY task's current state and output.
 Never waits. For PTY tasks, `outputMode` selects `screen` (vt100-rendered), `raw` (byte stream),
 or `both`.
+Optional `outputOffset` / `stderrOffset` request at most 64 KiB from the original
+stdout (or PTY) / stderr byte offset, returning masked page text and the next offset.
+Pi uses `output_offset` / `stderr_offset`, as with its other snake_case arguments.
 
 **`bash_watch`** — block on or register for a background task's output. In a main session sync
 waits are for a short remaining wait on a task (default 30s, max `bash.watch_sync_max_ms`, 120s
@@ -557,6 +560,16 @@ but never extends it beyond the configured worker limit. Every session's blockin
 call (`wait: true`, or any foreground call when
 `bash.subagent_background` is false) is bounded the same way: at the limit the command moves to the
 background, not killed, and the reply gives its task id, including on the tool-provider/v1 route.
+Async watches can opt into `deliver: "each_line"` (requires `background: true`): each
+complete matching line carries its source stream and byte offset, and consecutive identical
+lines are folded with a count. Each scan interval sends one batch, retaining at most 50 source
+lines, with at most 12 matching-line notifications per 60-second window per watch; omitted
+`deliver` keeps first-match delivery unchanged. Drops carry an exact count and a copyable
+`bash_status` byte-page call; rate-limited drops are summarized in the next allowed batch.
+The final watch notification is exempt from the match-rate cap so it can report final drop counts immediately.
+Lines longer than 64 KiB are skipped with an explicit incomplete-scan count; a final unterminated
+line is checked on exit. Matching is line-local, including for regexes; use a sync watch for
+cross-line patterns. `once` still defaults to true; use `once: false` to keep following a log.
 The head preset declares a reply deadline for `bash`; the worker preset declares it for `bash`
 and `bash_watch`. Both use the resolved `bash.worker_wait_max_ms` plus 240 seconds for spawn,
 terminal handoff and reply delivery. A watch does not spawn a command, but retains the same

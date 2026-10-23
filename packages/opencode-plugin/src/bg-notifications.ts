@@ -1,7 +1,10 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import type { BashWatchLineBatch } from "@cortexkit/aft-bridge";
 import {
   type AftProjectTransport,
   type BgNudgeRef,
+  formatWatchLineBatch,
+  mergeWatchLineBatches,
   resolveBridgeForNudge,
 } from "@cortexkit/aft-bridge";
 import { sessionLog, sessionWarn } from "./logger.js";
@@ -56,6 +59,7 @@ export interface BgCompletion {
 }
 
 export interface PatternMatchEntry {
+  batch?: BashWatchLineBatch;
   task_id: string;
   session_id: string;
   watch_id: string;
@@ -509,11 +513,21 @@ function queuePendingPatternMatch(state: SessionBgState, entry: PatternMatchEntr
     ? entry
     : { ...entry, reason: "pattern_match" };
   const existingIdx = state.pendingPatternMatches.findIndex(
-    (match) => match.task_id === normalized.task_id,
+    (match) =>
+      match.task_id === normalized.task_id &&
+      (normalized.batch || match.batch ? match.watch_id === normalized.watch_id : true),
   );
   if (existingIdx >= 0) {
     const existing = state.pendingPatternMatches[existingIdx];
-    if (existing.reason !== "pattern_match" && normalized.reason === "pattern_match") {
+    // Live pushes contain only new rows; replay replaces the durable snapshot.
+    // Bound the queue too, since the host can stay busy across many scan intervals.
+    if (normalized.batch && existing.batch) {
+      normalized.batch = mergeWatchLineBatches(existing.batch, normalized.batch);
+    }
+    if (
+      normalized.batch ||
+      (existing.reason !== "pattern_match" && normalized.reason === "pattern_match")
+    ) {
       state.pendingPatternMatches[existingIdx] = normalized;
     }
     return;
@@ -1620,7 +1634,14 @@ export function formatLongRunningReminder(reminders: readonly BgLongRunningRemin
 export function formatPatternMatchReminder(matches: readonly PatternMatchEntry[]): string {
   const bullets = matches
     .map((match) => {
-      const context = (match.context || match.match_text).replace(/\n/g, "\n      > ");
+      const context = (
+        match.batch
+          ? formatWatchLineBatch(match.task_id, match.batch, true)
+          : match.context || match.match_text
+      ).replace(/\n/g, "\n      > ");
+      if (match.batch) {
+        return `- task ${match.task_id} matching lines:\n      > ${context}`;
+      }
       if (match.reason === "task_exit") {
         return `- task ${match.task_id} exited:\n      > ${context}`;
       }
