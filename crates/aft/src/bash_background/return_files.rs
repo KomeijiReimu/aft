@@ -87,7 +87,8 @@ impl NotReturned {
             Self::OutsideProject => "the local path resolves outside the project".into(),
             Self::LocalWrite { error } => format!("could not write it here: {error}"),
             Self::NotRegular => {
-                "a symlink or a non-regular file is at this path here; it was left as it is".into()
+                "a symlink or other non-regular file is already at this path; AFT left it unchanged"
+                    .into()
             }
         }
     }

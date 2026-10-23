@@ -72,6 +72,22 @@ fn report_lists_each_path_once_with_its_size_or_reason() {
     );
 }
 
+#[test]
+fn a_local_non_regular_path_is_reported_in_the_approved_words() {
+    let report = render_report(&[ReturnedPath {
+        checkout_path: None,
+        path: "dist/app.bin".into(),
+        outcome: ReturnOutcome::NotReturned {
+            reason: NotReturned::NotRegular,
+        },
+    }]);
+    assert_eq!(
+        report,
+        "Files requested back from the server (return_paths):\n  \
+         dist/app.bin: not returned (a symlink or other non-regular file is already at this path; AFT left it unchanged)"
+    );
+}
+
 #[cfg(unix)]
 mod receiving {
     use super::super::*;
