@@ -1439,6 +1439,7 @@ fn remote_execution_header_without_a_job_id_keeps_its_existing_text() {
         returned_files: None,
         return_first_seq: None,
         return_staging: Default::default(),
+        expired_gap_unverified: Vec::new(),
     };
     assert_eq!(
         remote_execution_note(&remote),
@@ -2992,6 +2993,7 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
         returned_files: None,
         return_first_seq: None,
         return_staging: Default::default(),
+        expired_gap_unverified: Vec::new(),
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
     write_task_at(&layout, &metadata).unwrap();
@@ -4302,6 +4304,7 @@ fn persist_accepted_with_snapshot_cap(
         returned_files: None,
         return_first_seq: None,
         return_staging: Default::default(),
+        expired_gap_unverified: Vec::new(),
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
     write_task_at(&layout, &metadata).unwrap();
@@ -5073,6 +5076,7 @@ fn exec_remote_bash_only_not_sent_errors_prove_local_fallback_safe() {
             job_id: id(),
             last_seq: Some(3),
             gap_recovery: None,
+            last_output_seq: None,
         }),
         reason: "lost".into()
     }));
@@ -6667,6 +6671,7 @@ fn remote_phase_comes_from_acceptance_started_or_output() {
         returned_files: None,
         return_first_seq: None,
         return_staging: Default::default(),
+        expired_gap_unverified: Vec::new(),
     };
     assert_eq!(RemotePhase::of(&remote), RemotePhase::Submitting);
     remote.job_id = Some(id());
@@ -6789,6 +6794,7 @@ fn remote_phase_note_says_submitting_then_queued_until_started() {
         returned_files: None,
         return_first_seq: None,
         return_staging: Default::default(),
+        expired_gap_unverified: Vec::new(),
     });
     let now = 1_042_900;
     // Before acceptance the runner has not confirmed it copied the inputs.
@@ -7246,6 +7252,7 @@ async fn reattach_limit_counts_from_a_late_draining_resubmission() {
         returned_files: None,
         return_first_seq: None,
         return_staging: Default::default(),
+        expired_gap_unverified: Vec::new(),
     });
     let minutes_left = |budget: &ReattachBudget| {
         budget
@@ -13168,7 +13175,12 @@ async fn runon_return_paths_places_verified_files_and_lists_every_path() {
 
 #[tokio::test]
 async fn runon_return_paths_expired_replay_reports_expired_without_output_loss() {
-    let daemon = return_daemon("replay-expired").await;
+    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::MotorExpiredReplay,
+        RETURN_CLAIMS,
+        1,
+    )
+    .await;
     let dir = tempfile::tempdir().unwrap();
     let ctx = restarted_context(dir.path());
     let (reply, _) = orchestrated_reply(
@@ -13488,6 +13500,7 @@ async fn runon_return_paths_restart_before_the_manifest_replays_chunks_and_place
         returned_files: None,
         return_first_seq: None,
         return_staging: Default::default(),
+        expired_gap_unverified: Vec::new(),
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
     write_task_at(&layout, &metadata).unwrap();
@@ -13805,5 +13818,34 @@ async fn runon_return_paths_restart_during_gap_recovery_rewinds_to_the_first_chu
             .contains("  dist/app.bin: returned (10 bytes)"),
         "{}",
         done.output_preview
+    );
+}
+
+#[tokio::test]
+async fn runon_uncounted_expired_gap_that_never_fills_is_reported_unverified_not_lost() {
+    // The crate's replay-expired vector sends no chunk counts and its gap (3
+    // seqs) is not the one chunk derived from the 10-byte file. Each
+    // re-attach replays the same records, so the gap never fills.
+    let daemon = return_daemon("replay-expired").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let (reply, _) = orchestrated_reply(
+        &ctx,
+        &daemon,
+        return_call(&["dist/app.bin", "dist/absent.txt"]),
+    )
+    .await;
+    assert!(reply.success, "{reply:?}");
+    let output = reply.data["output"].as_str().unwrap();
+    assert!(
+        output.contains(&expired_gap_unverified_line(3, 5)),
+        "{output}"
+    );
+    assert!(output.contains(EXPIRED_GAP_UNVERIFIED_REASON), "{output}");
+    assert!(!output.contains("output lost"), "{output}");
+    assert!(
+        output
+            .contains("  dist/app.bin: not returned (the server no longer keeps this job's files)"),
+        "{output}"
     );
 }

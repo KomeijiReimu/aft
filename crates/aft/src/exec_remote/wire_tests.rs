@@ -238,6 +238,9 @@ pub(crate) enum Script {
     /// Like `ReturnVector`, but nothing is sent, not even the acceptance,
     /// until `Daemon::acceptance_gate` is notified.
     GatedReturnVector(&'static str),
+    /// The published expired replay reshaped as ck-motor sends it: its
+    /// 10-byte file had one chunk, so the manifest follows at seq 4.
+    MotorExpiredReplay,
 }
 
 pub(crate) struct Daemon {
@@ -399,9 +402,11 @@ pub(crate) async fn daemon_with_capabilities(
                             }
                             replies.push(Frame::build_with_version(header.ver, FrameType::StreamEnd, header.flags, header.channel, header.epoch, header.corr, vec![]).unwrap());
                         }
-                        "exec.run" if matches!(script, Script::ReturnVector(_) | Script::ReturnVectorReporting(..) | Script::GatedReturnVector(_)) => {
-                            let (Script::ReturnVector(name) | Script::ReturnVectorReporting(name, _) | Script::GatedReturnVector(name)) = script else { unreachable!() };
-                            let records = super::return_vectors::return_vector_records(name);
+                        "exec.run" if matches!(script, Script::ReturnVector(_) | Script::ReturnVectorReporting(..) | Script::GatedReturnVector(_) | Script::MotorExpiredReplay) => {
+                            let records = match script {
+                                Script::ReturnVector(name) | Script::ReturnVectorReporting(name, _) | Script::GatedReturnVector(name) => super::return_vectors::return_vector_records(name),
+                                _ => super::return_vectors::motor_expired_replay(4, None),
+                            };
                             if !matches!(records.first(), Some(StreamRecord::Accepted(_))) {
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), 1))).unwrap()));
                             }

@@ -128,11 +128,24 @@ mod receiving {
     fn receive(name: &str, root: &Path) -> Vec<ReturnedPath> {
         let (_dir, private) = private_folder();
         let mut receiver = receiver(name, root, &private);
+        // The stream names an expired replay's last output record; so does
+        // this, for vectors whose manifest has an expired entry.
+        let mut last_output = None;
         for record in return_vector_records(name) {
             match record {
+                StreamRecord::Output(output) => last_output = Some(output.seq),
+                StreamRecord::Started(started) => last_output = Some(started.seq),
                 StreamRecord::ReturnChunk(chunk) => receiver.chunk(&chunk, &mut |_| Ok(())),
                 StreamRecord::ReturnManifest(manifest) => {
-                    return receiver.manifest(&manifest, &mut |_| Ok(()))
+                    let expired = manifest.files.iter().any(|entry| {
+                        entry.cause()
+                            == Some(&crate::exec_remote::types::ReturnPathsFailureCause::Expired)
+                    });
+                    return receiver.manifest(
+                        &manifest,
+                        last_output.filter(|_| expired),
+                        &mut |_| Ok(()),
+                    );
                 }
                 _ => {}
             }
@@ -354,7 +367,7 @@ mod receiving {
         let staging = private.path().join(staging_name("task-1", 0));
         fs::remove_file(&staging).unwrap();
         std::os::unix::fs::symlink(&outside, &staging).unwrap();
-        let report = receiver.manifest(&manifest.unwrap(), &mut |_| Ok(()));
+        let report = receiver.manifest(&manifest.unwrap(), None, &mut |_| Ok(()));
         assert!(
             matches!(
                 &report[0].outcome,
@@ -394,7 +407,7 @@ mod receiving {
             match record {
                 StreamRecord::ReturnChunk(chunk) => receiver.chunk(&chunk, &mut |_| Ok(())),
                 StreamRecord::ReturnManifest(found) => {
-                    report = Some(receiver.manifest(&found, &mut |_| Ok(())))
+                    report = Some(receiver.manifest(&found, None, &mut |_| Ok(())))
                 }
                 _ => {}
             }
@@ -429,7 +442,7 @@ mod receiving {
             match stream_record {
                 StreamRecord::ReturnChunk(chunk) => receiver.chunk(&chunk, &mut record),
                 StreamRecord::ReturnManifest(found) => {
-                    report = Some(receiver.manifest(&found, &mut record))
+                    report = Some(receiver.manifest(&found, None, &mut record))
                 }
                 _ => {}
             }
@@ -577,7 +590,7 @@ mod receiving {
                     chunks += 1;
                 }
                 StreamRecord::ReturnManifest(manifest) => {
-                    return receiver.manifest(&manifest, &mut |_| Ok(()))
+                    return receiver.manifest(&manifest, None, &mut |_| Ok(()))
                 }
                 _ => {}
             }
@@ -685,7 +698,7 @@ mod receiving {
             Vec::<String>::new(),
             "nothing in the project yet"
         );
-        let report = receiver.manifest(&manifest.unwrap(), &mut record);
+        let report = receiver.manifest(&manifest.unwrap(), None, &mut record);
         assert_eq!(report[0].outcome, ReturnOutcome::Returned { bytes: 10 });
         assert_eq!(recorded.borrow().last().unwrap().dirs, [root.join("dist")]);
         assert_eq!(files_under(&root), ["dist/app.bin"]);

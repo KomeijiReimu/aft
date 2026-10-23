@@ -56,3 +56,11 @@ stated shape: refused before start with reason `request_rejected`,
 the run, and the refusal is final. It is not a published crate vector; it pins
 the record AFT maps to its "return_paths is not supported on the runner"
 refusal.
+
+`return-chunked/{read-error-after-chunks-counted,refuse-chunk-count-mismatch,replay-expired-counted,replay-retained-counted}.{jcs,sha256}`
+were copied byte-for-byte from the published `cortexkit-exec-remote-types`
+0.2.12 crate (archive SHA-256
+`0cbd9ea6e68e61a5b4dfa8b8a08e27ac548f5b1e3699d643b2e638d532312d0a`, the
+checksum locked in `Cargo.lock`). They add per-entry `chunks` counts. The 21
+earlier vectors are unchanged in 0.2.12 and were checked byte for byte
+against it.

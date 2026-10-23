@@ -1,5 +1,5 @@
 //! The published chunked-return vectors from `cortexkit-exec-remote-types`
-//! 0.2.10, vendored byte for byte under `fixtures/return-chunked/` (see
+//! 0.2.10 and the counted ones 0.2.12 added, vendored byte for byte under `fixtures/return-chunked/` (see
 //! `fixtures/SOURCE.md`). Each case is checked against its published digest
 //! before it is decoded.
 
@@ -41,6 +41,10 @@ vectors!(
     "refuse-path-not-echoed",
     "refuse-chunks-before-over-cap",
     "refuse-total-over-cap",
+    "read-error-after-chunks-counted",
+    "refuse-chunk-count-mismatch",
+    "replay-expired-counted",
+    "replay-retained-counted",
 );
 
 /// One case, after checking its bytes against the published digest.
@@ -102,6 +106,8 @@ struct ReturnSink {
     lost: Vec<u64>,
     gaps: usize,
     verdicts: Vec<super::Verdict>,
+    expired_anchors: Vec<Option<u64>>,
+    unverified: Vec<u64>,
 }
 
 impl super::OutputSink for ReturnSink {
@@ -126,8 +132,17 @@ impl super::OutputSink for ReturnSink {
         self.chunks.push(chunk.seq);
         Ok(())
     }
-    fn return_manifest(&mut self, manifest: &super::types::ReturnManifest) -> std::io::Result<()> {
+    fn return_manifest(
+        &mut self,
+        manifest: &super::types::ReturnManifest,
+        expired_replay: Option<u64>,
+    ) -> std::io::Result<()> {
         self.manifests.push(manifest.seq);
+        self.expired_anchors.push(expired_replay);
+        Ok(())
+    }
+    fn expired_gap_unverified(&mut self, before_seq: u64) -> std::io::Result<()> {
+        self.unverified.push(before_seq);
         Ok(())
     }
     fn terminal(
@@ -148,6 +163,7 @@ fn consume(records: Vec<StreamRecord>) -> (Result<(), super::Error>, ReturnSink)
         job_id: "0192a64a-1234-7000-8000-000000000001".parse().unwrap(),
         last_seq: Some(0),
         gap_recovery: None,
+        last_output_seq: Some(0),
     });
     let mut sink = ReturnSink::default();
     for record in records {
@@ -162,17 +178,91 @@ fn consume(records: Vec<StreamRecord>) -> (Result<(), super::Error>, ReturnSink)
     (consumer.finish().map(|_| ()), sink)
 }
 
+/// The published `replay-expired` vector with its manifest moved to `seq`
+/// and its entries replaced by `entries` when given. ck-motor fills every
+/// chunk but the last, so its 10-byte file had one chunk, at seq 3.
+pub(crate) fn motor_expired_replay(
+    seq: u64,
+    entries: Option<Vec<super::types::ReturnManifestEntry>>,
+) -> Vec<StreamRecord> {
+    return_vector_records("replay-expired")
+        .into_iter()
+        .map(|mut record| {
+            if let StreamRecord::ReturnManifest(manifest) = &mut record {
+                manifest.seq = seq;
+                if let Some(entries) = &entries {
+                    manifest.files = entries.clone();
+                }
+            }
+            record
+        })
+        .collect()
+}
+
 #[test]
-fn expired_replay_accepts_the_chunk_gap_before_its_manifest() {
-    // Output at seq 2, then the manifest at its original seq 6: the chunks
-    // the runner no longer keeps were at seqs 3 to 5.
-    let (result, sink) = consume(return_vector_records("replay-expired"));
+fn expired_replay_accepts_exactly_its_chunk_gap_before_its_manifest() {
+    // Output at seq 2, then the manifest at seq 4: the one chunk the runner
+    // no longer keeps was at seq 3.
+    let (result, sink) = consume(motor_expired_replay(4, None));
     result.expect("the expired replay completes without re-attaching");
-    assert_eq!(sink.manifests, [6]);
+    assert_eq!(sink.manifests, [4]);
     assert!(sink.chunks.is_empty());
     assert_eq!(sink.gaps, 0, "the chunk gap is not an output gap");
     assert!(sink.lost.is_empty(), "no output is reported lost");
     assert_eq!(sink.verdicts, [super::Verdict::Exited { code: 0 }]);
+}
+
+#[test]
+fn a_gap_one_seq_longer_than_the_expired_chunks_is_recovered() {
+    // Seq 3 held the chunk and seq 4 a final output record lost in transit.
+    let (result, sink) = consume(motor_expired_replay(5, None));
+    assert!(
+        matches!(result, Err(super::Error::RecoveryRequired { .. })),
+        "{result:?}"
+    );
+    assert_eq!(sink.gaps, 1);
+    assert!(sink.manifests.is_empty());
+}
+
+#[test]
+fn read_error_entries_count_no_chunks() {
+    use super::types::*;
+    let read_error = || {
+        ReturnManifestEntry::failed("dist/log.txt", ReturnPathsFailureCause::ReadError)
+            .with_size(10)
+    };
+    let expired = || {
+        ReturnManifestEntry::failed("dist/app.bin", ReturnPathsFailureCause::Expired).with_size(10)
+    };
+    // A read_error entry alone accounts for no gap.
+    let (result, sink) = consume(motor_expired_replay(4, Some(vec![read_error()])));
+    assert!(
+        matches!(result, Err(super::Error::RecoveryRequired { .. })),
+        "{result:?}"
+    );
+    assert!(sink.manifests.is_empty());
+    // Beside an expired file it adds nothing to that file's one chunk.
+    let (result, sink) = consume(motor_expired_replay(4, Some(vec![expired(), read_error()])));
+    result.unwrap();
+    assert_eq!(sink.manifests, [4]);
+    let (result, _) = consume(motor_expired_replay(5, Some(vec![expired(), read_error()])));
+    assert!(
+        matches!(result, Err(super::Error::RecoveryRequired { .. })),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn the_crate_vector_with_short_chunks_is_not_skipped() {
+    // The published vector returns its 10-byte file in three short chunks,
+    // which ck-motor never sends. Its three-seq gap is not the one chunk
+    // ck-motor would have sent, so it is recovered rather than skipped.
+    let (result, sink) = consume(return_vector_records("replay-expired"));
+    assert!(
+        matches!(result, Err(super::Error::RecoveryRequired { .. })),
+        "{result:?}"
+    );
+    assert!(sink.manifests.is_empty());
 }
 
 #[test]
@@ -342,8 +432,8 @@ fn a_lost_output_record_before_a_manifest_without_expired_files_is_recovered() {
 
 #[test]
 fn a_gap_longer_than_the_expired_files_could_fill_is_recovered() {
-    // One expired file of 1 byte can account for one chunk at most, so a
-    // gap of two records before the manifest is not all expired chunks.
+    // One expired file of 1 byte had exactly one chunk, so a gap of two
+    // records before the manifest is not all expired chunks.
     use super::types::*;
     let job_id: Uuid = "0192a64a-1234-7000-8000-000000000001".parse().unwrap();
     let mut consumer = super::StreamConsumer::new();
@@ -440,4 +530,254 @@ fn a_lost_output_record_that_never_comes_back_is_reported_lost() {
     assert_eq!(sink.lost, [2], "seq 1 is reported as never delivered");
     assert_eq!(sink.manifests, [2]);
     assert_eq!(sink.verdicts, [super::Verdict::Exited { code: 0 }]);
+}
+
+/// A live stream for two expired one-byte files (T = 2 chunks): acceptance,
+/// output at seq 0, then `middle`, then the manifest at `manifest_seq` and
+/// the terminal.
+fn two_expired_one_byte_files(
+    middle: Vec<StreamRecord>,
+    manifest_seq: u64,
+) -> (Result<(), super::Error>, ReturnSink) {
+    use super::types::*;
+    let job_id: Uuid = "0192a64a-1234-7000-8000-000000000001".parse().unwrap();
+    let expired = |path: &str| {
+        ReturnManifestEntry::failed(path, ReturnPathsFailureCause::Expired).with_size(1)
+    };
+    let mut records = vec![
+        StreamRecord::Accepted(Accepted::new(job_id, 1)),
+        StreamRecord::Output(Output::new(
+            0,
+            OutputStream::Stdout,
+            BytePayload(b"a".to_vec()),
+        )),
+    ];
+    records.extend(middle);
+    records.push(StreamRecord::ReturnManifest(ReturnManifest::new(
+        job_id,
+        manifest_seq,
+        vec![expired("dist/a.txt"), expired("dist/b.txt")],
+        0,
+        RETURN_CHUNKED_MAX_BYTES_CAP,
+    )));
+    records.push(StreamRecord::Terminal(TerminalRecord::new(
+        job_id,
+        Outcome::Exit { code: 0 },
+        1,
+        0,
+        0,
+    )));
+    let mut consumer = super::StreamConsumer::new();
+    let mut sink = ReturnSink::default();
+    for record in records {
+        if let Err(error) = consumer.consume_bytes(&serde_json::to_vec(&record).unwrap(), &mut sink)
+        {
+            return (Err(error), sink);
+        }
+    }
+    (consumer.finish().map(|_| ()), sink)
+}
+
+#[test]
+fn a_gap_holding_the_rest_of_the_expired_chunks_is_skipped() {
+    use super::types::*;
+    let job_id: Uuid = "0192a64a-1234-7000-8000-000000000001".parse().unwrap();
+    // The first file's chunk (seq 1) arrived before the reconnect; the
+    // second's (seq 2) is the whole gap before the manifest at seq 3.
+    let first_chunk = StreamRecord::ReturnChunk(ReturnChunk::new(
+        job_id,
+        1,
+        0,
+        0,
+        BytePayload(b"x".to_vec()),
+    ));
+    let (result, sink) = two_expired_one_byte_files(vec![first_chunk], 3);
+    result.expect("a gap of 1 within the 2 expired chunks is skipped");
+    assert_eq!(sink.chunks, [1]);
+    assert_eq!(sink.manifests, [3]);
+    assert_eq!(sink.gaps, 0);
+}
+
+#[test]
+fn a_gap_of_all_the_expired_chunks_is_skipped() {
+    let (result, sink) = two_expired_one_byte_files(Vec::new(), 3);
+    result.expect("a gap of T = 2 is skipped");
+    assert_eq!(sink.manifests, [3]);
+    assert_eq!(sink.gaps, 0);
+}
+
+#[test]
+fn a_gap_of_the_expired_chunks_plus_a_lost_output_record_is_recovered() {
+    // Seqs 2 and 3 were the chunks; seq 1, a final output record, was lost.
+    let (result, sink) = two_expired_one_byte_files(Vec::new(), 4);
+    assert!(
+        matches!(result, Err(super::Error::RecoveryRequired { .. })),
+        "{result:?}"
+    );
+    assert_eq!(sink.gaps, 1);
+    assert!(sink.manifests.is_empty());
+}
+
+#[test]
+fn a_record_received_inside_the_expired_gap_keeps_ordinary_recovery() {
+    use super::types::*;
+    // Seq 1 is missing but seq 2 arrived, so the hole is not directly
+    // before the manifest.
+    let later = StreamRecord::Output(Output::new(
+        2,
+        OutputStream::Stdout,
+        BytePayload(b"c".to_vec()),
+    ));
+    let (result, sink) = two_expired_one_byte_files(vec![later], 3);
+    assert!(
+        matches!(result, Err(super::Error::RecoveryRequired { .. })),
+        "{result:?}"
+    );
+    assert!(sink.manifests.is_empty());
+}
+
+/// Feed `records` through attaches until the stream completes, re-attaching
+/// from each resume point the way the remote task does, and replaying the
+/// same records each time.
+fn until_complete(records: &[StreamRecord]) -> ReturnSink {
+    let mut sink = ReturnSink::default();
+    let mut consumer = super::StreamConsumer::resume(super::ResumePoint {
+        job_id: "0192a64a-1234-7000-8000-000000000001".parse().unwrap(),
+        last_seq: Some(0),
+        gap_recovery: None,
+        last_output_seq: Some(0),
+    });
+    for _ in 0..10 {
+        let mut result = Ok(());
+        for record in records {
+            if matches!(record, StreamRecord::Accepted(_)) {
+                continue;
+            }
+            result = consumer.consume_bytes(&serde_json::to_vec(record).unwrap(), &mut sink);
+            if result.is_err() {
+                break;
+            }
+        }
+        match result {
+            Ok(()) => {
+                consumer.finish().unwrap();
+                return sink;
+            }
+            Err(super::Error::RecoveryRequired { resume, .. }) => {
+                consumer = super::StreamConsumer::resume(resume.unwrap());
+            }
+            Err(error) => panic!("{error}"),
+        }
+    }
+    panic!("the stream never completed")
+}
+
+#[test]
+fn a_counted_expired_replay_whose_gap_matches_is_skipped() {
+    // replay-expired-counted: output at seq 2, the manifest at seq 6, and
+    // its expired entry was sent as 3 chunks.
+    let (result, sink) = consume(return_vector_records("replay-expired-counted"));
+    result.expect("the counted gap matches");
+    assert_eq!(sink.manifests, [6]);
+    assert_eq!(
+        sink.expired_anchors,
+        [Some(2)],
+        "the anchor is the last output"
+    );
+    assert_eq!(sink.gaps, 0);
+}
+
+#[test]
+fn a_counted_expired_replay_one_seq_too_long_is_lost_output() {
+    let records: Vec<StreamRecord> = return_vector_records("replay-expired-counted")
+        .into_iter()
+        .map(|mut record| {
+            if let StreamRecord::ReturnManifest(manifest) = &mut record {
+                manifest.seq = 7;
+            }
+            record
+        })
+        .collect();
+    let (result, sink) = consume(records.clone());
+    assert!(
+        matches!(result, Err(super::Error::RecoveryRequired { .. })),
+        "{result:?}"
+    );
+    assert!(sink.manifests.is_empty());
+    // With counts the contract decides: a gap it rejects is lost output.
+    let sink = until_complete(&records);
+    assert_eq!(sink.lost, [7]);
+    assert!(sink.unverified.is_empty());
+}
+
+#[test]
+fn an_uncounted_gap_holding_chunks_received_before_a_reconnect_is_skipped() {
+    use super::types::*;
+    let job_id: Uuid = "0192a64a-1234-7000-8000-000000000001".parse().unwrap();
+    let expired = |path: &str| {
+        ReturnManifestEntry::failed(path, ReturnPathsFailureCause::Expired).with_size(1)
+    };
+    let mut sink = ReturnSink::default();
+    let mut first = super::StreamConsumer::new();
+    // Before the reconnect: output at seq 0 and the first file's chunk at
+    // seq 1.
+    for record in [
+        StreamRecord::Accepted(Accepted::new(job_id, 1)),
+        StreamRecord::Output(Output::new(
+            0,
+            OutputStream::Stdout,
+            BytePayload(b"a".to_vec()),
+        )),
+        StreamRecord::ReturnChunk(ReturnChunk::new(
+            job_id,
+            1,
+            0,
+            0,
+            BytePayload(b"x".to_vec()),
+        )),
+    ] {
+        first
+            .consume_bytes(&serde_json::to_vec(&record).unwrap(), &mut sink)
+            .unwrap();
+    }
+    let point = first.resume_point().unwrap();
+    assert_eq!(point.last_seq, Some(1));
+    assert_eq!(point.last_output_seq, Some(0));
+    // After it the files have expired: the second chunk (seq 2) is gone and
+    // the manifest follows at seq 3.
+    let mut second = super::StreamConsumer::resume(point);
+    for record in [
+        StreamRecord::ReturnManifest(ReturnManifest::new(
+            job_id,
+            3,
+            vec![expired("dist/a.txt"), expired("dist/b.txt")],
+            0,
+            RETURN_CHUNKED_MAX_BYTES_CAP,
+        )),
+        StreamRecord::Terminal(TerminalRecord::new(
+            job_id,
+            Outcome::Exit { code: 0 },
+            1,
+            0,
+            0,
+        )),
+    ] {
+        second
+            .consume_bytes(&serde_json::to_vec(&record).unwrap(), &mut sink)
+            .expect("two derived chunks after the last output record");
+    }
+    second.finish().unwrap();
+    assert_eq!(sink.manifests, [3]);
+    assert_eq!(sink.expired_anchors, [Some(0)]);
+}
+
+#[test]
+fn an_uncounted_mismatched_gap_that_never_fills_is_reported_unverified() {
+    // The crate's own vector sends its 10-byte file as three short chunks, so
+    // the derived count (1) does not match the three-seq gap. Recovery cannot
+    // fill it, and AFT cannot tell short chunks from lost output.
+    let sink = until_complete(&return_vector_records("replay-expired"));
+    assert_eq!(sink.unverified, [6], "reported under its own reason");
+    assert!(sink.lost.is_empty(), "not reported as lost output");
+    assert_eq!(sink.manifests, [6]);
 }

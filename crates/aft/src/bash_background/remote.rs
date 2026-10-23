@@ -879,6 +879,11 @@ pub(crate) struct RemoteTask {
         skip_serializing_if = "super::return_files::StagingRecord::is_empty"
     )]
     pub return_staging: super::return_files::StagingRecord,
+    /// Seq ranges missing before an expired replay's manifest that carried
+    /// no chunk counts, where the derived count did not match and recovery
+    /// could not fill them: lost output or differently sized chunks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expired_gap_unverified: Vec<(u64, u64)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1080,7 +1085,21 @@ impl RemoteTask {
             job_id: self.job_id?,
             last_seq,
             gap_recovery: self.gap_recovery.clone(),
+            last_output_seq: self.last_output_seq(),
         })
+    }
+
+    /// The seq of the last output record received, which an expired
+    /// replay's missing chunks are counted from. It is not saved apart from
+    /// the stream cursor: chunks follow every output record, so while the
+    /// file returns are unfinished it is the record just before the first
+    /// chunk, and otherwise the cursor itself. Once the manifest has been
+    /// handled no expired-replay gap is checked again, so the cursor serves.
+    fn last_output_seq(&self) -> Option<u64> {
+        match (self.return_first_seq, &self.returned_files) {
+            (Some(first), None) => self.last_seq.min(first.checked_sub(1)),
+            _ => self.last_seq,
+        }
     }
 }
 
@@ -1704,10 +1723,13 @@ impl OutputSink for TaskSink {
         Ok(())
     }
     fn truncated(&mut self, before_seq: u64) -> io::Result<()> {
-        self.truncate_output(before_seq, false)
+        self.truncate_output(before_seq, MissingRecords::NoLongerRetained)
     }
     fn undelivered(&mut self, before_seq: u64) -> io::Result<()> {
-        self.truncate_output(before_seq, true)
+        self.truncate_output(before_seq, MissingRecords::NeverDelivered)
+    }
+    fn expired_gap_unverified(&mut self, before_seq: u64) -> io::Result<()> {
+        self.truncate_output(before_seq, MissingRecords::ExpiredGapUnverified)
     }
     fn gap_recovery(&mut self, recovery: &exec::GapRecovery) -> io::Result<()> {
         self.commit(|r| r.gap_recovery = Some(recovery.clone()))
@@ -1753,13 +1775,17 @@ impl OutputSink for TaskSink {
         let unknown_len = self.output_progress.unknown_len;
         self.progress(chunk.seq, None, unknown_len)
     }
-    fn return_manifest(&mut self, manifest: &ReturnManifest) -> io::Result<()> {
+    fn return_manifest(
+        &mut self,
+        manifest: &ReturnManifest,
+        expired_replay: Option<u64>,
+    ) -> io::Result<()> {
         let report = match self.unsaved_return_report.take() {
             Some(report) => report,
             None => match self.returns.take() {
-                Some(mut returns) => {
-                    returns.manifest(manifest, &mut |staging| self.record_staging(staging))
-                }
+                Some(mut returns) => returns.manifest(manifest, expired_replay, &mut |staging| {
+                    self.record_staging(staging)
+                }),
                 None => return self.unknown_output(manifest.seq, &[]),
             },
         };
@@ -1891,7 +1917,7 @@ impl TaskSink {
         })
     }
 
-    fn truncate_output(&mut self, before_seq: u64, undelivered: bool) -> io::Result<()> {
+    fn truncate_output(&mut self, before_seq: u64, kind: MissingRecords) -> io::Result<()> {
         self.dirty
             .sync(&self.stdout, &self.stderr, self.unknown.as_ref())?;
         let mut db = DeferredDbWrites::new(&self.registry, &self.task);
@@ -1910,13 +1936,16 @@ impl TaskSink {
         let first = remote.last_seq.map_or(0, |seq| seq.saturating_add(1));
         remote.last_seq = before_seq.checked_sub(1);
         if first < before_seq {
-            if undelivered {
-                remote.undelivered_output.push((first, before_seq - 1));
+            let range = (first, before_seq - 1);
+            match kind {
+                MissingRecords::NoLongerRetained => state.metadata.incomplete_output.push(range),
+                MissingRecords::NeverDelivered => {
+                    remote.undelivered_output.push(range);
+                    state.metadata.incomplete_output.push(range);
+                }
+                // Not known to be lost output, so not listed as such.
+                MissingRecords::ExpiredGapUnverified => remote.expired_gap_unverified.push(range),
             }
-            state
-                .metadata
-                .incomplete_output
-                .push((first, before_seq - 1));
         }
         append_output_loss(&mut state.metadata);
         let result = self
@@ -2323,6 +2352,7 @@ impl BgTaskRegistry {
             returned_files: None,
             return_first_seq: None,
             return_staging: Default::default(),
+            expired_gap_unverified: Vec::new(),
         });
         metadata.pipeline_segments = single_top_level_pipeline(command)
             .map(|p| p.segments.into_iter().map(|s| s.label).collect())
@@ -4491,6 +4521,7 @@ async fn cancel_unknown_remote(metadata: &PersistedTask, job_id: Uuid) -> Result
             job_id,
             last_seq: remote.last_seq,
             gap_recovery: None,
+            last_output_seq: remote.last_output_seq(),
         })
         .await
         .map_err(|error| error.to_string())?;
@@ -5191,10 +5222,58 @@ fn repository_root(root: &Path) -> PathBuf {
         .unwrap_or_else(|| root.into())
 }
 
+/// Why records between the saved cursor and a later one are missing.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum MissingRecords {
+    /// The runner trimmed them from its retained history.
+    NoLongerRetained,
+    /// They never arrived, even after the re-attaches gap recovery makes.
+    NeverDelivered,
+    /// They never arrived and precede an expired replay's manifest without
+    /// chunk counts whose derived count did not match.
+    ExpiredGapUnverified,
+}
+
+/// The typed reason for a gap before an expired replay's manifest that AFT
+/// could not verify: the runner sent no per-file chunk counts, the count AFT
+/// derived from the file sizes did not match, and re-attaching did not fill
+/// the gap. It may be lost output or expired chunks of another size.
+#[cfg(unix)]
+pub(crate) const EXPIRED_GAP_UNVERIFIED_REASON: &str = "expired_gap_unverified";
+
+/// Placeholder wording for [`EXPIRED_GAP_UNVERIFIED_REASON`], pending
+/// approval of the agent-facing sentence. `{first}` and `{last}` are the seqs.
+#[cfg(unix)]
+pub(crate) const EXPIRED_GAP_UNVERIFIED_TEXT: &str =
+    "records {first} to {last} [placeholder wording, pending approval]";
+
+#[cfg(unix)]
+fn expired_gap_unverified_line(first: u64, last: u64) -> String {
+    let text = EXPIRED_GAP_UNVERIFIED_TEXT
+        .replace("{first}", &first.to_string())
+        .replace("{last}", &last.to_string());
+    format!("{EXPIRED_GAP_UNVERIFIED_REASON}: {text}")
+}
+
 #[cfg(unix)]
 fn append_output_loss(metadata: &mut PersistedTask) {
     append_environment_disclosure(metadata);
     append_executor_environment_disclosure(metadata);
+    let unverified = metadata
+        .remote
+        .as_ref()
+        .map(|remote| remote.expired_gap_unverified.clone())
+        .unwrap_or_default();
+    for (first, last) in unverified {
+        let warning = expired_gap_unverified_line(first, last);
+        let note = metadata
+            .execution_note
+            .get_or_insert_with(|| format!("remote execution on {RUNNER_ID}"));
+        if !note.contains(&warning) {
+            note.push_str(&format!("\n{warning}"));
+        }
+    }
     for (first, last) in &metadata.incomplete_output {
         let reason = if metadata
             .remote

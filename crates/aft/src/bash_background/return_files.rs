@@ -536,18 +536,29 @@ mod receiver {
         }
 
         /// Verify the manifest and place every verified file. Returns one
-        /// entry per requested path, in request order.
+        /// entry per requested path, in request order. `expired_replay` is
+        /// the seq of the last output record when the manifest is a replay
+        /// after the runner stopped keeping the job's files.
         pub(crate) fn manifest(
             &mut self,
             manifest: &ReturnManifest,
+            expired_replay: Option<u64>,
             record: &mut Recorder<'_>,
         ) -> Vec<ReturnedPath> {
-            let verified = match self.assembler.take() {
-                None => Err(self
+            let assembler = self.assembler.take();
+            let verified = match (assembler, expired_replay) {
+                // An expired replay sends no chunks and places nothing; any
+                // chunks taken before a reconnect are discarded, so it is
+                // checked by a fresh assembler under the contract's replay
+                // rule rather than against bytes this receiver holds.
+                (_, Some(last_output_seq)) => ReturnAssembler::new(&self.paths, self.cap_bytes)
+                    .finish_expired_replay(manifest, last_output_seq)
+                    .map_err(|error| error.code().to_string()),
+                (None, None) => Err(self
                     .stream_error
                     .clone()
                     .unwrap_or_else(|| "stream_refused".into())),
-                Some(assembler) => assembler
+                (Some(assembler), None) => assembler
                     .finish(manifest)
                     .map_err(|error| error.code().to_string()),
             };

@@ -240,6 +240,7 @@ fn published_outcomes_have_explicit_grades() {
                 job_id: terminal.job_id,
                 last_seq: Some(6),
                 gap_recovery: None,
+                last_output_seq: None,
             })
         } else {
             StreamConsumer::new()
@@ -882,6 +883,7 @@ fn retained_history_truncation_is_explicit_and_replay_continues() {
         job_id: job_id(),
         last_seq: Some(0),
         gap_recovery: None,
+        last_output_seq: None,
     });
     let mut sink = MemorySink::default();
     consumer
@@ -1051,6 +1053,7 @@ fn unknown_records_without_a_terminal_require_recovery() {
         job_id: job_id(),
         last_seq: None,
         gap_recovery: None,
+        last_output_seq: None,
     });
     let mut sink = MemorySink::default();
     consumer
