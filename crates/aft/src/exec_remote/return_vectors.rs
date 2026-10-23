@@ -273,3 +273,171 @@ fn motor_return_paths_unsupported_terminal_is_a_final_refusal_before_start() {
         }
     );
 }
+
+/// A live stream: acceptance, output at seq 0, output at seq 1 lost in
+/// transit, then a manifest at seq 2 holding `entries` and the terminal.
+fn lost_output_before_manifest(
+    entries: Vec<super::types::ReturnManifestEntry>,
+) -> (Result<(), super::Error>, ReturnSink) {
+    use super::types::*;
+    let job_id: Uuid = "0192a64a-1234-7000-8000-000000000001".parse().unwrap();
+    let records = vec![
+        StreamRecord::Accepted(Accepted::new(job_id, 1)),
+        StreamRecord::Output(Output::new(
+            0,
+            OutputStream::Stdout,
+            BytePayload(b"a".to_vec()),
+        )),
+        StreamRecord::ReturnManifest(ReturnManifest::new(
+            job_id,
+            2,
+            entries,
+            0,
+            RETURN_CHUNKED_MAX_BYTES_CAP,
+        )),
+        StreamRecord::Terminal(TerminalRecord::new(
+            job_id,
+            Outcome::Exit { code: 0 },
+            1,
+            0,
+            0,
+        )),
+    ];
+    let mut consumer = super::StreamConsumer::new();
+    let mut sink = ReturnSink::default();
+    for record in records {
+        let bytes = serde_json::to_vec(&record).unwrap();
+        if let Err(error) = consumer.consume_bytes(&bytes, &mut sink) {
+            return (Err(error), sink);
+        }
+    }
+    (consumer.finish().map(|_| ()), sink)
+}
+
+#[test]
+fn a_lost_output_record_before_a_manifest_without_expired_files_is_recovered() {
+    // No requested file expired, so no chunk can have been dropped: the gap
+    // at seq 1 is lost output, and the ordinary gap recovery re-attaches.
+    use super::types::*;
+    for entries in [
+        vec![ReturnManifestEntry::failed(
+            "dist/absent.txt",
+            ReturnPathsFailureCause::Missing,
+        )],
+        vec![ReturnManifestEntry::returned(
+            "dist/empty.txt",
+            0,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )],
+    ] {
+        let (result, sink) = lost_output_before_manifest(entries);
+        assert!(
+            matches!(result, Err(super::Error::RecoveryRequired { .. })),
+            "{result:?}"
+        );
+        assert_eq!(sink.gaps, 1);
+        assert!(sink.manifests.is_empty(), "the manifest waits for the hole");
+    }
+}
+
+#[test]
+fn a_gap_longer_than_the_expired_files_could_fill_is_recovered() {
+    // One expired file of 1 byte can account for one chunk at most, so a
+    // gap of two records before the manifest is not all expired chunks.
+    use super::types::*;
+    let job_id: Uuid = "0192a64a-1234-7000-8000-000000000001".parse().unwrap();
+    let mut consumer = super::StreamConsumer::new();
+    let mut sink = ReturnSink::default();
+    let entry =
+        ReturnManifestEntry::failed("dist/app.bin", ReturnPathsFailureCause::Expired).with_size(1);
+    let mut result = Ok(());
+    for record in [
+        StreamRecord::Accepted(Accepted::new(job_id, 1)),
+        StreamRecord::Output(Output::new(
+            0,
+            OutputStream::Stdout,
+            BytePayload(b"a".to_vec()),
+        )),
+        StreamRecord::ReturnManifest(ReturnManifest::new(
+            job_id,
+            3,
+            vec![entry],
+            0,
+            RETURN_CHUNKED_MAX_BYTES_CAP,
+        )),
+        StreamRecord::Terminal(TerminalRecord::new(
+            job_id,
+            Outcome::Exit { code: 0 },
+            1,
+            0,
+            0,
+        )),
+    ] {
+        let bytes = serde_json::to_vec(&record).unwrap();
+        result = consumer.consume_bytes(&bytes, &mut sink);
+        if result.is_err() {
+            break;
+        }
+    }
+    assert!(
+        matches!(result, Err(super::Error::RecoveryRequired { .. })),
+        "{result:?}"
+    );
+    assert!(sink.manifests.is_empty());
+}
+
+#[test]
+fn a_lost_output_record_that_never_comes_back_is_reported_lost() {
+    // Every re-attach replays the same records without seq 1. After the
+    // usual re-attaches the output record is reported lost, then the
+    // manifest and terminal are delivered.
+    use super::types::*;
+    let job_id: Uuid = "0192a64a-1234-7000-8000-000000000001".parse().unwrap();
+    let entry = ReturnManifestEntry::failed("dist/absent.txt", ReturnPathsFailureCause::Missing);
+    let replayed = vec![
+        StreamRecord::Output(Output::new(
+            0,
+            OutputStream::Stdout,
+            BytePayload(b"a".to_vec()),
+        )),
+        StreamRecord::ReturnManifest(ReturnManifest::new(
+            job_id,
+            2,
+            vec![entry],
+            0,
+            RETURN_CHUNKED_MAX_BYTES_CAP,
+        )),
+        StreamRecord::Terminal(TerminalRecord::new(
+            job_id,
+            Outcome::Exit { code: 0 },
+            1,
+            0,
+            0,
+        )),
+    ];
+    let mut sink = ReturnSink::default();
+    let mut consumer = super::StreamConsumer::new();
+    let accepted = serde_json::to_vec(&StreamRecord::Accepted(Accepted::new(job_id, 1))).unwrap();
+    consumer.consume_bytes(&accepted, &mut sink).unwrap();
+    for attempt in 0..10 {
+        let mut result = Ok(());
+        for record in &replayed {
+            result = consumer.consume_bytes(&serde_json::to_vec(record).unwrap(), &mut sink);
+            if result.is_err() {
+                break;
+            }
+        }
+        match result {
+            Ok(()) => break,
+            Err(super::Error::RecoveryRequired { resume, .. }) => {
+                assert!(attempt < 9, "the gap must end in reported loss");
+                consumer = super::StreamConsumer::resume(resume.unwrap());
+            }
+            Err(error) => panic!("{error}"),
+        }
+    }
+    consumer.finish().unwrap();
+    assert_eq!(sink.lost, [2], "seq 1 is reported as never delivered");
+    assert_eq!(sink.manifests, [2]);
+    assert_eq!(sink.verdicts, [super::Verdict::Exited { code: 0 }]);
+}

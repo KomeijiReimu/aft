@@ -275,23 +275,32 @@ impl StreamConsumer {
     /// the manifest at its original seq and no chunks, so its seq jumps over
     /// the chunks it used to send. The contract asks the caller to accept that
     /// one gap: directly before the manifest, with nothing received inside
-    /// it. Only a manifest that returns no bytes skips it. When a manifest
-    /// still returns bytes, the missing seqs held those bytes, so the ordinary
-    /// gap recovery re-attaches to fetch them.
+    /// it. When a manifest still returns bytes, the missing seqs held those
+    /// bytes, so the ordinary gap recovery re-attaches to fetch them.
     ///
     /// ck-motor assigns the seqs of every `return_chunk` and of the manifest
     /// in the same durable save that writes the terminal record, after output
-    /// collection has ended, and forwards seqs unchanged. So they come after
-    /// every output record, and a gap directly before the manifest can only
-    /// be chunks: skipping it loses no output. A record received inside the
-    /// gap's range is not a chunk the runner dropped, so it keeps the
-    /// ordinary gap recovery.
+    /// collection has ended, and forwards seqs unchanged, so in an expired
+    /// replay the gap holds only chunks. A gap there can also be an ordinary
+    /// loss, such as the last output record lost in transit, which must be
+    /// recovered or reported, never skipped. So the gap is skipped only when
+    /// the manifest accounts for it: its expired entries (and any `read_error`
+    /// or unrecognised entries, which may also have had chunks) must be able
+    /// to fill exactly that many chunks, at least one record per started
+    /// [`RETURN_CHUNK_MAX_BYTES`] and at most one per byte of their known
+    /// sizes. A gap the manifest cannot account for, or one with a record
+    /// received inside it, keeps the ordinary gap recovery.
     fn skip_expired_return_chunks(&mut self, manifest: &ReturnManifest) -> Result<(), Error> {
         let next = self.next_seq()?;
         if manifest.total_bytes != 0
             || manifest.seq <= next
             || self.pending.range(..manifest.seq).next().is_some()
         {
+            return Ok(());
+        }
+        let gap = manifest.seq - next;
+        let (fewest, most) = expired_chunk_bounds(manifest);
+        if gap < fewest || gap > most {
             return Ok(());
         }
         if let Some(point) = self.point.as_mut() {
@@ -413,4 +422,31 @@ impl StreamConsumer {
             self.recovery("stream ended without a known terminal record; re-attach to the job")
         })
     }
+}
+
+/// The fewest and most `return_chunk` records a replay can have dropped
+/// before `manifest`. Only expired entries lost their chunks for certain;
+/// `read_error` and unrecognised entries may have had some, up to their
+/// known size. An expired entry always carries its original size.
+fn expired_chunk_bounds(manifest: &ReturnManifest) -> (u64, u64) {
+    use super::types::{ReturnManifestOutcome, ReturnPathsFailureCause, RETURN_CHUNK_MAX_BYTES};
+    let mut fewest: u64 = 0;
+    let mut most: u64 = 0;
+    for entry in &manifest.files {
+        let ReturnManifestOutcome::Failed { cause, size } = &entry.outcome else {
+            continue;
+        };
+        let size = size.unwrap_or(0);
+        match cause {
+            ReturnPathsFailureCause::Expired => {
+                fewest = fewest.saturating_add(size.div_ceil(RETURN_CHUNK_MAX_BYTES as u64));
+                most = most.saturating_add(size);
+            }
+            ReturnPathsFailureCause::ReadError | ReturnPathsFailureCause::Unknown(_) => {
+                most = most.saturating_add(size);
+            }
+            _ => {}
+        }
+    }
+    (fewest, most)
 }
