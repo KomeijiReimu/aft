@@ -993,15 +993,22 @@ fn log_transient_heartbeat_failure(
 ///   handle to it released first (`LEASE_FILES`), because closing any
 ///   descriptor to a file drops the advisory locks this process holds on it.
 ///   That is why the replacement paths close before they rename.
-/// * A beat never trusts the handle blindly. The first time the lease on disk
-///   is not the identity this handle was opened for (reclaimed and recreated,
-///   or replaced), the handle is released and the next beat opens the path
+/// * A beat never trusts the handle blindly. Before reading it compares the
+///   file the handle refers to with the file the path now names (device and
+///   inode, or on Windows volume serial number and file index). Unix reads both
+///   with a stat; Windows reads the descriptor's identity from its own handle
+///   and opens the path for attributes only, so that arm does take one
+///   short-lived handle per beat. A different file means another owner
+///   reclaimed the lease and renamed its own over the path, so the beat reports
+///   `NotOwner` and the heartbeat stops rather than refresh the orphan the
+///   handle still holds.
+///   When the handle was released by a replacement, the next beat opens the path
 ///   again. Releases happen on the heartbeat thread, or on the thread running a
 ///   replacement through `with_lease_handles_closed`.
-/// * The heartbeat stops rather than refresh a lease this process no longer
-///   owns: it checks the owner on disk before every write, and stops when the
-///   path itself is gone. A guard whose heartbeat stopped reports the lease as
-///   unverified; see `heartbeat_is_visible`.
+/// * Failing that check, the bytes read through the handle must still carry this
+///   guard's identity, and a path that is gone is reported as `LockGone`. A
+///   guard whose heartbeat stopped reports the lease as unverified; see
+///   `heartbeat_is_visible`.
 #[derive(Debug)]
 struct HeartbeatPump {
     path: PathBuf,
@@ -1243,6 +1250,31 @@ fn heartbeat_once(
     let mut slot = handle
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // A kept descriptor only speaks for the lease while it is still the file
+    // the path names. Another process's reclaim renames its own lease over the
+    // path, which leaves our descriptor holding the old, unlinked file: reading
+    // it would show our own identity, the beat would refresh the orphan and
+    // report success, and the live lease would silently go stale. On Unix both
+    // identities come from a stat, so this costs no descriptor there.
+    if let Some(kept) = slot.as_mut() {
+        let on_path = match LeaseFileIdentity::of_path(path) {
+            Ok(identity) => identity,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(HeartbeatError::LockGone);
+            }
+            Err(error) => return Err(HeartbeatError::Io(error)),
+        };
+        // A stat that cannot read the descriptor's identity is the only reason
+        // this comparison is unavailable, and it may be the same failure that
+        // hides a replacement. Retire the handle instead of trusting it: the
+        // read below then opens the live file and compares the bytes, which is
+        // the behaviour before the descriptor was kept between beats.
+        match LeaseFileIdentity::of_file(kept.file()) {
+            Some(held) if held != on_path => return Err(HeartbeatError::NotOwner),
+            Some(_) => {}
+            None => *slot = None,
+        }
+    }
     let mut opened = None;
     let file = match slot.as_mut() {
         Some(kept) => kept.file(),
@@ -1270,6 +1302,129 @@ fn heartbeat_once(
     *slot = None;
     drop(opened);
     replace_lock_bytes_unsynced(path, &next).map_err(HeartbeatError::Io)
+}
+
+/// What identifies one lease file on disk, independent of the name pointing at
+/// it: device and inode on Unix, volume serial number and file index on
+/// Windows. A rename gives the path a different file, so comparing the file a
+/// heartbeat holds with the file the path now names tells whether the lease was
+/// replaced under the kept descriptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LeaseFileIdentity {
+    volume: u64,
+    file: u64,
+}
+
+impl LeaseFileIdentity {
+    #[cfg(unix)]
+    fn of_metadata(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            volume: metadata.dev(),
+            file: metadata.ino(),
+        }
+    }
+
+    /// Volume serial number and 64-bit file index from a handle. On Windows
+    /// that pair is what an inode is on Unix. Creation time would not do: NTFS
+    /// file-name tunneling gives a name reused within about 15 s the creation
+    /// time of the entry that last had it, so a replaced lease could look
+    /// unchanged.
+    #[cfg(windows)]
+    fn from_raw_handle(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<Self> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+        // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value (plain
+        // integers and FILETIME structs); the call only writes into it.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: the caller owns `handle` and keeps it alive across this call,
+        // and `info` is a valid out pointer.
+        let ok = unsafe { GetFileInformationByHandle(handle, &mut info) } != 0;
+        ok.then(|| Self {
+            volume: u64::from(info.dwVolumeSerialNumber),
+            file: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        })
+    }
+
+    /// The identity of the file behind an open descriptor, read from the
+    /// descriptor's own handle: nothing is opened.
+    #[cfg(unix)]
+    fn of_file(file: &File) -> Option<Self> {
+        file.metadata()
+            .ok()
+            .map(|metadata| Self::of_metadata(&metadata))
+    }
+
+    #[cfg(windows)]
+    fn of_file(file: &File) -> Option<Self> {
+        use std::os::windows::io::AsRawHandle;
+        Self::from_raw_handle(file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE)
+    }
+
+    /// The identity of the file the path names now. On Unix this is a stat and
+    /// opens nothing. Windows has no handle-free file index, so that arm opens
+    /// the path for attributes only, sharing every access a heartbeat holds, and
+    /// closes it before returning.
+    #[cfg(unix)]
+    fn of_path(path: &Path) -> io::Result<Self> {
+        fs::metadata(path).map(|metadata| Self::of_metadata(&metadata))
+    }
+
+    #[cfg(windows)]
+    fn of_path(path: &Path) -> io::Result<Self> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+
+        /// Closes the attribute handle on every path out of this function.
+        struct Closed(windows_sys::Win32::Foundation::HANDLE);
+        impl Drop for Closed {
+            fn drop(&mut self) {
+                // SAFETY: this wrapper is only ever built from the handle
+                // `CreateFileW` returned after it was checked against
+                // `INVALID_HANDLE_VALUE`, and it is dropped exactly once.
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the call;
+        // the remaining arguments are plain flags and null pointers.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let handle = Closed(handle);
+        Self::from_raw_handle(handle.0)
+            .ok_or_else(|| io::Error::other("lease path has no file identity"))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn of_file(_file: &File) -> Option<Self> {
+        None
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn of_path(_path: &Path) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no file identity on this platform",
+        ))
+    }
 }
 
 fn open_lease_for_heartbeat(path: &Path) -> Result<LeaseFile, HeartbeatError> {
@@ -3920,6 +4075,66 @@ mod tests {
             }
             other => panic!("unknown harness mode {other}"),
         }
+    }
+
+    /// A beat reads ownership through the descriptor the heartbeat keeps, not
+    /// through the path. When another process reclaims the lease, the rename
+    /// gives the path a new file while the kept descriptor still refers to the
+    /// old, unlinked one. Reading through it would still see this owner's
+    /// identity, so the beat would refresh the orphan and report success while
+    /// the live lease went stale. The beat must instead see that the path is no
+    /// longer the file it holds and stop.
+    #[test]
+    fn beat_stops_when_another_owner_replaces_the_lease_file() {
+        let (_dir, path) = test_lock_path();
+        let guard = acquire_with_config(&path, None, test_config()).expect("acquire");
+        guard
+            .heartbeat_once()
+            .expect("beat through the kept descriptor");
+
+        // Another process's reclaim: it writes its own lease beside the file and
+        // renames it over the path. It cannot see this process's open
+        // descriptors, so the heartbeat keeps the old, now unlinked file.
+        let mut foreign = current_process_metadata();
+        foreign.pid = foreign.pid.wrapping_add(1);
+        foreign.created_at_ms = now_ms().saturating_add(1_000);
+        foreign.writer_epoch = format!("foreign-{}", now_ms());
+        assert!(!lock_identity_matches(&foreign, &guard.metadata));
+        let staging = path.with_extension("foreign");
+        fs::write(
+            &staging,
+            lock_metadata_bytes(&foreign).expect("serialize foreign lease"),
+        )
+        .expect("write the foreign owner's lease");
+        rename_over(&staging, &path).expect("foreign reclaim renames over the lease");
+
+        assert!(
+            matches!(guard.heartbeat_once(), Err(HeartbeatError::NotOwner)),
+            "a beat must not accept the orphaned descriptor it still holds"
+        );
+        assert_eq!(
+            read_lock_metadata(&path).expect("read foreign lease"),
+            foreign,
+            "a beat must never write over the foreign owner's lease"
+        );
+    }
+
+    /// The identity check runs on every beat, so it must not open or close the
+    /// lease a second time. Unix needs a stat for it; on Windows the path lookup
+    /// takes one short-lived attribute handle, which this ledger only counts if
+    /// it went through the heartbeat's own open. What it pins is that the beat
+    /// neither reopens the lease for reading nor closes the descriptor it
+    /// keeps.
+    #[test]
+    fn descriptor_identity_check_opens_no_descriptor() {
+        let (_dir, path) = test_lock_path();
+        let guard = acquire_with_config(&path, None, test_config()).expect("acquire");
+        let _ = io_ledger::take();
+        for _ in 0..3 {
+            guard.heartbeat_once().expect("beat");
+        }
+        let ledger = io_ledger::take();
+        assert_beat_opens_no_descriptor(&ledger);
     }
 
     #[test]
