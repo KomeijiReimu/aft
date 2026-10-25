@@ -150,9 +150,31 @@ fn scope_selector(stamp: &ScopeStamp) -> ScopeSelector {
 #[derive(Clone, Debug, Default)]
 pub struct RouteScopes {
     routes: Vec<(String, Option<ScopeStamp>)>,
+    origins: Vec<(
+        crate::gh_shim_speech::model::RouteOrigin,
+        Option<ScopeStamp>,
+    )>,
+    pub(crate) speech: Option<Arc<crate::gh_shim_speech::service::Service>>,
 }
 
 impl RouteScopes {
+    pub(crate) fn push_origin(
+        &mut self,
+        origin: crate::gh_shim_speech::model::RouteOrigin,
+        stamp: Option<ScopeStamp>,
+    ) {
+        self.origins.push((origin, stamp));
+    }
+    pub(crate) fn origin_live(
+        &self,
+        origin: Option<&crate::gh_shim_speech::model::RouteOrigin>,
+        stamp: &ScopeStamp,
+    ) -> bool {
+        let Some(origin) = origin else { return false };
+        self.origins
+            .iter()
+            .any(|(key, value)| key == origin && value.as_ref() == Some(stamp))
+    }
     /// Record one bound tool route and the stamp the daemon put on it.
     pub fn push(&mut self, session: &str, stamp: Option<ScopeStamp>) {
         self.routes.push((session.to_string(), stamp));
@@ -209,6 +231,12 @@ pub struct RelayReply {
 }
 
 impl RelayReply {
+    pub(crate) fn task_refused(refusal: crate::gh_shim_speech::Refusal) -> Self {
+        Self {
+            ok: false,
+            data: refusal.wire_data(),
+        }
+    }
     fn relayed(reply: Value) -> Self {
         Self {
             ok: true,
@@ -267,6 +295,39 @@ pub async fn relay<T: RelayTransport>(
     call: RelayCall<'_>,
     log: &(dyn Fn(&str) + Send + Sync),
 ) -> RelayReply {
+    relay_inner(
+        transport,
+        call,
+        log,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+// This fixture exercises the existing awaited scoped transport, not posting
+// admission or the unpublished reserved-send API. Authority tests use relay.
+#[cfg(test)]
+async fn relay_transport_contract<T: RelayTransport>(
+    transport: &T,
+    call: RelayCall<'_>,
+    log: &(dyn Fn(&str) + Send + Sync),
+) -> RelayReply {
+    let stamp = call
+        .params
+        .get("ticket")
+        .and_then(Value::as_str)
+        .and_then(crate::gh_shim_ticket::redeem)
+        .and_then(|ticket| call.route_scopes.for_session(&ticket.session_id).cloned());
+    relay_inner(transport, call, log, Some(stamp)).await
+}
+
+async fn relay_inner<T: RelayTransport>(
+    transport: &T,
+    call: RelayCall<'_>,
+    log: &(dyn Fn(&str) + Send + Sync),
+    #[cfg(test)] wire_fixture: Option<Option<ScopeStamp>>,
+) -> RelayReply {
     let params = call.params;
     let nonce = params
         .get("request_nonce")
@@ -314,12 +375,37 @@ pub async fn relay<T: RelayTransport>(
                 "no agent session is attached to this command",
             );
         };
-        let Some(redeemed) = crate::gh_shim_ticket::redeem(ticket) else {
-            break 'reply RelayReply::refused(
-                "ticket_unknown",
-                "ticket",
-                "the command's session ticket is not live; it ended or was never issued",
-            );
+        let redeemed = match crate::gh_shim_ticket::redeem(ticket) {
+            Some(redeemed) => redeemed,
+            None if call.operation == BOT_REQUEST_OPERATION
+                || (call.operation == BINDINGS_READ_OPERATION
+                    && params.get("purpose").and_then(Value::as_str) == Some("speech")) =>
+            {
+                let Some(service) = call.route_scopes.speech.as_ref() else {
+                    break 'reply RelayReply::refused(
+                        "ticket_unknown",
+                        "ticket",
+                        "the command's session ticket is not live; it ended or was never issued",
+                    );
+                };
+                if !service.try_serve() {
+                    break 'reply RelayReply::task_refused(crate::gh_shim_speech::Refusal::new(
+                        crate::gh_shim_speech::Code::AuthorityUnavailable,
+                        "serving_lock_unavailable",
+                    ));
+                }
+                match crate::gh_shim_ticket::redeem_speech_cold(ticket, service) {
+                    Ok(redeemed) => redeemed,
+                    Err(error) => break 'reply RelayReply::task_refused(error),
+                }
+            }
+            None => {
+                break 'reply RelayReply::refused(
+                    "ticket_unknown",
+                    "ticket",
+                    "the command's session ticket is not live; it ended or was never issued",
+                )
+            }
         };
         session = redeemed.session_id.clone();
         task = if redeemed.task_id.is_empty() {
@@ -336,15 +422,29 @@ pub async fn relay<T: RelayTransport>(
             }
             SESSION_CONTEXT_OPERATION => session_context(
                 &redeemed,
-                call.route_scopes.for_session(&redeemed.session_id),
+                redeemed
+                    .lifecycle_scope
+                    .as_ref()
+                    .or_else(|| call.route_scopes.for_session(&redeemed.session_id)),
             ),
             BINDINGS_READ_OPERATION => {
                 path = PATH_UNSCOPED;
                 bindings_read(transport, &redeemed).await
             }
             BOT_REQUEST_OPERATION => {
-                let stamp = call.route_scopes.for_session(&redeemed.session_id);
-                let (reply, taken) = bot_request(transport, &redeemed, stamp, params).await;
+                let stamp = bot_authority(&redeemed, call.route_scopes);
+                #[cfg(test)]
+                let stamp = wire_fixture.clone().unwrap_or(stamp);
+                let (reply, taken) = bot_request(
+                    transport,
+                    &redeemed,
+                    stamp.as_ref(),
+                    params,
+                    call.route_scopes,
+                    #[cfg(test)]
+                    wire_fixture.is_some(),
+                )
+                .await;
                 path = taken;
                 reply
             }
@@ -364,6 +464,17 @@ pub async fn relay<T: RelayTransport>(
         reply.outcome_label().escape_debug(),
     ));
     reply
+}
+
+fn bot_authority(
+    ticket: &crate::gh_shim_ticket::Redeemed,
+    routes: &RouteScopes,
+) -> Option<ScopeStamp> {
+    let _ = routes;
+    ticket
+        .launch
+        .as_ref()
+        .map(|launch| launch.authority.clone())
 }
 
 /// Match the worker rule used for access grants: parented runs inherit worker
@@ -525,7 +636,27 @@ async fn bot_request<T: RelayTransport>(
     redeemed: &crate::gh_shim_ticket::Redeemed,
     stamp: Option<&ScopeStamp>,
     params: &Value,
+    routes: &RouteScopes,
+    #[cfg(test)] wire_fixture: bool,
 ) -> (RelayReply, &'static str) {
+    if redeemed
+        .launch
+        .as_ref()
+        .is_some_and(|launch| launch.authority.kind == subc_protocol::scope::ScopeKind::Worker)
+        || redeemed
+            .lifecycle_scope
+            .as_ref()
+            .is_some_and(|scope| scope.kind == subc_protocol::scope::ScopeKind::Worker)
+    {
+        return (
+            RelayReply::refused(
+                crate::gh_shim_speech::WORKER_WRITE_CODE,
+                "worker_policy",
+                crate::gh_shim_speech::WORKER_WRITE_REFUSED,
+            ),
+            "-",
+        );
+    }
     let Some(nonce) = params
         .get("request_nonce")
         .and_then(Value::as_str)
@@ -567,7 +698,7 @@ async fn bot_request<T: RelayTransport>(
     // plexus must be opened under that scope so plexus sees it. Otherwise the
     // write has no agent to speak as, so it is refused with
     // `bot_write_requires_scope`.
-    let Some((stamp_agent, stamp)) = stamp
+    let Some((stamp_agent, _stamp)) = stamp
         .filter(|_| transport.opens_scoped_routes())
         .and_then(|stamp| delegating_agent(stamp).map(|agent| (agent, stamp)))
     else {
@@ -603,24 +734,272 @@ async fn bot_request<T: RelayTransport>(
             PATH_STAMP,
         );
     }
-    let selector = scope_selector(stamp);
-    let body = github_call(json!({
-        "op": "bot_request",
-        "request_nonce": nonce,
-        "request": request,
-    }));
-    // Every reply, refusals included (`scope_unverifiable`, `scope_ended`,
-    // `delegation_withdrawn`, `agent_identity_conflict`, with their
-    // `legs_sent`), goes back to the shim as plexus sent it, and the write is
-    // never retried another way.
-    let reply = match transport
-        .plexus(&redeemed.project_root, session, Some(&selector), body)
-        .await
-    {
-        Ok(reply) => RelayReply::relayed(reply),
-        Err(error) => transport_refusal("plexus", error),
+    let _ = session;
+    #[cfg(test)]
+    if wire_fixture {
+        let selector = scope_selector(_stamp);
+        let body = github_call(json!({"op":"bot_request","request_nonce":nonce,"request":request}));
+        let reply = match transport
+            .plexus(&redeemed.project_root, session, Some(&selector), body)
+            .await
+        {
+            Ok(reply) => RelayReply::relayed(reply),
+            Err(error) => transport_refusal("plexus", error),
+        };
+        return (reply, PATH_STAMP);
+    }
+    let reply = match post_captured(redeemed, params, routes, nonce, request).await {
+        Ok(reply) => reply,
+        Err(error) => RelayReply::task_refused(error),
     };
     (reply, PATH_STAMP)
+}
+
+async fn post_captured(
+    redeemed: &crate::gh_shim_ticket::Redeemed,
+    params: &Value,
+    routes: &RouteScopes,
+    nonce: &str,
+    request: &Value,
+) -> Result<RelayReply, crate::gh_shim_speech::Refusal> {
+    use crate::gh_shim_speech::partner;
+    use crate::gh_shim_speech::{Code, Refusal, ScopeRole};
+    let invalid = || Refusal::new(Code::AuthorityUnavailable, "snapshot_invalid");
+    let launch = redeemed.launch.as_ref().ok_or_else(invalid)?;
+    launch.validate()?;
+    let service = routes
+        .speech
+        .as_ref()
+        .ok_or_else(|| Refusal::new(Code::AuthorityUnavailable, "not_serving_mode"))?;
+    service.check_pending(None, launch, &redeemed.session_id, &redeemed.task_id)?;
+    if !service.try_serve() {
+        return Err(Refusal::new(
+            Code::AuthorityUnavailable,
+            "serving_lock_unavailable",
+        ));
+    }
+    partner::require_plex_guards(launch.run.is_some())?;
+    let ticket = params
+        .get("ticket")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    let warm = crate::gh_shim_ticket::speech_for_ticket(ticket);
+    let stored = if let Some(warm) = &warm {
+        if let Some(error) = warm
+            .failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+        {
+            return Err(error);
+        }
+        if !warm.stored.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Refusal::new(
+                Code::AuthorityUnavailable,
+                "start_policy_missing",
+            ));
+        }
+        if warm.prepared.context.service.store.path() != service.store.path() {
+            return Err(invalid());
+        }
+        service.store.get(&warm.incarnation)?
+    } else {
+        service.store.find_digest(
+            &crate::gh_shim_ticket::speech_digest(ticket).ok_or_else(invalid)?,
+            crate::gh_shim_speech::service::run_nonce().unwrap_or_default(),
+        )?
+    };
+    if &stored.record.launch != launch {
+        return Err(invalid());
+    }
+    let foreground = warm
+        .as_ref()
+        .is_some_and(|warm| !warm.background.load(std::sync::atomic::Ordering::SeqCst));
+    if foreground
+        && !routes.origin_live(
+            launch.origin.as_ref(),
+            launch.run.as_ref().unwrap_or(&launch.authority),
+        )
+    {
+        return Err(Refusal::new(Code::AuthorityUnavailable, "owner_unresolved"));
+    }
+    for (role, scope) in launch.required_scopes() {
+        let origin = if role == ScopeRole::Head {
+            launch.head_origin.as_ref()
+        } else {
+            launch.origin.as_ref()
+        };
+        if !routes.origin_live(origin, scope) {
+            service.check_scope(scope, role).await?;
+        }
+        service.check_pending(
+            Some(&stored.record.incarnation),
+            launch,
+            &redeemed.session_id,
+            &redeemed.task_id,
+        )?;
+        service.store.get(&stored.record.incarnation)?;
+    }
+    let start = stored
+        .record
+        .policy
+        .as_ref()
+        .ok_or_else(|| Refusal::new(Code::AuthorityUnavailable, "start_policy_missing"))?;
+    let (current, desired, _) = crate::gh_shim::capture_speech_policy()?
+        .ok_or_else(|| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
+    let policy_generation = service.store.advance_policy(&current)?;
+    let invocation: crate::gh_shim_speech::invocation::Invocation =
+        serde_json::from_value(params.get("invocation").cloned().ok_or_else(invalid)?)
+            .map_err(|_| invalid())?;
+    crate::gh_shim::validate_speech_policy(start, &current, request, &invocation)?;
+    let repo = request
+        .get("repository")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?
+        .to_ascii_lowercase();
+    let initial = stored
+        .record
+        .bindings
+        .get(&repo)
+        .ok_or_else(|| Refusal::new(Code::PolicyDenied, "repository_denied"))?;
+    let reply =
+        bindings_read_for_service(service, &redeemed.project_root, &redeemed.session_id).await?;
+    service.check_pending(
+        Some(&stored.record.incarnation),
+        launch,
+        &redeemed.session_id,
+        &redeemed.task_id,
+    )?;
+    service.store.get(&stored.record.incarnation)?;
+    let current_bindings = crate::gh_shim_speech::service::parse_bindings(
+        &desired,
+        &facade_reply(&reply),
+        launch.agent()?,
+    )?;
+    let expect = current_bindings
+        .get(&repo)
+        .ok_or_else(|| Refusal::new(Code::IdentityConflict, "binding_changed"))?;
+    if expect.app_handle_id != initial.app_handle_id {
+        return Err(Refusal::new(Code::IdentityConflict, "binding_changed"));
+    }
+    let body =
+        partner::BotRequest::new(request.clone(), nonce, expect.clone(), launch.run.as_ref())?;
+    let slot = service
+        .reserve(
+            &redeemed.project_root,
+            &redeemed.session_id,
+            &launch.authority,
+            github_call(body.value()),
+        )
+        .await?;
+    service.check_pending(
+        Some(&stored.record.incarnation),
+        launch,
+        &redeemed.session_id,
+        &redeemed.task_id,
+    )?;
+    service.store.get(&stored.record.incarnation)?;
+    service.store.prepare_request(
+        nonce,
+        &stored.record.incarnation,
+        &body.payload_digest(),
+        &body.expect_json(),
+    )?;
+    let queued = {
+        let _local = service
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        service.check_pending(
+            Some(&stored.record.incarnation),
+            launch,
+            &redeemed.session_id,
+            &redeemed.task_id,
+        )?;
+        let queued = if foreground {
+            service.store.final_foreground_gate(
+                &stored.record.incarnation,
+                nonce,
+                stored.generation,
+                policy_generation,
+                &current,
+                || slot.send(),
+            )
+        } else {
+            service.store.final_gate(
+                &stored.record.incarnation,
+                nonce,
+                stored.generation,
+                policy_generation,
+                &current,
+                || slot.send(),
+            )
+        };
+        queued
+    };
+    let queued = match queued {
+        Ok(queued) => queued,
+        Err(crate::db::gh_speech::GateError::BeforeSend(error)) => return Err(error),
+        Err(crate::db::gh_speech::GateError::AfterSend) => {
+            return Ok(RelayReply::refused(
+                "outcome_unknown",
+                "plexus",
+                "the request was queued but its final database commit failed",
+            ))
+        }
+    };
+    let reply = match queued.response().await {
+        Ok(reply) => reply,
+        Err(_) => {
+            return Ok(RelayReply::refused(
+                "outcome_unknown",
+                "plexus",
+                "the queued write returned no verifiable result",
+            ))
+        }
+    };
+    let facade = facade_reply(&reply);
+    let result = facade.get("result").unwrap_or(&facade);
+    if facade_refusal_code(&facade)
+        .is_some_and(|code| code.split('{').next() == Some("scope_ended"))
+    {
+        let (role, scope) = if result.get("scope_role").and_then(Value::as_str) == Some("run") {
+            (ScopeRole::Run, launch.run.as_ref())
+        } else {
+            (
+                if launch.run.is_some() {
+                    ScopeRole::Head
+                } else {
+                    ScopeRole::Authority
+                },
+                Some(&launch.authority),
+            )
+        };
+        if let Some(scope) = scope {
+            service.invalidate(scope);
+            let _ = service.check_scope(scope, role).await;
+        }
+    }
+    // Posted legs and terminal replays are returned intact, even after revocation.
+    if let Some(refusal) = partner::map_refusal(
+        result,
+        if launch.run.is_some() {
+            ScopeRole::Head
+        } else {
+            ScopeRole::Authority
+        },
+    ) {
+        return Ok(RelayReply::task_refused(refusal));
+    }
+    Ok(RelayReply::relayed(reply))
+}
+
+async fn bindings_read_for_service(
+    service: &crate::gh_shim_speech::service::Service,
+    project: &str,
+    session: &str,
+) -> Result<Value, crate::gh_shim_speech::Refusal> {
+    service.read_bindings(project, session).await
 }
 
 /// The body of AFT's call to plexus's `github` tool. AFT is the caller here:
@@ -670,6 +1049,23 @@ impl GhRelay {
         Arc::new(Self {
             transport: SubcRelayTransport::new(connection_file),
         })
+    }
+
+    pub(crate) async fn read_bindings(
+        &self,
+        project: &str,
+        session: &str,
+    ) -> Result<Value, TransportError> {
+        self.transport
+            .plexus(
+                project,
+                session,
+                None,
+                github_call(
+                    json!({"op":"bindings.read","connection_id":BINDINGS_READ_CONNECTION_ID}),
+                ),
+            )
+            .await
     }
 }
 
@@ -1167,3 +1563,18 @@ impl RelayTransport for SubcRelayTransport {
 
 #[cfg(test)]
 mod tests;
+
+impl GhRelay {
+    pub(crate) async fn reserve_bot(
+        &self,
+        _project: &str,
+        _session: &str,
+        _scope: &ScopeStamp,
+        body: Value,
+    ) -> Result<crate::gh_shim_speech::partner::ReservedBotRequest, crate::gh_shim_speech::Refusal>
+    {
+        // The published SDK has no synchronous commit-to-queue primitive. Do not
+        // substitute its awaited request method or spawn a send behind the gate.
+        crate::gh_shim_speech::partner::reserve_bot_request(body).await
+    }
+}

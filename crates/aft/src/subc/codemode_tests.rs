@@ -575,6 +575,7 @@ fn codemode_identity_acting_for_a_run_is_not_the_runs_head() {
             },
             run_id: "earlier-run".into(),
             owner_route: other,
+            owner_route_channel: channel(2),
             run_route: channel(5),
             run_principal: other_principal,
         }));

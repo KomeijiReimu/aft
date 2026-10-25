@@ -136,7 +136,7 @@ fn run_with_scopes<T: RelayTransport>(
         .enable_all()
         .build()
         .unwrap();
-    let reply = runtime.block_on(relay(
+    let reply = runtime.block_on(relay_transport_contract(
         transport,
         RelayCall {
             operation,
@@ -211,7 +211,7 @@ fn untrusted_binds_are_refused_even_with_a_live_ticket() {
         .enable_all()
         .build()
         .unwrap();
-    let reply = runtime.block_on(relay(
+    let reply = runtime.block_on(relay_transport_contract(
         &transport,
         RelayCall {
             operation: BOT_REQUEST_OPERATION,
@@ -541,6 +541,148 @@ fn stamp(agent: Option<&str>, delegates: bool, owner_authorized: bool) -> ScopeS
 
 fn delegating_stamp() -> ScopeStamp {
     stamp(Some("agent-fixture"), true, true)
+}
+
+#[test]
+fn authority_never_widens_across_reconnect() {
+    let original = delegating_stamp();
+    let mut replacement = original.clone();
+    replacement.scope_ref = "new-work-scope".into();
+    replacement.scope_epoch = 99;
+    let ticket = crate::gh_shim_ticket::Redeemed {
+        session_id: "same-head-session".into(),
+        task_id: "bash-original".into(),
+        project_root: "/project".into(),
+        read_repository: None,
+        launch: Some(
+            crate::gh_shim_speech::model::LaunchAuthority::classic(original.clone(), None).unwrap(),
+        ),
+        lifecycle_scope: Some(original.clone()),
+    };
+    let routes = scopes_for("same-head-session", Some(replacement));
+    assert_eq!(bot_authority(&ticket, &routes), Some(original));
+}
+
+#[tokio::test]
+async fn posting_admission_is_fail_closed_until_plex_is_placed() {
+    let root = tempfile::tempdir().unwrap();
+    let relay_state = GhRelay::new(root.path().join("unused-connection.json"));
+    let service = crate::gh_shim_speech::service::start(
+        root.path(),
+        &relay_state,
+        std::sync::Arc::new(|_| {
+            Box::pin(async { panic!("unconfirmed posting must not probe scopes") })
+        }),
+        "control-fixture".into(),
+        true,
+    );
+    let stamp = delegating_stamp();
+    let live = crate::bash_background::registry::with_scope_spawn(Some(stamp.clone()), || {
+        crate::gh_shim_ticket::PendingTicket::issue("unconfirmed-post", "/project")
+    });
+    let mut params = bot_params(live.value().unwrap(), "unconfirmed-write");
+    params["request"]["metadata"]["agent_id"] = json!(stamp.attributes.agent_id);
+    let mut routes = scopes_for("unconfirmed-post", Some(stamp));
+    routes.speech = Some(service);
+    let transport = FakeTransport::scoped();
+    let answer = relay(
+        &transport,
+        RelayCall {
+            operation: BOT_REQUEST_OPERATION,
+            params: &params,
+            first_party: true,
+            route_scopes: &routes,
+        },
+        &|_| {},
+    )
+    .await;
+    assert!(!answer.ok);
+    assert_eq!(answer.data["reason"], "guard_unsupported");
+    assert!(transport.calls().is_empty());
+}
+
+#[tokio::test]
+async fn posting_admission_never_serves_speech_without_a_subc_service() {
+    let stamp = delegating_stamp();
+    let live = crate::bash_background::registry::with_scope_spawn(Some(stamp.clone()), || {
+        crate::gh_shim_ticket::PendingTicket::issue("standalone-post", "/project")
+    });
+    let mut params = bot_params(live.value().unwrap(), "no-serving-mode");
+    params["request"]["metadata"]["agent_id"] = json!(stamp.attributes.agent_id);
+    let routes = scopes_for("standalone-post", Some(stamp));
+    let transport = FakeTransport::scoped();
+    let answer = relay(
+        &transport,
+        RelayCall {
+            operation: BOT_REQUEST_OPERATION,
+            params: &params,
+            first_party: true,
+            route_scopes: &routes,
+        },
+        &|_| {},
+    )
+    .await;
+    assert!(!answer.ok);
+    assert_eq!(answer.data["reason"], "not_serving_mode");
+    assert!(transport.calls().is_empty());
+}
+
+#[tokio::test]
+async fn posting_admission_recorded_end_wins_over_live_rebind_and_partner_seams() {
+    let root = tempfile::tempdir().unwrap();
+    let relay_state = GhRelay::new(root.path().join("unused.json"));
+    let service = crate::gh_shim_speech::service::start(
+        root.path(),
+        &relay_state,
+        std::sync::Arc::new(|_| Box::pin(async { panic!("recorded end must not describe again") })),
+        "control-fixture".into(),
+        true,
+    );
+    let stamp = delegating_stamp();
+    let ended = subc_protocol::session::ModuleControlResponseToModule::ScopeDescribe {
+        status: subc_protocol::scope::ScopeStatus::Ended,
+        scope_epoch: Some(stamp.scope_epoch),
+        daemon_incarnation: "daemon-a".into(),
+        owner_synced: true,
+        owner_configured: true,
+        scope: None,
+    };
+    let proof = match crate::gh_shim_speech::scope::validate_scope_identity(
+        &stamp,
+        crate::gh_shim_speech::ScopeRole::Authority,
+        &ended,
+        "control-fixture",
+        "control-fixture",
+        0,
+    )
+    .unwrap()
+    {
+        crate::gh_shim_speech::scope::Answer::Ended(proof) => proof,
+        _ => panic!("expected end"),
+    };
+    service.record_end(&stamp, proof).unwrap();
+    let live = crate::bash_background::registry::with_scope_spawn(Some(stamp.clone()), || {
+        crate::gh_shim_ticket::PendingTicket::issue("ended-rebind", "/project")
+    });
+    let mut params = bot_params(live.value().unwrap(), "end-wins");
+    params["request"]["metadata"]["agent_id"] = json!(stamp.attributes.agent_id);
+    let mut routes = scopes_for("ended-rebind", Some(stamp));
+    routes.speech = Some(service);
+    let transport = FakeTransport::scoped();
+    let answer = relay(
+        &transport,
+        RelayCall {
+            operation: BOT_REQUEST_OPERATION,
+            params: &params,
+            first_party: true,
+            route_scopes: &routes,
+        },
+        &|_| {},
+    )
+    .await;
+    assert!(!answer.ok);
+    assert_eq!(answer.data["reason"], "ended_previously");
+    assert!(transport.calls().is_empty());
 }
 
 fn scopes_for(session: &str, stamp: Option<ScopeStamp>) -> RouteScopes {
@@ -1255,7 +1397,7 @@ async fn relay_stamped(
     let params = bot_params(live.value().unwrap(), nonce);
     let scopes = scopes_for(session, Some(delegating_stamp()));
     let lines = Mutex::new(Vec::new());
-    let reply = relay(
+    let reply = relay_transport_contract(
         transport,
         RelayCall {
             operation: BOT_REQUEST_OPERATION,

@@ -3,8 +3,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+pub(crate) mod invocation;
 pub(crate) mod model;
+pub(crate) mod partner;
 pub(crate) mod scope;
+pub(crate) mod service;
+pub(crate) mod start_view;
 
 pub(crate) const REFUSAL_STAGE: &str = "task_authority";
 
@@ -15,6 +19,10 @@ pub(crate) const UNAVAILABLE_TEXT: &str = "this command's bot-write permission c
 pub(crate) const ENDED_TEXT: &str = "the {scope_role} this command started from has ended ({reason}), so it can no longer write as the bot; start the command again from a live session.";
 pub(crate) const UNKNOWN_TEXT: &str = "AFT could not confirm that the {scope_role} this command started from is still active ({reason}); retry in a minute.";
 pub(crate) const REVOCATION_NOT_DURABLE: &str = "bot_write_revocation_not_durable: the block on this command's bot writes was not saved and lasts only until AFT restarts; check the command's state.";
+// Wording pending approval; worker-read-only policy is enforced independently.
+pub(crate) const WORKER_WRITE_REFUSED: &str =
+    "workers cannot write to GitHub; report what should be posted to your parent instead";
+pub(crate) const WORKER_WRITE_CODE: &str = "gh_shim_worker_write_refused";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Code {

@@ -36,6 +36,15 @@ fn approved_kill_warning_is_exact() {
 }
 
 #[test]
+fn pending_worker_write_wording_is_pinned_in_one_place() {
+    assert_eq!(
+        WORKER_WRITE_REFUSED,
+        "workers cannot write to GitHub; report what should be posted to your parent instead"
+    );
+    assert_eq!(WORKER_WRITE_CODE, "gh_shim_worker_write_refused");
+}
+
+#[test]
 fn scope_roles_keep_wire_identity_separate_from_plain_language() {
     let refusal = Refusal::scoped(Code::ScopeEnded, "ended_previously", ScopeRole::Run);
     assert_eq!(refusal.wire_data()["scope_role"], "run");

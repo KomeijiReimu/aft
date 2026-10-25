@@ -1183,7 +1183,7 @@ fn volume_uuid(_path: &Path) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn boot_id() -> Option<String> {
+pub(crate) fn boot_id() -> Option<String> {
     let mut buffer = [0_u8; 128];
     let mut size = buffer.len();
     let result = unsafe {

@@ -54,6 +54,26 @@ pub(super) fn stamp_key(stamp: &ScopeStamp) -> (String, String, u64) {
 pub(super) struct ScopeDescribes {
     goodbye: mpsc::UnboundedSender<ScopeStamp>,
     routed: Arc<StdMutex<HashSet<(String, String, u64)>>>,
+    observed: mpsc::UnboundedSender<ScopeStamp>,
+}
+
+pub(super) fn start_for_speech(
+    control: Arc<readiness::DaemonControl>,
+    executor: Arc<Executor>,
+    run_scopes: Arc<super::run_scope::RunScopes>,
+    speech: Arc<crate::gh_shim_speech::service::Service>,
+) -> (
+    ScopeDescribes,
+    mpsc::UnboundedReceiver<EndedScope>,
+    JoinHandle<()>,
+) {
+    start_with_scope_source_impl(
+        control,
+        executor.clone(),
+        poll_interval(),
+        move || work_scopes(executor.clone(), run_scopes.clone()),
+        Some(speech),
+    )
 }
 impl ScopeDescribes {
     pub(super) fn routes(&self, routes: &HashMap<RouteChannel, RouteIdentity>) {
@@ -76,6 +96,7 @@ pub(super) struct EndedScope {
     pub(super) keys: Vec<crate::db::call_ledger::Key>,
 }
 
+#[cfg(test)]
 pub(super) fn start(
     control: Arc<readiness::DaemonControl>,
     executor: Arc<Executor>,
@@ -90,6 +111,7 @@ pub(super) fn start(
     })
 }
 
+#[cfg(test)]
 fn start_with_scope_source<F, Fut>(
     control: Arc<readiness::DaemonControl>,
     executor: Arc<Executor>,
@@ -104,13 +126,39 @@ where
     F: Fn() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Vec<ScopeStamp>> + Send,
 {
+    start_with_scope_source_impl(control, executor, interval, scope_source, None)
+}
+
+fn start_with_scope_source_impl<F, Fut>(
+    control: Arc<readiness::DaemonControl>,
+    executor: Arc<Executor>,
+    interval: Duration,
+    scope_source: F,
+    speech: Option<Arc<crate::gh_shim_speech::service::Service>>,
+) -> (
+    ScopeDescribes,
+    mpsc::UnboundedReceiver<EndedScope>,
+    JoinHandle<()>,
+)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Vec<ScopeStamp>> + Send,
+{
     let (goodbye, mut closes) = mpsc::unbounded_channel();
+    let (observed, mut observations) = mpsc::unbounded_channel();
     let (ended, receiver) = mpsc::unbounded_channel();
     let routed = Arc::new(StdMutex::new(HashSet::new()));
     let handle = ScopeDescribes {
         goodbye,
         routed: routed.clone(),
+        observed,
     };
+    if let Some(service) = &speech {
+        let sender = handle.observed.clone();
+        service.set_end_notice(Arc::new(move |stamp| {
+            let _ = sender.send(stamp);
+        }));
+    }
     let worker = tokio::spawn(async move {
         if !control.advertises(subc_protocol::scope::SCOPE_DESCRIBE_OP) {
             return;
@@ -126,9 +174,26 @@ where
                 let key = queued.keys().next().cloned().unwrap();
                 let stamp: ScopeStamp = queued.remove(&key).unwrap();
                 let control = control.clone();
+                let speech = speech.clone();
                 inflight.spawn(async move {
+                    let sent = std::time::Instant::now();
+                    let generation = speech
+                        .as_ref()
+                        .map(|service| service.generation())
+                        .unwrap_or_default();
                     let reply = control.describe(&stamp).await;
-                    (key, stamp, reply)
+                    if let Some(service) = &speech {
+                        service.remember_probe(
+                            &stamp,
+                            &generation,
+                            sent,
+                            reply
+                                .as_ref()
+                                .map(Clone::clone)
+                                .map_err(ToString::to_string),
+                        );
+                    }
+                    (key, stamp, reply, generation)
                 });
             }
             let routed_now = routed
@@ -145,6 +210,14 @@ where
                 .min()
                 .map_or(next_scan, |due| due.min(next_scan));
             tokio::select! {
+                Some(stamp)=observations.recv()=>{
+                    if let Some(service)=&speech{
+                        if service.store.scope_ended(&stamp).unwrap_or(false){
+                            let keys=revoke(executor.clone(),&stamp).await;
+                            let _=ended.send(EndedScope{stamp,keys});
+                        }
+                    }
+                }
                 Some(stamp) = closes.recv() => {
                     // An idle route needs no RPC; parked consent asks still
                     // need a scope-end determination even without a process.
@@ -179,12 +252,24 @@ where
                     }
                 }
                 Some(result) = inflight.join_next(), if !inflight.is_empty() => {
-                    if let Ok((key, stamp, reply)) = result {
+                    if let Ok((key, stamp, reply,generation)) = result {
                         // A Goodbye query can finish just before the connection's
                         // periodic tick. Wait a full interval after its answer
                         // before rechecking shell tasks with that owner/ref/epoch.
                         next_poll.insert(key.clone(), tokio::time::Instant::now() + interval);
-                        if reply.as_ref().is_ok_and(describe_answer_ends_scope) {
+                        if let Some(service)=&speech{
+                            if let Ok(reply)=&reply{
+                                let role=if stamp.attributes.run_id.is_some(){crate::gh_shim_speech::ScopeRole::Run}else{crate::gh_shim_speech::ScopeRole::Authority};
+                                match crate::gh_shim_speech::scope::validate_scope_identity(&stamp,role,reply,&service.generation(),&generation,crate::db::call_ledger::now_ms() as u64){
+                                    Ok(crate::gh_shim_speech::scope::Answer::Ended(proof))=>{
+                                        if service.record_end(&stamp,proof).is_err(){kill_only(executor.clone(),&stamp).await;}
+                                        retry.remove(&key);
+                                    },
+                                    Ok(crate::gh_shim_speech::scope::Answer::Live(_))=>{retry.remove(&key);},
+                                    Err(_)=>{retry.insert(key.clone(),stamp);},
+                                }
+                            }else{retry.insert(key.clone(),stamp);}
+                        }else if reply.as_ref().is_ok_and(describe_answer_ends_scope) {
                             #[cfg(feature = "test-timing-hooks")]
                             crate::slog_info!("scope diagnostic phase=describe_ended scope_epoch={}", stamp.scope_epoch);
                             let keys = revoke(executor.clone(), &stamp).await;
@@ -475,5 +560,21 @@ mod tests {
         assert_ne!(repeated.header.corr, first.header.corr);
         assert!(ended.try_recv().is_err());
         worker.abort();
+    }
+}
+
+async fn kill_only(executor: Arc<Executor>, stamp: &ScopeStamp) {
+    for (root, _) in executor.actor_entries() {
+        let stamp = stamp.clone();
+        let job = executor.submit_async(
+            root,
+            Lane::Mutating,
+            "speech-end-safety-kill".into(),
+            Box::new(move |ctx| {
+                ctx.bash_background().kill_scope(&stamp);
+                Response::success("speech-end-safety-kill", json!({}))
+            }),
+        );
+        let _ = await_executor_response(job, "speech-end-safety-kill".into()).await;
     }
 }

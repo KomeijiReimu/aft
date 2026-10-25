@@ -78,14 +78,33 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 .kill_relaxed_typed(&task_id, project_root, &storage_dir)
         });
 
+    let warning = crate::gh_shim_speech::service::revocation_pending(req.session(), &task_id);
     match result {
-        Ok(snapshot) => Response::success(&req.id, json!(snapshot)),
+        Ok(snapshot) => {
+            let mut data = json!(snapshot);
+            if warning {
+                data["bot_write_revocation_warning"] =
+                    json!(crate::gh_shim_speech::REVOCATION_NOT_DURABLE);
+            }
+            Response::success(&req.id, data)
+        }
         Err(message) if message.is_missing_task() => Response::error(
             &req.id,
             "task_not_found",
             format_unknown_polled_task_message(&task_id, req.host_tool_names().shell()),
         ),
-        Err(message) => Response::error(&req.id, "kill_failed", message.to_string()),
+        Err(message) => Response::error(
+            &req.id,
+            "kill_failed",
+            if warning {
+                format!(
+                    "{message}\n{}",
+                    crate::gh_shim_speech::REVOCATION_NOT_DURABLE
+                )
+            } else {
+                message.to_string()
+            },
+        ),
     }
 }
 

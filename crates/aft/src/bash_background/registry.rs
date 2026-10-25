@@ -1378,6 +1378,7 @@ pub(crate) struct RegistryInner {
     pub(crate) compressor:
         Mutex<Option<Arc<dyn Fn(&str, String, Option<i64>) -> CompressionResult + Send + Sync>>>,
     pub(crate) db_pool: RwLock<Option<Arc<Mutex<TrackedConnection>>>>,
+    speech_db_path: RwLock<Option<PathBuf>>,
     /// Ids of tasks whose aft.db row write found no handle attached. A
     /// configured root opens aft.db after its bind is acknowledged and
     /// releases the handle while it is unbound, so its tasks can be written
@@ -1964,6 +1965,7 @@ impl BgTaskRegistry {
                 project_replay_scan_budget_for_test: Mutex::new(None),
                 compressor: Mutex::new(None),
                 db_pool: RwLock::new(None),
+                speech_db_path: RwLock::new(None),
                 db_writes_awaiting_pool: Mutex::new(HashSet::new()),
                 db_detached_logged: AtomicBool::new(false),
                 db_harness: RwLock::new(None),
@@ -2313,6 +2315,15 @@ impl BgTaskRegistry {
     }
 
     pub fn set_db_pool(&self, conn: Arc<Mutex<TrackedConnection>>) {
+        let path = conn
+            .lock()
+            .ok()
+            .and_then(|conn| conn.path().map(PathBuf::from));
+        *self
+            .inner
+            .speech_db_path
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = path;
         if let Ok(mut slot) = self.inner.db_pool.write() {
             if slot.as_ref().is_none_or(|old| !Arc::ptr_eq(old, &conn)) {
                 if let Err(error) = crate::db::call_ledger::recover_pool_once(&conn) {
@@ -9572,6 +9583,8 @@ impl BgTaskRegistry {
         };
         if terminal_after_promote {
             self.post_terminal_transition(&task, true)?;
+        } else {
+            crate::gh_shim_ticket::promote_speech_task(session_id, task_id);
         }
         Ok(true)
     }
@@ -12294,6 +12307,25 @@ impl BgTaskRegistry {
             && task
                 .lock_state()
                 .is_ok_and(|state| state.metadata.memory_policy.is_some());
+        let speech_path = self
+            .inner
+            .speech_db_path
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .or_else(|| {
+                let tasks = task.paths.session_dir.parent()?;
+                if tasks.file_name() != Some(std::ffi::OsStr::new("bash-tasks")) {
+                    return None;
+                }
+                let path = tasks.parent()?.join("aft.db");
+                path.is_file().then_some(path)
+            });
+        if let Some(path) = speech_path {
+            let _ = crate::gh_shim_speech::service::revoke_at(&path, session_id, task_id);
+        } else {
+            let _ = crate::gh_shim_speech::service::revoke_task_records(session_id, task_id);
+        }
         #[cfg(unix)]
         if task.lock_state().is_ok_and(|s| s.metadata.remote.is_some()) {
             if scope_end_label(reason.as_deref()).is_some() {
@@ -23808,6 +23840,63 @@ mod tests {
         assert_eq!(completions[0].status, BgTaskStatus::Killed);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cancel_commits_before_process_is_signalled() {
+        use crate::gh_shim_speech::model::{AuthorityRecord, LaunchAuthority};
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let pool = Arc::new(Mutex::new(crate::db::open(&path).unwrap()));
+        registry.set_db_pool(pool);
+        let task_id = spawn_unsandboxed_for_kill_test(&registry, dir.path(), LONG_RUNNING_COMMAND);
+        let scope = subc_protocol::scope::ScopeStamp::new(
+            subc_protocol::Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            },
+            "cancel-head",
+            7,
+            subc_protocol::scope::ScopeKind::Head,
+        )
+        .with_attributes(
+            subc_protocol::scope::ScopeAttributes::new()
+                .with_agent_id(Some("agent-a".into()))
+                .with_delegates(true),
+        )
+        .with_owner_authorized(true);
+        let store = crate::db::gh_speech::Store::new(&path);
+        store
+            .capture(&AuthorityRecord {
+                incarnation: "cancel-inc".into(),
+                minting_run: "minting-process".into(),
+                harness: "test".into(),
+                session_id: "session".into(),
+                task_id: task_id.clone(),
+                project_root: dir.path().display().to_string(),
+                launch: LaunchAuthority::classic(scope, None).unwrap(),
+                policy: None,
+                bindings: Default::default(),
+                seal: None,
+                ineligible_reason: None,
+            })
+            .unwrap();
+        let (reached, release) = install_kill_signal_gate_for_test(&task_id);
+        let killing = registry.clone();
+        let id = task_id.clone();
+        let killer = std::thread::spawn(move || killing.kill(&id, "session"));
+        reached
+            .recv_timeout(Duration::from_secs(10))
+            .expect("kill reached its pre-signal gate");
+        let marker_before_signal = store.get("cancel-inc");
+        release.send(()).unwrap();
+        let result = killer.join().unwrap().unwrap();
+        assert_eq!(result.info.status, BgTaskStatus::Killed);
+        assert!(
+            matches!(marker_before_signal,Err(ref error)if error.reason=="revoked"),
+            "the durable marker must already exist before the signal"
+        );
+    }
+
     /// `bash_status` answers with a settled status: during a kill held in
     /// flight by the test gate it waits for the kill's outcome instead of
     /// answering `killing`, and with no kill in flight it does not wait.
@@ -25551,6 +25640,8 @@ mod tests {
                 task_id: task_id.clone(),
                 project_root: "/project".to_string(),
                 read_repository: None,
+                launch: None,
+                lifecycle_scope: None,
             }),
             "a running task's ticket redeems to its own session"
         );

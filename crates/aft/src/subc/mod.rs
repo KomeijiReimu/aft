@@ -1574,6 +1574,58 @@ struct RouteIdentityData {
     run_owner: Option<Arc<codemode::RunOwner>>,
 }
 
+fn speech_launch_seed(
+    identity: &RouteIdentity,
+    route: RouteChannel,
+    control: Option<&Arc<readiness::DaemonControl>>,
+) -> Option<crate::gh_shim_speech::service::LaunchSeed> {
+    use crate::gh_shim_speech::model::{LaunchAuthority, RouteOrigin};
+    let lifecycle = identity.scope.clone()?;
+    let origin = |channel: RouteChannel| {
+        control.and_then(|control| {
+            Some(RouteOrigin {
+                run_nonce: crate::gh_shim_speech::service::run_nonce()?.into(),
+                connection_generation: format!("{:p}", Arc::as_ptr(control)),
+                channel: u32::from(channel.channel),
+                epoch: u64::from(channel.epoch),
+            })
+        })
+    };
+    let launch = if let Some(owner) = &identity.run_owner {
+        if owner.kind == codemode::RunKind::Worker {
+            Err(crate::gh_shim_speech::Refusal::new(crate::gh_shim_speech::Code::AuthorityUnavailable, "owner_unresolved"))
+        } else {
+        owner
+            .owner_route
+            .scope
+            .clone()
+            .ok_or_else(|| {
+                crate::gh_shim_speech::Refusal::new(
+                    crate::gh_shim_speech::Code::AuthorityUnavailable,
+                    "owner_unresolved",
+                )
+            })
+            .and_then(|head| {
+                LaunchAuthority::codemode(
+                    head,
+                    lifecycle.clone(),
+                    origin(route),
+                    origin(owner.owner_route_channel),
+                )
+            })
+        }
+    } else {
+        LaunchAuthority::classic(lifecycle.clone(), origin(route))
+    };
+    Some(crate::gh_shim_speech::service::LaunchSeed {
+        launch,
+        lifecycle: Some(lifecycle),
+        session: identity.session.clone(),
+        harness: identity.harness.clone(),
+        project_root: identity.project_root.display().to_string(),
+    })
+}
+
 impl Deref for RouteIdentity {
     type Target = RouteIdentityData;
 
@@ -4223,8 +4275,8 @@ fn run_subc_mode_inner(
         // Saved paused tasks may still owe their runner a cancel; send those
         // now rather than when (if ever) their projects bind again.
         crate::bash_background::note_storage_root(&storage_dir);
-        // Page snapshots an earlier daemon left behind are deleted now; the
-        // storage lease above makes this daemon their only user.
+        // Initialize the page snapshot store. The shared storage-use lease
+        // excludes cache cleanup, not other AFT daemons.
         crate::page_collect::snapshot::SnapshotStore::for_storage(&storage_dir);
         let stream =
             connect_and_authenticate(connection_file_path, lifecycle_probe.as_ref()).await?;
@@ -5101,8 +5153,30 @@ where
         HELLO_CORR + 1,
     ));
     let run_scopes = Arc::new(run_scope::RunScopes::new(control.clone()));
+    let gh_relay = crate::gh_shim_relay::GhRelay::new(connection_file_path.to_path_buf());
+    let speech_control = Arc::clone(&control);
+    let speech = crate::gh_shim_speech::service::start(
+        storage_dir,
+        &gh_relay,
+        Arc::new(move |scope| {
+            let control = Arc::clone(&speech_control);
+            Box::pin(async move {
+                control
+                    .describe(&scope)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        }),
+        format!("{:p}", Arc::as_ptr(&control)),
+        control.advertises(subc_protocol::scope::SCOPE_DESCRIBE_OP),
+    );
     let (scope_describes, mut scopes_ended_rx, scope_describe_task) =
-        scope_describe::start(control.clone(), executor.clone(), run_scopes.clone());
+        scope_describe::start_for_speech(
+            control.clone(),
+            executor.clone(),
+            run_scopes.clone(),
+            Arc::clone(&speech),
+        );
     let (run_ready_tx, mut run_ready_rx) = mpsc::unbounded_channel::<DecodedFrame>();
     let readiness_task = spawn_readiness(control.clone(), spawn_role, hello_at);
     // `read_frame` is NOT cancellation-safe, so it must never sit directly inside
@@ -5176,7 +5250,6 @@ where
         spawn_fleet_status_dial(connection_file_path, 64);
     // Serves the gh shim's bot-write relay on management routes; it dials
     // prefrontal and plexus over its own connection, off the frame loop.
-    let gh_relay = crate::gh_shim_relay::GhRelay::new(connection_file_path.to_path_buf());
     let (_worker_read_service, mut worker_read_scopes) =
         crate::gh_shim_worker_broker::install(Arc::clone(&gh_relay));
     // Stamped workers' permission asks go to Cingulate over this daemon.
@@ -5563,7 +5636,7 @@ where
             }
             Some(query) = worker_read_scopes.recv() => {
                 dispatch_path_metrics.mark_frame_loop_step("gh_relay_route_scopes", "", 0);
-                let scopes = gh_relay_route_scopes(&routes);
+                let scopes = gh_relay_route_scopes(&routes,&speech);
                 let _ = query.reply.send(scopes.for_session(&query.session).cloned());
             }
             _ = shutdown.notified() => {
@@ -5930,7 +6003,7 @@ where
                                 &gh_relay,
                                 &dispatch_path_metrics,
                                 true,
-                                gh_relay_route_scopes(&routes),
+                                gh_relay_route_scopes(&routes,&speech),
                             );
                             Ok(())
                         } else if management_routes.contains_key(&route) {
@@ -8951,10 +9024,23 @@ fn gh_relay_operation(frame: &Frame) -> Option<String> {
 /// command; the relay finds that route by the session its ticket names.
 fn gh_relay_route_scopes(
     routes: &HashMap<RouteChannel, RouteIdentity>,
+    speech: &Arc<crate::gh_shim_speech::service::Service>,
 ) -> crate::gh_shim_relay::RouteScopes {
     let mut scopes = crate::gh_shim_relay::RouteScopes::default();
-    for identity in routes.values() {
+    scopes.speech = Some(Arc::clone(speech));
+    for (channel, identity) in routes {
         scopes.push(&identity.session, identity.scope.clone());
+        scopes.push_origin(
+            crate::gh_shim_speech::model::RouteOrigin {
+                run_nonce: crate::gh_shim_speech::service::run_nonce()
+                    .unwrap_or_default()
+                    .into(),
+                connection_generation: speech.generation(),
+                channel: u32::from(channel.channel),
+                epoch: u64::from(channel.epoch),
+            },
+            identity.scope.clone(),
+        );
     }
     scopes
 }
@@ -9820,6 +9906,7 @@ pub(super) static PLAIN_RUN_IO_BUDGET_FOR_TEST: std::sync::LazyLock<
 /// held for a consent answer can run again with the approved capabilities.
 #[derive(Clone)]
 struct PlainToolRun {
+    speech_seed: Option<crate::gh_shim_speech::service::LaunchSeed>,
     bare_name: String,
     arguments: Value,
     format_context: crate::subc_format::FormatContext,
@@ -9852,6 +9939,7 @@ impl PlainToolRun {
         let runtime = tokio::runtime::Handle::current();
         Box::new(move |ctx| {
             let PlainToolRun {
+                speech_seed,
                 bare_name,
                 mut arguments,
                 format_context,
@@ -9920,30 +10008,33 @@ impl PlainToolRun {
                             access_grants::alfonso_worker(&identity_for_run),
                         )
                     });
-                    crate::sandbox_spawn::ToolLaunchPolicy::with_current(tool_policy, || {
-                        let mut trace = phase_trace.borrow_mut();
-                        let dispatch = |request: RawRequest, ctx: &AppContext| {
-                            if observation_only && bare_name == "bash_status" {
-                                crate::commands::bash_status::handle_with_observation_only(
-                                    &request,
-                                    ctx,
-                                    observation_only,
-                                )
-                            } else {
-                                dispatch(request, ctx)
-                            }
-                        };
-                        run_tool_call(
-                            &bare_name,
-                            arguments,
-                            &format_context,
-                            &tool_call_context,
-                            ctx,
-                            &dispatch,
-                            Some(&finalizer),
-                            trace.as_mut(),
-                        )
-                    })
+                    crate::gh_shim_speech::service::with_launch(
+                        speech_seed.clone(),
+                        &ctx.storage_dir(),
+                        || {
+                            crate::sandbox_spawn::ToolLaunchPolicy::with_current(
+                                tool_policy,
+                                || {
+                                    let mut trace = phase_trace.borrow_mut();
+                                    let dispatch = |request: RawRequest, ctx: &AppContext| {
+                                        if observation_only && bare_name == "bash_status" {
+                                            crate::commands::bash_status::handle_with_observation_only(&request,ctx,observation_only)
+                                        } else { dispatch(request,ctx) }
+                                    };
+                                    run_tool_call(
+                                        &bare_name,
+                                        arguments,
+                                        &format_context,
+                                        &tool_call_context,
+                                        ctx,
+                                        &dispatch,
+                                        Some(&finalizer),
+                                        trace.as_mut(),
+                                    )
+                                },
+                            )
+                        },
+                    )
                 };
                 let finish = |outcome: Result<ToolCallOutcome, Response>| {
                     let outcome = outcome.unwrap_or_else(|response| {
@@ -10921,6 +11012,7 @@ async fn handle_tool_call(
                     });
             route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
             let cancel = bash::BashWaitCancel {
+                speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
                 run_scope: identity.run_scope.get().cloned(),
                 scope: identity.scope.clone(),
                 late_results: identity.role == tool_provider::RouteRole::ToolProviderV1
@@ -10982,6 +11074,7 @@ async fn handle_tool_call(
                 });
         route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
         let cancel = bash::BashWaitCancel {
+            speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
             run_scope: identity.run_scope.get().cloned(),
             scope: identity.scope.clone(),
             late_results: identity.role == tool_provider::RouteRole::ToolProviderV1
@@ -11098,6 +11191,7 @@ async fn handle_tool_call(
                 | crate::access_policy::AskRoute::Elicitation { .. }
         )
         .then(|| PlainToolRun {
+            speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
             bare_name: bare_name.clone(),
             arguments: arguments.clone(),
             format_context: format_context.clone(),
@@ -11493,6 +11587,7 @@ async fn handle_tool_call(
     let (tool_call_tx, tool_call_rx) = oneshot::channel::<ToolCallCompletion>();
     phase_trace.mark_executor_submitted();
     let plain_run = PlainToolRun {
+        speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
         bare_name,
         arguments,
         format_context,
@@ -16449,6 +16544,7 @@ mod tests {
                     arguments: json!({"command": "printf must-not-run"}),
                     format_context: crate::subc_format::FormatContext::default(),
                     cancel: bash::BashWaitCancel {
+                        speech_seed: None,
                         run_scope: None,
                         scope: None,
                         late_results: false,
