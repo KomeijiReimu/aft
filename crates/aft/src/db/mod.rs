@@ -21,6 +21,7 @@ pub mod call_ledger;
 pub mod compression_events;
 #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
 pub(crate) mod contention_probe;
+pub(crate) mod gh_speech;
 pub mod github_read_cache;
 pub mod remote_exec;
 pub mod removal;
@@ -34,7 +35,7 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod wal_credit_probe;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 21;
+pub const CURRENT_SCHEMA_VERSION: u32 = 22;
 
 const MIGRATION_VERSIONS: &[u32] = &[
     1,
@@ -58,6 +59,7 @@ const MIGRATION_VERSIONS: &[u32] = &[
     19,
     rich_ui::SCHEMA_VERSION,
     21,
+    22,
 ];
 
 // Performance-only indexes do not change the table format or reader floor.
@@ -1019,6 +1021,7 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
         19 => call_ledger::migrate_result_source(conn),
         rich_ui::SCHEMA_VERSION => conn.execute_batch(rich_ui::MIGRATION),
         21 => apply_migration_v21(conn),
+        22 => conn.execute_batch(gh_speech::MIGRATION),
         _ => Ok(()),
     }
 }
@@ -1055,6 +1058,36 @@ fn apply_migration_v21(conn: &Connection) -> rusqlite::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_twenty_one_upgrade_adds_speech_authority_without_a_gap() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)")
+            .unwrap();
+        for version in 1..=21 {
+            apply_migration(&mut conn, version).unwrap();
+        }
+        assert_eq!(current_schema_version(&conn).unwrap(), 21);
+        assert_eq!(run_migrations(&mut conn).unwrap(), 22);
+        for table in [
+            "gh_speech_authorities",
+            "gh_speech_task_revocations",
+            "gh_speech_scope_ends",
+            "gh_speech_policy_versions",
+            "gh_speech_policy_watermarks",
+            "gh_speech_requests",
+        ] {
+            let present: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "missing {table}");
+        }
+        assert_eq!(MIGRATION_VERSIONS, (1..=22).collect::<Vec<_>>());
+    }
     use rusqlite::params;
     use tempfile::tempdir;
 

@@ -3,6 +3,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+pub(crate) mod model;
+pub(crate) mod scope;
+
 pub(crate) const REFUSAL_STAGE: &str = "task_authority";
 
 pub(crate) const IDENTITY_TEXT: &str = "this command's bot identity no longer matches the repository's bot ({reason}); start the command again from a live session.";
