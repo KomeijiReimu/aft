@@ -1197,6 +1197,31 @@
           }
         },
         "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"background task not found: tool-result-no-such-task. To run a command, use `bash`; `bash_write` only types into a task that `bash` started.\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"task_not_found\",\"message\":\"background task not found: tool-result-no-such-task. To run a command, use `bash`; `bash_write` only types into a task that `bash` started.\",\"text\":\"background task not found: tool-result-no-such-task. To run a command, use `bash`; `bash_write` only types into a task that `bash` started.\"}}"
+      },
+      {
+        "tool": "powershell",
+        "arguments": {
+          "command": "exit 7",
+          "wait": true,
+          "pty": true
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "bash: wait:true cannot be used with pty:true because PTY sessions run in background"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "invalid_request",
+            "message": "bash: wait:true cannot be used with pty:true because PTY sessions run in background",
+            "text": "bash: wait:true cannot be used with pty:true because PTY sessions run in background"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"bash: wait:true cannot be used with pty:true because PTY sessions run in background\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"invalid_request\",\"message\":\"bash: wait:true cannot be used with pty:true because PTY sessions run in background\",\"text\":\"bash: wait:true cannot be used with pty:true because PTY sessions run in background\"}}"
       }
     ],
     "worker": [
@@ -2069,6 +2094,31 @@
           }
         },
         "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"invalid_regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"invalid_request\",\"message\":\"invalid_regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\",\"text\":\"invalid_regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\"}}"
+      },
+      {
+        "tool": "powershell",
+        "arguments": {
+          "command": "exit 7",
+          "wait": true,
+          "pty": true
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "bash: wait:true cannot be used with pty:true because PTY sessions run in background"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "invalid_request",
+            "message": "bash: wait:true cannot be used with pty:true because PTY sessions run in background",
+            "text": "bash: wait:true cannot be used with pty:true because PTY sessions run in background"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"bash: wait:true cannot be used with pty:true because PTY sessions run in background\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"invalid_request\",\"message\":\"bash: wait:true cannot be used with pty:true because PTY sessions run in background\",\"text\":\"bash: wait:true cannot be used with pty:true because PTY sessions run in background\"}}"
       }
     ],
     "reader": [
@@ -2265,5 +2315,17 @@
         "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"callers: callgraph_off — callers: the callgraph index is off (indexes.callgraph: false); enable it with aft setup to use callgraph queries\\ndata: {\\n  \\\"index\\\": {\\n    \\\"callgraph\\\": {\\n      \\\"status\\\": \\\"off\\\",\\n      \\\"reason\\\": null\\n    }\\n  },\\n  \\\"results\\\": null\\n}\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"callgraph_off\",\"message\":\"callers: the callgraph index is off (indexes.callgraph: false); enable it with aft setup to use callgraph queries\",\"index\":{\"callgraph\":{\"status\":\"off\",\"reason\":null}},\"results\":null,\"text\":\"callers: callgraph_off — callers: the callgraph index is off (indexes.callgraph: false); enable it with aft setup to use callgraph queries\\ndata: {\\n  \\\"index\\\": {\\n    \\\"callgraph\\\": {\\n      \\\"status\\\": \\\"off\\\",\\n      \\\"reason\\\": null\\n    }\\n  },\\n  \\\"results\\\": null\\n}\"}}"
       }
     ]
+  },
+  "optional_tool_captures": {
+    "powershell": {
+      "source_commit": "a209fc15f4ac5866ad3afe5ea111d7ca44ae74e9",
+      "binary_sha256": "ba027ea8b7c1a74fc62a82733860185bf594b8c5b0ab23f686dfae2f3f82f5d5",
+      "catalog_references": [
+        "p1_runner_pwsh",
+        "worker_preset_pwsh"
+      ],
+      "availability": "executable-presence pwsh fixture on PATH; invocation marker remained absent",
+      "capture": "real pre-flip tool.call powershell; production wait:true/pty:true validation refusal"
+    }
   }
 }
