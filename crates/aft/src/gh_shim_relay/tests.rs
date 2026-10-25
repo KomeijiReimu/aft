@@ -563,8 +563,46 @@ fn authority_never_widens_across_reconnect() {
     assert_eq!(bot_authority(&ticket, &routes), Some(original));
 }
 
+fn background_ticket(
+    root: &std::path::Path,
+    session: &str,
+    stamp: &ScopeStamp,
+) -> crate::gh_shim_ticket::PendingTicket {
+    let launch = crate::gh_shim_speech::model::LaunchAuthority::classic(
+        stamp.clone(),
+        Some(launch_origin()),
+    )
+    .unwrap();
+    let seed = crate::gh_shim_speech::service::LaunchSeed {
+        launch: Ok(launch),
+        lifecycle: Some(stamp.clone()),
+        session: session.into(),
+        harness: "fixture".into(),
+        project_root: "/project".into(),
+    };
+    let ticket = crate::gh_shim_speech::service::with_launch(Some(seed), root, || {
+        crate::bash_background::registry::with_scope_spawn(Some(stamp.clone()), || {
+            crate::gh_shim_ticket::PendingTicket::issue(session, "/project")
+        })
+    });
+    crate::gh_shim_ticket::speech_for_ticket(ticket.value().unwrap())
+        .unwrap()
+        .background
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    ticket
+}
+
+fn launch_origin() -> crate::gh_shim_speech::model::RouteOrigin {
+    crate::gh_shim_speech::model::RouteOrigin {
+        run_nonce: crate::gh_shim_speech::service::run_nonce().unwrap().into(),
+        connection_generation: "control-fixture".into(),
+        channel: 1,
+        epoch: 1,
+    }
+}
+
 #[tokio::test]
-async fn posting_admission_is_fail_closed_until_plex_is_placed() {
+async fn production_foreground_forwards_while_reconnected_background_is_guarded() {
     let root = tempfile::tempdir().unwrap();
     let relay_state = GhRelay::new(root.path().join("unused-connection.json"));
     let service = crate::gh_shim_speech::service::start(
@@ -577,14 +615,56 @@ async fn posting_admission_is_fail_closed_until_plex_is_placed() {
         true,
     );
     let stamp = delegating_stamp();
-    let live = crate::bash_background::registry::with_scope_spawn(Some(stamp.clone()), || {
-        crate::gh_shim_ticket::PendingTicket::issue("unconfirmed-post", "/project")
-    });
-    let mut params = bot_params(live.value().unwrap(), "unconfirmed-write");
+    let foreground =
+        crate::gh_shim_ticket::ScopedTicket::issue("unconfirmed-post", "call", "/project");
+    let mut params = bot_params(foreground.value().unwrap(), "foreground-write");
     params["request"]["metadata"]["agent_id"] = json!(stamp.attributes.agent_id);
-    let mut routes = scopes_for("unconfirmed-post", Some(stamp));
+    let mut routes = scopes_for("unconfirmed-post", Some(stamp.clone()));
     routes.speech = Some(service);
     let transport = FakeTransport::scoped();
+    assert!(crate::gh_shim_speech::partner::require_plex_guards(false).is_err());
+    let answer = relay(
+        &transport,
+        RelayCall {
+            operation: BOT_REQUEST_OPERATION,
+            params: &params,
+            first_party: true,
+            route_scopes: &routes,
+        },
+        &|_| {},
+    )
+    .await;
+    assert!(
+        answer.ok,
+        "foreground must not depend on undeployed background guards: {:?}",
+        answer.data
+    );
+    assert_eq!(transport.calls().len(), 1);
+
+    let background = background_ticket(root.path(), "unconfirmed-post", &stamp);
+    params["ticket"] = json!(background.value().unwrap());
+    routes.push_origin(launch_origin(), Some(stamp.clone()));
+    let bound = relay(
+        &transport,
+        RelayCall {
+            operation: BOT_REQUEST_OPERATION,
+            params: &params,
+            first_party: true,
+            route_scopes: &routes,
+        },
+        &|_| {},
+    )
+    .await;
+    assert!(
+        bound.ok,
+        "an original launch route that is still bound retains today's forwarding"
+    );
+    assert_eq!(transport.calls().len(), 2);
+    routes.origins.clear();
+    let mut reconnected = stamp;
+    reconnected.scope_epoch += 1;
+    routes.routes.clear();
+    routes.push("unconfirmed-post", Some(reconnected));
     let answer = relay(
         &transport,
         RelayCall {
@@ -598,15 +678,17 @@ async fn posting_admission_is_fail_closed_until_plex_is_placed() {
     .await;
     assert!(!answer.ok);
     assert_eq!(answer.data["reason"], "guard_unsupported");
-    assert!(transport.calls().is_empty());
+    assert_eq!(answer.data["refusal_code"], "task_gh_authority_unavailable");
+    assert_eq!(answer.data["message"], "this command's bot-write permission cannot be verified (guard_unsupported); start the command again from a live session, and tell the operator if it repeats.");
+    assert_eq!(transport.calls().len(), 2);
 }
 
 #[tokio::test]
 async fn posting_admission_never_serves_speech_without_a_subc_service() {
+    let root = tempfile::tempdir().unwrap();
+    crate::gh_shim_speech::service::record_service(root.path());
     let stamp = delegating_stamp();
-    let live = crate::bash_background::registry::with_scope_spawn(Some(stamp.clone()), || {
-        crate::gh_shim_ticket::PendingTicket::issue("standalone-post", "/project")
-    });
+    let live = background_ticket(root.path(), "standalone-post", &stamp);
     let mut params = bot_params(live.value().unwrap(), "no-serving-mode");
     params["request"]["metadata"]["agent_id"] = json!(stamp.attributes.agent_id);
     let routes = scopes_for("standalone-post", Some(stamp));
@@ -661,9 +743,7 @@ async fn posting_admission_recorded_end_wins_over_live_rebind_and_partner_seams(
         _ => panic!("expected end"),
     };
     service.record_end(&stamp, proof).unwrap();
-    let live = crate::bash_background::registry::with_scope_spawn(Some(stamp.clone()), || {
-        crate::gh_shim_ticket::PendingTicket::issue("ended-rebind", "/project")
-    });
+    let live = background_ticket(root.path(), "ended-rebind", &stamp);
     let mut params = bot_params(live.value().unwrap(), "end-wins");
     params["request"]["metadata"]["agent_id"] = json!(stamp.attributes.agent_id);
     let mut routes = scopes_for("ended-rebind", Some(stamp));

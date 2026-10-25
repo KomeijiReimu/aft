@@ -97,6 +97,10 @@ pub(super) struct EndedScope {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "the binary's consent fixtures use this helper; library fixtures do not"
+)]
 pub(super) fn start(
     control: Arc<readiness::DaemonControl>,
     executor: Arc<Executor>,

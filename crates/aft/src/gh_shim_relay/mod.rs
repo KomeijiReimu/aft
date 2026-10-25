@@ -432,7 +432,13 @@ async fn relay_inner<T: RelayTransport>(
                 bindings_read(transport, &redeemed).await
             }
             BOT_REQUEST_OPERATION => {
-                let stamp = bot_authority(&redeemed, call.route_scopes);
+                let captured_background =
+                    needs_captured_background(&redeemed, ticket, call.route_scopes);
+                let stamp = if captured_background {
+                    bot_authority(&redeemed, call.route_scopes)
+                } else {
+                    call.route_scopes.for_session(&redeemed.session_id).cloned()
+                };
                 #[cfg(test)]
                 let stamp = wire_fixture.clone().unwrap_or(stamp);
                 let (reply, taken) = bot_request(
@@ -441,8 +447,7 @@ async fn relay_inner<T: RelayTransport>(
                     stamp.as_ref(),
                     params,
                     call.route_scopes,
-                    #[cfg(test)]
-                    wire_fixture.is_some(),
+                    captured_background,
                 )
                 .await;
                 path = taken;
@@ -464,6 +469,28 @@ async fn relay_inner<T: RelayTransport>(
         reply.outcome_label().escape_debug(),
     ));
     reply
+}
+
+fn needs_captured_background(
+    redeemed: &crate::gh_shim_ticket::Redeemed,
+    ticket: &str,
+    routes: &RouteScopes,
+) -> bool {
+    let Some(launch) = redeemed.launch.as_ref() else {
+        return false;
+    };
+    let background = crate::gh_shim_ticket::speech_for_ticket(ticket)
+        .map(|speech| speech.background.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or_else(|| crate::gh_shim_ticket::redeem(ticket).is_none());
+    background
+        && launch.required_scopes().into_iter().any(|(role, scope)| {
+            let origin = if role == crate::gh_shim_speech::ScopeRole::Head {
+                launch.head_origin.as_ref()
+            } else {
+                launch.origin.as_ref()
+            };
+            !routes.origin_live(origin, scope)
+        })
 }
 
 fn bot_authority(
@@ -637,12 +664,13 @@ async fn bot_request<T: RelayTransport>(
     stamp: Option<&ScopeStamp>,
     params: &Value,
     routes: &RouteScopes,
-    #[cfg(test)] wire_fixture: bool,
+    captured_background: bool,
 ) -> (RelayReply, &'static str) {
-    if redeemed
-        .launch
-        .as_ref()
-        .is_some_and(|launch| launch.authority.kind == subc_protocol::scope::ScopeKind::Worker)
+    if stamp.is_some_and(|stamp| stamp.kind == subc_protocol::scope::ScopeKind::Worker)
+        || redeemed
+            .launch
+            .as_ref()
+            .is_some_and(|launch| launch.authority.kind == subc_protocol::scope::ScopeKind::Worker)
         || redeemed
             .lifecycle_scope
             .as_ref()
@@ -735,8 +763,10 @@ async fn bot_request<T: RelayTransport>(
         );
     }
     let _ = session;
-    #[cfg(test)]
-    if wire_fixture {
+    // Foreground and still-bound tasks retain today's admission and forwarding.
+    // Applying the partner guards to foreground speech is a separate rollout
+    // after those guards are deployed, not a prerequisite for existing writes.
+    if !captured_background {
         let selector = scope_selector(_stamp);
         let body = github_call(json!({"op":"bot_request","request_nonce":nonce,"request":request}));
         let reply = match transport
