@@ -234,6 +234,26 @@ fn gh_shim_manifest_unavailable_home_default_survives_empty_override() {
 }
 
 #[test]
+fn gh_shim_manifest_unavailable_uninspectable_provisioning_records() {
+    let mut fixture = Fixture::new();
+    let default = fixture.state.clone();
+    fs::remove_dir(&default).unwrap();
+    fs::write(&default, "not a directory").unwrap();
+    // A regular-file parent makes metadata lookup fail even as root, unlike
+    // permission bits that root can bypass.
+    for record in [
+        "last-valid-manifest.json",
+        "manifest-version-high-water.json",
+    ] {
+        let error = fs::symlink_metadata(default.join(record)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+    }
+    fixture.state = fixture._root.path().join("empty-override");
+    fs::create_dir_all(&fixture.state).unwrap();
+    fixture.assert_unavailable();
+}
+
+#[test]
 fn gh_shim_manifest_unavailable_unprovisioned_passthrough_is_unchanged() {
     let fixture = Fixture::new();
     for invalid in [false, true] {
