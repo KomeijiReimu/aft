@@ -5,7 +5,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc, Arc, Mutex, MutexGuard, OnceLock, Weak,
+    mpsc, Arc, Mutex, OnceLock, Weak,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -61,8 +61,17 @@ const RECLAIM_TOKEN_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60)
 /// entries let those replacements find the open handles; acquisition, ownership
 /// checks and reclaim paths on other threads keep their own short-lived opens.
 static NEXT_LEASE_SLOT: AtomicU64 = AtomicU64::new(0);
-static LEASE_FILES: OnceLock<Mutex<HashMap<usize, Weak<Mutex<Option<LeaseFile>>>>>> =
-    OnceLock::new();
+static LEASE_FILES: OnceLock<Mutex<HashMap<usize, LeaseSlot>>> = OnceLock::new();
+static LEASE_SLOT_BY_PATH: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+/// One heartbeat handle, filed under the slot that owns it and, in
+/// `LEASE_SLOT_BY_PATH`, under the lease path it was opened for. The path entry
+/// is what lets a replacement release the handle for *its* lease without
+/// touching any other lease's handle.
+#[derive(Clone)]
+struct LeaseSlot {
+    handle: Weak<Mutex<Option<LeaseFile>>>,
+}
 
 // Lock files in these storage domains have the fixed layout
 // `<storage>/<domain>/<key>/<lock>`. Add a domain here when a new persistent
@@ -429,6 +438,9 @@ impl Drop for LockGuard {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *handle = None;
         drop(handle);
+        // Stop publishing the slot so a later replacement for this path never
+        // waits on this guard's closed handle.
+        unregister_lease_slot(self.pump.slot, &self.path);
 
         match remove_lock_if_owned(&self.path, &self.metadata) {
             Ok(true) => slog_debug!("released filesystem lock at {}", self.path.display()),
@@ -453,27 +465,41 @@ impl Drop for LockGuard {
 /// Because the guards are taken before the lock is released, a beat cannot open
 /// a lease into a slot this call is holding; a beat waits for the replacement
 /// and then opens the live file.
-fn with_lease_handles_closed<T>(replace: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
-    let registry = lease_files()
+fn with_lease_handles_closed<T>(
+    path: &Path,
+    replace: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    // Only this path's handle. Releasing every published handle would empty
+    // another lease's slot, and its next beat would reopen the file, giving
+    // back the per-beat descriptor churn the kept handle exists to avoid.
+    let slot = lease_slots_by_path()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let handles = registry
-        .values()
-        .filter_map(Weak::upgrade)
-        .collect::<Vec<_>>();
-    drop(registry);
-    let guards = handles
-        .iter()
-        .map(|handle| {
-            let mut slot = handle
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *slot = None;
-            slot
-        })
-        .collect::<Vec<MutexGuard<'_, Option<LeaseFile>>>>();
-    drop(guards);
-    replace()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(path)
+        .copied();
+    let handle = slot.and_then(|slot| {
+        lease_files()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&slot)
+            .and_then(|entry| entry.handle.upgrade())
+    });
+    // Take the handle without waiting. A held lock means the heartbeat is
+    // mid-beat on this lease (or the caller is the beat itself), and a beat that
+    // already holds the descriptor keeps its own safety: it re-checks the path's
+    // identity and the owner before every write. Waiting here would deadlock
+    // against the very thread that has to finish the beat.
+    let mut released = Vec::new();
+    for handle in handle.iter() {
+        let Ok(mut slot) = handle.try_lock() else {
+            continue;
+        };
+        *slot = None;
+        released.push(slot);
+    }
+    let result = replace();
+    drop(released);
+    result
 }
 
 #[derive(Debug)]
@@ -1031,8 +1057,45 @@ struct HeartbeatPump {
     stopped: Arc<AtomicBool>,
 }
 
-fn lease_files() -> &'static Mutex<HashMap<usize, Weak<Mutex<Option<LeaseFile>>>>> {
+fn lease_files() -> &'static Mutex<HashMap<usize, LeaseSlot>> {
     LEASE_FILES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lease_slots_by_path() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    LEASE_SLOT_BY_PATH.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record a handle under its slot and its path. A path holds one heartbeat's
+/// handle, so a later registration for the same path supersedes the earlier
+/// entry; the old handle belongs to a guard that has released or lost the lease.
+fn register_lease_slot(slot: usize, path: &Path, handle: &Arc<Mutex<Option<LeaseFile>>>) {
+    lease_files()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            slot,
+            LeaseSlot {
+                handle: Arc::downgrade(handle),
+            },
+        );
+    lease_slots_by_path()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path.to_path_buf(), slot);
+}
+
+/// Forget a slot and, if it still owns the path entry, that entry too.
+fn unregister_lease_slot(slot: usize, path: &Path) {
+    lease_files()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&slot);
+    let mut by_path = lease_slots_by_path()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if by_path.get(path).copied() == Some(slot) {
+        by_path.remove(path);
+    }
 }
 
 impl Clone for HeartbeatPump {
@@ -1065,13 +1128,15 @@ impl HeartbeatPump {
             open_lease_for_heartbeat(path).map_err(heartbeat_io_error)?,
         )));
         let slot = NEXT_LEASE_SLOT.fetch_add(1, Ordering::Relaxed) as usize;
-        let mut registry = lease_files()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if registry.len() > 4096 {
-            registry.retain(|_, known| known.strong_count() > 0);
+        {
+            let mut registry = lease_files()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if registry.len() > 4096 {
+                registry.retain(|_, known| known.handle.strong_count() > 0);
+            }
         }
-        registry.insert(slot, Arc::downgrade(&file));
+        register_lease_slot(slot, path, &file);
         Ok((
             Self {
                 path: path.to_path_buf(),
@@ -1115,7 +1180,9 @@ impl HeartbeatPump {
                 let registry = lease_files()
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                registry.get(&self.slot).and_then(Weak::upgrade)
+                registry
+                    .get(&self.slot)
+                    .and_then(|entry| entry.handle.upgrade())
             };
             let Some(handle) = handle else {
                 return Err(HeartbeatError::NotPumped);
@@ -1188,10 +1255,7 @@ impl HeartbeatPump {
     /// holds. Another thread's replacement looks the lease up here to know which
     /// descriptor it has to release before it renames the lease.
     fn index(&self, handle: &Arc<Mutex<Option<LeaseFile>>>) {
-        lease_files()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(self.slot, Arc::downgrade(handle));
+        register_lease_slot(self.slot, &self.path, handle);
     }
 
     /// Release the lease descriptor but keep the slot registered, so the next
@@ -1557,7 +1621,7 @@ fn replace_lock_bytes_unsynced(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let mut file = open_new_lock_file(&tmp_path)?;
         write_lock_bytes(&mut file, bytes)?;
         drop(file);
-        with_lease_handles_closed(|| rename_over(&tmp_path, path))
+        with_lease_handles_closed(path, || rename_over(&tmp_path, path))
     })();
 
     if write_result.is_err() {
@@ -1651,7 +1715,7 @@ fn remove_lock_if_owned(path: &Path, owner: &LockMetadata) -> io::Result<bool> {
 }
 
 fn remove_lock_file(path: &Path) -> io::Result<()> {
-    match with_lease_handles_closed(|| fs::remove_file(path)) {
+    match with_lease_handles_closed(path, || fs::remove_file(path)) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
@@ -3998,19 +4062,18 @@ mod tests {
         // Same digit count as the live heartbeat, so the serialized lease keeps
         // its byte length; the replacement itself is still an atomic rename.
         restored.heartbeat_at_ms = now_ms().saturating_sub(1_000);
-        let fresh = with_lease_handles_closed(|| {
-            replace_lock_bytes_unsynced(&path, &lock_metadata_bytes(&restored).expect("serialize"))
-                .map(|()| open_lease_for_heartbeat(&path))
-        })
-        .expect("replace the lease")
-        .expect("open the replacement lease");
+        let fresh = {
+            let bytes = lock_metadata_bytes(&restored).expect("serialize");
+            with_lease_handles_closed(&path, || {
+                replace_lock_bytes_unsynced(&path, &bytes).map(|()| open_lease_for_heartbeat(&path))
+            })
+            .expect("replace the lease")
+            .expect("open the replacement lease")
+        };
         // The owner keeps a reference, as `LockGuard` does, so the handle
         // survives until the guard is released.
         let replacement = Arc::new(Mutex::new(Some(fresh)));
-        lease_files()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(guard.pump.slot, Arc::downgrade(&replacement));
+        register_lease_slot(guard.pump.slot, &path, &replacement);
 
         let stale_at = restored.heartbeat_at_ms;
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -4119,6 +4182,50 @@ mod tests {
         );
     }
 
+    /// Replacing or removing another lease must not cost this lease its kept
+    /// descriptor. Every replacement releases the handle it publishes for its
+    /// own path; releasing every published handle instead would drop this one
+    /// and the next beat would reopen the file, restoring the per-beat
+    /// descriptor churn the kept handle exists to remove.
+    #[test]
+    fn unrelated_lease_churn_keeps_the_kept_descriptor() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let mut guards = (0..2)
+            .map(|index| {
+                acquire_with_config(
+                    &dir.path().join(format!("tenant-{index}.lease")),
+                    Some(Duration::from_secs(2)),
+                    test_config(),
+                )
+                .expect("acquire")
+            })
+            .collect::<Vec<_>>();
+        let neighbour = dir.path().join("neighbour.lease");
+
+        for _ in 0..3 {
+            // Another tenant is acquired, replaced and released while this
+            // lease keeps its own descriptor.
+            let churn = acquire_with_config(&neighbour, None, test_config()).expect("churn lease");
+            let mut restored = churn.metadata.clone();
+            restored.heartbeat_at_ms = now_ms().saturating_sub(1_000);
+            let bytes = lock_metadata_bytes(&restored).expect("serialize");
+            with_lease_handles_closed(&neighbour, || {
+                replace_lock_bytes_unsynced(&neighbour, &bytes)
+            })
+            .expect("replace the neighbour");
+            drop(churn);
+            let _ = io_ledger::take();
+        }
+
+        let _ = io_ledger::take();
+        for guard in &guards {
+            guard.heartbeat_once().expect("beat");
+        }
+        let cost = io_ledger::take();
+        assert_beat_opens_no_descriptor(&cost);
+        guards.clear();
+    }
+
     /// The identity check runs on every beat, so it must not open or close the
     /// lease a second time. Unix needs a stat for it; on Windows the path lookup
     /// takes one short-lived attribute handle, which this ledger only counts if
@@ -4209,13 +4316,11 @@ mod tests {
         // The atomic replacement, not a plain write: it releases the beat's
         // kept descriptor, while a plain write would leave that descriptor
         // still looking at the corrupted contents. The bytes keep the length.
-        with_lease_handles_closed(|| {
-            replace_lock_bytes_unsynced(
-                &path,
-                &lock_metadata_bytes(&restored).expect("serialize restored metadata"),
-            )
-        })
-        .expect("restore lock metadata");
+        {
+            let bytes = lock_metadata_bytes(&restored).expect("serialize restored metadata");
+            with_lease_handles_closed(&path, || replace_lock_bytes_unsynced(&path, &bytes))
+                .expect("restore lock metadata");
+        }
 
         // If the heartbeat thread is still alive (the fix), it will overwrite
         // heartbeat_at_ms with a current value. Poll for that recovery. The
