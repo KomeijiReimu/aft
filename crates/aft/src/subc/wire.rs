@@ -138,6 +138,11 @@ pub(super) struct WriterFrame {
     pub(super) tool_response_trace: Option<ToolResponseWriteTrace>,
     result_projection: Option<(ToolResponsePolicy, usize, Option<ToolCallResult>)>,
     prepared_projection: Option<Arc<Vec<u8>>>,
+    ack_receipt: Option<(
+        super::a0_egress::AckPublication,
+        tokio::sync::oneshot::Sender<Result<bool, SubcError>>,
+    )>,
+    ack_completion: Option<super::a0_egress::AckCompletion>,
 }
 
 impl From<Frame> for WriterFrame {
@@ -162,6 +167,8 @@ impl WriterFrame {
             tool_response_trace: None,
             result_projection: None,
             prepared_projection: None,
+            ack_receipt: None,
+            ack_completion: None,
         }
     }
 
@@ -173,7 +180,63 @@ impl WriterFrame {
             tool_response_trace: None,
             result_projection: None,
             prepared_projection: None,
+            ack_receipt: None,
+            ack_completion: None,
         }
+    }
+
+    pub(super) fn with_ack_receipt(
+        frame: Frame,
+        publication: super::a0_egress::AckPublication,
+    ) -> (
+        Self,
+        tokio::sync::oneshot::Receiver<Result<bool, SubcError>>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut outgoing = Self::plain(frame);
+        outgoing.ack_receipt = Some((publication, tx));
+        (outgoing, rx)
+    }
+
+    pub(super) fn begin_ack_write(&mut self) -> bool {
+        if self
+            .ack_receipt
+            .as_ref()
+            .is_some_and(|(publication, _)| !publication.begin_write())
+        {
+            if let Some(completion) = self.ack_completion.take() {
+                completion.publish(true);
+            }
+            if let Some((_, receipt)) = self.ack_receipt.take() {
+                let _ = receipt.send(Ok(false));
+            }
+            return false;
+        }
+        true
+    }
+
+    pub(super) fn finish_ack_write(&mut self, written: bool) {
+        if written {
+            if let Some(completion) = self.ack_completion.take() {
+                completion.publish(false);
+            }
+        } else {
+            self.ack_completion.take();
+        }
+        if let Some((publication, receipt)) = self.ack_receipt.take() {
+            if written {
+                publication.written();
+            }
+            let _ = receipt.send(if written {
+                Ok(true)
+            } else {
+                Err(SubcError::WriterClosed)
+            });
+        }
+    }
+
+    pub(super) fn set_ack_completion(&mut self, completion: super::a0_egress::AckCompletion) {
+        self.ack_completion = Some(completion);
     }
 
     fn traced_tool_response(frame: impl Into<Self>, trace: ToolResponseWriteTrace) -> Self {
@@ -483,7 +546,7 @@ fn enqueue_writer_item(
     permit.send(item);
 }
 
-fn try_enqueue_writer_item(
+pub(super) fn try_enqueue_writer_item(
     tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     mut item: WriterFrame,
@@ -524,7 +587,7 @@ pub(super) fn try_enqueue_shared_push_frame(
     try_enqueue_writer_item(tx, metrics, WriterFrame::shared_push(frame, body))
 }
 
-async fn send_reliable_writer_item(
+pub(super) async fn send_reliable_writer_item(
     tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     mut item: WriterFrame,

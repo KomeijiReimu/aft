@@ -81,6 +81,7 @@ fn bind_observed(
             let metrics = Arc::new(DispatchPathMetrics::new());
             let (writer_tx, mut writer_rx) = mpsc::channel(8);
             let (completion_tx, mut completion_rx) = mpsc::channel(8);
+            let a0 = A0Egress::new(writer_tx.clone(), completion_tx.clone());
             let (lossy_tx, _lossy_rx) = mpsc::channel(8);
             let (reliable_tx, _reliable_rx) = mpsc::unbounded_channel();
             let senders = PushSenders {
@@ -122,6 +123,8 @@ fn bind_observed(
                 .map(|_| observe_next_comparison());
             handle_control_request(
                 &writer_tx,
+                &writer_tx,
+                &a0,
                 &frame,
                 &app,
                 &executor,
@@ -159,6 +162,9 @@ fn bind_observed(
                 .unwrap()
                 .unwrap();
             let expected_root = ProjectRootId::from_path(root).unwrap();
+            let ControlCompletion::ConfigureReady(completion) = completion else {
+                panic!("configure completion expected");
+            };
             assert!(completion.configure_response.success);
             assert_eq!(completion.bind_root_id, expected_root);
             assert_eq!(completion.identity.root, expected_root);
@@ -185,6 +191,35 @@ fn bind_observed(
             handle_route_bind_completion(
                 &writer_tx,
                 completion,
+                false,
+                &a0,
+                &mut routes,
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &mut pending,
+                &mut installed,
+                &executor,
+                &Arc::new(Notify::new()),
+                &metrics,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(routes.is_empty(), "route must wait for ACK write");
+            let mut ack = writer_rx.recv().await.expect("successful bind reply");
+            assert!(ack.begin_ack_write());
+            ack.finish_ack_write(true);
+            let ControlCompletion::AckWritten(completion) = completion_rx.recv().await.unwrap()
+            else {
+                panic!("written ACK expected");
+            };
+            handle_route_bind_completion(
+                &writer_tx,
+                completion,
+                true,
+                &a0,
                 &mut routes,
                 &mut HashMap::new(),
                 &mut HashMap::new(),
@@ -200,7 +235,6 @@ fn bind_observed(
             .await
             .unwrap();
             assert_eq!(routes[&route_key(7, 1)].root, expected_root);
-            let ack = writer_rx.try_recv().expect("successful bind reply");
             assert_eq!(ack.header.ty, FrameType::Response);
             assert_eq!(
                 (ack.header.channel, ack.header.epoch, ack.header.corr),

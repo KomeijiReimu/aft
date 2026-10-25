@@ -197,7 +197,9 @@ impl fmt::Display for RouteChannel {
 type PushEnvelope = (ProjectRootId, PushFrame);
 type LossyPushEnvelope = (u64, ProjectRootId, PushFrame);
 type RetryBuffer = HashMap<RouteChannel, VecDeque<(push::ReplayKey, PushFrame)>>;
+mod a0_egress;
 mod access_grants;
+use a0_egress::{A0Egress, ControlCompletion};
 mod bash;
 mod bind_log;
 mod call_policy;
@@ -1433,6 +1435,7 @@ struct RootMeta {
 
 #[derive(Debug)]
 struct PendingBind {
+    ack_publication: Option<a0_egress::AckPublication>,
     bind_root_id: ProjectRootId,
     inserted_new_actor: bool,
     cancelled: bool,
@@ -4732,7 +4735,9 @@ async fn connect_and_authenticate_once(
 #[allow(clippy::too_many_arguments)]
 async fn process_route_bind_completion(
     writer_tx: &WriterSender,
-    completion: RouteBindCompletion,
+    completion: ControlCompletion,
+    a0: &A0Egress,
+    management_routes: &mut HashMap<RouteChannel, Option<Principal>>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
@@ -4746,9 +4751,33 @@ async fn process_route_bind_completion(
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
     decrement_counted_channel(&metrics.control_completion_queued);
+    let (completion, ack_written) = match completion {
+        ControlCompletion::ConfigureReady(completion) => (completion, false),
+        ControlCompletion::AckWritten(completion) => (completion, true),
+        ControlCompletion::AckCancelled(completion) => match *completion {
+            ControlCompletion::AckWritten(completion) => (completion, false),
+            ControlCompletion::ManagementAckWritten { route, .. } => {
+                a0.retire(route);
+                return Ok(());
+            }
+            _ => return Err(SubcError::WriterClosed),
+        },
+        ControlCompletion::ManagementAckWritten {
+            route, principal, ..
+        } => {
+            a0.retire(route);
+            if installed_route_epochs.get(&route.channel) == Some(&route.epoch) {
+                management_routes.insert(route, principal);
+            }
+            return Ok(());
+        }
+        ControlCompletion::WriteFailed => return Err(SubcError::WriterClosed),
+    };
     handle_route_bind_completion(
         writer_tx,
         completion,
+        ack_written,
+        a0,
         routes,
         root_channels,
         session_identity,
@@ -4766,7 +4795,9 @@ async fn process_route_bind_completion(
 
 #[allow(clippy::too_many_arguments)]
 async fn drain_pending_route_bind_completions(
-    control_completion_rx: &mut mpsc::Receiver<RouteBindCompletion>,
+    control_completion_rx: &mut mpsc::Receiver<ControlCompletion>,
+    a0: &A0Egress,
+    management_routes: &mut HashMap<RouteChannel, Option<Principal>>,
     writer_tx: &WriterSender,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
@@ -4785,6 +4816,8 @@ async fn drain_pending_route_bind_completions(
         process_route_bind_completion(
             writer_tx,
             completion,
+            a0,
+            management_routes,
             routes,
             root_channels,
             session_identity,
@@ -4908,6 +4941,7 @@ where
         Arc::clone(&dispatch_path_metrics),
     );
     let (ledger_edge, mut ledger_ready_rx) = tool_provider::LedgerEdge::new();
+    let raw_writer_tx = writer_tx.clone();
     let (writer_tx, mut ledger_writer_task) = ledger_edge.proxy(
         writer_tx,
         Arc::clone(&executor),
@@ -4992,7 +5026,9 @@ where
     };
     let (bash_poll_touch_tx, mut bash_poll_touch_rx) = mpsc::channel::<ProjectRootId>(256);
     let (control_completion_tx, mut control_completion_rx) =
-        mpsc::channel::<RouteBindCompletion>(256);
+        mpsc::channel::<ControlCompletion>(256);
+    let a0 = A0Egress::new(raw_writer_tx, control_completion_tx.clone())
+        .with_probe(lifecycle_probe.clone());
     let (lossy_tx, mut lossy_rx) = mpsc::channel::<LossyPushEnvelope>(1024);
     let lossy_overflow = Arc::new(push::LossyOverflow::default());
     let lossy_seq = Arc::new(AtomicU64::new(0));
@@ -5130,6 +5166,8 @@ where
         );
         match drain_pending_route_bind_completions(
             &mut control_completion_rx,
+            &a0,
+            &mut management_routes,
             &writer_tx,
             &mut routes,
             &mut root_channels,
@@ -5174,7 +5212,7 @@ where
                 0,
             );
             if let Err(error) = expire_overdue_route_binds(
-                &writer_tx,
+                &a0.writer,
                 &executor,
                 &mut pending_binds,
                 &mut installed_route_epochs,
@@ -5337,10 +5375,12 @@ where
                 }
             }
             Some(completion) = control_completion_rx.recv() => {
-                dispatch_path_metrics.mark_frame_loop_step("process_route_bind_completion", "route_bind", completion.corr);
+                dispatch_path_metrics.mark_frame_loop_step("process_route_bind_completion", "route_bind", completion.corr());
                 if let Err(error) = process_route_bind_completion(
                     &writer_tx,
                     completion,
+                    &a0,
+                    &mut management_routes,
                     &mut routes,
                     &mut root_channels,
                     &mut session_identity,
@@ -5437,6 +5477,7 @@ where
                         break Ok(ModuleLoopExit::Graceful);
                     }
                     FrameType::Goodbye => {
+                        a0.cancel(route_key(frame.header.channel, frame.header.epoch));
                         let channel = route_key(frame.header.channel, frame.header.epoch);
                         if let Some(stamp) = routes.get(&channel).and_then(|identity| identity.scope.clone()) {
                             scope_describes.goodbye(stamp);
@@ -5516,7 +5557,9 @@ where
                     }
                     FrameType::Request if frame.header.channel == 0 => {
                         if let Err(error) = handle_control_request(
+                            &a0.writer,
                             &writer_tx,
+                            &a0,
                             &frame,
                             &shared_app,
                             &executor,
@@ -5704,7 +5747,7 @@ where
                             Ok(())
                         } else if management_routes.contains_key(&route) {
                             handle_management_request(
-                                &writer_tx,
+                                &a0.writer,
                                 &frame,
                                 &shared_app,
                                 &executor,
@@ -6370,6 +6413,7 @@ where
         }
     };
 
+    a0.stop();
     // The exit budget runs from the drain, so the teardown between the loop
     // ending and the index flush is timed and logged as its own exit phase.
     let teardown_started = Instant::now();
@@ -6486,6 +6530,8 @@ where
     // so flow reads can ask the daemon whether their parent scope is still
     // live; the writer tasks cannot drain while the handle is alive.
     drop(control);
+    a0.stop();
+    drop(a0);
     drop(writer_tx);
     drop(pong_tx);
     if tokio::time::timeout(Duration::from_secs(5), &mut ledger_writer_task)
@@ -6614,6 +6660,10 @@ where
                 continue;
             };
             prefer_pong = !control;
+            decrement_counted_channel(&metrics.writer_queued);
+            if !queued.begin_ack_write() {
+                continue;
+            }
             queued.project_tool_result().map_err(|error| {
                 subc_transport::FrameIoError::Io(io::Error::other(error.to_string()))
             })?;
@@ -6623,7 +6673,6 @@ where
                 .then(crate::run_tool_call::ThreadCpuSample::now)
                 .flatten();
             metrics.writer_active.store(true, Ordering::Relaxed);
-            decrement_counted_channel(&metrics.writer_queued);
             let write_timing = write_frame_contiguous(
                 &mut write,
                 queued.frame(),
@@ -6636,12 +6685,14 @@ where
             let write_timing = match write_timing {
                 Ok(write_timing) => write_timing,
                 Err(error) => {
+                    queued.finish_ack_write(false);
                     if let Some(trace) = queued.tool_response_trace.as_ref() {
                         trace.note_write_failure(&error.to_string());
                     }
                     return Err(error);
                 }
             };
+            queued.finish_ack_write(true);
             metrics.tool_replied(queued.frame());
 
             if let (Some(trace), Some(dequeued), Some(write_timing)) =
@@ -6992,7 +7043,7 @@ fn route_bind_error_code_for_configure_response(response: &Response) -> &'static
         // Actor lifecycle gaps are transient from the daemon/client viewpoint:
         // a fresh bind can create or join a healthy actor, so do not classify
         // them as permanent config divergence.
-        Some("actor_not_registered" | "actor_fatal") => "actor_not_ready",
+        Some("actor_not_registered" | "actor_fatal" | "actor_not_ready") => "actor_not_ready",
         // The retention binding record sits behind a storage-wide file lock
         // that background sweeps also take. A bind that times out waiting for
         // it is contention, not divergent configuration, so the client retries
@@ -7059,7 +7110,9 @@ fn queue_post_bind_configure_and_completion_maintenance(
 #[allow(clippy::too_many_arguments)]
 async fn handle_route_bind_completion(
     tx: &WriterSender,
-    completion: RouteBindCompletion,
+    mut completion: RouteBindCompletion,
+    ack_written: bool,
+    a0: &A0Egress,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
@@ -7073,6 +7126,47 @@ async fn handle_route_bind_completion(
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
     let route_id = completion.route;
+    if !ack_written
+        && completion.configure_response.success
+        && pending_binds
+            .get(&route_id)
+            .is_some_and(|pending| !pending.cancelled && !pending.deadline_reported)
+    {
+        if pending_binds[&route_id].ack_publication.is_some() {
+            return Ok(());
+        }
+        let restore_watcher = live_roots
+            .get(&completion.bind_root_id)
+            .is_some_and(|meta| meta.idle_artifacts_evicted || meta.unbound_quiesced);
+        if let Some(ctx) = executor.actor_context(&completion.bind_root_id) {
+            ctx.mark_subc_bound();
+            if restore_watcher {
+                crate::commands::configure::ensure_project_watcher(&ctx);
+            }
+        }
+        let ack = route_bind_ack_frame(completion.ver, completion.corr, completion.flags)?;
+        match a0.enqueue_ack(
+            route_id,
+            ack,
+            ControlCompletion::AckWritten(completion),
+            metrics,
+        ) {
+            Ok(publication) => {
+                pending_binds.get_mut(&route_id).unwrap().ack_publication = Some(publication);
+                return Ok(());
+            }
+            Err(ControlCompletion::AckWritten(mut rejected)) => {
+                rejected.configure_response = Response::error(
+                    "bind-ack",
+                    "actor_not_ready",
+                    "route bind ACK publication is busy; retry shortly",
+                );
+                completion = rejected;
+            }
+            Err(_) => return Err(SubcError::WriterClosed),
+        }
+    }
+    a0.retire(route_id);
     let Some(pending) = pending_binds.remove(&route_id) else {
         log::warn!(
             "subc attach: dropping RouteBind completion for non-pending route {}",
@@ -7175,7 +7269,7 @@ async fn handle_route_bind_completion(
         let fatal = response_is_fatal_panic(response);
         let error_code = route_bind_error_code_for_configure_response(response);
         send_route_bind_error_parts(
-            tx,
+            &a0.writer,
             completion.ver,
             completion.corr,
             completion.flags,
@@ -7209,9 +7303,6 @@ async fn handle_route_bind_completion(
         Some(&completion.bind_root_id),
         Some(metrics),
     );
-    let restore_watcher = live_roots
-        .get(&completion.bind_root_id)
-        .is_some_and(|meta| meta.idle_artifacts_evicted || meta.unbound_quiesced);
     live_roots
         .entry(completion.bind_root_id.clone())
         .and_modify(|meta| {
@@ -7225,31 +7316,13 @@ async fn handle_route_bind_completion(
         meta.maintenance_poisoned = false;
     }
     if let Some(ctx) = executor.actor_context(&completion.bind_root_id) {
-        ctx.mark_subc_bound();
-        if restore_watcher {
-            crate::commands::configure::ensure_project_watcher(&ctx);
-        }
+        debug_assert!(ack_written);
         if crate::commands::configure::ignore_rules_load_pending(&ctx) {
             submit_ignore_rule_load(executor, &completion.bind_root_id);
         }
     }
 
-    let ack =
-        serde_json::to_vec(&ModuleControlResponse::RouteBindAck {}).map_err(SubcError::Json)?;
-    let response = Frame::build_with_version(
-        completion.ver,
-        FrameType::Response,
-        control_flags(),
-        0,
-        0,
-        completion.corr,
-        ack,
-    )
-    .map_err(SubcError::FrameBuild)?;
-    send_reliable_writer_frame(tx, metrics, response, "RouteBindAck").await?;
-    if let Some(probe) = lifecycle_probe {
-        probe.route_bind_ack_queued(completion.corr);
-    }
+    debug_assert!(ack_written);
     start_post_ack_database_open(executor, &completion.bind_root_id);
     if let Some(identity) = routes
         .get(&route_id)
@@ -7321,7 +7394,13 @@ async fn expire_overdue_route_binds(
         .iter()
         .filter_map(|(route, pending)| {
             let age = now.saturating_duration_since(pending.started_at);
-            (!pending.deadline_reported && age >= ROUTE_BIND_DEADLINE).then(|| {
+            (!pending.deadline_reported
+                && age >= ROUTE_BIND_DEADLINE
+                && pending
+                    .ack_publication
+                    .as_ref()
+                    .is_none_or(|ack| ack.cancel_before_write()))
+            .then(|| {
                 (
                     *route,
                     pending.corr,
@@ -7602,6 +7681,8 @@ fn log_scope_workdir_comparison(
 #[allow(clippy::too_many_arguments)]
 async fn handle_control_request(
     tx: &WriterSender,
+    legacy_tx: &WriterSender,
+    a0: &A0Egress,
     frame: &Frame,
     shared_app: &Arc<App>,
     executor: &Arc<Executor>,
@@ -7622,7 +7703,7 @@ async fn handle_control_request(
     retry_buffer: &mut RetryBuffer,
     push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
     shutdown: &Arc<Notify>,
-    control_completion_tx: &mpsc::Sender<RouteBindCompletion>,
+    control_completion_tx: &mpsc::Sender<ControlCompletion>,
     metrics: &Arc<DispatchPathMetrics>,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
     health_rollup_cache: &HealthRollupCache,
@@ -7728,8 +7809,9 @@ async fn handle_control_request(
                         )
                         .await;
                     }
+                    a0.cancel(route_key(route_channel, installed_epoch));
                     teardown_installed_route(
-                        tx,
+                        legacy_tx,
                         metrics,
                         executor,
                         route_key(route_channel, installed_epoch),
@@ -7768,15 +7850,32 @@ async fn handle_control_request(
                 }
 
                 installed_route_epochs.insert(route_channel, epoch);
-                management_routes.insert(route_id, principal);
-                return send_route_bind_ack(
-                    tx,
-                    frame.header.ver,
-                    frame.header.corr,
-                    frame.header.flags,
-                    metrics,
-                )
-                .await;
+                let ack =
+                    route_bind_ack_frame(frame.header.ver, frame.header.corr, frame.header.flags)?;
+                if a0
+                    .enqueue_ack(
+                        route_id,
+                        ack,
+                        ControlCompletion::ManagementAckWritten {
+                            route: route_id,
+                            principal,
+                            corr: frame.header.corr,
+                        },
+                        metrics,
+                    )
+                    .is_err()
+                {
+                    remove_installed_route(installed_route_epochs, route_id);
+                    return send_route_bind_error(
+                        tx,
+                        frame,
+                        "actor_not_ready",
+                        "route bind ACK publication is busy; retry shortly",
+                        metrics,
+                    )
+                    .await;
+                }
+                return Ok(());
             }
             if matches!(&target, RouteTarget::InternalService { .. }) {
                 return send_route_bind_error(
@@ -7815,8 +7914,9 @@ async fn handle_control_request(
                         .await;
                     }
                 };
+                a0.cancel(route_key(route_channel, installed_epoch));
                 teardown_installed_route(
-                    tx,
+                    legacy_tx,
                     metrics,
                     executor,
                     route_key(route_channel, installed_epoch),
@@ -8055,6 +8155,7 @@ async fn handle_control_request(
             pending_binds.insert(
                 route_id,
                 PendingBind {
+                    ack_publication: None,
                     bind_root_id: bind_root_id.clone(),
                     inserted_new_actor,
                     cancelled: false,
@@ -8100,7 +8201,7 @@ async fn handle_control_request(
                 if send_counted_channel(
                     &completion_tx,
                     &completion_metrics.control_completion_queued,
-                    completion,
+                    ControlCompletion::ConfigureReady(completion),
                 )
                 .await
                 .is_err()
@@ -8849,18 +8950,11 @@ fn install_bash_compressor(ctx: &AppContext) {
     );
 }
 
-async fn send_route_bind_ack(
-    tx: &WriterSender,
-    ver: u8,
-    corr: u64,
-    flags: Flags,
-    metrics: &DispatchPathMetrics,
-) -> Result<(), SubcError> {
+fn route_bind_ack_frame(ver: u8, corr: u64, flags: Flags) -> Result<Frame, SubcError> {
     let body =
         serde_json::to_vec(&ModuleControlResponse::RouteBindAck {}).map_err(SubcError::Json)?;
-    let response = Frame::build_with_version(ver, FrameType::Response, flags, 0, 0, corr, body)
-        .map_err(SubcError::FrameBuild)?;
-    send_reliable_writer_frame(tx, metrics, response, "RouteBindAck").await
+    Frame::build_with_version(ver, FrameType::Response, flags, 0, 0, corr, body)
+        .map_err(SubcError::FrameBuild)
 }
 
 /// Longest decode-error text a refusal carries back to the sender; serde can
@@ -14481,6 +14575,8 @@ mod tests {
             let cpu = cpu_hunt_process_cpu_us();
             handle_control_request(
                 &writer_tx,
+                &writer_tx,
+                &A0Egress::new(writer_tx.clone(), completion_tx.clone()),
                 &frame,
                 &app,
                 &executor,
@@ -14526,6 +14622,9 @@ mod tests {
                 .await
                 .expect("configure completes")
                 .expect("completion delivered");
+            let ControlCompletion::ConfigureReady(completion) = completion else {
+                panic!("configure completion expected");
+            };
             assert!(completion.configure_response.success);
             assert_eq!(pending_binds.len(), 1, "the bind must reach admission");
             assert_eq!(
@@ -19127,6 +19226,7 @@ mod tests {
         let mut pending_binds = HashMap::from([(
             route,
             PendingBind {
+                ack_publication: None,
                 bind_root_id: root,
                 inserted_new_actor: false,
                 cancelled: false,
@@ -19146,11 +19246,16 @@ mod tests {
         let (writer_tx, mut writer_rx) = mpsc::channel(8);
         let metrics = Arc::new(DispatchPathMetrics::new());
         let executor = Arc::new(Executor::new());
+        let mut published_routes = HashMap::new();
+        let (ack_tx, mut ack_rx) = mpsc::channel(8);
+        let a0 = A0Egress::new(writer_tx.clone(), ack_tx);
 
         handle_route_bind_completion(
             &writer_tx,
             completion,
-            &mut HashMap::new(),
+            false,
+            &a0,
+            &mut published_routes,
             &mut HashMap::new(),
             &mut HashMap::new(),
             &mut push_buffer,
@@ -19165,7 +19270,41 @@ mod tests {
         .await
         .unwrap();
 
-        let ack = writer_rx.try_recv().expect("RouteBindAck");
+        assert!(
+            !published_routes.contains_key(&route),
+            "route published before actual ACK write"
+        );
+
+        let mut ack = writer_rx.recv().await.expect("RouteBindAck");
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "route egress must remain buffered"
+        );
+        assert!(ack.begin_ack_write());
+        ack.finish_ack_write(true);
+        let ControlCompletion::AckWritten(completion) = ack_rx.recv().await.unwrap() else {
+            panic!("ACK write completion expected");
+        };
+        handle_route_bind_completion(
+            &writer_tx,
+            completion,
+            true,
+            &a0,
+            &mut published_routes,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut push_buffer,
+            &mut HashMap::new(),
+            &mut pending_binds,
+            &mut installed_route_epochs,
+            &executor,
+            &Arc::new(Notify::new()),
+            &metrics,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(published_routes.contains_key(&route));
         assert_eq!(ack.header.ty, FrameType::Response);
         assert_eq!((ack.header.channel, ack.header.epoch), (0, 0));
         let route_frame = writer_rx.try_recv().expect("post-ack route frame");
@@ -19215,6 +19354,7 @@ mod tests {
         let mut pending_binds = HashMap::from([(
             route,
             PendingBind {
+                ack_publication: None,
                 bind_root_id: root,
                 inserted_new_actor: false,
                 cancelled: false,
@@ -19236,6 +19376,8 @@ mod tests {
         handle_route_bind_completion(
             &writer_tx,
             completion,
+            true,
+            &A0Egress::new(writer_tx.clone(), mpsc::channel(8).0),
             &mut HashMap::new(),
             &mut HashMap::new(),
             &mut HashMap::new(),
@@ -19265,6 +19407,7 @@ mod tests {
     async fn a_held_bind_is_refused_before_the_daemon_bind_relay_times_out() {
         let (_dir, root) = test_root("route-bind-held-configure");
         let pending_bind = |age: Duration, corr: u64| PendingBind {
+            ack_publication: None,
             bind_root_id: root.clone(),
             inserted_new_actor: false,
             cancelled: false,
@@ -19366,6 +19509,7 @@ mod tests {
         let mut pending_binds = HashMap::from([(
             route,
             PendingBind {
+                ack_publication: None,
                 bind_root_id: root.clone(),
                 inserted_new_actor: false,
                 cancelled: false,
@@ -19560,6 +19704,7 @@ mod tests {
         let mut pending_binds = HashMap::from([(
             route,
             PendingBind {
+                ack_publication: None,
                 bind_root_id: root.clone(),
                 inserted_new_actor: false,
                 cancelled: false,
@@ -19802,6 +19947,7 @@ mod tests {
         let mut pending_binds = HashMap::from([(
             route,
             PendingBind {
+                ack_publication: None,
                 bind_root_id: root.clone(),
                 inserted_new_actor: false,
                 cancelled: false,

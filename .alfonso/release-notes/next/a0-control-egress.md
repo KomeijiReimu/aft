@@ -1,0 +1,1 @@
+- Prepared route-bind and management replies use a writer path independent of tool-outcome persistence, and routes and replayed events are published only after the bind acknowledgement is written.
