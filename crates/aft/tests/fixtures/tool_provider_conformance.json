@@ -116,6 +116,7 @@
       "head": {
         "hooks": {
           "enabled_cases": [
+            "tool_result_v1_valid",
             "user_commands_catalog",
             "catalog_emits_events_boolean",
             "catalog_listed_presets_served",
@@ -162,7 +163,6 @@
             "user_commands_flow_refused",
             "user_commands_accepted_late",
             "tool_result_held_reply_route_gating",
-            "tool_result_v1_valid",
             "system_text_preset_optional_served"
           ],
           "inapplicable_cases": [
@@ -183,6 +183,7 @@
         },
         "no_hooks": {
           "enabled_cases": [
+            "tool_result_v1_valid",
             "user_commands_catalog",
             "catalog_emits_events_boolean",
             "catalog_listed_presets_served",
@@ -229,7 +230,6 @@
             "late_results_ack",
             "crash_after_prepared_not_started",
             "crash_after_authorized_not_started",
-            "tool_result_v1_valid",
             "system_text_preset_optional_served"
           ],
           "inapplicable_cases": [
@@ -251,6 +251,7 @@
       "worker": {
         "hooks": {
           "enabled_cases": [
+            "tool_result_v1_valid",
             "user_commands_catalog",
             "catalog_emits_events_boolean",
             "catalog_listed_presets_served",
@@ -297,7 +298,6 @@
             "user_commands_flow_refused",
             "user_commands_accepted_late",
             "tool_result_held_reply_route_gating",
-            "tool_result_v1_valid",
             "system_text_preset_optional_served"
           ],
           "inapplicable_cases": [
@@ -318,6 +318,7 @@
         },
         "no_hooks": {
           "enabled_cases": [
+            "tool_result_v1_valid",
             "user_commands_catalog",
             "catalog_emits_events_boolean",
             "catalog_listed_presets_served",
@@ -364,7 +365,6 @@
             "late_results_ack",
             "crash_after_prepared_not_started",
             "crash_after_authorized_not_started",
-            "tool_result_v1_valid",
             "system_text_preset_optional_served"
           ],
           "inapplicable_cases": [
@@ -386,6 +386,7 @@
       "reader": {
         "hooks": {
           "enabled_cases": [
+            "tool_result_v1_valid",
             "user_commands_catalog",
             "catalog_emits_events_boolean",
             "catalog_listed_presets_served",
@@ -432,7 +433,6 @@
             "crash_after_prepared_not_started",
             "crash_after_authorized_not_started",
             "call_mode_matches_catalog",
-            "tool_result_v1_valid",
             "system_text_preset_optional_served"
           ],
           "inapplicable_cases": [
@@ -447,6 +447,7 @@
         },
         "no_hooks": {
           "enabled_cases": [
+            "tool_result_v1_valid",
             "user_commands_catalog",
             "catalog_emits_events_boolean",
             "catalog_listed_presets_served",
@@ -493,7 +494,6 @@
             "crash_after_prepared_not_started",
             "crash_after_authorized_not_started",
             "call_mode_matches_catalog",
-            "tool_result_v1_valid",
             "system_text_preset_optional_served"
           ],
           "inapplicable_cases": [
