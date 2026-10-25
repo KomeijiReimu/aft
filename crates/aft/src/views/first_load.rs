@@ -1861,6 +1861,12 @@ impl FirstLoadDriver for CheckoutDriver {
             .registry()
             .note_publish(self.owner.scope())
             .map_err(|error| SiblingLoader::error(error.to_string()))?;
+        // Successful publication must also be readable through the registry's
+        // read-only pointer path. Let SQLite establish its WAL sidecars here;
+        // skipping this probe changes later opens of a read-only view directory.
+        let _ = store
+            .current_generation_read_only()
+            .map_err(|error| SiblingLoader::error(error.to_string()))?;
         for adapter in &self.adapters {
             adapter.generation_published(access, &generation)?;
         }

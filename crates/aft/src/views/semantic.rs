@@ -487,6 +487,11 @@ struct Resident {
     legacy_summaries: BTreeSet<RelPath>,
 }
 
+struct SemanticReader {
+    resident: Arc<Resident>,
+    state: Arc<Mutex<ViewState>>,
+}
+
 type CacheKey = (String, [u8; 32], u64, bool);
 
 /// Per-checkout mutable state: installed completions and failures that are
@@ -637,6 +642,76 @@ impl SemanticPlane {
                 .entry((access.family().to_owned(), access.scope().to_owned()))
                 .or_default(),
         )
+    }
+
+    fn query_view(&self, access: &ViewAccess, snapshot: &Snapshot) -> Arc<Mutex<ViewState>> {
+        self.query_view_for(access.family(), access.scope(), snapshot)
+    }
+
+    fn query_view_for(
+        &self,
+        family: &str,
+        scope: &str,
+        snapshot: &Snapshot,
+    ) -> Arc<Mutex<ViewState>> {
+        if let Some(reader) = self.pinned_reader(family, scope, snapshot) {
+            return reader.state.clone();
+        }
+        lock(&self.views)
+            .get(&(family.to_owned(), scope.to_owned()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn open_resident(
+        &self,
+        access: &ViewAccess,
+        generation: &Arc<ComposedGeneration>,
+    ) -> Result<Arc<Resident>, PlaneError> {
+        let resident = if let Some(resident) = self.resident(access, &generation.resident_key()) {
+            resident
+        } else {
+            let resident = Arc::new(self.admit(access, generation)?);
+            let key = (
+                access.family().to_owned(),
+                access.scope().to_owned(),
+                generation.resident_key(),
+            );
+            lock(&self.residents).entry(key).or_insert(resident).clone()
+        };
+        if matches!(access, ViewAccess::Reader { .. }) && !resident.legacy_summaries.is_empty() {
+            log::info!("semantic borrower loaded {} legacy small-budget summary runs; serving published vectors until owner repair", resident.legacy_summaries.len());
+        }
+        Ok(resident)
+    }
+
+    fn pinned_reader(
+        &self,
+        family: &str,
+        scope: &str,
+        snapshot: &Snapshot,
+    ) -> Option<Arc<SemanticReader>> {
+        let key = snapshot.generation().resident_key();
+        let readers = snapshot.readers();
+        readers
+            .and_then(|readers| readers.resource(self as *const Self as usize, family, scope, &key))
+            .and_then(|resource| resource.downcast::<SemanticReader>().ok())
+    }
+
+    fn pinned_resident(
+        &self,
+        family: &str,
+        scope: &str,
+        snapshot: &Snapshot,
+    ) -> Option<Arc<Resident>> {
+        let key = snapshot.generation().resident_key();
+        self.pinned_reader(family, scope, snapshot)
+            .map(|reader| reader.resident.clone())
+            .or_else(|| {
+                lock(&self.residents)
+                    .get(&(family.to_owned(), scope.to_owned(), key))
+                    .cloned()
+            })
     }
 
     fn resident(&self, access: &ViewAccess, generation: &str) -> Option<Arc<Resident>> {
@@ -913,7 +988,7 @@ impl SemanticPlane {
             return Err(plane_error("view belongs to another storage root"));
         }
         let resident = self
-            .resident(&access, &snapshot.generation().resident_key())
+            .pinned_resident(access.family(), access.scope(), snapshot)
             .ok_or_else(|| plane_error("semantic generation not resident"))?;
         let view = self.view(&access);
         let mut report = FillReport::default();
@@ -1773,10 +1848,10 @@ impl SemanticPlane {
         snapshot: &Snapshot,
     ) -> Result<SemanticOverlay, PlaneError> {
         let resident = self
-            .resident(access, &snapshot.generation().resident_key())
+            .pinned_resident(access.family(), access.scope(), snapshot)
             .ok_or_else(|| plane_error("semantic generation not resident"))?;
         let arena = self.arena(access.family());
-        let view = self.view(access);
+        let view = self.query_view(access, snapshot);
         let mut state = lock(&view);
         let mut members = snapshot.membership();
         let unvouched = snapshot.watcher() != WatcherState::Healthy
@@ -1943,10 +2018,10 @@ impl SemanticPlane {
 
     /// Outstanding semantic work for the checkout, as a fill would see it.
     pub fn pending_work(&self, access: &ViewAccess, snapshot: &Snapshot) -> Vec<WorkItem> {
-        let Some(resident) = self.resident(access, &snapshot.generation().resident_key()) else {
+        let Some(resident) = self.pinned_resident(access.family(), access.scope(), snapshot) else {
             return Vec::new();
         };
-        let view = self.view(access);
+        let view = self.query_view(access, snapshot);
         let state = lock(&view);
         self.work_items(
             &state,
@@ -1956,9 +2031,10 @@ impl SemanticPlane {
         )
     }
 
-    /// Forgets everything this process holds for a checkout that unbinds:
-    /// its fill map and live pin, its resident generations, and any arena run
-    /// no other view still references.
+    /// Remove mutable scope caches and lookup entries when a checkout unbinds.
+    /// Query bundles retain their readers and the ViewState whose live pin
+    /// protects unpublished fill keys until the last query drops. Only
+    /// unreferenced arena runs can be trimmed here.
     pub fn unbind(&self, access: &ViewAccess) {
         let family = access.family().to_owned();
         let scope = access.scope().to_owned();
@@ -1991,22 +2067,33 @@ impl PlaneAdapter for SemanticPlane {
         access: &ViewAccess,
         generation: &Arc<ComposedGeneration>,
     ) -> Result<(), PlaneError> {
-        let key = (
-            access.family().to_owned(),
-            access.scope().to_owned(),
-            generation.resident_key(),
-        );
-        let existing = lock(&self.residents).get(&key).cloned();
-        let resident = if let Some(resident) = existing {
-            resident
-        } else {
-            let resident = Arc::new(self.admit(access, generation)?);
-            Arc::clone(lock(&self.residents).entry(key).or_insert(resident))
+        self.open_resident(access, generation).map(|_| ())
+    }
+
+    fn open_reader(
+        &self,
+        access: &ViewAccess,
+        generation: &Arc<ComposedGeneration>,
+    ) -> Result<Option<super::snapshot::PlaneAttachment>, PlaneError> {
+        let handle = self.open_resident(access, generation)?;
+        Ok(Some(handle))
+    }
+
+    fn bind_reader(
+        &self,
+        access: &ViewAccess,
+        _: &Arc<ComposedGeneration>,
+        handle: Option<super::snapshot::PlaneAttachment>,
+    ) -> Result<Option<super::snapshot::PlaneAttachment>, PlaneError> {
+        let resident = handle
+            .and_then(|handle| handle.downcast::<Resident>().ok())
+            .ok_or_else(|| plane_error("semantic reader handle missing"))?;
+        let state = match access {
+            ViewAccess::Owner(_) => self.view(access),
+            ViewAccess::Reader { .. } => Arc::default(),
         };
-        if matches!(access, ViewAccess::Reader { .. }) && !resident.legacy_summaries.is_empty() {
-            log::info!("semantic borrower loaded {} legacy small-budget summary runs; serving published vectors until owner repair", resident.legacy_summaries.len());
-        }
-        Ok(())
+        let reader = Arc::new(SemanticReader { resident, state });
+        Ok(Some(reader))
     }
 
     fn generation_published(
@@ -2073,18 +2160,10 @@ impl SemanticPlane {
         snapshot: &Snapshot,
         repair_summaries: bool,
     ) -> PlaneReadiness {
-        let key = (
-            family.to_owned(),
-            scope.to_owned(),
-            snapshot.generation().resident_key(),
-        );
-        let Some(resident) = lock(&self.residents).get(&key).cloned() else {
+        let Some(resident) = self.pinned_resident(family, scope, snapshot) else {
             return PlaneReadiness::Building;
         };
-        let view = lock(&self.views)
-            .get(&(family.to_owned(), scope.to_owned()))
-            .cloned()
-            .unwrap_or_default();
+        let view = self.query_view_for(family, scope, snapshot);
         let state = lock(&view);
         let mut pending = 0;
         let mut failed = 0;
@@ -2383,7 +2462,7 @@ mod tests {
             )
             .unwrap();
         let draft = Arc::new(ComposedGeneration::new("unpublished-draft", manifest, None));
-        plane.open_generation(&checkout.access, &draft).unwrap();
+        let _draft_reader = plane.open_reader(&checkout.access, &draft).unwrap();
         assert_eq!(lock(&view).fill.len(), 1);
         assert!(lock(&view).live.as_ref().unwrap().keys_path().exists());
         plane
@@ -4022,6 +4101,96 @@ mod tests {
     }
 
     #[test]
+    fn retired_semantic_readiness_uses_its_pinned_fills_after_unbind_and_rebind() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        write_tree(root.path(), FILES);
+        let plane = new_plane(storage.path(), "model-a");
+        let checkout = ready_checkout(storage.path(), root.path(), &plane);
+        let installed = checkout.installed();
+        write_tree(root.path(), &[("src/alpha.rs", "fn alpha_edited() {}\n")]);
+        let mut delta = LiveDelta::new(installed.generation().clone());
+        crate::views::live_delta::reconcile(&mut delta, root.path(), &trigram_policy());
+        let snapshot = delta
+            .snapshot()
+            .with_readers(installed.readers().unwrap().clone());
+        let model = Model::default();
+        assert_eq!(checkout.fill(&snapshot, &model, "model-a").installed, 1);
+        let access = checkout.access.clone();
+        let ready = PlaneReadiness::Ready {
+            pending: 0,
+            failed: 0,
+        };
+        assert_eq!(plane.readiness(&access, &snapshot), ready);
+        plane.unbind(&access);
+        assert_eq!(plane.readiness(&access, &snapshot), ready);
+        assert!(plane.pending_work(&access, &snapshot).is_empty());
+        assert!(!lock(&plane.views)
+            .contains_key(&(access.family().to_owned(), access.scope().to_owned())));
+
+        let adapters: Vec<Arc<dyn PlaneAdapter>> = vec![plane.clone()];
+        let readers = super::super::snapshot::PlaneReaders::open(
+            &access,
+            snapshot.generation().clone(),
+            &adapters,
+        )
+        .unwrap();
+        let rebound = snapshot.clone().with_readers(readers);
+        assert_eq!(
+            plane.readiness(&access, &rebound),
+            PlaneReadiness::Ready {
+                pending: 1,
+                failed: 0
+            }
+        );
+        assert_eq!(plane.readiness(&access, &snapshot), ready);
+        assert!(plane.pending_work(&access, &snapshot).is_empty());
+    }
+
+    #[test]
+    fn an_old_semantic_bundle_survives_unbind_without_reopening_or_resurrecting_scope_state() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        write_tree(root.path(), FILES);
+        let plane = new_plane(storage.path(), "model-a");
+        let checkout = ready_checkout(storage.path(), root.path(), &plane);
+        let bundle = checkout.driver.installed_bundle();
+        let snapshot = checkout.installed();
+        let access = checkout.access.clone();
+        let expected = rows(
+            root.path(),
+            &checkout.query(&snapshot, "model-a", "alpha").results,
+        );
+        assert!(!expected.is_empty());
+        let arena = plane.arena("family");
+        let work = (arena.decode_count(), arena.store_reads());
+        plane.unbind(&access);
+        drop(checkout);
+        let answer = plane
+            .search(
+                &access,
+                root.path(),
+                &snapshot,
+                &vector("model-a", "alpha"),
+                100,
+                &|_| true,
+            )
+            .unwrap();
+        assert!(answer.complete(), "{answer:?}");
+        assert_eq!(rows(root.path(), &answer.results), expected);
+        assert_eq!((arena.decode_count(), arena.store_reads()), work);
+        assert!(
+            !lock(&plane.views)
+                .contains_key(&(access.family().to_owned(), access.scope().to_owned())),
+            "a retired query must not recreate mutable scope state"
+        );
+        drop(bundle);
+        assert!(arena.memory().runs > 0);
+        drop(snapshot);
+        assert_eq!(arena.memory().runs, 0);
+    }
+
+    #[test]
     fn queries_never_decode_store_rows_and_unbind_releases_the_arena() {
         let storage = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -4073,8 +4242,17 @@ mod tests {
         );
 
         plane.unbind(&checkout.access);
+        drop(checkout);
+        assert!(
+            arena.memory().runs > 0,
+            "the old query still owns its resident reader"
+        );
         drop(generation);
-        assert_eq!(arena.memory().runs, 0, "unbind left runs resident");
+        assert_eq!(
+            arena.memory().runs,
+            0,
+            "unbind left runs resident after the last query drained"
+        );
     }
 
     /// A fold may install a generation built from a cut taken before a fill

@@ -211,6 +211,30 @@ pub trait PlaneAdapter: Send + Sync {
         generation: &Arc<ComposedGeneration>,
     ) -> Result<(), PlaneError>;
 
+    /// Open the resident state and optionally retain its actual read handle.
+    /// Adapters whose scope caches may be cleared while queries outlive them
+    /// return an owned handle; simpler adapters use the release-generation lease.
+    fn open_reader(
+        &self,
+        access: &ViewAccess,
+        generation: &Arc<ComposedGeneration>,
+    ) -> Result<Option<super::snapshot::PlaneAttachment>, PlaneError> {
+        self.open_generation(access, generation)?;
+        Ok(None)
+    }
+
+    /// Bind a shared immutable reader to this bundle's query state. This runs
+    /// for every bundle, including cache hits, so a new binding cannot inherit
+    /// mutable fill state from a retired binding of the same generation.
+    fn bind_reader(
+        &self,
+        _access: &ViewAccess,
+        _generation: &Arc<ComposedGeneration>,
+        reader: Option<super::snapshot::PlaneAttachment>,
+    ) -> Result<Option<super::snapshot::PlaneAttachment>, PlaneError> {
+        Ok(reader)
+    }
+
     /// Drops resident state for a generation that no snapshot holds.
     fn release_generation(&self, access: &ViewAccess, generation: &str);
 

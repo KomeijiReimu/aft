@@ -952,6 +952,7 @@ mod mutation_tests {
             key: key.clone(),
             adapter,
             access,
+            resource: None,
             generation,
         });
         cache.insert(key, Arc::downgrade(&replacement));
@@ -1293,19 +1294,26 @@ pub struct InstallCut {
 /// A lease on resident adapters. Query snapshots retain this lease, so removing
 /// the driver's old bundle cannot invalidate a lazy open by an old query.
 pub struct PlaneReaders {
-    generation: Arc<ComposedGeneration>,
+    // Bundle-owned state drops before the shared reader and the generation Arc
+    // that retains the residency pins.
+    resources: Vec<Option<PlaneAttachment>>,
     adapters: Vec<Arc<AdapterLease>>,
+    generation: Arc<ComposedGeneration>,
 }
 
 struct AdapterLease {
     key: ReaderCacheKey,
     adapter: Arc<dyn super::contracts::PlaneAdapter>,
     access: super::contracts::ViewAccess,
+    resource: Option<PlaneAttachment>,
     generation: Arc<ComposedGeneration>,
 }
 
 impl Drop for AdapterLease {
     fn drop(&mut self) {
+        // Release the owned handle before adapter cleanup trims its arena.
+        // The generation Arc retains residency pins until the lease is dropped.
+        drop(self.resource.take());
         let mut cache = reader_cache()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1339,6 +1347,25 @@ impl fmt::Debug for PlaneReaders {
 }
 
 impl PlaneReaders {
+    pub(super) fn resource(
+        &self,
+        adapter: usize,
+        family: &str,
+        scope: &str,
+        generation: &str,
+    ) -> Option<PlaneAttachment> {
+        self.adapters
+            .iter()
+            .zip(&self.resources)
+            .find(|(lease, _)| {
+                lease.key.0 == adapter
+                    && lease.key.1 == family
+                    && lease.key.2 == scope
+                    && lease.key.3 == generation
+            })
+            .and_then(|(_, resource)| resource.clone())
+    }
+
     pub fn open_available(
         access: &super::contracts::ViewAccess,
         generation: Arc<ComposedGeneration>,
@@ -1347,11 +1374,15 @@ impl PlaneReaders {
         let mut readers = Self {
             generation: generation.clone(),
             adapters: Vec::new(),
+            resources: Vec::new(),
         };
         let mut errors = Vec::new();
         for adapter in adapters {
             match Self::open(access, generation.clone(), std::slice::from_ref(adapter)) {
-                Ok(open) => readers.adapters.extend(open.adapters.iter().cloned()),
+                Ok(open) => {
+                    readers.adapters.extend(open.adapters.iter().cloned());
+                    readers.resources.extend(open.resources.iter().cloned());
+                }
                 Err(error) => errors.push(error),
             }
         }
@@ -1366,6 +1397,7 @@ impl PlaneReaders {
         let mut readers = Self {
             generation,
             adapters: Vec::new(),
+            resources: Vec::new(),
         };
         for adapter in adapters {
             let key = (
@@ -1381,11 +1413,12 @@ impl PlaneReaders {
             let lease = match cache.get(&key).and_then(std::sync::Weak::upgrade) {
                 Some(lease) => lease,
                 None => {
-                    adapter.open_generation(access, &readers.generation)?;
+                    let resource = adapter.open_reader(access, &readers.generation)?;
                     let lease = Arc::new(AdapterLease {
                         key: key.clone(),
                         adapter: adapter.clone(),
                         access: access.clone(),
+                        resource,
                         generation: readers.generation.clone(),
                     });
                     cache.insert(key, Arc::downgrade(&lease));
@@ -1393,7 +1426,10 @@ impl PlaneReaders {
                 }
             };
             drop(cache);
+            let resource =
+                adapter.bind_reader(access, &readers.generation, lease.resource.clone())?;
             readers.adapters.push(lease);
+            readers.resources.push(resource);
         }
         Ok(Arc::new(readers))
     }
@@ -1858,8 +1894,27 @@ mod composition_tests {
             LiveEntry::new(DiskState::of_bytes(b"changed bytes"), 1),
         );
         assert!(live.readiness().contains_key(&path));
+        let snapshot = live.snapshot();
         for plane in FamilyPlane::ALL {
-            assert_eq!(live.snapshot().plane_readiness(&path, plane), None);
+            assert_eq!(snapshot.plane_readiness(&path, plane), None);
+            for facts in [
+                &live as &dyn readiness::LiveEntries,
+                &snapshot as &dyn readiness::LiveEntries,
+            ] {
+                assert_eq!(
+                    readiness::plane_readiness(
+                        plane,
+                        Some(snapshot.generation()),
+                        facts,
+                        &FillMap::default(),
+                        &|_| true
+                    ),
+                    PlaneReadiness::Ready {
+                        pending: 4,
+                        failed: 0
+                    }
+                );
+            }
         }
     }
 
@@ -1938,6 +1993,13 @@ mod composition_tests {
 
     #[test]
     fn composition_rejects_base_chains_and_missing_override_members() {
+        assert!(ComposedGeneration::compose(
+            "not-a-worker",
+            ManifestV2::new(header()),
+            base(),
+            None
+        )
+        .is_err());
         let first = Arc::new(ComposedGeneration::compose("first", worker(), base(), None).unwrap());
         assert!(ComposedGeneration::compose("chain", worker(), first, None).is_err());
         let mut delta = worker();
