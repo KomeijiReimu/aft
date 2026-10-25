@@ -374,6 +374,14 @@ fn render_thread_state_confirmation(result: &Value, request: &Value) -> Option<S
 }
 
 fn daemon_refusal(code: &str, stage: &str, message: &str) -> RouteOutcome {
+    if stage == crate::gh_shim_speech::REFUSAL_STAGE
+        && crate::gh_shim_speech::Code::parse(code).is_some()
+    {
+        return RouteOutcome::RelayRefusal {
+            code: code.to_string(),
+            text: format!("{code}: {message}"),
+        };
+    }
     match code {
         "ticket_absent" => RouteOutcome::NoAgentSession,
         "ticket_unknown" => RouteOutcome::RelayRefusal {

@@ -15,6 +15,64 @@ use super::super::{
 };
 use super::*;
 
+fn assert_approved_background_refusal(code: &str, message: &str) {
+    match daemon_refusal(code, "task_authority", message) {
+        RouteOutcome::RelayRefusal { code: actual, text } => {
+            assert_eq!(actual, code);
+            assert_eq!(text, format!("{code}: {message}"));
+        }
+        _ => panic!("expected a typed background bot-write refusal"),
+    }
+}
+
+#[test]
+fn approved_background_identity_text_is_preserved() {
+    assert_approved_background_refusal(
+        "task_gh_identity_conflict",
+        "this command's bot identity no longer matches the repository's bot (binding_changed); start the command again from a live session.",
+    );
+}
+
+#[test]
+fn approved_background_policy_text_is_preserved() {
+    assert_approved_background_refusal(
+        "task_gh_policy_denied",
+        "this GitHub write is not allowed by the routing policy the command started under, or by the current one (manifest_rollback); use a permitted operation, or ask the operator to update the policy and start the command again.",
+    );
+}
+
+#[test]
+fn approved_background_temporary_text_is_preserved() {
+    assert_approved_background_refusal(
+        "task_gh_authority_unavailable",
+        "bot writes from background commands are briefly unavailable (serving_lock_unavailable); retry in a few seconds.",
+    );
+}
+
+#[test]
+fn approved_background_lasting_text_is_preserved() {
+    assert_approved_background_refusal(
+        "task_gh_authority_unavailable",
+        "this command's bot-write permission cannot be verified (snapshot_invalid); start the command again from a live session, and tell the operator if it repeats.",
+    );
+}
+
+#[test]
+fn approved_background_ended_text_is_preserved() {
+    assert_approved_background_refusal(
+        "task_gh_scope_ended",
+        "the program this command started from has ended (ended_previously), so it can no longer write as the bot; start the command again from a live session.",
+    );
+}
+
+#[test]
+fn approved_background_unknown_text_is_preserved() {
+    assert_approved_background_refusal(
+        "task_gh_scope_unknown",
+        "AFT could not confirm that the session this command started from is still active (not_synced); retry in a minute.",
+    );
+}
+
 #[test]
 fn poisoned_diagnostic_stage_remains_readable_and_updateable() {
     let stage = Mutex::new(ProbeStage::CatalogList);
