@@ -10,11 +10,11 @@
     },
     {
       "name": "cortexkit-role-tool-provider-conformance",
-      "version": "0.13.0",
+      "version": "0.13.1",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "5165507004302a8c8140e4b4ea934b575d372549d63e11856bfadc3fbefccd1c",
+      "checksum": "f6775f73511eaa32fca482b0c862e8949252fc9d1fd3edf1026832efe481881c",
       "dependency_kind": "dev",
-      "release_tag": "cortexkit-role-tool-provider-conformance-v0.13.0"
+      "release_tag": "cortexkit-role-tool-provider-conformance-v0.13.1"
     },
     {
       "name": "cortexkit-role-harness",
@@ -117,6 +117,7 @@
         "hooks": {
           "enabled_cases": [
             "tool_result_v1_valid",
+            "tool_result_legacy_route_unchanged",
             "user_commands_catalog",
             "catalog_emits_events_boolean",
             "catalog_listed_presets_served",
@@ -170,6 +171,7 @@
           ],
           "capabilities": [
             "disable_tool",
+            "legacy_reply",
             "cancellation",
             "call_key",
             "schema_pin",
@@ -184,6 +186,7 @@
         "no_hooks": {
           "enabled_cases": [
             "tool_result_v1_valid",
+            "tool_result_legacy_route_unchanged",
             "user_commands_catalog",
             "catalog_emits_events_boolean",
             "catalog_listed_presets_served",
@@ -237,6 +240,7 @@
           ],
           "capabilities": [
             "disable_tool",
+            "legacy_reply",
             "cancellation",
             "call_key",
             "schema_pin",
@@ -252,6 +256,7 @@
         "hooks": {
           "enabled_cases": [
             "tool_result_v1_valid",
+            "tool_result_legacy_route_unchanged",
             "user_commands_catalog",
             "catalog_emits_events_boolean",
             "catalog_listed_presets_served",
@@ -305,6 +310,7 @@
           ],
           "capabilities": [
             "disable_tool",
+            "legacy_reply",
             "cancellation",
             "call_key",
             "schema_pin",
@@ -319,6 +325,7 @@
         "no_hooks": {
           "enabled_cases": [
             "tool_result_v1_valid",
+            "tool_result_legacy_route_unchanged",
             "user_commands_catalog",
             "catalog_emits_events_boolean",
             "catalog_listed_presets_served",
@@ -372,6 +379,7 @@
           ],
           "capabilities": [
             "disable_tool",
+            "legacy_reply",
             "cancellation",
             "call_key",
             "schema_pin",
@@ -387,6 +395,7 @@
         "hooks": {
           "enabled_cases": [
             "tool_result_v1_valid",
+            "tool_result_legacy_route_unchanged",
             "user_commands_catalog",
             "catalog_emits_events_boolean",
             "catalog_listed_presets_served",
@@ -440,6 +449,7 @@
           ],
           "capabilities": [
             "disable_tool",
+            "legacy_reply",
             "call_key",
             "schema_pin",
             "system_text"
@@ -448,6 +458,7 @@
         "no_hooks": {
           "enabled_cases": [
             "tool_result_v1_valid",
+            "tool_result_legacy_route_unchanged",
             "user_commands_catalog",
             "catalog_emits_events_boolean",
             "catalog_listed_presets_served",
@@ -501,6 +512,7 @@
           ],
           "capabilities": [
             "disable_tool",
+            "legacy_reply",
             "call_key",
             "schema_pin",
             "system_text"

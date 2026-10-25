@@ -8,6 +8,7 @@ use cortexkit_role_tool_provider_conformance::{
     ToolProviderSubject, ToolRoute,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
@@ -36,6 +37,115 @@ use tokio::{
 #[path = "helpers/aft_binary.rs"]
 mod aft_binary;
 
+const LEGACY_FIXTURES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/tool_provider_legacy_replies.json"
+);
+
+fn legacy_fixtures() -> Value {
+    serde_json::from_slice(&std::fs::read(LEGACY_FIXTURES).unwrap()).unwrap()
+}
+
+fn replace_fixture_root(value: Value, from: &str, to: &str) -> Value {
+    match value {
+        Value::String(text) => Value::String(text.replace(from, to)),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| replace_fixture_root(item, from, to))
+                .collect(),
+        ),
+        Value::Object(items) => Value::Object(
+            items
+                .into_iter()
+                .map(|(key, value)| (key, replace_fixture_root(value, from, to)))
+                .collect(),
+        ),
+        value => value,
+    }
+}
+
+/// Schema-valid calls that either read state or fail before mutating it. Apart
+/// from status's pinned snapshot, all responses come from real production paths,
+/// including argument validation before shell execution.
+fn result_probes() -> Vec<CallSpec> {
+    vec![
+        ("status".into(), json!({})),
+        (
+            "bash".into(),
+            json!({"command":"exit 7", "wait":true, "pty":true}),
+        ),
+        (
+            "powershell".into(),
+            json!({"command":"exit 7", "wait":true, "pty":true}),
+        ),
+        ("read".into(), json!({"path":".cortexkit/no-such-file.txt"})),
+        (
+            "write".into(),
+            json!({"path":".cortexkit", "content":"unused"}),
+        ),
+        ("edit".into(), json!({"path":".cortexkit"})),
+        ("apply_patch".into(), json!({"patchText":"not a patch"})),
+        ("grep".into(), json!({"pattern":"["})),
+        (
+            "glob".into(),
+            json!({"pattern":"*", "path":".tool-result-missing-directory"}),
+        ),
+        ("search".into(), json!({"pattern":"["})),
+        ("outline".into(), json!({"target":".cortexkit/no-such.rs"})),
+        (
+            "zoom".into(),
+            json!({"batch":[{"target":".cortexkit/no-such.rs", "symbols":"missing"}]}),
+        ),
+        (
+            "inspect".into(),
+            json!({"sections":"__invalid_probe_section__"}),
+        ),
+        (
+            "callgraph".into(),
+            json!({"op":"callers", "path":".cortexkit/aft.jsonc", "symbol":"missing"}),
+        ),
+        ("conflicts".into(), json!({"path":".cortexkit/aft.jsonc"})),
+        (
+            "ast_search".into(),
+            json!({"pattern":"catch", "lang":"javascript"}),
+        ),
+        (
+            "ast_replace".into(),
+            json!({"pattern":"console.log($MSG)", "rewrite":"logger.info($$$)", "lang":"javascript", "dryRun":true}),
+        ),
+        ("delete".into(), json!({"files":[".cortexkit"]})),
+        (
+            "move".into(),
+            json!({"path":".cortexkit", "destination":"tool-result-moved"}),
+        ),
+        (
+            "import".into(),
+            json!({"op":"organize", "path":".cortexkit/aft.jsonc"}),
+        ),
+        (
+            "safety".into(),
+            json!({"op":"restore", "name":"tool-result-no-such-checkpoint"}),
+        ),
+        (
+            "bash_status".into(),
+            json!({"taskId":"tool-result-no-such-task"}),
+        ),
+        (
+            "bash_kill".into(),
+            json!({"taskId":"tool-result-no-such-task"}),
+        ),
+        (
+            "bash_write".into(),
+            json!({"taskId":"tool-result-no-such-task", "input":"unused"}),
+        ),
+        (
+            "bash_watch".into(),
+            json!({"taskId":"tool-result-no-such-task", "pattern":{"regex":"["}, "timeoutMs":1}),
+        ),
+    ]
+}
+
 /// The provider under test, fetching its catalog with `preset` (`None` sends
 /// no preset, which AFT serves as `head`).
 struct Subject {
@@ -43,6 +153,9 @@ struct Subject {
     /// Launches the provider under test with the main-thread stack Windows
     /// gives it, instead of this host's.
     one_mib_main_stack: bool,
+    project: Mutex<Option<PathBuf>>,
+    served_tools: Mutex<Option<BTreeSet<String>>>,
+    capture_live_status: bool,
     /// Stands in for the consumer's elicitation provider: the permission
     /// questions AFT files for the runner's held calls arrive here.
     stand_in: Arc<StandIn>,
@@ -52,6 +165,9 @@ impl Subject {
         Self {
             preset,
             one_mib_main_stack: false,
+            project: Mutex::new(None),
+            served_tools: Mutex::new(None),
+            capture_live_status: false,
             stand_in: Arc::default(),
         }
     }
@@ -502,6 +618,8 @@ impl Harness for Subject {
     }
     async fn spawn(&self, root: &Path) -> Result<Process, HarnessError> {
         prepare_provider_project(root)?;
+        *self.project.lock().unwrap() = Some(root.join("project"));
+        *self.served_tools.lock().unwrap() = None;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(harness_error)?;
@@ -567,6 +685,16 @@ impl Harness for Subject {
                      than the {bytes} Windows gives by default, so it cannot run this \
                      case here"
                 );
+            }
+        }
+        command.env(
+            "AFT_TEST_CONFORMANCE_RESPONSE_ID",
+            serde_json::to_string(&result_probes()).unwrap(),
+        );
+        if !self.capture_live_status {
+            let snapshot = legacy_fixtures()["status_snapshot"].clone();
+            if !snapshot.is_null() {
+                command.env("AFT_TEST_CONFORMANCE_STATUS_SNAPSHOT", snapshot.to_string());
             }
         }
         let child = command.spawn().map_err(|error| {
@@ -656,8 +784,19 @@ impl Harness for Subject {
             stamp,
         )
         .await?;
-        route.scoped_preset = stamp.scope.as_ref().map(|_| self.preset.unwrap_or("head"));
+        route.scoped_preset = self.preset.or(Some("head"));
         wait_for_route_ready(&route, self.quick_call()).await;
+        if self.served_tools.lock().unwrap().is_none() {
+            let catalog = catalog_reply(&route, self.catalog_arguments()).await;
+            *self.served_tools.lock().unwrap() = Some(
+                catalog["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|tool| tool["name"].as_str().unwrap().to_owned())
+                    .collect(),
+            );
+        }
         Ok(route)
     }
     async fn kill_at(
@@ -2956,6 +3095,7 @@ impl ToolProviderSubject for Subject {
             Capability::CallKey,
             Capability::SchemaPin,
             Capability::SystemText,
+            Capability::LegacyReply,
         ]);
         if self.serves_shell() {
             declared.extend([
@@ -3014,6 +3154,30 @@ impl ToolProviderSubject for Subject {
             ("status".into(), json!({}))
         }
     }
+    fn tool_result_v1_calls(&self) -> Vec<CallSpec> {
+        let tools = self.served_tools.lock().unwrap();
+        let tools = tools
+            .as_ref()
+            .expect("the subject's live catalog was fetched");
+        result_probes()
+            .into_iter()
+            .filter(|(name, _)| tools.contains(name))
+            .collect()
+    }
+    fn legacy_reply(&self, tool: &str, arguments: &Value) -> Option<Value> {
+        let fixtures = legacy_fixtures();
+        let rows = fixtures["presets"][self.preset.unwrap_or("head")].as_array()?;
+        let row = rows
+            .iter()
+            .find(|row| row["tool"] == tool && &row["arguments"] == arguments)?;
+        let project = self.project.lock().unwrap();
+        let project = project.as_ref()?;
+        Some(replace_fixture_root(
+            row["reply"].clone(),
+            "{PROJECT}",
+            &project.to_string_lossy(),
+        ))
+    }
     fn call_mode_probe(&self) -> Option<cortexkit_role_tool_provider_conformance::CallModeProbe> {
         if self.preset == Some("reader") {
             return None;
@@ -3043,7 +3207,7 @@ impl ToolProviderSubject for Subject {
             None,
         )
         .await?;
-        route.scoped_preset = stamp.scope.as_ref().map(|_| self.preset.unwrap_or("head"));
+        route.scoped_preset = self.preset.or(Some("head"));
         wait_for_route_ready(&route, self.quick_call()).await;
         Ok(route)
     }
@@ -3207,6 +3371,201 @@ async fn cold_bash_admission_on_one_mib_module_stack() {
 /// Runs the conformance suite against the head subject (no preset sent) and
 /// checks its outcomes against the inventory pinned for `head` in
 /// `fixtures/tool_provider_conformance.json`.
+/// Explicit capture only: expected replies never update during verification.
+#[tokio::test]
+#[ignore = "generate pre-flip legacy baselines from the original main source"]
+async fn regenerate_pre_flip_legacy_replies() {
+    fn fixed_status_values(value: Value) -> Value {
+        match value {
+            Value::String(text) if text.starts_with('/') => json!("/conformance"),
+            Value::Array(items) => {
+                Value::Array(items.into_iter().map(fixed_status_values).collect())
+            }
+            Value::Object(items) => Value::Object(
+                items
+                    .into_iter()
+                    .map(|(key, value)| (key, fixed_status_values(value)))
+                    .collect(),
+            ),
+            value => value,
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut bootstrap = Subject::head();
+    bootstrap.capture_live_status = true;
+    let process = bootstrap.spawn(root.path()).await.unwrap();
+    let route = bootstrap
+        .route(&process, &bootstrap.plain_stamp())
+        .await
+        .unwrap();
+    let frame = route
+        .terminal(json!({"op":"tool.call", "name":"status", "arguments":{}}))
+        .await;
+    assert_eq!(frame.header.ty, FrameType::Response);
+    let body: Value = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(
+        body["structuredContent"]["id"], "conformance-result-probe",
+        "build the fixture binary with test-conformance-result-inputs"
+    );
+    let mut snapshot = body["structuredContent"].clone();
+    for key in ["id", "success", "text"] {
+        snapshot.as_object_mut().unwrap().remove(key);
+    }
+    let mut fixtures = json!({
+        "source_commit":"a209fc15f4ac5866ad3afe5ea111d7ca44ae74e9",
+        "source_description":"origin/main at task start, before the catalog flip; only test-only status/response-id input hooks overlaid",
+        "renderer_git_blobs": {
+            "subc/wire.rs":"323dd1bb64dc9d48fbd5e01bbe04d969ff68d35c",
+            "subc_format.rs":"64d5b4b4b7c7d7d86917c8de320d4944bd702df0",
+            "run_tool_call.rs":"ce5eb9f1c762183455f3c640ae6338ac82f3343f"
+        },
+        "binary_sha256":format!("{:x}", Sha256::digest(std::fs::read(aft_binary::aft_binary()).unwrap())),
+        "rustc":String::from_utf8(Command::new("rustc").arg("--version").output().unwrap().stdout).unwrap().trim(),
+        "profile":"debug, test-conformance-result-inputs",
+        "normalization":"only the disposable project root is replaced with {PROJECT}; status snapshot and response id are fixed producer inputs",
+        "fixture_project_sha256":format!("{:x}", Sha256::digest(std::fs::read(root.path().join("project/.cortexkit/aft.jsonc")).unwrap())),
+        "status_snapshot":fixed_status_values(snapshot),
+        "presets":{}
+    });
+    std::fs::write(
+        LEGACY_FIXTURES,
+        format!("{}\n", serde_json::to_string_pretty(&fixtures).unwrap()),
+    )
+    .unwrap();
+    drop(route);
+    drop(process);
+    for preset in ["head", "worker", "reader"] {
+        let subject = Subject::new(Some(preset));
+        let root = tempfile::tempdir().unwrap();
+        let process = subject.spawn(root.path()).await.unwrap();
+        let route = subject
+            .route(&process, &subject.plain_stamp())
+            .await
+            .unwrap();
+        let catalog = catalog_reply(&route, subject.catalog_arguments()).await;
+        assert!(
+            catalog["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tool| tool.get("result_format").is_none()),
+            "capture requires pre-flip main's declaration=false"
+        );
+        let project = root.path().join("project").to_string_lossy().into_owned();
+        let mut rows = Vec::new();
+        for (name, arguments) in subject.tool_result_v1_calls() {
+            let frame = route
+                .terminal(
+                    json!({"op":"tool.call", "preset":preset, "name":name, "arguments":arguments}),
+                )
+                .await;
+            assert_eq!(
+                frame.header.ty,
+                FrameType::Response,
+                "{preset}/{name}: {}",
+                String::from_utf8_lossy(&frame.body)
+            );
+            let wire_body = String::from_utf8(frame.body)
+                .unwrap()
+                .replace(&project, "{PROJECT}");
+            let reply: Value = serde_json::from_str(&wire_body).unwrap();
+            rows.push(
+                json!({"tool":name, "arguments":arguments, "reply":reply, "wire_body":wire_body}),
+            );
+        }
+        fixtures["presets"][preset] = json!(rows);
+    }
+    std::fs::write(
+        LEGACY_FIXTURES,
+        format!("{}\n", serde_json::to_string_pretty(&fixtures).unwrap()),
+    )
+    .unwrap();
+    println!(
+        "Captured pre-flip legacy baselines from {}",
+        fixtures["source_commit"]
+    );
+}
+
+#[test]
+fn legacy_probe_arguments_match_pinned_catalogs() {
+    let head: Value =
+        serde_json::from_str(include_str!("fixtures/tool_provider_catalog.json")).unwrap();
+    let presets: Value =
+        serde_json::from_str(include_str!("fixtures/tool_provider_catalog_presets.json")).unwrap();
+    let probes = result_probes();
+    for preset in ["head", "worker", "reader"] {
+        let fixtures = if preset == "head" { &head } else { &presets };
+        let fixture = fixtures
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|fixture| {
+                fixture["request"]["preset"].as_str().unwrap_or("head") == preset
+                    && fixture["powershell_available"] == true
+            })
+            .unwrap();
+        for tool in fixture["reply"]["tools"].as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            let (_, arguments) = probes
+                .iter()
+                .find(|(probe, _)| probe == name)
+                .unwrap_or_else(|| panic!("no probe for {preset}/{name}"));
+            assert_eq!(tool["result_format"], "tool-result/v1");
+            let validator = jsonschema::validator_for(&tool["input_schema"]).unwrap();
+            assert!(
+                validator.is_valid(arguments),
+                "invalid arguments for pinned {preset}/{name}: {arguments}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn real_legacy_probe_wire_bytes_match_pre_flip_baselines() {
+    let fixtures = legacy_fixtures();
+    assert_eq!(
+        fixtures["source_commit"],
+        "a209fc15f4ac5866ad3afe5ea111d7ca44ae74e9"
+    );
+    for preset in ["head", "worker", "reader"] {
+        let subject = Subject::new(Some(preset));
+        let root = tempfile::tempdir().unwrap();
+        let process = subject.spawn(root.path()).await.unwrap();
+        let route = subject
+            .route(&process, &subject.plain_stamp())
+            .await
+            .unwrap();
+        let rows = fixtures["presets"][preset].as_array().unwrap();
+        let probes = subject.tool_result_v1_calls();
+        assert_eq!(
+            rows.len(),
+            probes.len(),
+            "every live {preset} probe has a pre-flip baseline"
+        );
+        for (name, arguments) in probes {
+            let expected = rows
+                .iter()
+                .find(|row| row["tool"] == name && row["arguments"] == arguments)
+                .unwrap();
+            let frame = route
+                .terminal(
+                    json!({"op":"tool.call", "preset":preset, "name":name, "arguments":arguments}),
+                )
+                .await;
+            assert_eq!(frame.header.ty, FrameType::Response);
+            let actual = String::from_utf8(frame.body).unwrap().replace(
+                root.path().join("project").to_string_lossy().as_ref(),
+                "{PROJECT}",
+            );
+            assert_eq!(
+                actual,
+                expected["wire_body"].as_str().unwrap(),
+                "pre-flip wire bytes: {preset}/{name}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn slice_a_real_module_conformance_inventory() {
     conformance_inventory(Subject::head()).await;
@@ -3313,6 +3672,13 @@ async fn conformance_inventory(subject: Subject) {
     assert_eq!(enabled, expected_enabled);
     assert_eq!(skipped, expected_skipped);
     assert_eq!(inapplicable, expected_inapplicable);
+    for case in ["tool_result_v1_valid", "tool_result_legacy_route_unchanged"] {
+        assert_eq!(report.outcome(case), Some(&CaseOutcome::Passed));
+        eprintln!(
+            "{} ({build}): {case} PASS",
+            subject.preset.unwrap_or("head")
+        );
+    }
     // Every route is bound with role_versions {"tool-provider": "v1"}, so the
     // real module admits these calls under the v1 grammar. Every enabled case
     // must pass; the provider conforms for the capabilities it declares and
