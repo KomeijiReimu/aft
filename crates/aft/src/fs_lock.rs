@@ -5,7 +5,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc, Arc, Mutex, OnceLock,
+    mpsc, Arc, Mutex, MutexGuard, OnceLock, Weak,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -51,6 +51,18 @@ const RECLAIM_BLOCK_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const DEAD_RECLAIM_INITIAL_BACKOFF_MS: u64 = 250;
 const DEAD_RECLAIM_MAX_BACKOFF_MS: u64 = 5_000;
 const RECLAIM_TOKEN_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A heartbeat normally keeps one descriptor per lease open between beats
+/// instead of opening and closing the file on every beat. Closing a lease
+/// descriptor is expensive on the live daemon: it pulls the write-back of the
+/// lease page into the closing thread, and with hundreds of long-lived leases on
+/// macOS that was 10% of a core. The handle is released only when this process
+/// replaces the lease, or when a beat finds the lease no longer its own. These
+/// entries let those replacements find the open handles; acquisition, ownership
+/// checks and reclaim paths on other threads keep their own short-lived opens.
+static NEXT_LEASE_SLOT: AtomicU64 = AtomicU64::new(0);
+static LEASE_FILES: OnceLock<Mutex<HashMap<usize, Weak<Mutex<Option<LeaseFile>>>>>> =
+    OnceLock::new();
 
 // Lock files in these storage domains have the fixed layout
 // `<storage>/<domain>/<key>/<lock>`. Add a domain here when a new persistent
@@ -109,6 +121,36 @@ enum ReclaimResult {
 struct ReclaimBlockLogRecord {
     last_emitted: Instant,
     suppressed: u64,
+}
+
+/// Which live-owner conditions one acquisition already reported, so a single
+/// attempt that polls many times (a daemon waiting on its own long-lived lease)
+/// logs each condition once instead of on every poll.
+#[derive(Clone, Debug, Default)]
+struct LiveOwnerLogRecord {
+    stale_logged: bool,
+    long_held_logged: bool,
+}
+
+/// Per-acquisition record of which live-owner conditions it already reported.
+struct LiveOwnerLog {
+    record: LiveOwnerLogRecord,
+}
+
+impl LiveOwnerLog {
+    fn new() -> Self {
+        Self {
+            record: LiveOwnerLogRecord::default(),
+        }
+    }
+
+    fn first_stale(&mut self) -> bool {
+        !std::mem::replace(&mut self.record.stale_logged, true)
+    }
+
+    fn first_long_held(&mut self) -> bool {
+        !std::mem::replace(&mut self.record.long_held_logged, true)
+    }
 }
 
 static RECLAIM_BLOCK_LOGS: OnceLock<Mutex<HashMap<PathBuf, ReclaimBlockLogRecord>>> =
@@ -296,6 +338,11 @@ pub struct LockGuard {
     heartbeat_failed: Arc<AtomicBool>,
     heartbeat_done: mpsc::Receiver<()>,
     heartbeat: Option<JoinHandle<()>>,
+    pump: HeartbeatPump,
+    /// The heartbeat thread's handle on the lease, shared with it so the guard
+    /// can close it before any replacement of the lease and so this process's
+    /// lease index can tell other threads to wait for it.
+    heartbeat_file: Arc<Mutex<Option<LeaseFile>>>,
 }
 
 impl LockGuard {
@@ -307,11 +354,26 @@ impl LockGuard {
         &self.metadata.writer_epoch
     }
 
+    /// Whether this guard's heartbeat is still running. `verify_writer_epoch`
+    /// treats a guard whose heartbeat stopped as unverified, because nothing
+    /// else would keep the lease's heartbeat fresh for other processes.
+    pub(crate) fn heartbeat_is_visible(&self) -> bool {
+        self.pump.is_visible()
+    }
+
+    /// Refresh this lease once through the guard's own handle, so a same-length
+    /// beat costs one write and no descriptor open or close. Tests use this to
+    /// drive beats from a single thread; runtime beats go through the pump.
+    #[cfg(test)]
+    fn heartbeat_once(&self) -> Result<(), HeartbeatError> {
+        heartbeat_once(&self.path, &self.metadata, &self.heartbeat_file)
+    }
+
     /// Re-read the lock file and confirm that this guard still owns the writer
     /// token. Writers call this right before saving published data or starting
     /// SQLite writes so they stop if another process has taken over the lock.
     pub fn verify_writer_epoch(&self) -> io::Result<bool> {
-        if self.heartbeat_failed.load(Ordering::Acquire) {
+        if self.heartbeat_failed.load(Ordering::Acquire) || !self.heartbeat_is_visible() {
             return Ok(false);
         }
         match read_lock_metadata(&self.path) {
@@ -358,6 +420,16 @@ impl Drop for LockGuard {
         // defensive).
         while self.heartbeat_done.try_recv().is_ok() {}
 
+        // Release the heartbeat handle before the lease file: closing any other
+        // descriptor to it now would drop the advisory locks this process holds
+        // on it, so the unlink and any concurrent replacement wait for this.
+        let mut handle = self
+            .heartbeat_file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *handle = None;
+        drop(handle);
+
         match remove_lock_if_owned(&self.path, &self.metadata) {
             Ok(true) => slog_debug!("released filesystem lock at {}", self.path.display()),
             Ok(false) => {}
@@ -368,6 +440,40 @@ impl Drop for LockGuard {
             ),
         }
     }
+}
+
+/// Run `replace`, a replacement of a lease file, after releasing the heartbeat
+/// handles this process publishes for leases.
+///
+/// Closing one descriptor to a file drops *all* the POSIX advisory locks this
+/// process holds on it, including on a descriptor another thread still keeps.
+/// A heartbeat holds its lease open between beats, so the process must not leave
+/// that descriptor to be closed by a replacement: this takes each published
+/// handle, drops the descriptor, and holds the handle's lock across `replace`.
+/// Because the guards are taken before the lock is released, a beat cannot open
+/// a lease into a slot this call is holding; a beat waits for the replacement
+/// and then opens the live file.
+fn with_lease_handles_closed<T>(replace: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    let registry = lease_files()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let handles = registry
+        .values()
+        .filter_map(Weak::upgrade)
+        .collect::<Vec<_>>();
+    drop(registry);
+    let guards = handles
+        .iter()
+        .map(|handle| {
+            let mut slot = handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *slot = None;
+            slot
+        })
+        .collect::<Vec<MutexGuard<'_, Option<LeaseFile>>>>();
+    drop(guards);
+    replace()
 }
 
 #[derive(Debug)]
@@ -419,8 +525,10 @@ fn acquire_with_deadline(
     config: LockConfig,
 ) -> Result<LockGuard, AcquireError> {
     let hostname = current_hostname();
-    let mut warned_live_owner = false;
-    let mut warned_stale_live_owner = false;
+    // Report a live blocking owner once, not once per poll this acquisition
+    // makes: a daemon with many roots re-attempts its own long-lived leases
+    // constantly, and every attempt would otherwise repeat the same warning.
+    let mut live_owner_log = LiveOwnerLog::new();
     let mut transient_create_failures: u32 = 0;
     let mut attempted_once = false;
     let mut dead_reclaim_blocked_attempts = 0_u32;
@@ -589,7 +697,7 @@ fn acquire_with_deadline(
         }
         dead_reclaim_blocked_attempts = 0;
 
-        if since_heartbeat > config.stale_heartbeat_ms && !warned_stale_live_owner {
+        if since_heartbeat > config.stale_heartbeat_ms && live_owner_log.first_stale() {
             // Same-host PID plus start-time identity is authoritative. A
             // SIGSTOP'd process, suspended VM, or sleeping laptop can miss
             // heartbeats and later resume inside the critical section. Breaking
@@ -604,17 +712,28 @@ fn acquire_with_deadline(
                 metadata.pid,
                 since_heartbeat
             );
-            warned_stale_live_owner = true;
         }
 
         let held_for = now.saturating_sub(metadata.created_at_ms);
-        if held_for > config.live_owner_warn_ms && !warned_live_owner {
-            slog_warn!(
-                "filesystem lock at {} held >10min by live heartbeating PID {}; NOT breaking",
-                path.display(),
-                metadata.pid
-            );
-            warned_live_owner = true;
+        if held_for > config.live_owner_warn_ms && live_owner_log.first_long_held() {
+            if metadata.pid == std::process::id() {
+                // A lease this process holds and keeps heartbeating is a
+                // long-lived writer (an inspect or callgraph writer lease lives
+                // as long as its cache), so nothing is wrong and nothing is at
+                // risk. Report it at debug level so the acquisition trace still
+                // shows why it is waiting.
+                slog_debug!(
+                    "filesystem lock at {} is held by a live lease of this process for >10min; \
+                     waiting without breaking it",
+                    path.display()
+                );
+            } else {
+                slog_warn!(
+                    "filesystem lock at {} held >10min by live heartbeating PID {}; NOT breaking",
+                    path.display(),
+                    metadata.pid
+                );
+            }
         }
 
         sleep_until_retry(deadline, config.poll_interval_ms)?;
@@ -639,19 +758,24 @@ fn create_new_lock(path: &Path, hostname: &str, config: LockConfig) -> io::Resul
 
     create_lock_file_atomically(path, &metadata)?;
 
+    let (heartbeat_pump, heartbeat_file) =
+        HeartbeatPump::attach(path, &metadata).inspect_err(|_| {
+            let _ = remove_lock_if_owned(path, &metadata);
+        })?;
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let heartbeat_failed = Arc::new(AtomicBool::new(false));
     let (done_tx, done_rx) = mpsc::channel();
     let heartbeat_path = path.to_path_buf();
-    let heartbeat_metadata = metadata.clone();
     let heartbeat_shutdown = Arc::clone(&shutdown);
     let heartbeat_failed_for_thread = Arc::clone(&heartbeat_failed);
+    let heartbeat_pump_for_thread = heartbeat_pump.clone();
     let heartbeat = spawn_heartbeat(move || {
         let heartbeat_shutdown_for_run = Arc::clone(&heartbeat_shutdown);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_heartbeat(
                 heartbeat_path,
-                heartbeat_metadata,
+                &heartbeat_pump_for_thread,
                 heartbeat_shutdown_for_run,
                 config,
             );
@@ -678,6 +802,8 @@ fn create_new_lock(path: &Path, hostname: &str, config: LockConfig) -> io::Resul
         heartbeat_failed,
         heartbeat_done: done_rx,
         heartbeat: Some(heartbeat),
+        pump: heartbeat_pump,
+        heartbeat_file,
     })
 }
 
@@ -712,7 +838,7 @@ fn spawn_heartbeat(run: impl FnOnce() + Send + 'static) -> io::Result<thread::Jo
 
 fn run_heartbeat(
     path: PathBuf,
-    owner: LockMetadata,
+    pump: &HeartbeatPump,
     shutdown: Arc<AtomicBool>,
     config: LockConfig,
 ) {
@@ -733,7 +859,7 @@ fn run_heartbeat(
             return;
         }
 
-        match heartbeat_once(&path, &owner) {
+        match pump.heartbeat_once() {
             Ok(()) => {
                 if consecutive_transient_failures > 0 {
                     slog_info!(
@@ -749,6 +875,8 @@ fn run_heartbeat(
                 // someone else. Continuing to write would clobber a new owner's
                 // metadata (the exact race documented in LockGuard::drop), so
                 // stop heartbeating.
+                #[cfg(test)]
+                pump.mark_stopped();
                 slog_error!(
                     "{}; stopping heartbeat",
                     terminal_heartbeat_message(&path, &error)
@@ -783,7 +911,10 @@ fn run_heartbeat(
 /// they are typically temporary disk/NFS hiccups or a read that raced a
 /// concurrent writer — so the heartbeat retries rather than dying.
 fn heartbeat_error_is_terminal(error: &HeartbeatError) -> bool {
-    matches!(error, HeartbeatError::LockGone | HeartbeatError::NotOwner)
+    matches!(
+        error,
+        HeartbeatError::LockGone | HeartbeatError::NotOwner | HeartbeatError::NotPumped
+    )
 }
 
 fn terminal_heartbeat_message(path: &Path, error: &HeartbeatError) -> String {
@@ -793,6 +924,10 @@ fn terminal_heartbeat_message(path: &Path, error: &HeartbeatError) -> String {
         }
         HeartbeatError::NotOwner => format!(
             "filesystem lock at {} is no longer owned by this guard",
+            path.display()
+        ),
+        HeartbeatError::NotPumped => format!(
+            "filesystem lock at {} heartbeat handle was released by this process",
             path.display()
         ),
         // Not reachable for non-terminal errors, but keep a sensible string.
@@ -814,6 +949,7 @@ fn transient_heartbeat_reason(error: &HeartbeatError) -> String {
         HeartbeatError::Malformed(error) => format!("became malformed: {error}"),
         HeartbeatError::LockGone => "lock disappeared".to_string(),
         HeartbeatError::NotOwner => "lock no longer owned".to_string(),
+        HeartbeatError::NotPumped => "heartbeat handle released".to_string(),
     }
 }
 
@@ -845,6 +981,238 @@ fn log_transient_heartbeat_failure(
     }
 }
 
+/// The heartbeat thread's handle on one lease.
+///
+/// The thread keeps the lease open between beats so a beat costs one write
+/// instead of an open, a read and a close. A `File` released on its own thread
+/// closes there, and on macOS the close is where the lease's write-back runs,
+/// so per-beat close/open churn put the write-back cost on the heartbeat
+/// thread. Three rules bound how long the handle lives:
+///
+/// * Another thread of this process that has to replace the lease needs every
+///   handle to it released first (`LEASE_FILES`), because closing any
+///   descriptor to a file drops the advisory locks this process holds on it.
+///   That is why the replacement paths close before they rename.
+/// * A beat never trusts the handle blindly. The first time the lease on disk
+///   is not the identity this handle was opened for (reclaimed and recreated,
+///   or replaced), the handle is released and the next beat opens the path
+///   again. Releases happen on the heartbeat thread, or on the thread running a
+///   replacement through `with_lease_handles_closed`.
+/// * The heartbeat stops rather than refresh a lease this process no longer
+///   owns: it checks the owner on disk before every write, and stops when the
+///   path itself is gone. A guard whose heartbeat stopped reports the lease as
+///   unverified; see `heartbeat_is_visible`.
+#[derive(Debug)]
+struct HeartbeatPump {
+    path: PathBuf,
+    slot: usize,
+    /// How long one beat keeps retrying (reopening the lease and reading it
+    /// again) before it reports the failure. When no beat is running, the handle
+    /// simply stays open between beats.
+    idle: Duration,
+    /// Full owner identity, recorded at attach. The path can later hold a
+    /// different owner: a reclaim by any process mints a new epoch, so a path
+    /// whose identity no longer matches was released and re-indexed for its new
+    /// owner. A reclaim happens when the owner is judged dead, or when another
+    /// host's heartbeat went stale beyond its extended window.
+    owner: Mutex<LockMetadata>,
+    visible: AtomicBool,
+    /// Set when the heartbeat ends for a reason other than the guard closing.
+    /// Tests read it to tell "a later beat failed" from "the beat was still
+    /// retrying", which a file timestamp cannot show.
+    #[cfg(test)]
+    stopped: Arc<AtomicBool>,
+}
+
+fn lease_files() -> &'static Mutex<HashMap<usize, Weak<Mutex<Option<LeaseFile>>>>> {
+    LEASE_FILES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+impl Clone for HeartbeatPump {
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            slot: self.slot,
+            idle: self.idle,
+            owner: Mutex::new(
+                self.owner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            ),
+            visible: AtomicBool::new(self.is_visible()),
+            #[cfg(test)]
+            stopped: Arc::clone(&self.stopped),
+        }
+    }
+}
+
+impl HeartbeatPump {
+    /// Register a heartbeat handle for a newly created lease and publish it in
+    /// this process's lease index.
+    fn attach(
+        path: &Path,
+        owner: &LockMetadata,
+    ) -> io::Result<(Self, Arc<Mutex<Option<LeaseFile>>>)> {
+        let file = Arc::new(Mutex::new(Some(
+            open_lease_for_heartbeat(path).map_err(heartbeat_io_error)?,
+        )));
+        let slot = NEXT_LEASE_SLOT.fetch_add(1, Ordering::Relaxed) as usize;
+        let mut registry = lease_files()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if registry.len() > 4096 {
+            registry.retain(|_, known| known.strong_count() > 0);
+        }
+        registry.insert(slot, Arc::downgrade(&file));
+        Ok((
+            Self {
+                path: path.to_path_buf(),
+                slot,
+                idle: Duration::from_millis(HEARTBEAT_INTERVAL_MS),
+                owner: Mutex::new(owner.clone()),
+                visible: AtomicBool::new(true),
+                #[cfg(test)]
+                stopped: Arc::new(AtomicBool::new(false)),
+            },
+            file,
+        ))
+    }
+
+    fn is_visible(&self) -> bool {
+        self.visible.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn mark_stopped(&self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+
+    /// Whether the heartbeat thread ended by itself instead of at guard drop.
+    #[cfg(test)]
+    pub(super) fn heartbeat_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    /// One beat: read the lease through the kept handle, refresh the timestamp,
+    /// and write it back through the same handle, opening the lease only when
+    /// no handle is kept.
+    fn heartbeat_once(&self) -> Result<(), HeartbeatError> {
+        if !self.is_visible() {
+            return Err(HeartbeatError::NotPumped);
+        }
+        let deadline = Instant::now() + self.idle;
+        let mut wait_logged = false;
+        loop {
+            let handle = {
+                let registry = lease_files()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                registry.get(&self.slot).and_then(Weak::upgrade)
+            };
+            let Some(handle) = handle else {
+                return Err(HeartbeatError::NotPumped);
+            };
+            match self.beat(&handle) {
+                Ok(()) => return Ok(()),
+                // The lease on disk is not the one this handle was opened for.
+                // If it is no longer this process's lease, stop instead of
+                // writing over another owner's heartbeat; otherwise the path
+                // was replaced under the handle (a plain rewrite, or a stale
+                // rename), so the next attempt reads the live file.
+                Err(HeartbeatError::NotOwner) => {
+                    self.retire_handle(&handle);
+                    if self.release_if_reclaimed() {
+                        return Err(HeartbeatError::NotOwner);
+                    }
+                    self.index(&handle);
+                }
+                // A partially visible rewrite, or a lease this process is
+                // replacing right now: read it afresh on the next attempt.
+                Err(HeartbeatError::Malformed(_)) => {
+                    self.retire_handle(&handle);
+                    self.index(&handle);
+                }
+                Err(error) => return Err(error),
+            }
+            if Instant::now() >= deadline {
+                return Err(HeartbeatError::NotOwner);
+            }
+            if !wait_logged {
+                wait_logged = true;
+                slog_warn!(
+                    "filesystem lock at {} is being rewritten in this process; \
+                     heartbeat retrying",
+                    self.path.display()
+                );
+            }
+            thread::sleep(self.idle);
+        }
+    }
+
+    fn beat(&self, handle: &Arc<Mutex<Option<LeaseFile>>>) -> Result<(), HeartbeatError> {
+        let owner = self
+            .owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let needs_open = handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none();
+        if needs_open {
+            // Publish the reopened descriptor under the slot before the beat:
+            // the handle another thread's replacement waits for must always be
+            // the one this process holds. Opening inside the beat would leave a
+            // window where a replacement renames the lease the beat is not
+            // looking at.
+            let file = open_lease_for_heartbeat(&self.path)?;
+            let mut slot = handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if slot.is_none() {
+                *slot = Some(file);
+            }
+        }
+        heartbeat_once(&self.path, &owner, handle)
+    }
+
+    /// Keep this process's lease index pointing at the handle the heartbeat
+    /// holds. Another thread's replacement looks the lease up here to know which
+    /// descriptor it has to release before it renames the lease.
+    fn index(&self, handle: &Arc<Mutex<Option<LeaseFile>>>) {
+        lease_files()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(self.slot, Arc::downgrade(handle));
+    }
+
+    /// Release the lease descriptor but keep the slot registered, so the next
+    /// beat reopens the lease into it. Dropping the slot instead would leave the
+    /// heartbeat with no handle to find, and it would stop.
+    fn retire_handle(&self, handle: &Arc<Mutex<Option<LeaseFile>>>) {
+        let mut slot = handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = None;
+    }
+
+    fn release_if_reclaimed(&self) -> bool {
+        match read_lock_metadata(&self.path) {
+            Err(ReadLockError::Malformed(_)) => false,
+            Err(ReadLockError::Io(error)) if error.kind() == io::ErrorKind::NotFound => true,
+            Err(ReadLockError::Io(_)) => false,
+            Ok(on_disk) => {
+                let owner = self
+                    .owner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                !lock_identity_matches(&on_disk, &owner)
+            }
+        }
+    }
+}
+
 /// Refresh `heartbeat_at_ms` in a lease this guard owns.
 ///
 /// Durability: a heartbeat only has to be visible to other processes, so this
@@ -854,7 +1222,7 @@ fn log_transient_heartbeat_failure(
 /// handle. Creation and reclaim tokens also need only visibility: ownership
 /// depends on a live process identity, which cannot survive a machine crash.
 ///
-/// The rewrite happens in place on the handle whose contents were just checked
+/// The rewrite happens in place on `handle`, whose contents were just checked
 /// for ownership: no new inode per beat, and no window in which the path is
 /// missing (which other code reads as `LockGone`). Serialization is
 /// deterministic, so only the digits of `heartbeat_at_ms` differ and the file
@@ -862,14 +1230,25 @@ fn log_transient_heartbeat_failure(
 /// a truncated or zero-length file. If the length would change (the timestamp
 /// gained a digit), fall back to an unsynced temp-file rename, which still
 /// replaces the path atomically.
-fn heartbeat_once(path: &Path, owner: &LockMetadata) -> Result<(), HeartbeatError> {
-    let mut file = match OpenOptions::new().read(true).write(true).open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(HeartbeatError::LockGone);
-        }
-        Err(error) => return Err(HeartbeatError::Io(error)),
+///
+/// `handle` is empty for a beat that has no kept descriptor; that beat opens
+/// the lease for itself and releases it when it returns. A heartbeat thread
+/// passes the handle it keeps, so a same-length beat opens and closes nothing;
+/// a length change still writes a temp file and renames it.
+fn heartbeat_once(
+    path: &Path,
+    owner: &LockMetadata,
+    handle: &Mutex<Option<LeaseFile>>,
+) -> Result<(), HeartbeatError> {
+    let mut slot = handle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut opened = None;
+    let file = match slot.as_mut() {
+        Some(kept) => kept.file(),
+        None => opened.insert(open_lease_for_heartbeat(path)?).file(),
     };
+    file.seek(SeekFrom::Start(0)).map_err(HeartbeatError::Io)?;
     let mut current = Vec::new();
     file.read_to_end(&mut current).map_err(HeartbeatError::Io)?;
     let mut metadata: LockMetadata =
@@ -883,10 +1262,51 @@ fn heartbeat_once(path: &Path, owner: &LockMetadata) -> Result<(), HeartbeatErro
     let next = lock_metadata_bytes(&metadata).map_err(HeartbeatError::Io)?;
     if next.len() == current.len() {
         file.seek(SeekFrom::Start(0)).map_err(HeartbeatError::Io)?;
-        return write_lock_bytes(&mut file, &next).map_err(HeartbeatError::Io);
+        return write_lock_bytes(file, &next).map_err(HeartbeatError::Io);
     }
-    drop(file);
+    // Close before replacing the path: a handle stays usable for later beats
+    // only while it refers to the lease at this path. The replacement itself
+    // also releases any handle this process publishes for the path.
+    *slot = None;
+    drop(opened);
     replace_lock_bytes_unsynced(path, &next).map_err(HeartbeatError::Io)
+}
+
+fn open_lease_for_heartbeat(path: &Path) -> Result<LeaseFile, HeartbeatError> {
+    let file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(HeartbeatError::LockGone);
+        }
+        Err(error) => return Err(HeartbeatError::Io(error)),
+    };
+    io_ledger::record(|ledger| ledger.opens += 1);
+    Ok(LeaseFile(file))
+}
+
+/// A descriptor the heartbeat opened, so its release is counted wherever it
+/// happens: a beat that drops it, `LockGuard::drop`, or a lease replacement
+/// that releases the published handle.
+#[derive(Debug)]
+struct LeaseFile(File);
+
+impl LeaseFile {
+    fn file(&mut self) -> &mut File {
+        &mut self.0
+    }
+}
+
+impl Drop for LeaseFile {
+    fn drop(&mut self) {
+        io_ledger::record(|ledger| ledger.closes += 1);
+    }
+}
+
+fn heartbeat_io_error(error: HeartbeatError) -> io::Error {
+    match error {
+        HeartbeatError::Io(error) => error,
+        other => io::Error::other(format!("{other:?}")),
+    }
 }
 
 #[derive(Debug)]
@@ -895,6 +1315,7 @@ enum HeartbeatError {
     LockGone,
     Malformed(serde_json::Error),
     NotOwner,
+    NotPumped,
 }
 
 #[derive(Debug)]
@@ -981,7 +1402,7 @@ fn replace_lock_bytes_unsynced(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let mut file = open_new_lock_file(&tmp_path)?;
         write_lock_bytes(&mut file, bytes)?;
         drop(file);
-        rename_over(&tmp_path, path)
+        with_lease_handles_closed(|| rename_over(&tmp_path, path))
     })();
 
     if write_result.is_err() {
@@ -1075,7 +1496,7 @@ fn remove_lock_if_owned(path: &Path, owner: &LockMetadata) -> io::Result<bool> {
 }
 
 fn remove_lock_file(path: &Path) -> io::Result<()> {
-    match fs::remove_file(path) {
+    match with_lease_handles_closed(|| fs::remove_file(path)) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
@@ -1677,6 +2098,11 @@ pub(crate) mod io_ledger {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) struct IoLedger {
         pub(crate) acquisitions: u64,
+        /// Descriptors opened for a heartbeat read or write (`fopen`/`open`).
+        pub(crate) opens: u64,
+        /// Descriptors released by a heartbeat (`fclose`/`close`), at the
+        /// `fclose` that `close()` spends its time in on the performance sweep.
+        pub(crate) closes: u64,
         pub(crate) file_syncs: u64,
         pub(crate) dir_syncs: u64,
         pub(crate) new_files: u64,
@@ -1971,6 +2397,8 @@ pub(crate) fn process_alive(_pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufRead;
+    use std::process::{Child, ChildStdin, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Barrier};
 
@@ -2145,6 +2573,9 @@ mod tests {
             Ok(_) => panic!("acquired a lock whose metadata could not be read"),
         }
     }
+
+    const HARNESS_TEST: &str = "fs_lock::tests::fs_lock_separate_process_harness";
+    const HARNESS_MODE_INSPECT: &str = "inspect";
 
     fn test_config() -> LockConfig {
         LockConfig {
@@ -2545,7 +2976,7 @@ mod tests {
         let _ = io_ledger::take();
         for _ in 0..LEDGER_BEATS_PER_LEASE {
             for (path, owner) in &leases {
-                heartbeat_once(path, owner).expect("heartbeat");
+                heartbeat_once(path, owner, &Mutex::new(None)).expect("heartbeat");
             }
         }
         let ledger = io_ledger::take();
@@ -2623,6 +3054,91 @@ mod tests {
         assert_eq!(crate::durability::sync_count(&crate::durability::take()), 0);
     }
 
+    /// Leases a live daemon of this size holds at once: one root-keyed inspect
+    /// writer lease and one root-keyed callgraph writer lease per bound project,
+    /// for about a hundred projects with both caches open.
+    const DAEMON_SCALE_LEASES: usize = 200;
+
+    /// Fails if a beat opened or closed a descriptor instead of writing through
+    /// the handle the guard keeps, which is what a regression to open-per-beat
+    /// would show up as in the ledger.
+    fn assert_beat_opens_no_descriptor(beat: &io_ledger::IoLedger) {
+        assert_eq!(
+            (beat.opens, beat.closes),
+            (0, 0),
+            "a beat must write through the kept handle, without opening or \
+             closing a descriptor: {beat:?}"
+        );
+    }
+
+    /// What the heartbeat costs for a daemon-shaped set of long-lived leases.
+    ///
+    /// Before the kept handle, every beat of every lease opened the file,
+    /// read it, wrote it and closed it: 200 opens and 200 closes per beat, 40
+    /// per second at the five-second interval, and the macOS `close()` that
+    /// pulls the page write-back ran on the heartbeat thread. A beat now writes
+    /// through the handle the heartbeat already holds. `kept_descriptors` counts
+    /// how many descriptor opens occur across all the beats, so a regression to
+    /// open-per-beat moves it from zero to the number of beats.
+    #[test]
+    fn daemon_scale_heartbeats_keep_descriptors_open_between_beats() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let _ = io_ledger::take();
+        let guards = (0..DAEMON_SCALE_LEASES)
+            .map(|index| {
+                acquire_with_config(
+                    &dir.path().join(format!("root-{index}.writer.lease")),
+                    Some(Duration::from_secs(2)),
+                    test_config(),
+                )
+                .expect("acquire live lease")
+            })
+            .collect::<Vec<_>>();
+        // Open-only: every lease created here had no prior contents, so its
+        // heartbeat started from the handle acquisition opened. A kept
+        // descriptor released since would have taken the close path below.
+        let setup = io_ledger::take();
+        assert_eq!(
+            setup.closes, 0,
+            "acquiring a fresh lease must not close a descriptor: {setup:?}"
+        );
+
+        let beats = 3;
+        let _ = io_ledger::take();
+        for _ in 0..beats {
+            for guard in &guards {
+                guard.heartbeat_once().expect("beat");
+            }
+        }
+        let beat_cost = io_ledger::take();
+        eprintln!(
+            "fs_lock heartbeat cost: leases={DAEMON_SCALE_LEASES} beats_per_lease={beats} \
+             opens={} closes={} bytes={} (open+close per beat would be opens={} closes={})",
+            beat_cost.opens,
+            beat_cost.closes,
+            beat_cost.bytes_written,
+            DAEMON_SCALE_LEASES * beats,
+            DAEMON_SCALE_LEASES * beats,
+        );
+        assert_beat_opens_no_descriptor(&beat_cost);
+        assert!(beat_cost.bytes_written > 0, "{beat_cost:?}");
+
+        for guard in &guards {
+            let current = read_lock_metadata(guard.path()).expect("read lease");
+            assert!(lock_identity_matches(&current, &guard.metadata));
+        }
+
+        drop(guards);
+        let released = io_ledger::take();
+        // Release closes each handle once. Other tests in this process run
+        // their own leases on their own threads, so this asks only that the
+        // releases are accounted for, never for exactly this test's count.
+        assert!(
+            released.closes >= DAEMON_SCALE_LEASES as u64,
+            "each live lease closes its handle once, at release: {released:?}"
+        );
+    }
+
     /// A crash after an unsynced rename can leave a zero-length lease. Readers
     /// must treat it as stale: acquisition removes it and takes the lock, the
     /// owner's heartbeat reports a transient malformed read, and nothing panics.
@@ -2632,7 +3148,7 @@ mod tests {
         fs::write(&path, b"").expect("write empty lease");
         let owner = current_process_metadata();
         assert!(matches!(
-            heartbeat_once(&path, &owner),
+            heartbeat_once(&path, &owner, &Mutex::new(None)),
             Err(HeartbeatError::Malformed(_))
         ));
         assert!(!heartbeat_error_is_terminal(&HeartbeatError::Malformed(
@@ -2654,7 +3170,7 @@ mod tests {
         create_lock_file_atomically(&path, &owner).expect("create lock");
 
         let _ = io_ledger::take();
-        heartbeat_once(&path, &owner).expect("heartbeat");
+        heartbeat_once(&path, &owner, &Mutex::new(None)).expect("heartbeat");
         let ledger = io_ledger::take();
         assert_eq!((ledger.file_syncs, ledger.dir_syncs), (0, 0), "{ledger:?}");
         assert_eq!(ledger.new_files, 1, "{ledger:?}");
@@ -3204,6 +3720,208 @@ mod tests {
         remove_lock_file(&path).expect("cleanup synthetic lock");
     }
 
+    /// Run a helper path in its own process using the Rust test binary under a
+    /// stdio harness, so a test can observe what a *separate* process sees.
+    fn spawn_test_harness(mode: &str, path: &Path) -> (Child, ChildStdin, mpsc::Receiver<String>) {
+        let mut command = std::process::Command::new(std::env::current_exe().expect("test exe"));
+        command
+            .args(["--exact", HARNESS_TEST, "--nocapture", "--test-threads=1"])
+            .env("FS_LOCK_HARNESS_MODE", mode)
+            .env("FS_LOCK_HARNESS_PATH", path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        for name in [
+            "AFT_TEST_REQUIRE_RUST_ANALYZER",
+            "AFT_TEST_STORAGE_ROOT",
+            "AFT_STORAGE_DIR",
+        ] {
+            command.env_remove(name);
+        }
+        let mut child = command.spawn().expect("spawn test harness process");
+        let stdin = child.stdin.take().expect("harness stdin");
+        let stdout = child.stdout.take().expect("harness stdout");
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            for line in io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        (child, stdin, receiver)
+    }
+
+    /// Reads harness stdout lines until one starts with `ready:`, returning the
+    /// timestamp it reports. A panic message from the harness process is
+    /// surfaced instead of timing out.
+    fn await_harness_ready(writes_at_ms: u64, seen: &mut mpsc::Receiver<String>) -> u64 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            match seen.recv_timeout(Duration::from_millis(100)) {
+                Ok(line) => {
+                    if let Some(stamp) = line.strip_prefix("ready:") {
+                        let stamp = stamp.trim().parse().expect("ready timestamp");
+                        assert!(
+                            stamp >= writes_at_ms,
+                            "the other process saw heartbeat {stamp} older than ours {writes_at_ms}"
+                        );
+                        return stamp;
+                    }
+                    if line.contains("panicked") || line.contains("test result: FAILED") {
+                        panic!("harness process failed: {line}");
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        panic!("harness process never reported its view of the lease");
+    }
+
+    /// Another process must see `heartbeat_at_ms` advance, even while this
+    /// process keeps its lease open between beats. The harness process watches
+    /// the lease for several beats and requires at least one advance; this test
+    /// also re-reads the lease itself and requires it to move forward on every
+    /// step.
+    ///
+    /// Deliberately breaking the heartbeat (returning before the beat in
+    /// `HeartbeatPump::heartbeat_once`) leaves the timestamp frozen, and the
+    /// harness reports no change, which fails this test.
+    #[test]
+    fn separate_process_sees_heartbeat_advance() {
+        if std::env::var_os(HARNESS_TEST).is_some() {
+            return;
+        }
+        let (_dir, path) = test_lock_path();
+        let guard = acquire_with_config(&path, None, test_config()).expect("acquire lock");
+        guard.heartbeat_once().expect("initial beat");
+        let visible_in_process = read_lock_metadata(&path)
+            .expect("read lease")
+            .heartbeat_at_ms;
+        let (mut child, stdin, mut harness_lines) = spawn_test_harness(HARNESS_MODE_INSPECT, &path);
+        let first_visible = await_harness_ready(visible_in_process, &mut harness_lines);
+        let mut previous = first_visible;
+        // Four beats at the test interval (25ms); the stale bound is 2s, so a
+        // heartbeat this process really refreshes moves well inside it.
+        for step in 0..4 {
+            thread::sleep(Duration::from_millis(
+                test_config().heartbeat_interval_ms * 6,
+            ));
+            let seen = read_lock_metadata(&path)
+                .expect("read lease")
+                .heartbeat_at_ms;
+            assert!(
+                seen > previous,
+                "the other process saw the lease heartbeat stall at {seen} after step {step}"
+            );
+            previous = seen;
+        }
+        // Close the harness's stdin and drain its output before waiting, so it
+        // never writes into a pipe whose reader has gone.
+        drop(stdin);
+        while harness_lines
+            .recv_timeout(Duration::from_millis(200))
+            .is_ok()
+        {}
+        let status = child.wait().expect("harness exit");
+        assert!(status.success(), "harness process failed: {status:?}");
+        drop(guard);
+    }
+
+    /// A replacement by another part of this process must leave the owner's
+    /// heartbeat working: writers keep publishing through the same guard, and a
+    /// heartbeat that stopped would let another process reclaim the lease after
+    /// the stale window while the writer is still running. The test replaces the
+    /// lease (which releases the published handle), then opens a fresh handle
+    /// and publishes it, and requires the next beat to refresh through it.
+    #[test]
+    fn replacing_the_lease_keeps_the_next_beat_working_for_the_owner() {
+        let (_dir, path) = test_lock_path();
+        let guard = acquire_with_config(&path, None, test_config()).expect("acquire");
+        let mut restored = guard.metadata.clone();
+        // Same digit count as the live heartbeat, so the serialized lease keeps
+        // its byte length; the replacement itself is still an atomic rename.
+        restored.heartbeat_at_ms = now_ms().saturating_sub(1_000);
+        let fresh = with_lease_handles_closed(|| {
+            replace_lock_bytes_unsynced(&path, &lock_metadata_bytes(&restored).expect("serialize"))
+                .map(|()| open_lease_for_heartbeat(&path))
+        })
+        .expect("replace the lease")
+        .expect("open the replacement lease");
+        // The owner keeps a reference, as `LockGuard` does, so the handle
+        // survives until the guard is released.
+        let replacement = Arc::new(Mutex::new(Some(fresh)));
+        lease_files()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(guard.pump.slot, Arc::downgrade(&replacement));
+
+        let stale_at = restored.heartbeat_at_ms;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut advanced = false;
+        while Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(
+                test_config().heartbeat_interval_ms * 2,
+            ));
+            if read_lock_metadata(&path)
+                .map(|meta| meta.heartbeat_at_ms > stale_at)
+                .unwrap_or(false)
+            {
+                advanced = true;
+                break;
+            }
+        }
+        assert!(
+            advanced,
+            "the heartbeat did not refresh the lease through the replacement \
+             handle: {:?}",
+            read_lock_metadata(&path)
+        );
+        assert!(
+            guard.verify_writer_epoch().expect("verify lease"),
+            "writers must still verify their epoch after a replacement"
+        );
+    }
+
+    /// Body of the separate-process harness this module's tests spawn.
+    #[test]
+    fn fs_lock_separate_process_harness() {
+        let Some(mode) = std::env::var_os("FS_LOCK_HARNESS_MODE") else {
+            return;
+        };
+        let path = PathBuf::from(std::env::var_os("FS_LOCK_HARNESS_PATH").expect("harness path"));
+        println!("mode:{mode:?} path={}", path.display());
+        match mode.to_string_lossy().as_ref() {
+            HARNESS_MODE_INSPECT => {
+                let first = read_lock_metadata(&path).expect("read lease as a separate process");
+                println!("ready:{}", first.heartbeat_at_ms);
+                let mut seen = first.heartbeat_at_ms;
+                // Watch for a few beats. Every read here is this process's own
+                // open of the lease file, so what it sees is what the owner's
+                // heartbeat has made visible to any other process.
+                let deadline = Instant::now()
+                    + Duration::from_millis(test_config().heartbeat_interval_ms * 40);
+                while Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(
+                        test_config().heartbeat_interval_ms * 2,
+                    ));
+                    if let Ok(metadata) = read_lock_metadata(&path) {
+                        if metadata.heartbeat_at_ms > seen {
+                            println!("moved:{}", metadata.heartbeat_at_ms);
+                            seen = metadata.heartbeat_at_ms;
+                        }
+                    }
+                }
+                assert!(
+                    seen > first.heartbeat_at_ms,
+                    "the lease heartbeat never advanced for this process"
+                );
+            }
+            other => panic!("unknown harness mode {other}"),
+        }
+    }
+
     #[test]
     fn drop_stops_heartbeat_thread() {
         let (_dir, path) = test_lock_path();
@@ -3252,8 +3970,12 @@ mod tests {
         // Corrupt the lockfile out from under the heartbeat (simulates a
         // concurrent-writer race producing a momentarily-unparseable read).
         // The heartbeat reads-then-writes, so it observes Malformed and, with
-        // the fix, retries instead of dying.
-        fs::write(&path, b"{ not valid json").expect("corrupt lockfile");
+        // the fix, retries instead of dying. The corruption keeps the lease's
+        // byte length: a length change takes the process-wide replacement path,
+        // which releases the beat's kept handle and leaves the ownership check
+        // to the next open, and this test is about retrying a read that failed.
+        let live = fs::read(&path).expect("read live lease");
+        fs::write(&path, vec![b'x'; live.len()]).expect("corrupt lockfile");
 
         // Give the heartbeat several intervals to observe the malformed file.
         // Pre-fix, the thread is dead by now.
@@ -3261,28 +3983,30 @@ mod tests {
             test_config().heartbeat_interval_ms * 4,
         ));
 
-        // Restore valid owner metadata with a clearly-stale heartbeat sentinel.
-        // Ownership fields must match `owner` exactly so heartbeat_once passes
-        // its ownership check and writes a fresh timestamp.
-        //
-        // Use the atomic temp-write+rename path rather than remove-then-recreate:
-        // a remove followed by a separate create leaves a window where the file
-        // does not exist, and a heartbeat poll landing in that window reads
-        // NotFound -> LockGone (terminal) and kills the thread, failing this test
-        // spuriously under runner load (observed on macOS CI). The atomic replace
-        // overwrites the corrupt file in place with no no-file window on Unix.
-        let sentinel = now_ms().saturating_sub(1_000_000);
+        // Restore the owner's own lease bytes with a clearly-stale heartbeat
+        // timestamp. The replacement bytes keep the lease's byte length, so the
+        // next beat takes its in-place path. The restore's timestamp only has to
+        // be older than the beat that follows, so a value from before the
+        // corruption is enough.
         let mut restored = owner.clone();
-        restored.heartbeat_at_ms = sentinel;
-        replace_lock_bytes_unsynced(
-            &path,
-            &lock_metadata_bytes(&restored).expect("serialize restored metadata"),
-        )
-        .expect("atomically restore lock metadata");
+        restored.heartbeat_at_ms = now_ms().saturating_sub(1_000_000);
+        let sentinel = restored.heartbeat_at_ms;
+        // The atomic replacement, not a plain write: it releases the beat's
+        // kept descriptor, while a plain write would leave that descriptor
+        // still looking at the corrupted contents. The bytes keep the length.
+        with_lease_handles_closed(|| {
+            replace_lock_bytes_unsynced(
+                &path,
+                &lock_metadata_bytes(&restored).expect("serialize restored metadata"),
+            )
+        })
+        .expect("restore lock metadata");
 
         // If the heartbeat thread is still alive (the fix), it will overwrite
-        // heartbeat_at_ms with a current value. Poll for that recovery.
-        let deadline = std::time::Instant::now() + Duration::from_millis(3_000);
+        // heartbeat_at_ms with a current value. Poll for that recovery. The
+        // window covers the beat that finds the restored lease but is still
+        // failing on the earlier corrupt state, plus several retries after it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut recovered = false;
         while std::time::Instant::now() < deadline {
             thread::sleep(Duration::from_millis(25));
@@ -3299,7 +4023,11 @@ mod tests {
         }
         assert!(
             recovered,
-            "heartbeat did not recover after a transient malformed read — thread likely died"
+            "heartbeat did not recover after a transient malformed read — thread likely died: \
+             stopped={} visible={} on_disk={:?}",
+            guard.pump.heartbeat_stopped(),
+            guard.heartbeat_is_visible(),
+            read_lock_metadata(&path)
         );
         drop(guard);
     }

@@ -1,0 +1,1 @@
+- Reduced daemon CPU on hosts with many bound projects: writer-lease heartbeats no longer reopen and close each lease file every few seconds, and a daemon no longer warns about its own long-lived leases.
