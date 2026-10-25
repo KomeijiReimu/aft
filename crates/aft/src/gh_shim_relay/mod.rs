@@ -764,6 +764,7 @@ async fn post_captured(
 ) -> Result<RelayReply, crate::gh_shim_speech::Refusal> {
     use crate::gh_shim_speech::partner;
     use crate::gh_shim_speech::{Code, Refusal, ScopeRole};
+    let probe_deadline = tokio::time::Instant::now() + Duration::from_millis(9_750);
     let invalid = || Refusal::new(Code::AuthorityUnavailable, "snapshot_invalid");
     let launch = redeemed.launch.as_ref().ok_or_else(invalid)?;
     launch.validate()?;
@@ -830,7 +831,7 @@ async fn post_captured(
             launch.origin.as_ref()
         };
         if !routes.origin_live(origin, scope) {
-            service.check_scope(scope, role).await?;
+            service.check_scope(scope, role, probe_deadline).await?;
         }
         service.check_pending(
             Some(&stored.record.incarnation),
@@ -845,7 +846,8 @@ async fn post_captured(
         .policy
         .as_ref()
         .ok_or_else(|| Refusal::new(Code::AuthorityUnavailable, "start_policy_missing"))?;
-    let (current, desired, _) = crate::gh_shim::capture_speech_policy()?
+    let (current, desired) = service
+        .register_accepted_policy()?
         .ok_or_else(|| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
     let policy_generation = service.store.advance_policy(&current)?;
     let invocation: crate::gh_shim_speech::invocation::Invocation =
@@ -916,6 +918,22 @@ async fn post_captured(
             &redeemed.session_id,
             &redeemed.task_id,
         )?;
+        let send = || {
+            for (role, scope) in launch.required_scopes() {
+                let origin = if role == ScopeRole::Head {
+                    launch.head_origin.as_ref()
+                } else {
+                    launch.origin.as_ref()
+                };
+                if !routes.origin_live(origin, scope) {
+                    if tokio::time::Instant::now() >= probe_deadline {
+                        return Err(Refusal::scoped(Code::ScopeUnknown, "timeout", role));
+                    }
+                    service.check_cached_scope(scope, role)?;
+                }
+            }
+            slot.send()
+        };
         let queued = if foreground {
             service.store.final_foreground_gate(
                 &stored.record.incarnation,
@@ -923,7 +941,7 @@ async fn post_captured(
                 stored.generation,
                 policy_generation,
                 &current,
-                || slot.send(),
+                send,
             )
         } else {
             service.store.final_gate(
@@ -932,7 +950,7 @@ async fn post_captured(
                 stored.generation,
                 policy_generation,
                 &current,
-                || slot.send(),
+                send,
             )
         };
         queued
@@ -977,7 +995,7 @@ async fn post_captured(
         };
         if let Some(scope) = scope {
             service.invalidate(scope);
-            let _ = service.check_scope(scope, role).await;
+            let _ = service.check_scope(scope, role, probe_deadline).await;
         }
     }
     // Posted legs and terminal replays are returned intact, even after revocation.

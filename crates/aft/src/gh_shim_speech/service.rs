@@ -382,6 +382,9 @@ impl Service {
     }
 }
 
+#[cfg(test)]
+mod tests;
+
 impl LaunchContext {
     pub(crate) fn prepare(&self) -> PreparedLaunch {
         let started = Instant::now();
@@ -393,7 +396,7 @@ impl LaunchContext {
             denial: None,
             provisioned: false,
         };
-        let (snapshot, desired, legacy) = match crate::gh_shim::capture_speech_policy() {
+        let (snapshot, desired) = match self.service.register_accepted_policy() {
             Ok(Some(value)) => value,
             Ok(None) => {
                 if let Ok(Some(old)) = self.service.store.latest_policy() {
@@ -422,15 +425,6 @@ impl LaunchContext {
                 return prepared;
             }
         };
-        let result = self
-            .service
-            .store
-            .initialize_policy(&snapshot, legacy)
-            .and_then(|_| self.service.store.advance_policy(&snapshot));
-        if let Err(error) = result {
-            prepared.denial = Some(error);
-            return prepared;
-        }
         let (handle, relay) = {
             let guard = self
                 .service
@@ -487,6 +481,22 @@ impl LaunchContext {
             Err(error) => prepared.denial = Some(error),
         }
         prepared
+    }
+}
+
+impl Service {
+    /// Observe only a manifest already accepted by the shim. The shim owns its
+    /// JSON records; the daemon independently verifies them before writing aft.db.
+    pub(crate) fn register_accepted_policy(
+        &self,
+    ) -> Result<Option<(PolicySnapshot, BTreeMap<String, String>)>, Refusal> {
+        let Some((snapshot, desired, accepted_version)) = crate::gh_shim::capture_speech_policy()?
+        else {
+            return Ok(None);
+        };
+        self.store.initialize_policy(&snapshot, accepted_version)?;
+        self.store.advance_policy(&snapshot)?;
+        Ok(Some((snapshot, desired)))
     }
 }
 
@@ -553,8 +563,11 @@ impl Service {
         self: &Arc<Self>,
         scope: &ScopeStamp,
         role: ScopeRole,
+        deadline: tokio::time::Instant,
     ) -> Result<(), Refusal> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Refusal::scoped(Code::ScopeUnknown, "timeout", role));
+        }
         let key = ScopeKey::from_stamp(scope);
         if self
             .pending_scopes
@@ -616,7 +629,23 @@ impl Service {
                 .cloned()
                 .unwrap_or(cached)
         };
-        if self.generation() != cached.generation {
+        match self.validate_cached_scope(scope, role, &cached)? {
+            Answer::Live(_) => Ok(()),
+            Answer::Ended(proof) => {
+                let _ = self.record_end(scope, proof);
+                Err(Refusal::scoped(Code::ScopeEnded, "ended", role))
+            }
+        }
+    }
+
+    fn validate_cached_scope(
+        &self,
+        scope: &ScopeStamp,
+        role: ScopeRole,
+        cached: &Cached,
+    ) -> Result<Answer, Refusal> {
+        let generation = self.generation();
+        if generation != cached.generation {
             return Err(Refusal::scoped(Code::ScopeUnknown, "unverifiable", role));
         }
         let reply = cached
@@ -638,12 +667,29 @@ impl Service {
                 if cached.sent.elapsed() >= Duration::from_secs(5) {
                     return Err(Refusal::scoped(Code::ScopeUnknown, "timeout", role));
                 }
-                Ok(())
+                Ok(Answer::Live(stamp))
             }
-            Answer::Ended(proof) => {
-                let _ = self.record_end(scope, proof);
-                Err(Refusal::scoped(Code::ScopeEnded, "ended", role))
-            }
+            answer => Ok(answer),
+        }
+    }
+
+    /// Recheck cached evidence after queue/binding waits, without a network call
+    /// or a nested database transaction inside the final SQLite send gate.
+    pub(crate) fn check_cached_scope(
+        &self,
+        scope: &ScopeStamp,
+        role: ScopeRole,
+    ) -> Result<(), Refusal> {
+        let cached = self
+            .cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&ScopeKey::from_stamp(scope))
+            .cloned()
+            .ok_or_else(|| Refusal::scoped(Code::ScopeUnknown, "timeout", role))?;
+        match self.validate_cached_scope(scope, role, &cached)? {
+            Answer::Live(_) => Ok(()),
+            Answer::Ended(_) => Err(Refusal::scoped(Code::ScopeEnded, "ended", role)),
         }
     }
 }

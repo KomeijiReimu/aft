@@ -208,7 +208,7 @@ fn protected_dormant_invalid_regressed_and_operator_arms_never_delegate_ambient(
             std::fs::write(&paths.manifest, "invalid-json").unwrap();
         }
         if mode == "regressed" {
-            write_last_valid_manifest(&paths, &manifest);
+            write_last_valid_manifest(&paths, &manifest, &[]);
         }
         if matches!(
             mode,
@@ -275,4 +275,129 @@ fn protected_dormant_invalid_regressed_and_operator_arms_never_delegate_ambient(
     assert!(!crate::gh_shim_speech::start_view::protected(&[
         "--version".into()
     ]));
+}
+
+#[cfg(debug_assertions)]
+fn with_acceptance_store(test: impl FnOnce(&StatePaths, &crate::gh_shim_speech::service::Service)) {
+    let _lock = crate::test_env::process_env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("shim-state");
+    fs::create_dir_all(&state).unwrap();
+    let _state = Env::set("AFT_GH_SHIM_STATE_DIR", Some(state.as_os_str()));
+    let root = dir.path().join("daemon-store");
+    fs::create_dir_all(&root).unwrap();
+    crate::db::open(&root.join("aft.db")).unwrap();
+    let service = crate::gh_shim_speech::service::record_service(&root);
+    test(&StatePaths::from_root(state), &service);
+}
+
+#[cfg(debug_assertions)]
+fn accept(paths: &StatePaths, manifest: &Manifest) {
+    super::tests::write_signed_manifest(paths, manifest.clone(), unix_seconds());
+    load_manifest(paths, unix_seconds()).unwrap();
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn shim_acceptance_registers_verified_policy_and_monotonic_upgrade() {
+    with_acceptance_store(|paths, service| {
+        let mut manifest = super::tests::fixture_manifest();
+        accept(paths, &manifest);
+        let (first, _) = service.register_accepted_policy().unwrap().unwrap();
+        assert_eq!(first.version, manifest.manifest_version);
+        assert_eq!(first.signed_envelope, fs::read(&paths.manifest).unwrap());
+        assert_eq!(service.store.latest_policy().unwrap(), Some(first.clone()));
+        manifest.manifest_version += 1;
+        accept(paths, &manifest);
+        let (next, _) = service.register_accepted_policy().unwrap().unwrap();
+        assert_eq!(next.version, first.version + 1);
+        assert_ne!(next.digest, first.digest);
+        assert_eq!(service.store.latest_policy().unwrap(), Some(next));
+    });
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn missing_shim_acceptance_cannot_initialize_speech_history() {
+    with_acceptance_store(|paths, service| {
+        let manifest = super::tests::fixture_manifest();
+        super::tests::write_signed_manifest(paths, manifest.clone(), unix_seconds());
+        write_version_high_water(paths, manifest.manifest_version);
+        assert!(service.register_accepted_policy().is_err());
+        assert_eq!(service.store.latest_policy().unwrap(), None);
+        accept(paths, &manifest);
+        service.register_accepted_policy().unwrap();
+        fs::remove_file(&paths.last_valid_manifest).unwrap();
+        assert!(service.register_accepted_policy().is_err());
+        assert_eq!(
+            service.store.latest_policy().unwrap().unwrap().version,
+            manifest.manifest_version
+        );
+    });
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn rolled_back_shim_acceptance_cannot_lower_daemon_watermark() {
+    with_acceptance_store(|paths, service| {
+        let mut manifest = super::tests::fixture_manifest();
+        accept(paths, &manifest);
+        let old_record = fs::read(&paths.last_valid_manifest).unwrap();
+        let old_envelope = fs::read(&paths.manifest).unwrap();
+        manifest.manifest_version += 1;
+        accept(paths, &manifest);
+        service.register_accepted_policy().unwrap();
+        fs::write(&paths.last_valid_manifest, old_record).unwrap();
+        fs::write(&paths.manifest, old_envelope).unwrap();
+        write_version_high_water(paths, manifest.manifest_version - 1);
+        assert_eq!(
+            service.register_accepted_policy().unwrap_err().reason,
+            "manifest_rollback"
+        );
+        assert_eq!(
+            service.store.latest_policy().unwrap().unwrap().version,
+            manifest.manifest_version
+        );
+    });
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn same_version_accepted_digest_conflict_does_not_replace_speech_history() {
+    with_acceptance_store(|paths, service| {
+        let mut manifest = super::tests::fixture_manifest();
+        accept(paths, &manifest);
+        let (first, _) = service.register_accepted_policy().unwrap().unwrap();
+        manifest.issued_at_unix_secs -= 1;
+        accept(paths, &manifest);
+        assert_eq!(
+            service.register_accepted_policy().unwrap_err().reason,
+            "manifest_rollback"
+        );
+        assert_eq!(service.store.latest_policy().unwrap(), Some(first));
+    });
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn tampered_accepted_envelope_cannot_provision_speech_history() {
+    with_acceptance_store(|paths, service| {
+        let manifest = super::tests::fixture_manifest();
+        accept(paths, &manifest);
+        let mut accepted: LastValidManifest =
+            serde_json::from_slice(&fs::read(&paths.last_valid_manifest).unwrap()).unwrap();
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&accepted.signed_envelope).unwrap();
+        envelope["signature"] =
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode([0_u8; 64]));
+        accepted.signed_envelope = serde_json::to_vec(&envelope).unwrap();
+        fs::write(&paths.manifest, &accepted.signed_envelope).unwrap();
+        fs::write(
+            &paths.last_valid_manifest,
+            serde_json::to_vec(&accepted).unwrap(),
+        )
+        .unwrap();
+        assert!(service.register_accepted_policy().is_err());
+        assert_eq!(service.store.latest_policy().unwrap(), None);
+    });
 }

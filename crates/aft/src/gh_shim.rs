@@ -4196,7 +4196,7 @@ fn load_manifest_with_trust_set(
     if manifest.manifest_version > newest_accepted {
         write_version_high_water(paths, manifest.manifest_version);
     }
-    write_last_valid_manifest(paths, &manifest);
+    write_last_valid_manifest(paths, &manifest, &bytes);
     // Retain the exact verified bytes for later reproducibility checks. The
     // signature already verified above; the admission filter re-checks that the
     // version inside the verified payload matches the filing name. This never
@@ -4487,15 +4487,18 @@ enum RegressedDisposition {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct LastValidManifest {
     manifest: Manifest,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    signed_envelope: Vec<u8>,
 }
 
 fn read_last_valid_manifest(paths: &StatePaths) -> Option<LastValidManifest> {
     serde_json::from_slice(&fs::read(&paths.last_valid_manifest).ok()?).ok()
 }
 
-fn write_last_valid_manifest(paths: &StatePaths, manifest: &Manifest) {
+fn write_last_valid_manifest(paths: &StatePaths, manifest: &Manifest, signed_envelope: &[u8]) {
     let record = LastValidManifest {
         manifest: manifest.clone(),
+        signed_envelope: signed_envelope.to_vec(),
     };
     let Ok(bytes) = serde_json::to_vec(&record) else {
         return;
@@ -5234,12 +5237,25 @@ pub(crate) fn capture_speech_policy() -> Result<
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .filter(|high: &VersionHighWater| high.newest_accepted_version > 0)
         .ok_or_else(|| Refusal::new(Code::PolicyDenied, "manifest_rollback"))?;
-    let bytes = fs::read(&paths.manifest)
+    let accepted: LastValidManifest = fs::read(&paths.last_valid_manifest)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or_else(|| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
+    let bytes = accepted.signed_envelope;
+    let current = fs::read(&paths.manifest)
         .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
     let manifest = verified_speech_manifest(&bytes)
         .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
-    if manifest.manifest_version < high.newest_accepted_version {
+    if manifest.manifest_version != high.newest_accepted_version {
         return Err(Refusal::new(Code::PolicyDenied, "manifest_rollback"));
+    }
+    if bytes != current
+        || serde_json::to_value(&accepted.manifest).ok() != serde_json::to_value(&manifest).ok()
+    {
+        return Err(Refusal::new(
+            Code::AuthorityUnavailable,
+            "current_manifest_unverifiable",
+        ));
     }
     Ok(Some((
         crate::gh_shim_speech::model::PolicySnapshot {
@@ -16555,6 +16571,8 @@ fn captured_plan(
     if operator_bypass_requested() || operator_credential_use(args).is_some() {
         return Err(Refusal::new(Code::PolicyDenied, "not_governed"));
     }
+    load_manifest(paths, now)
+        .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
     let (snapshot, _, _) = capture_speech_policy()?
         .ok_or_else(|| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
     let manifest = verified_speech_manifest(&snapshot.signed_envelope)
