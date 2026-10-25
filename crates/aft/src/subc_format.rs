@@ -5555,7 +5555,7 @@ mod bot_kill_warning_tests {
     #[test]
     fn kill_warning_keeps_the_reported_kill_outcome_first() {
         let text = format_bash_kill(
-            &json!({"task_id":"bash-warning","status":"killed","bot_write_revocation_warning":crate::gh_shim_speech::REVOCATION_NOT_DURABLE}),
+            &serde_json::json!({"task_id":"bash-warning","status":"killed","bot_write_revocation_warning":crate::gh_shim_speech::REVOCATION_NOT_DURABLE}),
         );
         assert_eq!(
             text,
