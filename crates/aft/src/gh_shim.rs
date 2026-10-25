@@ -5200,9 +5200,10 @@ fn attach_invocation(
         .map(|value| value.to_str().map(str::to_string).ok_or_else(denied))
         .collect::<Result<Vec<_>, _>>()?;
     if !is_api_tuple(tuple) && explicit_repo(args).is_none() {
-        let repository = request.repository.as_ref().ok_or_else(denied)?;
-        frozen_args.push("--repo".into());
-        frozen_args.push(repository.clone());
+        if let Some(repository) = request.repository.as_ref() {
+            frozen_args.push("--repo".into());
+            frozen_args.push(repository.clone());
+        }
     }
     let invocation = crate::gh_shim_speech::invocation::Invocation {
         args: frozen_args,
@@ -11241,6 +11242,10 @@ mod tests {
     #[test]
     fn refusal_and_self_report_codes_are_separate_closed_sets() {
         assert_eq!(RefusalCode::ALL.len(), 21);
+        assert_eq!(
+            RefusalCode::WorkerWriteRefused.as_str(),
+            crate::gh_shim_speech::WORKER_WRITE_CODE
+        );
         assert_eq!(
             RefusalCode::WorkerNativeGh.as_str(),
             "gh_shim_worker_native_gh"
