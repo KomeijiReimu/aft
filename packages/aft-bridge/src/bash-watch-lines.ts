@@ -1,6 +1,17 @@
 import type { BashWatchLineBatch } from "./bridge.js";
 
 const MAX_PENDING_WATCH_LINES = 50;
+const DEFAULT_MASKING_LINE_CAP_BYTES = 8 * 1024;
+export const UNAVAILABLE_MATCH_SINGULAR =
+  "1 matching line over {limit} KiB was not shown; AFT can check lines only up to {limit} KiB for secrets.";
+export const UNAVAILABLE_MATCH_PLURAL =
+  "{count} matching lines over {limit} KiB were not shown; AFT can check lines only up to {limit} KiB for secrets.";
+
+function unavailableMatchText(count: number, limit: number): string {
+  return (count === 1 ? UNAVAILABLE_MATCH_SINGULAR : UNAVAILABLE_MATCH_PLURAL)
+    .replaceAll("{count}", String(count))
+    .replaceAll("{limit}", String(Math.ceil(limit / 1024)));
+}
 export const WATCH_EACH_LINE_NEEDS_BACKGROUND =
   'bash_watch: deliver: "each_line" needs background: true.';
 
@@ -13,6 +24,7 @@ export function mergeWatchLineBatches(
   if (previous.pending_id && next.pending_id && previous.pending_id !== next.pending_id)
     return next;
   const merged = { ...previous, lines: previous.lines.map((line) => ({ ...line })) };
+  merged.masking_limit_bytes = next.masking_limit_bytes ?? previous.masking_limit_bytes;
   merged.pending_id = next.pending_id ?? previous.pending_id;
   merged.version = next.version ?? previous.version;
   let retained = merged.lines.reduce((sum, line) => sum + line.count, 0);
@@ -30,6 +42,8 @@ export function mergeWatchLineBatches(
         last &&
         last.stream === line.stream &&
         last.text === line.text &&
+        Boolean(last.unavailable) === Boolean(line.unavailable) &&
+        last.end_offset - last.offset === line.end_offset - line.offset &&
         last.offset + last.count * (last.end_offset - last.offset) === line.offset
       )
         last.count += keep;
@@ -54,7 +68,7 @@ export function formatWatchLineBatch(
 ): string {
   const lines = batch.lines.map(
     (line) =>
-      `${line.stream} byte ${line.offset}${line.count > 1 ? ` ×${line.count}` : ""}: ${line.text}`,
+      `${line.stream} byte ${line.offset}${line.count > 1 ? ` ×${line.count}` : ""}: ${line.unavailable ? unavailableMatchText(line.count, batch.masking_limit_bytes ?? DEFAULT_MASKING_LINE_CAP_BYTES) : line.text}`,
   );
   if (batch.dropped_lines > 0 || batch.skipped_long_lines > 0) {
     const taskKey = camelCase ? "taskId" : "task_id";

@@ -132,23 +132,26 @@ impl WatchRegistry {
             let Some(batch) = delivery.take(now, terminal, &watch.pattern) else {
                 continue;
             };
+            let matched = batch.has_matches();
             let offset = batch
                 .lines
                 .first()
                 .map(|line| line.offset)
                 .or(batch.first_dropped_offset)
                 .unwrap_or(0);
-            self.matched_tasks.insert(task_id.to_string());
+            if matched {
+                self.matched_tasks.insert(task_id.to_string());
+            }
             found.push(PatternMatch {
                 watch_id: watch.watch_id.clone(),
                 task_id: task_id.to_string(),
                 match_text: "matching lines".to_string(),
                 match_offset: offset,
                 context: String::new(),
-                once: watch.once,
+                once: watch.once && matched,
                 batch: Some(batch),
             });
-            if watch.once {
+            if watch.once && matched {
                 self.unregister(task_id, &watch.watch_id);
             }
         }

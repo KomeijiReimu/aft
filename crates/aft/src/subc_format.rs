@@ -5456,6 +5456,17 @@ pub fn format_watch_line_batch(
 ) -> String {
     let mut text = String::new();
     for line in &batch.lines {
+        let body = if line.unavailable {
+            crate::bash_background::watch_lines::unavailable_match_text(
+                line.count,
+                batch
+                    .masking_limit_bytes
+                    .map(|limit| limit as usize)
+                    .unwrap_or(crate::bash_background::watch_lines::MASKING_LINE_CAP_BYTES),
+            )
+        } else {
+            line.text.clone()
+        };
         let repeats = if line.count > 1 {
             format!(" ×{}", line.count)
         } else {
@@ -5463,7 +5474,7 @@ pub fn format_watch_line_batch(
         };
         text.push_str(&format!(
             "{} byte {}{repeats}: {}\n",
-            line.stream, line.offset, line.text
+            line.stream, line.offset, body
         ));
     }
     if batch.dropped_lines > 0 || batch.skipped_long_lines > 0 {
@@ -5498,6 +5509,7 @@ mod watch_line_format_tests {
                 offset: 18234,
                 end_offset: 18257,
                 text: "ERROR db timeout".into(),
+                unavailable: false,
                 count: 1,
             }],
             ..Default::default()

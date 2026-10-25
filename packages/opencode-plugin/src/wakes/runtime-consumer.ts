@@ -385,8 +385,8 @@ export function createV2RuntimeConsumer(
 ): V2RuntimeConsumer {
   const delivery = new V2SessionDelivery(context.session);
   // SubC owns acknowledgement retries outside admission. Keep its existing
-  // completion/scalar-watch keys; batched watches retire through exact-ack and
-  // durable-pending callbacks below.
+  // completion and non-batched watch keys. Batched watch keys clear when an
+  // acknowledgement is confirmed or the watch is absent from the pending list.
   const subcDelivery = new V2SessionDelivery(context.session, Number.POSITIVE_INFINITY);
   const sessions = new Set<string>();
   let subcPool: (() => AftTransportPool) | undefined;

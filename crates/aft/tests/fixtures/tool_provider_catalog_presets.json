@@ -10,8 +10,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "2111895a0a09efca0b7dd4b6734737c70647f9cd1e685c8e5fa84c9635098304",
-      "catalog_digest": "2111895a0a09efca0b7dd4b6734737c70647f9cd1e685c8e5fa84c9635098304",
+      "generation": "b72d9ca1a119835ce0a26c136c52da81e5d5ee9d8b160fb1555bf61f238e2e7b",
+      "catalog_digest": "b72d9ca1a119835ce0a26c136c52da81e5d5ee9d8b160fb1555bf61f238e2e7b",
       "tools": [
         {
           "name": "status",
@@ -21,7 +21,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -42,7 +41,6 @@
             "prepend",
             "append"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -124,7 +122,6 @@
             "prepend",
             "append"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -175,7 +172,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -207,7 +203,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -290,7 +285,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -318,7 +312,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -357,7 +350,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -387,7 +379,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -436,7 +427,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -482,7 +472,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -547,7 +536,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -608,7 +596,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -679,7 +666,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -703,7 +689,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -768,7 +753,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -836,7 +820,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -871,7 +854,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -903,7 +885,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -990,7 +971,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -1034,13 +1014,12 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -1052,6 +1031,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -1070,9 +1061,8 @@
         },
         {
           "name": "bash_watch",
-          "schema_digest": "1f3fb25a580902d58c7e391df1c2da3d065079f62c9ba1a3363f6eb880955a35",
+          "schema_digest": "ef95a7f8b48971965f988186737cac47c1f88c1a246468a2cf924b62bfbc594e",
           "semantics": 2,
-          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -1117,6 +1107,13 @@
                 "minimum": 1,
                 "maximum": 1800000
               },
+              "deliver": {
+                "description": "Rejected: this watch always waits synchronously; deliver requires background:true with an async notification channel.",
+                "type": "string",
+                "enum": [
+                  "each_line"
+                ]
+              },
               "once": {
                 "description": "Accepted for compatibility; only an async watch reads it.",
                 "type": "boolean"
@@ -1135,7 +1132,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -1162,7 +1158,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -1260,8 +1255,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "4fd58920eb47227531e7a3c8c56c0a223d311cf9c8e17c863474397bf65d2009",
-      "catalog_digest": "4fd58920eb47227531e7a3c8c56c0a223d311cf9c8e17c863474397bf65d2009",
+      "generation": "1385f78c9c4b26deea68c370e4c3c0c522e36f8cf4137c3916f2ee850a7db0c2",
+      "catalog_digest": "1385f78c9c4b26deea68c370e4c3c0c522e36f8cf4137c3916f2ee850a7db0c2",
       "tools": [
         {
           "name": "status",
@@ -1271,7 +1266,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -1292,7 +1286,6 @@
             "prepend",
             "append"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -1369,7 +1362,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -1448,7 +1440,6 @@
             "prepend",
             "append"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -1499,7 +1490,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -1531,7 +1521,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -1614,7 +1603,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -1642,7 +1630,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -1681,7 +1668,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -1711,7 +1697,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -1760,7 +1745,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -1806,7 +1790,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -1871,7 +1854,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -1932,7 +1914,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -2003,7 +1984,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -2027,7 +2007,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -2092,7 +2071,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -2160,7 +2138,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -2195,7 +2172,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -2227,7 +2203,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -2314,7 +2289,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -2358,13 +2332,12 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -2376,6 +2349,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -2394,9 +2379,8 @@
         },
         {
           "name": "bash_watch",
-          "schema_digest": "1f3fb25a580902d58c7e391df1c2da3d065079f62c9ba1a3363f6eb880955a35",
+          "schema_digest": "ef95a7f8b48971965f988186737cac47c1f88c1a246468a2cf924b62bfbc594e",
           "semantics": 2,
-          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -2441,6 +2425,13 @@
                 "minimum": 1,
                 "maximum": 1800000
               },
+              "deliver": {
+                "description": "Rejected: this watch always waits synchronously; deliver requires background:true with an async notification channel.",
+                "type": "string",
+                "enum": [
+                  "each_line"
+                ]
+              },
               "once": {
                 "description": "Accepted for compatibility; only an async watch reads it.",
                 "type": "boolean"
@@ -2459,7 +2450,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -2486,7 +2476,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -2585,8 +2574,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "1801458c3f5790126bcccaae9b8cb96df2e25ecbcbc4fe94bbae607762f5865d",
-      "catalog_digest": "1801458c3f5790126bcccaae9b8cb96df2e25ecbcbc4fe94bbae607762f5865d",
+      "generation": "b9f52eab7b5fbe5109f23c609b5c726ccd9b86d7abf7e1d974ed4d157c2c8101",
+      "catalog_digest": "b9f52eab7b5fbe5109f23c609b5c726ccd9b86d7abf7e1d974ed4d157c2c8101",
       "tools": [
         {
           "name": "read",
@@ -2601,7 +2590,6 @@
             "prepend",
             "append"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -2653,7 +2641,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -2692,7 +2679,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -2722,7 +2708,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -2771,7 +2756,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -2817,7 +2801,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -2882,7 +2865,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -2943,7 +2925,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -3038,8 +3019,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "1801458c3f5790126bcccaae9b8cb96df2e25ecbcbc4fe94bbae607762f5865d",
-      "catalog_digest": "1801458c3f5790126bcccaae9b8cb96df2e25ecbcbc4fe94bbae607762f5865d",
+      "generation": "b9f52eab7b5fbe5109f23c609b5c726ccd9b86d7abf7e1d974ed4d157c2c8101",
+      "catalog_digest": "b9f52eab7b5fbe5109f23c609b5c726ccd9b86d7abf7e1d974ed4d157c2c8101",
       "tools": [
         {
           "name": "read",
@@ -3054,7 +3035,6 @@
             "prepend",
             "append"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -3106,7 +3086,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -3145,7 +3124,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -3175,7 +3153,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -3224,7 +3201,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -3270,7 +3246,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -3335,7 +3310,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -3396,7 +3370,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -3492,8 +3465,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "bd64527bddcaa6bf8faf6a884faba123a50d86f6cac19ed17174d14fc6a11104",
-      "catalog_digest": "bd64527bddcaa6bf8faf6a884faba123a50d86f6cac19ed17174d14fc6a11104",
+      "generation": "9df500ec0a2a304a10a869e05894016e5ef20053dcc752e20b841eb58be3223f",
+      "catalog_digest": "9df500ec0a2a304a10a869e05894016e5ef20053dcc752e20b841eb58be3223f",
       "tools": [
         {
           "name": "status",
@@ -3503,7 +3476,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -3514,7 +3486,7 @@
         },
         {
           "name": "bash",
-          "schema_digest": "019128a28f9f2724d2c086f93a1c74222b294ad95fee8b255fa799b257397a4f",
+          "schema_digest": "029ddfaa46f2b46b773e15231b41cf5c86acd1ed1668068236039c1edb978aca",
           "semantics": 2,
           "modes": [
             "classic",
@@ -3524,11 +3496,10 @@
             "prepend",
             "append"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so a long command moves to the background while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then wait on it with bash_watch before you report a result: a background task never wakes you, and a watch without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. Never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one); never loop bash_status to wait. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive. When remote runs are available, put `runon: \"linux\"` on build and test lines (cargo, bun test), including chains and pipes. Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs this machine's own operating system or hardware (its sandbox, code signing, service manager, permission prompts or GUI frameworks) or runs a binary that already exists on this machine; a build or test that needs only macOS (its sandbox, code signing or file watching) can use runon: \"macos\" instead; building and testing still go remote, and a remote build leaves no binaries or target/ output in the local worktree. Add `,Nc` to request N vCPUs (`linux,4c`); without it the job gets 2 vCPUs. The job sees exactly the CPUs it gets, so ask for what the command uses: 2c (the default) for a single test binary or script, 4c for `cargo check`/clippy on one crate, 8c for a workspace test suite, and 16c for a large release build.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, outline, or zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so a long command moves to the background while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then wait on it with bash_watch before you report a result: a background task never wakes you, and a watch without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. Never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one); never loop bash_status to wait. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive. When remote runs are available, put `runon: \"linux\"` on build and test lines (cargo, bun test), including chains and pipes. Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs this machine's own operating system or hardware (its sandbox, code signing, service manager, permission prompts or GUI frameworks) or runs a binary that already exists on this machine; building and testing still go remote, and a remote build leaves no binaries or target/ output in the local worktree. Add `,Nc` to request N vCPUs (`linux,4c`); without it the job gets 2 vCPUs. The job sees exactly the CPUs it gets, so ask for what the command uses: 2c (the default) for a single test binary or script, 4c for `cargo check`/clippy on one crate, 8c for a workspace test suite, and 16c for a large release build.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, outline, or zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
             "max_ms": 2040000
           },
@@ -3589,15 +3560,7 @@
               },
               "runon": {
                 "type": "string",
-                "description": "Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add \",net\" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options). `macos` sends the command to a macOS machine for builds and tests that need macOS (no vCPU or network options)."
-              },
-              "return_paths": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                },
-                "maxItems": 64,
-                "description": "With runon: up to 64 files to copy back from the build server after the command, as paths relative to workdir inside the project (10 MiB in total). Each verified file replaces the local file at the same path; the result lists every path as returned or not returned, with the reason."
+                "description": "Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add \",net\" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options)."
               }
             },
             "required": [
@@ -3618,7 +3581,6 @@
             "prepend",
             "append"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -3669,7 +3631,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -3701,7 +3662,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -3784,7 +3744,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -3812,7 +3771,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -3851,7 +3809,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -3881,7 +3838,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -3930,7 +3886,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -3976,7 +3931,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -4041,7 +3995,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -4102,7 +4055,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -4173,7 +4125,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -4197,7 +4148,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -4262,7 +4212,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -4330,7 +4279,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -4365,7 +4313,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -4397,7 +4344,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -4484,7 +4430,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -4528,13 +4473,12 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -4546,6 +4490,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -4564,9 +4520,8 @@
         },
         {
           "name": "bash_watch",
-          "schema_digest": "1f3fb25a580902d58c7e391df1c2da3d065079f62c9ba1a3363f6eb880955a35",
+          "schema_digest": "ef95a7f8b48971965f988186737cac47c1f88c1a246468a2cf924b62bfbc594e",
           "semantics": 2,
-          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -4611,6 +4566,13 @@
                 "minimum": 1,
                 "maximum": 1800000
               },
+              "deliver": {
+                "description": "Rejected: this watch always waits synchronously; deliver requires background:true with an async notification channel.",
+                "type": "string",
+                "enum": [
+                  "each_line"
+                ]
+              },
               "once": {
                 "description": "Accepted for compatibility; only an async watch reads it.",
                 "type": "boolean"
@@ -4629,7 +4591,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -4656,7 +4617,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -4755,8 +4715,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "e3d5b309182b2e65fdd660b8b14c48bfbb669b0ca6c469e5a61556776536af94",
-      "catalog_digest": "e3d5b309182b2e65fdd660b8b14c48bfbb669b0ca6c469e5a61556776536af94",
+      "generation": "cffd704ddb1c1685097625acf1df5d76c57e555722ffa784193c50de67b40058",
+      "catalog_digest": "cffd704ddb1c1685097625acf1df5d76c57e555722ffa784193c50de67b40058",
       "tools": [
         {
           "name": "status",
@@ -4766,7 +4726,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -4777,7 +4736,7 @@
         },
         {
           "name": "bash",
-          "schema_digest": "019128a28f9f2724d2c086f93a1c74222b294ad95fee8b255fa799b257397a4f",
+          "schema_digest": "029ddfaa46f2b46b773e15231b41cf5c86acd1ed1668068236039c1edb978aca",
           "semantics": 2,
           "modes": [
             "classic",
@@ -4787,11 +4746,10 @@
             "prepend",
             "append"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so a long command moves to the background while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then wait on it with bash_watch before you report a result: a background task never wakes you, and a watch without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. Never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one); never loop bash_status to wait. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive. When remote runs are available, put `runon: \"linux\"` on build and test lines (cargo, bun test), including chains and pipes. Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs this machine's own operating system or hardware (its sandbox, code signing, service manager, permission prompts or GUI frameworks) or runs a binary that already exists on this machine; a build or test that needs only macOS (its sandbox, code signing or file watching) can use runon: \"macos\" instead; building and testing still go remote, and a remote build leaves no binaries or target/ output in the local worktree. Add `,Nc` to request N vCPUs (`linux,4c`); without it the job gets 2 vCPUs. The job sees exactly the CPUs it gets, so ask for what the command uses: 2c (the default) for a single test binary or script, 4c for `cargo check`/clippy on one crate, 8c for a workspace test suite, and 16c for a large release build.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, outline, or zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so a long command moves to the background while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then wait on it with bash_watch before you report a result: a background task never wakes you, and a watch without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. Never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one); never loop bash_status to wait. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive. When remote runs are available, put `runon: \"linux\"` on build and test lines (cargo, bun test), including chains and pipes. Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs this machine's own operating system or hardware (its sandbox, code signing, service manager, permission prompts or GUI frameworks) or runs a binary that already exists on this machine; building and testing still go remote, and a remote build leaves no binaries or target/ output in the local worktree. Add `,Nc` to request N vCPUs (`linux,4c`); without it the job gets 2 vCPUs. The job sees exactly the CPUs it gets, so ask for what the command uses: 2c (the default) for a single test binary or script, 4c for `cargo check`/clippy on one crate, 8c for a workspace test suite, and 16c for a large release build.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, outline, or zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
             "max_ms": 2040000
           },
@@ -4852,15 +4810,7 @@
               },
               "runon": {
                 "type": "string",
-                "description": "Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add \",net\" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options). `macos` sends the command to a macOS machine for builds and tests that need macOS (no vCPU or network options)."
-              },
-              "return_paths": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                },
-                "maxItems": 64,
-                "description": "With runon: up to 64 files to copy back from the build server after the command, as paths relative to workdir inside the project (10 MiB in total). Each verified file replaces the local file at the same path; the result lists every path as returned or not returned, with the reason."
+                "description": "Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add \",net\" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options)."
               }
             },
             "required": [
@@ -4876,7 +4826,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -4955,7 +4904,6 @@
             "prepend",
             "append"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -5006,7 +4954,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -5038,7 +4985,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -5121,7 +5067,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -5149,7 +5094,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -5188,7 +5132,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -5218,7 +5161,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -5267,7 +5209,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -5313,7 +5254,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -5378,7 +5318,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -5439,7 +5378,6 @@
             "codemode",
             "flow"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -5510,7 +5448,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -5534,7 +5471,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -5599,7 +5535,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -5667,7 +5602,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -5702,7 +5636,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -5734,7 +5667,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -5821,7 +5753,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -5865,13 +5796,12 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -5883,6 +5813,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -5901,9 +5843,8 @@
         },
         {
           "name": "bash_watch",
-          "schema_digest": "1f3fb25a580902d58c7e391df1c2da3d065079f62c9ba1a3363f6eb880955a35",
+          "schema_digest": "ef95a7f8b48971965f988186737cac47c1f88c1a246468a2cf924b62bfbc594e",
           "semantics": 2,
-          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -5948,6 +5889,13 @@
                 "minimum": 1,
                 "maximum": 1800000
               },
+              "deliver": {
+                "description": "Rejected: this watch always waits synchronously; deliver requires background:true with an async notification channel.",
+                "type": "string",
+                "enum": [
+                  "each_line"
+                ]
+              },
               "once": {
                 "description": "Accepted for compatibility; only an async watch reads it.",
                 "type": "boolean"
@@ -5966,7 +5914,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -5993,7 +5940,6 @@
             "classic",
             "codemode"
           ],
-          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],

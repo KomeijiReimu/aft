@@ -1042,7 +1042,7 @@ describe("Pi subc forced-drain dedup (C-#1 / C-#3)", () => {
                   match_offset: 0,
                   context: "background task artifacts were erased",
                   once: true,
-                  reason: "watch_target_erased",
+                  reason: "task_exit",
                 },
               ]
             : [],
@@ -1562,3 +1562,97 @@ test("exact pattern ack retries keep sibling watches and newer versions delivera
   ).toBe(true);
   for (const call of acks) expect(call.params.task_ids ?? []).not.toContain("task-pattern");
 });
+
+for (const route of ["in-turn", "wake"] as const) {
+  test(`admitted each_line snapshot rows and counters are not repeated after a failed ack (${route})`, async () => {
+    const first = {
+      task_id: "task-batch",
+      session_id: "s1",
+      watch_id: "watch-batch",
+      match_offset: 0,
+      match_text: "matching lines",
+      context: "batch",
+      once: false,
+      reason: "pattern_match",
+      batch: {
+        pending_id: "pending-a",
+        version: 0,
+        snapshot: true,
+        lines: [{ stream: "stdout", offset: 0, end_offset: 8, text: "ERROR A", count: 1 }],
+        dropped_lines: 3,
+        skipped_long_lines: 1,
+        first_dropped_offset: 20,
+        first_dropped_stream: "stdout",
+      },
+    };
+    let current = first;
+    let failAck = true;
+    const acknowledgements: Record<string, unknown>[] = [];
+    const { ctx } = harness((command, params) => {
+      if (command === "bash_drain_completions")
+        return { success: true, bg_completions: [], pending_matches: [current] };
+      if (command === "bash_ack_completions") {
+        acknowledgements.push(params);
+        if (failAck) {
+          failAck = false;
+          return { success: false, message: "ack response lost" };
+        }
+        return { success: true, acked_matches: params.matches ?? [] };
+      }
+      return { success: true };
+    });
+    const sent: string[] = [];
+    const runtime = {
+      sendUserMessage: (text: string) => {
+        sent.push(text);
+      },
+    };
+    const context = { ctx, directory: "/tmp/project", sessionID: "s1", runtime };
+    const deliver = async () => {
+      if (route === "in-turn") {
+        const content = await appendToolResultBgCompletions(context, [
+          { type: "text", text: "tool" },
+        ]);
+        return (
+          content
+            ?.filter((item) => item.type === "text")
+            .map((item) => item.text)
+            .join("\n") ?? ""
+        );
+      }
+      const wanted = sent.length + 1;
+      await handleSubcBgEventsNudge(context);
+      await waitUntil(() => sent.length === wanted && acknowledgements.length >= wanted);
+      return sent.at(-1)!;
+    };
+    const old = await deliver();
+    expect(old).toContain("stdout byte 0: ERROR A");
+    expect(old).toContain("3 matching lines dropped.");
+    expect(old).toContain("1 lines longer than 64 KiB");
+    current = {
+      ...first,
+      match_offset: 1,
+      batch: {
+        ...first.batch,
+        version: 1,
+        lines: [
+          { ...first.batch.lines[0] },
+          { stream: "stderr", offset: 0, end_offset: 8, text: "ERROR B", count: 1 },
+        ],
+        dropped_lines: 5,
+        skipped_long_lines: 2,
+      },
+    };
+    const next = await deliver();
+    expect(next).toContain("stderr byte 0: ERROR B");
+    expect(next).not.toContain("ERROR A");
+    expect(next).toContain("2 matching lines dropped.");
+    expect(next).not.toContain("5 matching lines dropped.");
+    expect(next).toContain("1 lines longer than 64 KiB");
+    expect(next).not.toContain("2 lines longer than 64 KiB");
+    expect(acknowledgements.at(-1)).toEqual({
+      session_id: "s1",
+      matches: [{ task_id: "task-batch", watch_id: "watch-batch", match_offset: 1 }],
+    });
+  });
+}

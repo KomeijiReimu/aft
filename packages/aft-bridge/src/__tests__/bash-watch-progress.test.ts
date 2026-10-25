@@ -1,5 +1,9 @@
 import { expect, test } from "bun:test";
-import { WatchBatchProgress, watchBatchHasContent } from "../bash-watch-progress.js";
+import {
+  WatchBatchAdmissions,
+  WatchBatchProgress,
+  watchBatchHasContent,
+} from "../bash-watch-progress.js";
 import type { BashWatchLineBatch } from "../bridge.js";
 
 function snapshot(id = "a"): BashWatchLineBatch {
@@ -43,4 +47,46 @@ test("watch progress does not reserve rows before admission or across pending ge
   fresh.dropped_lines = 10;
   expect(progress.unseen(fresh).dropped_lines).toBe(10);
   expect(progress.unseen(fresh).lines).toHaveLength(1);
+});
+
+test("session batch admissions retain content watermarks while exact ack versions change", () => {
+  const admissions = new WatchBatchAdmissions();
+  const a = { task_id: "task", watch_id: "watch", match_offset: 0, batch: snapshot() };
+  admissions.admit([a]);
+  const b = {
+    ...a,
+    match_offset: 1,
+    batch: {
+      ...snapshot(),
+      version: 1,
+      dropped_lines: 10,
+      lines: [
+        ...snapshot().lines,
+        { stream: "stderr", offset: 0, end_offset: 8, text: "READY b", count: 1 },
+      ],
+    },
+  };
+  const shown = admissions.unseen([b]);
+  expect(shown[0]?.match_offset).toBe(1);
+  expect(shown[0]?.batch?.lines.map((line) => line.text)).toEqual(["READY b"]);
+  expect(shown[0]?.batch?.dropped_lines).toBe(3);
+  admissions.admit([b]);
+  admissions.confirmed([{ task_id: "task", watch_id: "watch", match_offset: 0 }]);
+  expect(admissions.size).toBe(1);
+  expect(admissions.unseen([b])).toEqual([]);
+  admissions.confirmed([{ task_id: "task", watch_id: "watch", match_offset: 1 }]);
+  expect(admissions.size).toBe(0);
+});
+
+test("session batch admission preview is not a reservation and durable absence retires state", () => {
+  const admissions = new WatchBatchAdmissions();
+  const a = { task_id: "task", watch_id: "watch", match_offset: 0, batch: snapshot() };
+  expect(admissions.unseen([a])).toHaveLength(1);
+  expect(admissions.unseen([a])).toHaveLength(1);
+  expect(admissions.size).toBe(0);
+  admissions.admit([a]);
+  admissions.reconcile([{ ...a, match_offset: 1 }]);
+  expect(admissions.size).toBe(1);
+  admissions.reconcile([]);
+  expect(admissions.size).toBe(0);
 });

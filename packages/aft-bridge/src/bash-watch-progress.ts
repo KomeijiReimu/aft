@@ -1,3 +1,4 @@
+import type { BashAckTarget } from "./bash-pattern-ack.js";
 import type { BashWatchLineBatch } from "./bridge.js";
 
 type Stream = "stdout" | "stderr" | "pty";
@@ -87,4 +88,67 @@ export class WatchBatchProgress {
 
 export function watchBatchHasContent(batch: BashWatchLineBatch): boolean {
   return batch.lines.length > 0 || batch.dropped_lines > 0 || batch.skipped_long_lines > 0;
+}
+
+type BatchMatch = {
+  task_id: string;
+  watch_id: string;
+  match_offset: number;
+  batch?: BashWatchLineBatch;
+};
+
+/** Watermarks survive failed acknowledgements, but clear on a confirmed ack or absence from the pending list. */
+export class WatchBatchAdmissions {
+  private readonly watches = new Map<string, WatchBatchProgress>();
+
+  private key(match: Pick<BatchMatch, "task_id" | "watch_id">): string {
+    return JSON.stringify([match.task_id, match.watch_id]);
+  }
+
+  unseen<T extends BatchMatch>(matches: readonly T[]): T[] {
+    const visible: T[] = [];
+    for (const match of matches) {
+      if (!match.batch) {
+        visible.push(match);
+        continue;
+      }
+      const progress = this.watches.get(this.key(match)) ?? new WatchBatchProgress();
+      const batch = progress.unseen({ ...match.batch, version: match.match_offset });
+      if (watchBatchHasContent(batch)) visible.push({ ...match, batch });
+    }
+    return visible;
+  }
+
+  admit(matches: readonly BatchMatch[]): void {
+    for (const match of matches) {
+      if (!match.batch) continue;
+      const key = this.key(match);
+      const progress = this.watches.get(key) ?? new WatchBatchProgress();
+      progress.admit({ ...match.batch, version: match.match_offset });
+      this.watches.set(key, progress);
+    }
+  }
+
+  confirmed(targets: readonly BashAckTarget[]): void {
+    for (const target of targets) {
+      if ("watch_id" in target) {
+        const key = this.key(target);
+        if (this.watches.get(key)?.admittedVersion === target.match_offset)
+          this.watches.delete(key);
+      } else {
+        for (const key of this.watches.keys()) {
+          if ((JSON.parse(key) as [string, string])[0] === target.task_id) this.watches.delete(key);
+        }
+      }
+    }
+  }
+
+  reconcile(pending: readonly BatchMatch[]): void {
+    const present = new Set(pending.map((match) => this.key(match)));
+    for (const key of this.watches.keys()) if (!present.has(key)) this.watches.delete(key);
+  }
+
+  get size(): number {
+    return this.watches.size;
+  }
 }

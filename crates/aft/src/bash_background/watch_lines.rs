@@ -11,6 +11,41 @@ pub const MAX_LINES_PER_NOTIFICATION: usize = 50;
 pub const MAX_NOTIFICATIONS_PER_MINUTE: usize = 12;
 pub const NOTIFICATION_WINDOW: Duration = Duration::from_secs(60);
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
+pub const MASKING_LINE_CAP_BYTES: usize = 8 * 1024;
+pub const UNAVAILABLE_MATCH_SINGULAR: &str = "1 matching line over {limit} KiB was not shown; AFT can check lines only up to {limit} KiB for secrets.";
+pub const UNAVAILABLE_MATCH_PLURAL: &str = "{count} matching lines over {limit} KiB were not shown; AFT can check lines only up to {limit} KiB for secrets.";
+pub const UNAVAILABLE_PAGE_SINGULAR: &str = "1 line in this page over {limit} KiB was not shown; AFT can check lines only up to {limit} KiB for secrets.";
+pub const UNAVAILABLE_PAGE_PLURAL: &str = "{count} lines in this page over {limit} KiB were not shown; AFT can check lines only up to {limit} KiB for secrets.";
+
+pub fn unavailable_match_text(count: u64, limit: usize) -> String {
+    unavailable_text(
+        if count == 1 {
+            UNAVAILABLE_MATCH_SINGULAR
+        } else {
+            UNAVAILABLE_MATCH_PLURAL
+        },
+        count,
+        limit,
+    )
+}
+
+pub(super) fn unavailable_page_text(count: u64) -> String {
+    unavailable_text(
+        if count == 1 {
+            UNAVAILABLE_PAGE_SINGULAR
+        } else {
+            UNAVAILABLE_PAGE_PLURAL
+        },
+        count,
+        MASKING_LINE_CAP_BYTES,
+    )
+}
+
+fn unavailable_text(template: &str, count: u64, limit: usize) -> String {
+    template
+        .replace("{count}", &count.to_string())
+        .replace("{limit}", &limit.div_ceil(1024).to_string())
+}
 pub const EACH_LINE_NEEDS_BACKGROUND: &str =
     "bash_watch: deliver: \"each_line\" needs background: true.";
 
@@ -21,10 +56,14 @@ pub struct WatchLine {
     pub end_offset: u64,
     pub text: String,
     pub count: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unavailable: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LineBatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub masking_limit_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -41,7 +80,12 @@ pub struct LineBatch {
 }
 
 impl LineBatch {
+    pub(super) fn has_matches(&self) -> bool {
+        !self.lines.is_empty() || self.dropped_lines > 0
+    }
+
     pub fn merge(&mut self, next: LineBatch) {
+        self.masking_limit_bytes = next.masking_limit_bytes.or(self.masking_limit_bytes);
         self.terminal_summary = next.terminal_summary;
         let mut retained = self.lines.iter().map(|line| line.count).sum::<u64>();
         for mut line in next.lines {
@@ -201,6 +245,7 @@ impl LineDelivery {
             end_offset: end,
             text: text.into_owned(),
             count: 1,
+            unavailable: false,
         });
     }
 

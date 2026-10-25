@@ -1,5 +1,9 @@
 import { expect, test } from "bun:test";
-import { formatWatchLineBatch, WATCH_EACH_LINE_NEEDS_BACKGROUND } from "../bash-watch-lines.js";
+import {
+  formatWatchLineBatch,
+  mergeWatchLineBatches,
+  WATCH_EACH_LINE_NEEDS_BACKGROUND,
+} from "../bash-watch-lines.js";
 import type { BashWatchLineBatch } from "../bridge.js";
 
 function batch(): BashWatchLineBatch {
@@ -55,4 +59,40 @@ test("each_line sync refusal wording golden", () => {
   expect(WATCH_EACH_LINE_NEEDS_BACKGROUND).toBe(
     'bash_watch: deliver: "each_line" needs background: true.',
   );
+});
+
+test("unavailable matching lines preserve source locations and use the transmitted masking bound", () => {
+  const value = batch();
+  value.masking_limit_bytes = 8 * 1024;
+  value.lines.push({
+    stream: "stdout",
+    offset: 42,
+    end_offset: 10283,
+    text: "stored diagnostic",
+    count: 1,
+    unavailable: true,
+  });
+  expect(formatWatchLineBatch("task", value, false)).toBe(
+    "stdout byte 42: 1 matching line over 8 KiB was not shown; AFT can check lines only up to 8 KiB for secrets.",
+  );
+  value.lines[0].count = 3;
+  expect(formatWatchLineBatch("task", value, false)).toBe(
+    "stdout byte 42 ×3: 3 matching lines over 8 KiB were not shown; AFT can check lines only up to 8 KiB for secrets.",
+  );
+  value.masking_limit_bytes = 16 * 1024;
+  expect(formatWatchLineBatch("task", value, false)).toContain(
+    "over 16 KiB were not shown; AFT can check lines only up to 16 KiB for secrets.",
+  );
+});
+
+test("masked rows with different source widths are not folded into an invented byte span", () => {
+  const first = {
+    ...batch(),
+    lines: [{ stream: "stdout", offset: 0, end_offset: 100, text: "same masked text", count: 1 }],
+  };
+  const next = {
+    ...batch(),
+    lines: [{ stream: "stdout", offset: 100, end_offset: 220, text: "same masked text", count: 1 }],
+  };
+  expect(mergeWatchLineBatches(first, next).lines).toEqual([...first.lines, ...next.lines]);
 });
