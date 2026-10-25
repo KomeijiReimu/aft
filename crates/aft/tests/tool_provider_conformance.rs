@@ -76,7 +76,7 @@ fn legacy_row_for_probe<'a>(
 
 fn catalog_pwsh_path(root: &Path) -> PathBuf {
     root.join("catalog-only-pwsh")
-        .join(if cfg!(windows) { "pwsh.cmd" } else { "pwsh" })
+        .join(if cfg!(windows) { "pwsh.exe" } else { "pwsh" })
 }
 
 fn catalog_pwsh_marker(root: &Path) -> PathBuf {
@@ -93,25 +93,84 @@ fn advertise_catalog_powershell(command: &mut Command, root: &Path) -> Result<()
     let executable = catalog_pwsh_path(root);
     let directory = executable.parent().unwrap();
     std::fs::create_dir_all(directory).map_err(harness_error)?;
-    let script = if cfg!(windows) {
-        "@echo invoked>\"%~f0.invoked\"\r\n@exit /b 99\r\n"
-    } else {
-        "#!/bin/sh\nprintf invoked > \"$0.invoked\"\nexit 99\n"
-    };
-    std::fs::write(&executable, script).map_err(harness_error)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf invoked > \"$0.invoked\"\nexit 99\n",
+        )
+        .map_err(harness_error)?;
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
             .map_err(harness_error)?;
+        eprintln!(
+            "PowerShell catalog fixture branch: Unix script {}",
+            executable.display()
+        );
+    }
+    #[cfg(windows)]
+    {
+        // AFT resolves pwsh.exe on Windows, not command scripts. Build a real
+        // marker executable so host-installed PowerShell cannot mask this fixture.
+        let source = directory.join("pwsh.rs");
+        std::fs::write(
+            &source,
+            r#"
+fn main() {
+    let mut marker = std::env::current_exe().unwrap().into_os_string();
+    marker.push(".invoked");
+    std::fs::write(std::path::PathBuf::from(marker), b"invoked").unwrap();
+    std::process::exit(99);
+}
+"#,
+        )
+        .map_err(harness_error)?;
+        let output = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+            .arg("--crate-name")
+            .arg("aft_catalog_pwsh")
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .map_err(harness_error)?;
+        if !output.status.success() {
+            return Err(HarnessError::new(format!(
+                "building the Windows pwsh.exe fixture failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        eprintln!(
+            "PowerShell catalog fixture branch: Windows native executable {}",
+            executable.display()
+        );
     }
     let paths = std::iter::once(directory.to_path_buf())
         .chain(std::env::split_paths(
             &std::env::var_os("PATH").unwrap_or_default(),
         ))
         .collect::<Vec<_>>();
-    command.env("PATH", std::env::join_paths(paths).map_err(harness_error)?);
+    let path = std::env::join_paths(paths).map_err(harness_error)?;
+    let lookup = if cfg!(windows) { "pwsh.exe" } else { "pwsh" };
+    let resolved = which::which_in(lookup, Some(&path), root).map_err(harness_error)?;
+    assert_eq!(
+        resolved, executable,
+        "PowerShell lookup must select the fixture, not a host executable"
+    );
+    command.env("PATH", path);
     Ok(())
+}
+
+#[test]
+fn catalog_powershell_fixture_is_discovered_and_marks_execution() {
+    let root = tempfile::tempdir().unwrap();
+    let mut command = Command::new(aft_binary::aft_binary());
+    advertise_catalog_powershell(&mut command, root.path()).unwrap();
+    let executable = catalog_pwsh_path(root.path());
+    let marker = catalog_pwsh_marker(root.path());
+    assert!(!marker.exists());
+    let status = Command::new(executable).status().unwrap();
+    assert_eq!(status.code(), Some(99));
+    assert_eq!(std::fs::read(marker).unwrap(), b"invoked");
 }
 
 fn replace_fixture_root(value: Value, from: &str, to: &str) -> Value {
@@ -131,6 +190,80 @@ fn replace_fixture_root(value: Value, from: &str, to: &str) -> Value {
         ),
         value => value,
     }
+}
+
+fn legacy_probe_key(tool: &str, arguments: &Value) -> String {
+    format!("{tool}:{}", serde_json::to_string(arguments).unwrap())
+}
+
+/// The SDK reports the pointer; include bounded values there without changing
+/// its equality check or omitting any reply fields from the comparison.
+fn legacy_mismatch_diagnostic(expected: &Value, actual: &Value) -> Option<String> {
+    fn difference(
+        expected: Option<&Value>,
+        actual: Option<&Value>,
+        pointer: String,
+    ) -> Option<String> {
+        if expected == actual {
+            return None;
+        }
+        match (expected, actual) {
+            (Some(Value::Object(left)), Some(Value::Object(right))) => {
+                let keys: BTreeSet<_> = left.keys().chain(right.keys()).collect();
+                keys.into_iter().find_map(|key| {
+                    difference(
+                        left.get(key),
+                        right.get(key),
+                        format!("{pointer}/{}", key.replace('~', "~0").replace('/', "~1")),
+                    )
+                })
+            }
+            (Some(Value::Array(left)), Some(Value::Array(right))) => {
+                (0..left.len().max(right.len())).find_map(|index| {
+                    difference(
+                        left.get(index),
+                        right.get(index),
+                        format!("{pointer}/{index}"),
+                    )
+                })
+            }
+            _ => Some(pointer),
+        }
+    }
+    fn bounded(value: Option<&Value>) -> String {
+        let text = match value {
+            Some(Value::String(text)) => text.clone(),
+            Some(value) => value.to_string(),
+            None => "<missing>".to_owned(),
+        };
+        match text.char_indices().nth(400) {
+            Some((end, _)) => format!("{}…", &text[..end]),
+            None => text,
+        }
+    }
+    let pointer = difference(Some(expected), Some(actual), String::new())?;
+    Some(format!(
+        "JSON pointer {pointer}: expected={:?}; actual={:?}",
+        bounded(expected.pointer(&pointer)),
+        bounded(actual.pointer(&pointer))
+    ))
+}
+
+#[test]
+fn legacy_mismatch_diagnostic_names_pointer_and_bounds_both_values() {
+    let expected = json!({"content":[{"text":"expected"}]});
+    let actual = json!({"content":[{"text":"actual"}]});
+    assert_eq!(
+        legacy_mismatch_diagnostic(&expected, &actual).unwrap(),
+        "JSON pointer /content/0/text: expected=\"expected\"; actual=\"actual\""
+    );
+    let long = json!({"text":"λ".repeat(401)});
+    let other = json!({"text":"β".repeat(401)});
+    let diagnostic = legacy_mismatch_diagnostic(&long, &other).unwrap();
+    assert!(diagnostic.contains(&format!("{}…", "λ".repeat(400))));
+    assert!(diagnostic.contains(&format!("{}…", "β".repeat(400))));
+    assert!(!diagnostic.contains(&"λ".repeat(401)));
+    assert!(legacy_mismatch_diagnostic(&expected, &expected).is_none());
 }
 
 /// Schema-valid calls that either read state or fail before mutating it. Apart
@@ -225,6 +358,7 @@ struct Subject {
     served_tools: Mutex<Option<BTreeSet<String>>>,
     capture_live_status: bool,
     catalog_powershell: bool,
+    legacy_diagnostics: Arc<Mutex<HashMap<String, Value>>>,
     /// Stands in for the consumer's elicitation provider: the permission
     /// questions AFT files for the runner's held calls arrive here.
     stand_in: Arc<StandIn>,
@@ -238,6 +372,7 @@ impl Subject {
             served_tools: Mutex::new(None),
             capture_live_status: false,
             catalog_powershell: false,
+            legacy_diagnostics: Arc::default(),
             stand_in: Arc::default(),
         }
     }
@@ -420,6 +555,7 @@ struct Route {
     wire: Arc<Wire>,
     channel: u16,
     scoped_preset: Option<&'static str>,
+    legacy_diagnostics: Option<Arc<Mutex<HashMap<String, Value>>>>,
 }
 impl Drop for Process {
     fn drop(&mut self) {
@@ -872,6 +1008,7 @@ impl Harness for Subject {
         )
         .await?;
         route.scoped_preset = self.preset.or(Some("head"));
+        route.legacy_diagnostics = Some(self.legacy_diagnostics.clone());
         wait_for_route_ready(&route, self.quick_call()).await;
         if self.served_tools.lock().unwrap().is_none() {
             let catalog = catalog_reply(&route, self.catalog_arguments()).await;
@@ -2995,6 +3132,7 @@ async fn bind_route_stamped_with_mode(
         wire,
         channel,
         scoped_preset: stamp.scope.as_ref().map(|_| "head"),
+        legacy_diagnostics: None,
     })
 }
 fn decode_principal(principal: &str) -> Result<Principal, HarnessError> {
@@ -3176,7 +3314,24 @@ impl Route {
 #[async_trait]
 impl ToolRoute for Route {
     async fn request(&self, body: Value) -> Result<Exchange, RouteFailure> {
-        self.exchange(body, false).await
+        let key = body["name"]
+            .as_str()
+            .map(|tool| legacy_probe_key(tool, &body["arguments"]));
+        let expected = self.legacy_diagnostics.as_ref().and_then(|pending| {
+            key.as_ref()
+                .and_then(|key| pending.lock().unwrap().remove(key))
+        });
+        let exchange = self.exchange(body, false).await?;
+        if let Some(expected) = expected {
+            for frame in &exchange.frames {
+                if let ObservedFrame::Response(actual) = frame {
+                    if let Some(diagnostic) = legacy_mismatch_diagnostic(&expected, actual) {
+                        eprintln!("legacy reply mismatch: {diagnostic}");
+                    }
+                }
+            }
+        }
+        Ok(exchange)
     }
     async fn request_then_cancel(&self, body: Value) -> Result<Exchange, RouteFailure> {
         self.exchange(body, true).await
@@ -3274,11 +3429,16 @@ impl ToolProviderSubject for Subject {
         let row = legacy_row_for_probe(&rows, preset, tool, arguments);
         let project = self.project.lock().unwrap();
         let project = project.as_ref()?;
-        Some(replace_fixture_root(
+        let expected = replace_fixture_root(
             row["reply"].clone(),
             "{PROJECT}",
             &project.to_string_lossy(),
-        ))
+        );
+        self.legacy_diagnostics
+            .lock()
+            .unwrap()
+            .insert(legacy_probe_key(tool, arguments), expected.clone());
+        Some(expected)
     }
     fn call_mode_probe(&self) -> Option<cortexkit_role_tool_provider_conformance::CallModeProbe> {
         if self.preset == Some("reader") {
@@ -3788,20 +3948,29 @@ async fn assert_legacy_probe_wire_bytes(subject: Subject) {
     );
     for (name, arguments) in probes {
         let expected = legacy_row_for_probe(&rows, preset, &name, &arguments);
+        eprintln!("legacy probe {preset}/{name}: sending {arguments}");
         let frame = route
             .terminal(
                 json!({"op":"tool.call", "preset":preset, "name":name, "arguments":arguments}),
             )
             .await;
+        eprintln!(
+            "legacy probe {preset}/{name}: received {:?}",
+            frame.header.ty
+        );
         assert_eq!(frame.header.ty, FrameType::Response);
         let actual = String::from_utf8(frame.body).unwrap().replace(
             root.path().join("project").to_string_lossy().as_ref(),
             "{PROJECT}",
         );
+        let diagnostic = serde_json::from_str::<Value>(&actual)
+            .ok()
+            .and_then(|actual| legacy_mismatch_diagnostic(&expected["reply"], &actual))
+            .unwrap_or_else(|| "JSON values match; serialized bytes differ".to_owned());
         assert_eq!(
             actual,
             expected["wire_body"].as_str().unwrap(),
-            "pre-flip wire bytes: {preset}/{name}"
+            "pre-flip wire bytes: {preset}/{name}; {diagnostic}"
         );
     }
     eprintln!(
