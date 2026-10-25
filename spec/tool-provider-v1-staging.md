@@ -45,7 +45,7 @@ are dev-only dependencies.
 
 | Artifact | SHA-256 |
 | --- | --- |
-| `crates/aft/tests/fixtures/tool_provider_catalog.json` | `9e2507bcebd1755aa7513c6c6b67965a0acb655e09cbbeebea71ebbf9127dd90` |
+| `crates/aft/tests/fixtures/tool_provider_catalog.json` | `fbd8f686ad6e8cc5002511f9fb5d78ea4a23475641f1849ad5462d321fc44215` |
 | `crates/aft/tests/fixtures/tool_provider_conformance.json` | `502faafc7b2d65ffc62ad90a7e2f6b1ffd25791557802363a6504ec274bfde4e` |
 | `crates/aft/tests/fixtures/tool_provider_system_text.json` | `980dfec2799636f1f2e1919dcc3a00f0f65d1cfd9c8adfadc34d83e1cd2f4e2b` |
 

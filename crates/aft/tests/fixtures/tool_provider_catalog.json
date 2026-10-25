@@ -16,8 +16,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "57227959149f7fdb264935f6c51f649af08936061fe27abad0a2c5baed474d4a",
-      "catalog_digest": "57227959149f7fdb264935f6c51f649af08936061fe27abad0a2c5baed474d4a",
+      "generation": "6acd0f55a7e0a3cb5f35b19ba4d844ee8f646cf9ef2dd2f55f1bfceb84811569",
+      "catalog_digest": "6acd0f55a7e0a3cb5f35b19ba4d844ee8f646cf9ef2dd2f55f1bfceb84811569",
       "tools": [
         {
           "name": "status",
@@ -27,6 +27,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -47,6 +48,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -128,6 +130,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -178,6 +181,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -209,6 +213,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -291,6 +296,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -318,6 +324,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -356,6 +363,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -385,6 +393,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -433,6 +442,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -478,6 +488,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -542,6 +553,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -602,6 +614,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -672,6 +685,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -695,6 +709,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -759,6 +774,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -826,6 +842,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -860,6 +877,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -891,6 +909,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -977,6 +996,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -1026,6 +1046,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -1061,6 +1082,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -1087,6 +1109,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -1194,8 +1217,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "f042b90b98d362004dfc3540be5eb65b63c78670b3a12d11f8275d0e05dc3785",
-      "catalog_digest": "f042b90b98d362004dfc3540be5eb65b63c78670b3a12d11f8275d0e05dc3785",
+      "generation": "87374a7245a828f9e1d849c44602031b906a6e945a43eb20ff7824e70e65e46a",
+      "catalog_digest": "87374a7245a828f9e1d849c44602031b906a6e945a43eb20ff7824e70e65e46a",
       "tools": [
         {
           "name": "status",
@@ -1205,6 +1228,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -1225,6 +1249,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -1306,6 +1331,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -1356,6 +1382,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -1387,6 +1414,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -1469,6 +1497,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -1496,6 +1525,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -1534,6 +1564,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -1563,6 +1594,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -1611,6 +1643,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -1656,6 +1689,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -1720,6 +1754,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -1780,6 +1815,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -1850,6 +1886,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -1873,6 +1910,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -1937,6 +1975,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -2004,6 +2043,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -2038,6 +2078,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -2069,6 +2110,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -2155,6 +2197,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -2204,6 +2247,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -2239,6 +2283,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -2265,6 +2310,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -2374,8 +2420,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "44c0645bbad480218af01a0988c7ae82f5ed1d20df3a436164923f6d98eecd7c",
-      "catalog_digest": "44c0645bbad480218af01a0988c7ae82f5ed1d20df3a436164923f6d98eecd7c",
+      "generation": "5542ce3275d21530752c6d5a3a547c00844557f25f6e7a26c9d7f34b87c4a9f6",
+      "catalog_digest": "5542ce3275d21530752c6d5a3a547c00844557f25f6e7a26c9d7f34b87c4a9f6",
       "tools": [
         {
           "name": "status",
@@ -2385,6 +2431,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -2406,6 +2453,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -2456,6 +2504,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -2487,6 +2536,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -2569,6 +2619,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -2596,6 +2647,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -2634,6 +2686,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -2663,6 +2716,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -2711,6 +2765,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -2756,6 +2811,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -2820,6 +2876,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -2880,6 +2937,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -2950,6 +3008,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -2973,6 +3032,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -3037,6 +3097,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -3104,6 +3165,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -3138,6 +3200,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -3169,6 +3232,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -3255,6 +3319,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -3304,6 +3369,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -3339,6 +3405,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -3365,6 +3432,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -3473,8 +3541,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "aae16d0455db6858a3e6b8bac729475b849f2acefe9a8aa658e8833bbbef7632",
-      "catalog_digest": "aae16d0455db6858a3e6b8bac729475b849f2acefe9a8aa658e8833bbbef7632",
+      "generation": "a425afdd1b84c4d0b4c7485cc4e4ea887107d38061fee51ddc2a3b82c357eb11",
+      "catalog_digest": "a425afdd1b84c4d0b4c7485cc4e4ea887107d38061fee51ddc2a3b82c357eb11",
       "tools": [
         {
           "name": "status",
@@ -3484,6 +3552,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -3504,6 +3573,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -3585,6 +3655,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -3635,6 +3706,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -3666,6 +3738,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -3748,6 +3821,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -3775,6 +3849,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -3813,6 +3888,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -3842,6 +3918,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -3890,6 +3967,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -3954,6 +4032,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -4014,6 +4093,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -4084,6 +4164,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -4107,6 +4188,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -4171,6 +4253,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -4238,6 +4321,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -4272,6 +4356,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -4303,6 +4388,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -4389,6 +4475,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -4438,6 +4525,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -4473,6 +4561,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -4499,6 +4588,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -4607,8 +4697,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "e202269df33d5e5d9f9cb5ec9e8664dbdc373ccaca802fb666616364475d4978",
-      "catalog_digest": "e202269df33d5e5d9f9cb5ec9e8664dbdc373ccaca802fb666616364475d4978",
+      "generation": "f6243c9b40734e773acae9fe3cb59386bd1e43edfea3d2bd08ab96925787bc25",
+      "catalog_digest": "f6243c9b40734e773acae9fe3cb59386bd1e43edfea3d2bd08ab96925787bc25",
       "tools": [
         {
           "name": "status",
@@ -4618,6 +4708,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -4638,6 +4729,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -4719,6 +4811,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -4769,6 +4862,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -4800,6 +4894,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -4882,6 +4977,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -4909,6 +5005,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -4947,6 +5044,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -4976,6 +5074,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -5021,6 +5120,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -5085,6 +5185,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -5145,6 +5246,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -5215,6 +5317,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -5238,6 +5341,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -5302,6 +5406,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -5369,6 +5474,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -5403,6 +5509,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -5434,6 +5541,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -5520,6 +5628,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -5569,6 +5678,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -5604,6 +5714,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -5630,6 +5741,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -5739,8 +5851,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "76c4b0752c925b8f4e6ed0098c94b51b842c8142a21ccf185c3c1c299c3fed59",
-      "catalog_digest": "76c4b0752c925b8f4e6ed0098c94b51b842c8142a21ccf185c3c1c299c3fed59",
+      "generation": "406e9a1163332ade930a2cfea82791d1f08bc21465151eb436fb73afed097d15",
+      "catalog_digest": "406e9a1163332ade930a2cfea82791d1f08bc21465151eb436fb73afed097d15",
       "tools": [
         {
           "name": "status",
@@ -5750,6 +5862,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -5770,6 +5883,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -5851,6 +5965,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -5901,6 +6016,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -5932,6 +6048,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -6014,6 +6131,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -6041,6 +6159,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -6079,6 +6198,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -6108,6 +6228,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -6156,6 +6277,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -6221,6 +6343,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -6291,6 +6414,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -6314,6 +6438,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -6378,6 +6503,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -6445,6 +6571,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -6479,6 +6606,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -6510,6 +6638,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -6596,6 +6725,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -6645,6 +6775,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -6680,6 +6811,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -6706,6 +6838,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -6814,8 +6947,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "0a92c216f6896a1fd74598aa40297c8f34f99b5cbcb5cffce954ab0cc39f51dd",
-      "catalog_digest": "0a92c216f6896a1fd74598aa40297c8f34f99b5cbcb5cffce954ab0cc39f51dd",
+      "generation": "9bb8e82f9dd24ddd00fb5d22b7786da7858a8a7f2ed48e0e867d474872b85d48",
+      "catalog_digest": "9bb8e82f9dd24ddd00fb5d22b7786da7858a8a7f2ed48e0e867d474872b85d48",
       "tools": [
         {
           "name": "status",
@@ -6825,6 +6958,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -6845,6 +6979,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -6926,6 +7061,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -6976,6 +7112,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -7007,6 +7144,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -7089,6 +7227,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -7116,6 +7255,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -7154,6 +7294,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -7183,6 +7324,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -7228,6 +7370,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -7293,6 +7436,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -7363,6 +7507,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -7386,6 +7531,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -7450,6 +7596,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -7517,6 +7664,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -7551,6 +7699,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -7582,6 +7731,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -7668,6 +7818,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -7717,6 +7868,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -7752,6 +7904,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -7778,6 +7931,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -7886,8 +8040,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "574041f2866c79dcdfd09862db9782d0bfde97515e76b266537ea0cc0370d327",
-      "catalog_digest": "574041f2866c79dcdfd09862db9782d0bfde97515e76b266537ea0cc0370d327",
+      "generation": "394423c042beffc88e0fa1d60d3087300e5a5a975d08ffa4b1620f7737415a7c",
+      "catalog_digest": "394423c042beffc88e0fa1d60d3087300e5a5a975d08ffa4b1620f7737415a7c",
       "tools": [
         {
           "name": "status",
@@ -7897,6 +8051,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -7917,6 +8072,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -7998,6 +8154,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -8048,6 +8205,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -8079,6 +8237,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -8161,6 +8320,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -8188,6 +8348,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -8226,6 +8387,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -8255,6 +8417,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -8302,6 +8465,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -8362,6 +8526,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -8432,6 +8597,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -8455,6 +8621,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -8519,6 +8686,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -8586,6 +8754,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -8620,6 +8789,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -8651,6 +8821,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -8737,6 +8908,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -8786,6 +8958,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -8821,6 +8994,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -8847,6 +9021,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -8955,8 +9130,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "ceba921134226f17e1145d7c2ded09d396ab8b73a021baa1773b0bd2e8dbf17f",
-      "catalog_digest": "ceba921134226f17e1145d7c2ded09d396ab8b73a021baa1773b0bd2e8dbf17f",
+      "generation": "63694ae3b86048b3122363f99b4444ad68bc04ba9868eb1f9863000d9abb47ec",
+      "catalog_digest": "63694ae3b86048b3122363f99b4444ad68bc04ba9868eb1f9863000d9abb47ec",
       "tools": [
         {
           "name": "status",
@@ -8966,6 +9141,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -8986,6 +9162,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -9067,6 +9244,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -9117,6 +9295,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -9148,6 +9327,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -9230,6 +9410,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -9257,6 +9438,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -9295,6 +9477,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -9324,6 +9507,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -9368,6 +9552,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -9428,6 +9613,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -9498,6 +9684,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -9521,6 +9708,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -9585,6 +9773,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -9652,6 +9841,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -9686,6 +9876,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -9717,6 +9908,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -9803,6 +9995,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -9852,6 +10045,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -9887,6 +10081,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -9913,6 +10108,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -10018,8 +10214,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "a5c8341b468978388bc00faf138640c9cee8722e0a1a7e37df65135da2dbab8b",
-      "catalog_digest": "a5c8341b468978388bc00faf138640c9cee8722e0a1a7e37df65135da2dbab8b",
+      "generation": "2dcdf552ec7c32271dea1c5ad8fd52d907804ad9272f5cf8a3f787f15df26c01",
+      "catalog_digest": "2dcdf552ec7c32271dea1c5ad8fd52d907804ad9272f5cf8a3f787f15df26c01",
       "tools": [
         {
           "name": "status",
@@ -10029,6 +10225,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -10049,6 +10246,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -10125,6 +10323,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -10203,6 +10402,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -10253,6 +10453,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -10284,6 +10485,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -10366,6 +10568,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -10393,6 +10596,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -10431,6 +10635,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -10460,6 +10665,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -10508,6 +10714,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -10553,6 +10760,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -10617,6 +10825,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -10677,6 +10886,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -10747,6 +10957,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -10770,6 +10981,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -10834,6 +11046,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -10901,6 +11114,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -10935,6 +11149,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -10966,6 +11181,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -11052,6 +11268,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -11101,6 +11318,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -11136,6 +11354,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -11162,6 +11381,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -11270,8 +11490,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "57c7e6fa0e44a63cf1a7ad14f1e92f07b2cc1771a0d5b42bffeaaeb8bcb32181",
-      "catalog_digest": "57c7e6fa0e44a63cf1a7ad14f1e92f07b2cc1771a0d5b42bffeaaeb8bcb32181",
+      "generation": "479daf2c2b3aa387b64ed1d7ee54d7345908f26cbf4e0b80d0c9a49fc5405d6f",
+      "catalog_digest": "479daf2c2b3aa387b64ed1d7ee54d7345908f26cbf4e0b80d0c9a49fc5405d6f",
       "tools": [
         {
           "name": "status",
@@ -11281,6 +11501,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -11301,6 +11522,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -11377,6 +11599,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -11455,6 +11678,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -11505,6 +11729,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -11536,6 +11761,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -11618,6 +11844,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -11645,6 +11872,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -11683,6 +11911,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -11712,6 +11941,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -11760,6 +11990,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -11805,6 +12036,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -11869,6 +12101,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -11929,6 +12162,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -11999,6 +12233,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -12022,6 +12257,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -12086,6 +12322,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -12153,6 +12390,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -12187,6 +12425,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -12218,6 +12457,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -12304,6 +12544,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -12353,6 +12594,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -12388,6 +12630,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -12414,6 +12657,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -12524,8 +12768,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "6529301071d0232e1a1ad1c74b12f3f433ecb55cf1850471edcebe4ea406a433",
-      "catalog_digest": "6529301071d0232e1a1ad1c74b12f3f433ecb55cf1850471edcebe4ea406a433",
+      "generation": "8e3aea4beca3ff63cdb2637ca808cfc8613885008f844048912935b13a6e91d2",
+      "catalog_digest": "8e3aea4beca3ff63cdb2637ca808cfc8613885008f844048912935b13a6e91d2",
       "tools": [
         {
           "name": "status",
@@ -12535,6 +12779,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -12551,6 +12796,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -12629,6 +12875,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -12679,6 +12926,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -12710,6 +12958,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -12792,6 +13041,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -12819,6 +13069,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -12857,6 +13108,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -12886,6 +13138,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -12934,6 +13187,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -12979,6 +13233,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -13043,6 +13298,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -13103,6 +13359,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -13173,6 +13430,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -13196,6 +13454,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -13260,6 +13519,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -13327,6 +13587,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -13361,6 +13622,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -13392,6 +13654,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -13478,6 +13741,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -13527,6 +13791,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -13562,6 +13827,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -13588,6 +13854,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -13697,8 +13964,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "3ba11f5cc5476e3dd37ee272653ed7f8ec149f22b754bb6ced1843f0b8dd9440",
-      "catalog_digest": "3ba11f5cc5476e3dd37ee272653ed7f8ec149f22b754bb6ced1843f0b8dd9440",
+      "generation": "8ff9764cbed7cd00435451ab9150acfac21a10dbb0a681bbb1ed2f27dd68ca56",
+      "catalog_digest": "8ff9764cbed7cd00435451ab9150acfac21a10dbb0a681bbb1ed2f27dd68ca56",
       "tools": [
         {
           "name": "status",
@@ -13708,6 +13975,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -13728,6 +13996,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -13804,6 +14073,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -13882,6 +14152,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -13932,6 +14203,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -13963,6 +14235,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -14045,6 +14318,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -14072,6 +14346,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -14110,6 +14385,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -14139,6 +14415,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -14187,6 +14464,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -14251,6 +14529,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -14311,6 +14590,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -14381,6 +14661,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -14404,6 +14685,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -14468,6 +14750,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -14535,6 +14818,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -14569,6 +14853,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -14600,6 +14885,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -14686,6 +14972,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -14735,6 +15022,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -14770,6 +15058,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -14796,6 +15085,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -14905,8 +15195,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "38868e01ed10ae04ec27bd39467c7d5263cef0f407467eec60e567744314a9c9",
-      "catalog_digest": "38868e01ed10ae04ec27bd39467c7d5263cef0f407467eec60e567744314a9c9",
+      "generation": "ab7c34727ff1cc050a07dde48ec92b187a24de148d1b7660046414397a5edc4b",
+      "catalog_digest": "ab7c34727ff1cc050a07dde48ec92b187a24de148d1b7660046414397a5edc4b",
       "tools": [
         {
           "name": "status",
@@ -14916,6 +15206,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -14936,6 +15227,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -15012,6 +15304,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -15090,6 +15383,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -15140,6 +15434,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -15171,6 +15466,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -15253,6 +15549,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -15280,6 +15577,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -15318,6 +15616,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -15347,6 +15646,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -15392,6 +15692,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -15456,6 +15757,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -15516,6 +15818,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -15586,6 +15889,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -15609,6 +15913,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -15673,6 +15978,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -15740,6 +16046,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -15774,6 +16081,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -15805,6 +16113,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -15891,6 +16200,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -15940,6 +16250,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -15975,6 +16286,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -16001,6 +16313,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -16111,8 +16424,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "84c24d03e4efd359f726c3f76ef94e5d693faba6b2948b92da1d8c0bd40338fd",
-      "catalog_digest": "84c24d03e4efd359f726c3f76ef94e5d693faba6b2948b92da1d8c0bd40338fd",
+      "generation": "8dd19a2bb406911fa77fe14be366be5dde1a717179cba188f564696691a8ae83",
+      "catalog_digest": "8dd19a2bb406911fa77fe14be366be5dde1a717179cba188f564696691a8ae83",
       "tools": [
         {
           "name": "status",
@@ -16122,6 +16435,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -16142,6 +16456,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -16218,6 +16533,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -16296,6 +16612,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -16346,6 +16663,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -16377,6 +16695,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -16459,6 +16778,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -16486,6 +16806,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -16524,6 +16845,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -16553,6 +16875,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -16601,6 +16924,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -16666,6 +16990,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -16736,6 +17061,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -16759,6 +17085,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -16823,6 +17150,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -16890,6 +17218,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -16924,6 +17253,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -16955,6 +17285,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -17041,6 +17372,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -17090,6 +17422,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -17125,6 +17458,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -17151,6 +17485,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -17260,8 +17595,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "6ba85c9fe6268235848a6c13238dcf85ebf65785750cbebd02dab2fe843b7b84",
-      "catalog_digest": "6ba85c9fe6268235848a6c13238dcf85ebf65785750cbebd02dab2fe843b7b84",
+      "generation": "f53ef55b3e18e15b6d13ecdd464e7da13fc741f2dc9ee004ae0e8b4fca3946fc",
+      "catalog_digest": "f53ef55b3e18e15b6d13ecdd464e7da13fc741f2dc9ee004ae0e8b4fca3946fc",
       "tools": [
         {
           "name": "status",
@@ -17271,6 +17606,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -17291,6 +17627,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -17367,6 +17704,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -17445,6 +17783,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -17495,6 +17834,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -17526,6 +17866,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -17608,6 +17949,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -17635,6 +17977,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -17673,6 +18016,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -17702,6 +18046,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -17747,6 +18092,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -17812,6 +18158,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -17882,6 +18229,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -17905,6 +18253,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -17969,6 +18318,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -18036,6 +18386,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -18070,6 +18421,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -18101,6 +18453,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -18187,6 +18540,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -18236,6 +18590,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -18271,6 +18626,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -18297,6 +18653,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -18406,8 +18763,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "ead8e801829358becb1dbb42457afbcb7b55cc55c184df41332db6ee5a22c8bf",
-      "catalog_digest": "ead8e801829358becb1dbb42457afbcb7b55cc55c184df41332db6ee5a22c8bf",
+      "generation": "23091932d963f35204727d96b2d56a0e015142b799439215db08f948bead1b44",
+      "catalog_digest": "23091932d963f35204727d96b2d56a0e015142b799439215db08f948bead1b44",
       "tools": [
         {
           "name": "status",
@@ -18417,6 +18774,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -18437,6 +18795,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -18513,6 +18872,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -18591,6 +18951,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -18641,6 +19002,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -18672,6 +19034,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -18754,6 +19117,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -18781,6 +19145,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -18819,6 +19184,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -18848,6 +19214,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -18895,6 +19262,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -18955,6 +19323,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -19025,6 +19394,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -19048,6 +19418,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -19112,6 +19483,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -19179,6 +19551,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -19213,6 +19586,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -19244,6 +19618,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -19330,6 +19705,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -19379,6 +19755,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -19414,6 +19791,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -19440,6 +19818,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -19549,8 +19928,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "f3fa16b4c6fed1fe007f80d42fe111f9d2460723f35635eb91e43e090efb3643",
-      "catalog_digest": "f3fa16b4c6fed1fe007f80d42fe111f9d2460723f35635eb91e43e090efb3643",
+      "generation": "6953a382e27b9b9398e8db83e554c4205aeaf162c6f05f3692fbfb700a809ee9",
+      "catalog_digest": "6953a382e27b9b9398e8db83e554c4205aeaf162c6f05f3692fbfb700a809ee9",
       "tools": [
         {
           "name": "status",
@@ -19560,6 +19939,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -19580,6 +19960,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -19656,6 +20037,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -19734,6 +20116,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -19784,6 +20167,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -19815,6 +20199,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -19897,6 +20282,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -19924,6 +20310,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -19962,6 +20349,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -19991,6 +20379,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -20035,6 +20424,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -20095,6 +20485,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -20165,6 +20556,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -20188,6 +20580,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -20252,6 +20645,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -20319,6 +20713,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -20353,6 +20748,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -20384,6 +20780,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -20470,6 +20867,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -20519,6 +20917,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -20554,6 +20953,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -20580,6 +20980,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
