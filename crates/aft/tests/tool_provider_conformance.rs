@@ -61,6 +61,24 @@ fn legacy_rows_for_catalog<'a>(
     );
     rows.iter()
         .filter(|row| row["tool"] != "powershell" || powershell)
+        .map(|row| {
+            // Windows reports a directory write as ERROR_ACCESS_DENIED rather
+            // than Unix EISDIR. Pin that native error instead of normalizing it.
+            #[cfg(windows)]
+            if row["tool"] == "write" {
+                return fixtures["platform_overrides"]["windows"]["presets"][preset]
+                    .as_array()
+                    .and_then(|rows| {
+                        rows.iter().find(|native| {
+                            native["tool"] == row["tool"] && native["arguments"] == row["arguments"]
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("no generated Windows legacy baseline for {preset}/write")
+                    });
+            }
+            row
+        })
         .collect()
 }
 
@@ -173,23 +191,55 @@ fn catalog_powershell_fixture_is_discovered_and_marks_execution() {
     assert_eq!(std::fs::read(marker).unwrap(), b"invoked");
 }
 
-fn replace_fixture_root(value: Value, from: &str, to: &str) -> Value {
+/// Only the marked project path is platform-dependent. Do not rewrite other
+/// backslashes, URLs, reply text, or operating-system error messages.
+fn expand_legacy_project_paths(value: Value, project: &Path) -> Value {
+    fn text(input: &str, project: &str, separator: char) -> String {
+        let path = regex::Regex::new(r"\{PROJECT\}(?:[/\\][A-Za-z0-9_.\\/-]+)?").unwrap();
+        path.replace_all(input, |capture: &regex::Captures<'_>| {
+            let suffix = capture[0].strip_prefix("{PROJECT}").unwrap();
+            format!(
+                "{project}{}",
+                suffix.replace(['/', '\\'], &separator.to_string())
+            )
+        })
+        .into_owned()
+    }
     match value {
-        Value::String(text) => Value::String(text.replace(from, to)),
+        Value::String(input) => Value::String(text(
+            &input,
+            &project.to_string_lossy(),
+            std::path::MAIN_SEPARATOR,
+        )),
         Value::Array(items) => Value::Array(
             items
                 .into_iter()
-                .map(|item| replace_fixture_root(item, from, to))
+                .map(|item| expand_legacy_project_paths(item, project))
                 .collect(),
         ),
         Value::Object(items) => Value::Object(
             items
                 .into_iter()
-                .map(|(key, value)| (key, replace_fixture_root(value, from, to)))
+                .map(|(key, item)| (key, expand_legacy_project_paths(item, project)))
                 .collect(),
         ),
         value => value,
     }
+}
+
+fn canonical_fixture_project(project: &Path) -> PathBuf {
+    let project = std::fs::canonicalize(project).unwrap();
+    #[cfg(windows)]
+    let project = aft::windows_path::normalize_windows_path(&project);
+    project
+}
+
+#[test]
+fn legacy_project_expansion_changes_only_marked_paths() {
+    let project = Path::new("fixture").join("project");
+    let input = json!({"text":"read: {PROJECT}/.cortexkit/no-such-file.txt; https://example.com/a/b; literal \\n", "error":"Is a directory (os error 21)"});
+    let expected = json!({"text":format!("read: {}; https://example.com/a/b; literal \\n", project.join(".cortexkit").join("no-such-file.txt").display()), "error":"Is a directory (os error 21)"});
+    assert_eq!(expand_legacy_project_paths(input, &project), expected);
 }
 
 fn legacy_probe_key(tool: &str, arguments: &Value) -> String {
@@ -838,7 +888,7 @@ impl Harness for Subject {
     }
     async fn spawn(&self, root: &Path) -> Result<Process, HarnessError> {
         prepare_provider_project(root)?;
-        *self.project.lock().unwrap() = Some(root.join("project"));
+        *self.project.lock().unwrap() = Some(canonical_fixture_project(&root.join("project")));
         *self.served_tools.lock().unwrap() = None;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -3429,11 +3479,7 @@ impl ToolProviderSubject for Subject {
         let row = legacy_row_for_probe(&rows, preset, tool, arguments);
         let project = self.project.lock().unwrap();
         let project = project.as_ref()?;
-        let expected = replace_fixture_root(
-            row["reply"].clone(),
-            "{PROJECT}",
-            &project.to_string_lossy(),
-        );
+        let expected = expand_legacy_project_paths(row["reply"].clone(), project);
         self.legacy_diagnostics
             .lock()
             .unwrap()
@@ -3826,6 +3872,64 @@ async fn regenerate_pre_flip_powershell_legacy_replies() {
     .unwrap();
 }
 
+/// Native error codes and messages are platform content, not path formatting.
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "capture Windows native errors from the catalog-declaration-off binary"]
+async fn regenerate_pre_flip_windows_native_error_replies() {
+    let mut fixtures = legacy_fixtures();
+    let (name, arguments) = result_probes()
+        .into_iter()
+        .find(|(name, _)| name == "write")
+        .unwrap();
+    for preset in ["head", "worker"] {
+        let subject = Subject::new(Some(preset));
+        let root = tempfile::tempdir().unwrap();
+        let process = subject.spawn(root.path()).await.unwrap();
+        let route = subject
+            .route(&process, &subject.plain_stamp())
+            .await
+            .unwrap();
+        let catalog = catalog_reply(&route, subject.catalog_arguments()).await;
+        assert!(
+            catalog["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tool| tool.get("result_format").is_none()),
+            "capture requires declaration=false"
+        );
+        let frame = route
+            .terminal(json!({"name":name, "preset":preset, "arguments":arguments}))
+            .await;
+        assert_eq!(frame.header.ty, FrameType::Response);
+        let wire_body = String::from_utf8(frame.body).unwrap();
+        let reply: Value = serde_json::from_str(&wire_body).unwrap();
+        let captured =
+            json!({"tool":name, "arguments":arguments, "reply":reply, "wire_body":wire_body});
+        let slot = &mut fixtures["platform_overrides"]["windows"]["presets"][preset];
+        if !slot.is_null() {
+            assert_eq!(
+                slot,
+                &json!([captured]),
+                "do not refresh an existing native oracle"
+            );
+        } else {
+            *slot = json!([captured]);
+        }
+    }
+    fixtures["platform_overrides"]["windows"]["provenance"] = json!({
+        "source_commit":fixtures["source_commit"].clone(),
+        "binary_sha256":format!("{:x}", Sha256::digest(std::fs::read(aft_binary::aft_binary()).unwrap())),
+        "capture":"native Windows write to an existing directory; original-main renderer with declaration=false and authorized input hooks"
+    });
+    std::fs::write(
+        LEGACY_FIXTURES,
+        format!("{}\n", serde_json::to_string_pretty(&fixtures).unwrap()),
+    )
+    .unwrap();
+}
+
 #[test]
 fn legacy_probe_arguments_match_pinned_catalogs() {
     let head: Value =
@@ -3959,17 +4063,23 @@ async fn assert_legacy_probe_wire_bytes(subject: Subject) {
             frame.header.ty
         );
         assert_eq!(frame.header.ty, FrameType::Response);
-        let actual = String::from_utf8(frame.body).unwrap().replace(
-            root.path().join("project").to_string_lossy().as_ref(),
-            "{PROJECT}",
+        let actual = String::from_utf8(frame.body).unwrap();
+        assert_eq!(
+            serde_json::to_string(&expected["reply"]).unwrap(),
+            expected["wire_body"].as_str().unwrap(),
+            "pinned legacy JSON and bytes must describe the same reply"
         );
+        let expected_reply = expand_legacy_project_paths(
+            expected["reply"].clone(),
+            &canonical_fixture_project(&root.path().join("project")),
+        );
+        let expected_wire_body = serde_json::to_string(&expected_reply).unwrap();
         let diagnostic = serde_json::from_str::<Value>(&actual)
             .ok()
-            .and_then(|actual| legacy_mismatch_diagnostic(&expected["reply"], &actual))
+            .and_then(|actual| legacy_mismatch_diagnostic(&expected_reply, &actual))
             .unwrap_or_else(|| "JSON values match; serialized bytes differ".to_owned());
         assert_eq!(
-            actual,
-            expected["wire_body"].as_str().unwrap(),
+            actual, expected_wire_body,
             "pre-flip wire bytes: {preset}/{name}; {diagnostic}"
         );
     }

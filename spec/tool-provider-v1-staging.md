@@ -47,7 +47,7 @@ are dev-only dependencies.
 | --- | --- |
 | `crates/aft/tests/fixtures/tool_provider_catalog.json` | `fbd8f686ad6e8cc5002511f9fb5d78ea4a23475641f1849ad5462d321fc44215` |
 | `crates/aft/tests/fixtures/tool_provider_conformance.json` | `7d9936b0323ab6cd69bcc84101d93cd935dc806631e957cf5eada474a81f3a0f` |
-| `crates/aft/tests/fixtures/tool_provider_legacy_replies.json` | `b049e846eee14f14d1d42280c04a8f790e8e3af31af42184dd7bbd3a6b6005b6` |
+| `crates/aft/tests/fixtures/tool_provider_legacy_replies.json` | `ff8f4763ed604ecceebacf4ac7b1d1885d2b42803e86b5e796c72e2af2338934` |
 | `crates/aft/tests/fixtures/tool_provider_system_text.json` | `980dfec2799636f1f2e1919dcc3a00f0f65d1cfd9c8adfadc34d83e1cd2f4e2b` |
 
 Catalog fixtures pin full serialized replies, resolved disables, availability,

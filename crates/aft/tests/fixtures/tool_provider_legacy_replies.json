@@ -2327,5 +2327,68 @@
       "availability": "executable-presence pwsh fixture on PATH; invocation marker remained absent",
       "capture": "real pre-flip tool.call powershell; production wait:true/pty:true validation refusal"
     }
+  },
+  "platform_overrides": {
+    "windows": {
+      "presets": {
+        "head": [
+          {
+            "tool": "write",
+            "arguments": {
+              "path": ".cortexkit",
+              "content": "unused"
+            },
+            "reply": {
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Access is denied. (os error 5)"
+                }
+              ],
+              "isError": true,
+              "structuredContent": {
+                "id": "conformance-result-probe",
+                "success": false,
+                "code": "io_error",
+                "message": "Access is denied. (os error 5)",
+                "text": "Access is denied. (os error 5)"
+              }
+            },
+            "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"Access is denied. (os error 5)\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"io_error\",\"message\":\"Access is denied. (os error 5)\",\"text\":\"Access is denied. (os error 5)\"}}"
+          }
+        ],
+        "worker": [
+          {
+            "tool": "write",
+            "arguments": {
+              "path": ".cortexkit",
+              "content": "unused"
+            },
+            "reply": {
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Access is denied. (os error 5)"
+                }
+              ],
+              "isError": true,
+              "structuredContent": {
+                "id": "conformance-result-probe",
+                "success": false,
+                "code": "io_error",
+                "message": "Access is denied. (os error 5)",
+                "text": "Access is denied. (os error 5)"
+              }
+            },
+            "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"Access is denied. (os error 5)\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"io_error\",\"message\":\"Access is denied. (os error 5)\",\"text\":\"Access is denied. (os error 5)\"}}"
+          }
+        ]
+      },
+      "provenance": {
+        "source_commit": "a209fc15f4ac5866ad3afe5ea111d7ca44ae74e9",
+        "binary_sha256": "c58ab913a9438774266cdfc9e1c9afe5b8cfcb7bd417fd7d1f43891c8df000fe",
+        "capture": "native Windows write to an existing directory; original-main renderer with declaration=false and authorized input hooks"
+      }
+    }
   }
 }
