@@ -13838,14 +13838,28 @@ async fn runon_uncounted_expired_gap_that_never_fills_is_reported_unverified_not
     assert!(reply.success, "{reply:?}");
     let output = reply.data["output"].as_str().unwrap();
     assert!(
-        output.contains(&expired_gap_unverified_line(3, 5)),
+        output.contains(
+            "records 3 to 5 could not be verified: they may be expired returned-file data or lost output, and the runner did not report chunk counts"
+        ),
         "{output}"
     );
-    assert!(output.contains(EXPIRED_GAP_UNVERIFIED_REASON), "{output}");
     assert!(!output.contains("output lost"), "{output}");
     assert!(
         output
             .contains("  dist/app.bin: not returned (the server no longer keeps this job's files)"),
         "{output}"
+    );
+}
+
+#[test]
+fn expired_gap_unverified_line_is_the_approved_text() {
+    assert_eq!(
+        expired_gap_unverified_line(4, 6),
+        "records 4 to 6 could not be verified: they may be expired returned-file data or lost output, and the runner did not report chunk counts"
+    );
+    // A single record keeps the range form, like the lost-output line.
+    assert_eq!(
+        expired_gap_unverified_line(4, 4),
+        "records 4 to 4 could not be verified: they may be expired returned-file data or lost output, and the runner did not report chunk counts"
     );
 }

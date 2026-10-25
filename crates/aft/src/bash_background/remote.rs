@@ -5235,25 +5235,21 @@ enum MissingRecords {
     ExpiredGapUnverified,
 }
 
-/// The typed reason for a gap before an expired replay's manifest that AFT
-/// could not verify: the runner sent no per-file chunk counts, the count AFT
-/// derived from the file sizes did not match, and re-attaching did not fill
-/// the gap. It may be lost output or expired chunks of another size.
+/// The agent-facing line for a gap before an expired replay's manifest that
+/// AFT could not verify: the runner sent no per-file chunk counts, the count
+/// AFT derived from the file sizes did not match, and re-attaching did not
+/// fill the gap. It is kept apart from lost output in
+/// `RemoteTask::expired_gap_unverified`. `{first}` and `{last}` are the seqs;
+/// a single record reads "records N to N", like the lost-output line beside
+/// it.
 #[cfg(unix)]
-pub(crate) const EXPIRED_GAP_UNVERIFIED_REASON: &str = "expired_gap_unverified";
-
-/// Placeholder wording for [`EXPIRED_GAP_UNVERIFIED_REASON`], pending
-/// approval of the agent-facing sentence. `{first}` and `{last}` are the seqs.
-#[cfg(unix)]
-pub(crate) const EXPIRED_GAP_UNVERIFIED_TEXT: &str =
-    "records {first} to {last} [placeholder wording, pending approval]";
+pub(crate) const EXPIRED_GAP_UNVERIFIED_TEXT: &str = "records {first} to {last} could not be verified: they may be expired returned-file data or lost output, and the runner did not report chunk counts";
 
 #[cfg(unix)]
 fn expired_gap_unverified_line(first: u64, last: u64) -> String {
-    let text = EXPIRED_GAP_UNVERIFIED_TEXT
+    EXPIRED_GAP_UNVERIFIED_TEXT
         .replace("{first}", &first.to_string())
-        .replace("{last}", &last.to_string());
-    format!("{EXPIRED_GAP_UNVERIFIED_REASON}: {text}")
+        .replace("{last}", &last.to_string())
 }
 
 #[cfg(unix)]
