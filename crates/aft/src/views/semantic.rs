@@ -49,7 +49,7 @@ use super::readiness::{
 };
 use super::registry::ViewRegistration;
 use super::segment_store::rel_path_to_os;
-use super::snapshot::{DiskState, LiveEntry, OpenGeneration, Snapshot, Source, WatcherState};
+use super::snapshot::{ComposedGeneration, DiskState, LiveEntry, Snapshot, Source, WatcherState};
 use super::RelPath;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -498,7 +498,21 @@ struct ViewState {
     failed: BTreeMap<(RelPath, ContentHash), String>,
     tracker: FailureTracker,
     live: Option<crate::pins::LivePin>,
+    active_fills: usize,
     cache: Option<(CacheKey, Arc<SemanticIndex>)>,
+}
+
+struct ActiveFill(Arc<Mutex<ViewState>>);
+impl ActiveFill {
+    fn new(view: &Arc<Mutex<ViewState>>) -> Self {
+        lock(view).active_fills += 1;
+        Self(view.clone())
+    }
+}
+impl Drop for ActiveFill {
+    fn drop(&mut self) {
+        lock(&self.0).active_fills -= 1;
+    }
 }
 
 type ViewKey = (String, String);
@@ -653,9 +667,9 @@ impl SemanticPlane {
     fn admit(
         &self,
         access: &ViewAccess,
-        generation: &OpenGeneration,
+        generation: &ComposedGeneration,
     ) -> Result<Resident, PlaneError> {
-        let manifest = generation.manifest();
+        let manifest = generation;
         let id = self.producer.id();
         let compatible = manifest.header().producers.semantic.as_deref() == Some(id.as_str());
         let mut runs = Vec::new();
@@ -668,9 +682,10 @@ impl SemanticPlane {
             // Markers of every run loaded here are probed together afterwards.
             let mut seeds = Vec::new();
             for (path, entry) in manifest.entries() {
-                let (Some(content), Some(state)) =
-                    (entry.content(), entry.plane_state(FamilyPlane::Semantic))
-                else {
+                let (Some(content), Some(state)) = (
+                    entry.content(),
+                    generation.plane_readiness(path, FamilyPlane::Semantic),
+                ) else {
                     continue;
                 };
                 match state {
@@ -734,6 +749,27 @@ impl SemanticPlane {
         content: ContentHash,
         repair_summaries: bool,
     ) -> VectorSource {
+        if let Some(patch) = snapshot
+            .readiness_patches()
+            .get(path)
+            .filter(|patch| patch.content == content)
+            .and_then(|patch| patch.planes.semantic.as_ref())
+        {
+            if snapshot
+                .generation()
+                .plane_readiness(path, FamilyPlane::Semantic)
+                != Some(patch)
+            {
+                if let Some(key) = state.fill.get(path, &content, FamilyPlane::Semantic) {
+                    return VectorSource::Fill(*key);
+                }
+                return if patch.is_failed() {
+                    VectorSource::Failed
+                } else {
+                    VectorSource::Pending
+                };
+            }
+        }
         // A live entry supersedes the generation: its base run, if any, holds
         // other content and must never be scored.
         let live = matches!(snapshot.source(path), Source::Live(_));
@@ -793,6 +829,11 @@ impl SemanticPlane {
                     return None;
                 };
                 (applies_to(&path)
+                    && (matches!(snapshot.source(&path), Source::Live(_))
+                        || snapshot.readiness_patches().contains_key(&path)
+                        || snapshot
+                            .generation()
+                            .owns_work(&path, FamilyPlane::Semantic))
                     && (Self::summary_repair_pending(
                         state,
                         resident,
@@ -872,7 +913,7 @@ impl SemanticPlane {
             return Err(plane_error("view belongs to another storage root"));
         }
         let resident = self
-            .resident(&access, snapshot.generation().name())
+            .resident(&access, &snapshot.generation().resident_key())
             .ok_or_else(|| plane_error("semantic generation not resident"))?;
         let view = self.view(&access);
         let mut report = FillReport::default();
@@ -1097,6 +1138,7 @@ impl SemanticPlane {
             )
             .collect::<Vec<_>>();
         let store_started = Instant::now();
+        let _active_fill = ActiveFill::new(&view);
         protect(&view, &keys)?;
         report.timing.store_write += store_started.elapsed();
         let mut pending = to_embed.into_iter().zip(chunks).peekable();
@@ -1555,7 +1597,7 @@ fn admit_ready(
             &Completion { item, key },
             producer,
             live.as_ref(),
-            Some(now.generation().manifest()),
+            Some(now.generation()),
         ) {
             Admission::Installed => report.installed += 1,
             Admission::DroppedContent | Admission::DroppedProducer => report.dropped += 1,
@@ -1731,7 +1773,7 @@ impl SemanticPlane {
         snapshot: &Snapshot,
     ) -> Result<SemanticOverlay, PlaneError> {
         let resident = self
-            .resident(access, snapshot.generation().name())
+            .resident(access, &snapshot.generation().resident_key())
             .ok_or_else(|| plane_error("semantic generation not resident"))?;
         let arena = self.arena(access.family());
         let view = self.view(access);
@@ -1818,7 +1860,7 @@ impl SemanticPlane {
             shape.update(&[0]);
         }
         let cache_key = (
-            snapshot.generation().name().to_owned(),
+            snapshot.generation().resident_key(),
             *shape.finalize().as_bytes(),
             state.fill_version,
             unvouched,
@@ -1901,7 +1943,7 @@ impl SemanticPlane {
 
     /// Outstanding semantic work for the checkout, as a fill would see it.
     pub fn pending_work(&self, access: &ViewAccess, snapshot: &Snapshot) -> Vec<WorkItem> {
-        let Some(resident) = self.resident(access, snapshot.generation().name()) else {
+        let Some(resident) = self.resident(access, &snapshot.generation().resident_key()) else {
             return Vec::new();
         };
         let view = self.view(access);
@@ -1942,17 +1984,17 @@ impl PlaneAdapter for SemanticPlane {
     }
 
     /// Admits the generation's runs into the family arena (this is the only
-    /// place, besides a fill's own puts, that decodes store rows) and, for the
-    /// owner, drops fills and live-pin keys the generation now records.
+    /// place, besides a fill's own puts, that decodes store rows). Live fills
+    /// remain protected until the separate durable-publication callback.
     fn open_generation(
         &self,
         access: &ViewAccess,
-        generation: &Arc<OpenGeneration>,
+        generation: &Arc<ComposedGeneration>,
     ) -> Result<(), PlaneError> {
         let key = (
             access.family().to_owned(),
             access.scope().to_owned(),
-            generation.name().to_owned(),
+            generation.resident_key(),
         );
         let existing = lock(&self.residents).get(&key).cloned();
         let resident = if let Some(resident) = existing {
@@ -1964,11 +2006,19 @@ impl PlaneAdapter for SemanticPlane {
         if matches!(access, ViewAccess::Reader { .. }) && !resident.legacy_summaries.is_empty() {
             log::info!("semantic borrower loaded {} legacy small-budget summary runs; serving published vectors until owner repair", resident.legacy_summaries.len());
         }
+        Ok(())
+    }
+
+    fn generation_published(
+        &self,
+        access: &ViewAccess,
+        generation: &Arc<ComposedGeneration>,
+    ) -> Result<(), PlaneError> {
         if let ViewAccess::Owner(_) = access {
             let view = self.view(access);
             let mut state = lock(&view);
             let before = state.fill.len();
-            state.fill.trim_folded(generation.manifest());
+            state.fill.trim_folded(generation);
             if state.fill.len() != before {
                 state.fill_version += 1;
             }
@@ -1977,8 +2027,19 @@ impl PlaneAdapter for SemanticPlane {
                 .keys()
                 .map(FamilyKey::to_hex)
                 .collect::<HashSet<_>>();
+            if keep.is_empty() && state.active_fills == 0 {
+                // Chunk-cache keys have no manifest edge. Once no fill needs
+                // this pin, release its files instead of rewriting an empty list.
+                state.live.take();
+                return Ok(());
+            }
             if let Some(pin) = state.live.as_mut() {
-                pin.trim(|key| keep.contains(key))
+                let published = generation
+                    .ready_keys()
+                    .iter()
+                    .map(FamilyKey::to_hex)
+                    .collect();
+                pin.trim_published(&published, |key| keep.contains(key))
                     .map_err(|error| plane_error(error.to_string()))?;
             }
         }
@@ -2015,7 +2076,7 @@ impl SemanticPlane {
         let key = (
             family.to_owned(),
             scope.to_owned(),
-            snapshot.generation().name().to_owned(),
+            snapshot.generation().resident_key(),
         );
         let Some(resident) = lock(&self.residents).get(&key).cloned() else {
             return PlaneReadiness::Building;
@@ -2275,6 +2336,96 @@ mod tests {
     }
 
     #[test]
+    fn opening_draft_readers_keeps_unpublished_fill_protection() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let plane = new_plane(storage.path(), "model-a");
+        let checkout = Checkout::open(storage.path(), "draft-fill", root.path(), &plane);
+        let snapshot = checkout.load();
+        let view = plane.view(&checkout.access);
+        let path = RelPath::new(b"file.rs".to_vec()).unwrap();
+        let content = ContentHash::of(b"file content");
+        let key = plane.producer.key(b"file content", &path);
+        let completion = super::super::readiness::Completion {
+            item: WorkItem {
+                plane: FamilyPlane::Semantic,
+                rel_path: path.clone(),
+                content,
+                producer: plane.producer.id(),
+            },
+            key,
+        };
+        let disk = DiskState::Present { content, size: 12 };
+        {
+            let mut state = lock(&view);
+            assert_eq!(
+                state
+                    .fill
+                    .admit(&completion, &plane.producer.id(), Some(&disk), None),
+                Admission::Installed
+            );
+            state.live = Some(crate::pins::LivePin::create(&checkout.owner).unwrap());
+            state.live.as_mut().unwrap().protect(&[key]).unwrap();
+        }
+        let mut manifest =
+            super::super::manifest_v2::ManifestV2::new(snapshot.generation().header().clone());
+        manifest
+            .insert(
+                path,
+                super::super::manifest_v2::EntryV2::regular(
+                    content,
+                    12,
+                    super::super::manifest_v2::EntryPlanes {
+                        semantic: Some(PlaneState::ready(&key)),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap();
+        let draft = Arc::new(ComposedGeneration::new("unpublished-draft", manifest, None));
+        plane.open_generation(&checkout.access, &draft).unwrap();
+        assert_eq!(lock(&view).fill.len(), 1);
+        assert!(lock(&view).live.as_ref().unwrap().keys_path().exists());
+        plane
+            .generation_published(&checkout.access, &draft)
+            .unwrap();
+        assert!(lock(&view).fill.is_empty());
+        assert!(lock(&view).live.is_none());
+    }
+
+    #[test]
+    fn publication_cleanup_keeps_keys_of_an_active_fill() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let plane = new_plane(storage.path(), "model-a");
+        let checkout = Checkout::open(storage.path(), "active-fill", root.path(), &plane);
+        let snapshot = checkout.load();
+        let view = plane.view(&checkout.access);
+        let active = ActiveFill::new(&view);
+        lock(&view).live = Some(crate::pins::LivePin::create(&checkout.owner).unwrap());
+        let key = plane
+            .producer
+            .key(b"pending bytes", &RelPath::new(b"new.rs".to_vec()).unwrap());
+        protect(&view, &[key]).unwrap();
+        let path = lock(&view).live.as_ref().unwrap().keys_path().to_path_buf();
+        plane
+            .generation_published(&checkout.access, snapshot.generation())
+            .unwrap();
+        assert!(
+            path.exists(),
+            "publication must not release a pin still needed by a fill"
+        );
+        drop(active);
+        plane
+            .generation_published(&checkout.access, snapshot.generation())
+            .unwrap();
+        assert!(
+            !path.exists(),
+            "the idle pin may be released after publication"
+        );
+    }
+
+    #[test]
     fn admission_propagates_semantic_payload_decode_errors() {
         let storage = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -2311,7 +2462,7 @@ mod tests {
                 ),
             )
             .unwrap();
-        let generation = OpenGeneration::new("bad", manifest, None);
+        let generation = ComposedGeneration::new("bad", manifest, None);
         assert!(plane.admit(&checkout.access, &generation).is_err());
     }
 
@@ -3844,8 +3995,7 @@ mod tests {
         assert!(matches!(
             folded
                 .generation()
-                .manifest()
-                .get(&RelPath::new(b"src/broken.rs".to_vec()).unwrap())
+                .entry(&RelPath::new(b"src/broken.rs".to_vec()).unwrap())
                 .and_then(|entry| entry.plane_state(FamilyPlane::Semantic)),
             Some(PlaneState::Failed { .. })
         ));

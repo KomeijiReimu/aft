@@ -519,7 +519,7 @@ pub(crate) fn callgraph_paths_match(
 /// Content verification for an opted-in ruled callgraph generation. Legacy
 /// payload keys are intentionally incompatible with its dispatch-hint producer.
 pub fn callgraph_paths_match_v2(
-    manifest: &super::manifest_v2::ManifestV2,
+    manifest: &super::snapshot::ComposedGeneration,
     root: &std::path::Path,
     paths: &[PathBuf],
 ) -> super::Result<bool> {
@@ -574,7 +574,7 @@ pub fn open_foreign_generation(
     reader: &super::registry::ReaderRegistration,
     scope: &str,
     producers: &super::manifest_v2::Producers,
-) -> super::Result<Option<std::sync::Arc<super::snapshot::OpenGeneration>>> {
+) -> super::Result<Option<std::sync::Arc<super::snapshot::ComposedGeneration>>> {
     let protected = reader.protect_current(scope).map_err(|error| {
         super::ViewError::InvalidManifest(format!("foreign view {scope} unavailable: {error}"))
     })?;
@@ -589,8 +589,13 @@ pub fn open_foreign_generation(
         })?;
     let manifest = store.load_manifest_v2(protected.generation())?;
     manifest.ensure_producers(producers)?;
+    if manifest.base_header().is_some() {
+        return Err(super::ViewError::InvalidManifest(
+            "durable v3 base resolution is not wired".into(),
+        ));
+    }
     Ok(Some(std::sync::Arc::new(
-        super::snapshot::OpenGeneration::new(
+        super::snapshot::ComposedGeneration::new(
             protected.generation().to_owned(),
             manifest,
             Some(super::snapshot::Residency::Protected(protected)),
@@ -649,6 +654,7 @@ mod producer_tests {
                 ),
             )
             .unwrap();
+        let manifest = super::super::snapshot::ComposedGeneration::new("test", manifest, None);
         assert!(callgraph_paths_match_v2(&manifest, root.path(), &[absolute.clone()]).unwrap());
         std::fs::write(&absolute, b"fn changed() {}").unwrap();
         assert!(!callgraph_paths_match_v2(&manifest, root.path(), &[absolute]).unwrap());

@@ -4267,6 +4267,14 @@ fn orphan_first(
 /// One pass with an explicit time budget. Production always passes
 /// PASS_BUDGET; tests that check the entry bound pass a budget no runner can
 /// exhaust, so a slow machine cannot stop the pass by wall clock first.
+#[cfg(test)]
+pub(crate) fn run_pass_with_budget_for_test(
+    storage: &StoragePaths,
+    budget: Duration,
+) -> SweepReport {
+    run_pass_with_budget(storage, &|| false, &Instant::now, budget)
+}
+
 fn run_pass_with_budget(
     storage: &StoragePaths,
     cancelled: &dyn Fn() -> bool,

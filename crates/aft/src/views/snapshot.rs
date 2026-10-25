@@ -13,7 +13,7 @@
 //!
 //! When a new generation `G+1` is published (by this daemon or by another
 //! one), the successor delta is derived over
-//! `K = keys(delta@v) ∪ paths(diff(G, G+1))`: for each path in `K` the last
+//! `K = keys(delta@v) ∪ keys(readiness@v) ∪ paths(diff(G, G+1))`: for each path in `K` the last
 //! observed disk state is the live entry's if there is one, else `G`'s entry
 //! (exact, by the invariant), and the successor has an entry exactly when that
 //! state differs from `G+1`. The rule never reads what the fold itself read,
@@ -29,8 +29,10 @@ use std::sync::Arc;
 
 use crate::blob_store::v2::{ContentHash, FamilyPlane};
 
-use super::manifest_v2::{EntryV2, ManifestV2};
-use super::readiness::LiveEntries;
+use super::manifest_v2::{
+    EntryPlanes, EntryV2, ManifestHeader, ManifestV2, Producers, PublishedFrontier,
+};
+use super::readiness::{LiveEntries, PlaneState};
 use super::registry::ProtectedGeneration;
 use super::RelPath;
 
@@ -74,36 +76,336 @@ pub enum Residency {
 
 /// One opened, immutable generation. Dropping the last `Arc` releases its
 /// residency pin.
+///
+/// A plane cannot bypass composition through a raw manifest:
+/// ```compile_fail
+/// fn bypass(generation: &aft::views::snapshot::ComposedGeneration) {
+///     let _ = generation.manifest();
+/// }
+/// ```
 #[derive(Debug)]
-pub struct OpenGeneration {
+pub struct ComposedGeneration {
     name: String,
-    manifest: Arc<ManifestV2>,
+    delta: Arc<ManifestV2>,
+    base: Option<Arc<ComposedGeneration>>,
+    overrides: BTreeMap<RelPath, EntryV2>,
     _residency: Option<Residency>,
 }
 
-impl OpenGeneration {
+/// Compatibility name for callers that open a flat generation. Both names
+/// expose only the composed projection, never a raw manifest accessor.
+pub type OpenGeneration = ComposedGeneration;
+
+impl ComposedGeneration {
     pub fn new(
         name: impl Into<String>,
         manifest: ManifestV2,
         residency: Option<Residency>,
     ) -> Self {
+        assert!(
+            manifest.base_header().is_none(),
+            "a worker must be opened with ComposedGeneration::compose"
+        );
         Self {
             name: name.into(),
-            manifest: Arc::new(manifest),
+            delta: Arc::new(manifest),
+            base: None,
+            overrides: BTreeMap::new(),
             _residency: residency,
         }
+    }
+
+    pub fn compose(
+        name: impl Into<String>,
+        delta: ManifestV2,
+        base: Arc<ComposedGeneration>,
+        residency: Option<Residency>,
+    ) -> super::Result<Self> {
+        if delta.base_header().is_none()
+            || base.base.is_some()
+            || base.delta.base_header().is_some()
+        {
+            return Err(super::ViewError::InvalidManifest(
+                "composition requires a worker and a depth-one base".into(),
+            ));
+        }
+        delta.ensure_producers(&base.header().producers)?;
+        let mut overrides = BTreeMap::new();
+        for (path, patch) in delta.readiness_overrides() {
+            let Some(EntryV2::Regular { .. }) = base.entry(path) else {
+                return Err(super::ViewError::InvalidManifest(
+                    "readiness override must name an inherited regular file".into(),
+                ));
+            };
+            let mut entry = base.entry(path).unwrap().clone();
+            if let EntryV2::Regular { planes, .. } = &mut entry {
+                for plane in FamilyPlane::ALL {
+                    if let Some(state) = patch.get(plane) {
+                        *planes.get_mut(plane) = Some(state.clone());
+                    }
+                }
+            }
+            overrides.insert(path.clone(), entry);
+        }
+        Ok(Self {
+            name: name.into(),
+            delta: Arc::new(delta),
+            base: Some(base),
+            overrides,
+            _residency: residency,
+        })
     }
 
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    pub fn manifest(&self) -> &ManifestV2 {
-        &self.manifest
+    pub fn resident_key(&self) -> String {
+        match &self.base {
+            Some(base) => format!(
+                "{}:{}:{}",
+                self.name,
+                self.base_header().unwrap().scope,
+                base.name()
+            ),
+            None => self.name.clone(),
+        }
+    }
+
+    pub fn header(&self) -> &ManifestHeader {
+        self.delta.header()
+    }
+    pub fn base_header(&self) -> Option<&super::manifest_v2::BaseHeader> {
+        self.delta.base_header()
+    }
+    pub fn published(&self) -> Option<&PublishedFrontier> {
+        self.delta.published()
+    }
+    pub fn base(&self) -> Option<&Arc<ComposedGeneration>> {
+        self.base.as_ref()
+    }
+    pub fn ensure_producers(&self, producers: &Producers) -> super::Result<()> {
+        self.delta.ensure_producers(producers)
+    }
+
+    pub fn entry(&self, path: &RelPath) -> Option<&EntryV2> {
+        if self.delta.tombstones().contains(path) {
+            return None;
+        }
+        self.delta
+            .get(path)
+            .or_else(|| self.overrides.get(path))
+            .or_else(|| self.base.as_ref().and_then(|base| base.entry(path)))
+    }
+
+    /// Sorted, lazy merge: a caller's existing walk budget stops the producing
+    /// iterator without first collecting the inherited membership.
+    pub fn entries(&self) -> impl Iterator<Item = (&RelPath, &EntryV2)> {
+        let mut delta = self.delta.entries().peekable();
+        let mut base = self
+            .base
+            .as_ref()
+            .into_iter()
+            .flat_map(|base| base.delta.entries())
+            .peekable();
+        std::iter::from_fn(move || loop {
+            let next = match (delta.peek(), base.peek()) {
+                (Some((d, _)), Some((b, _))) => match d.cmp(b) {
+                    std::cmp::Ordering::Less => delta.next(),
+                    std::cmp::Ordering::Greater => base.next(),
+                    std::cmp::Ordering::Equal => {
+                        base.next();
+                        delta.next()
+                    }
+                },
+                (Some(_), None) => delta.next(),
+                (None, Some(_)) => base.next(),
+                (None, None) => return None,
+            };
+            if let Some((path, entry)) = next {
+                if !self.delta.tombstones().contains(path) {
+                    return Some((path, self.overrides.get(path).unwrap_or(entry)));
+                }
+            }
+        })
+    }
+
+    pub fn plane_readiness(&self, path: &RelPath, plane: FamilyPlane) -> Option<&PlaneState> {
+        self.entry(path).and_then(|entry| entry.plane_state(plane))
+    }
+
+    pub fn owns_work(&self, path: &RelPath, plane: FamilyPlane) -> bool {
+        self.base.is_none()
+            || self.delta.get(path).is_some()
+            || self
+                .delta
+                .readiness_overrides()
+                .get(path)
+                .and_then(|patch| patch.get(plane))
+                .is_some()
+    }
+
+    pub fn segment_ids(&self) -> BTreeSet<[u8; 32]> {
+        self.delta
+            .segment_id()
+            .into_iter()
+            .chain(self.base.as_ref().and_then(|base| base.delta.segment_id()))
+            .collect()
+    }
+
+    pub fn segment_id(&self) -> Option<[u8; 32]> {
+        self.delta
+            .segment_id()
+            .or_else(|| self.base.as_ref().and_then(|base| base.delta.segment_id()))
+    }
+
+    pub fn owned_ready_keys(&self) -> impl Iterator<Item = crate::blob_store::v2::FamilyKey> + '_ {
+        self.delta.ready_keys()
+    }
+    pub fn ready_keys(&self) -> BTreeSet<crate::blob_store::v2::FamilyKey> {
+        self.owned_ready_keys()
+            .chain(
+                self.base
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|base| base.owned_ready_keys()),
+            )
+            .collect()
+    }
+
+    pub fn membership(&self) -> BTreeMap<RelPath, DiskState> {
+        self.entries()
+            .filter_map(|(path, entry)| match entry {
+                EntryV2::Regular { content, size, .. } => Some((
+                    path.clone(),
+                    DiskState::Present {
+                        content: *content,
+                        size: *size,
+                    },
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries().count()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries().next().is_none()
+    }
+
+    pub fn diff_paths(&self, other: &Self) -> BTreeSet<RelPath> {
+        let mut changed = BTreeSet::new();
+        for (path, entry) in self.entries() {
+            if other.entry(path) != Some(entry)
+                || FamilyPlane::ALL.into_iter().any(|plane| {
+                    self.plane_readiness(path, plane) != other.plane_readiness(path, plane)
+                })
+            {
+                changed.insert(path.clone());
+            }
+        }
+        for (path, _) in other.entries() {
+            if self.entry(path).is_none() {
+                changed.insert(path.clone());
+            }
+        }
+        changed
+    }
+
+    /// Explicit export for legacy materializers and parity tests. Query consumers
+    /// use the lazy projection, rather than allocating a full worker copy.
+    pub fn flatten(&self) -> super::Result<ManifestV2> {
+        let mut manifest = ManifestV2::new(self.header().clone());
+        if let Some(id) = self.segment_id() {
+            manifest.header_mut().segment = Some(crate::blob_store::v2::to_hex(&id));
+        }
+        for (path, entry) in self.entries() {
+            let mut entry = entry.clone();
+            if let EntryV2::Regular { planes, .. } = &mut entry {
+                for plane in FamilyPlane::ALL {
+                    *planes.get_mut(plane) = self.plane_readiness(path, plane).cloned();
+                }
+            }
+            manifest.insert(path.clone(), entry)?;
+        }
+        Ok(manifest)
+    }
+
+    pub fn fold(
+        &self,
+        producers: &Producers,
+        updates: impl IntoIterator<Item = (RelPath, Option<EntryV2>)>,
+        fill: &super::readiness::FillMap,
+    ) -> super::Result<ManifestV2> {
+        self.ensure_producers(producers)?;
+        let mut next = self.delta.as_ref().clone();
+        for (path, entry) in updates {
+            if let (Some(base), Some(entry)) = (&self.base, &entry) {
+                if let Some(inherited) = base.entry(&path) {
+                    let mut metadata = inherited.clone();
+                    if let (EntryV2::Regular { planes, .. }, Some(new_planes)) =
+                        (&mut metadata, entry.planes())
+                    {
+                        *planes = new_planes.clone();
+                    }
+                    if &metadata == entry {
+                        let patch = (entry != inherited)
+                            .then(|| entry.planes().cloned())
+                            .flatten();
+                        next.inherit(path, patch);
+                        continue;
+                    }
+                }
+            }
+            next.set(path, entry)?;
+        }
+        for (path, entry) in next.entries_mut() {
+            if let EntryV2::Regular {
+                content, planes, ..
+            } = entry
+            {
+                apply_fills(path, content, planes, fill);
+            }
+        }
+        let overrides: Vec<_> = next
+            .readiness_overrides()
+            .iter()
+            .map(|(path, patch)| (path.clone(), patch.clone()))
+            .collect();
+        for (path, mut patch) in overrides {
+            if let Some(content) = self.entry(&path).and_then(EntryV2::content) {
+                apply_fills(&path, &content, &mut patch, fill);
+            }
+            next.set_readiness_override(path, patch)?;
+        }
+        Ok(next)
     }
 
     pub fn disk_state(&self, rel_path: &RelPath) -> DiskState {
-        DiskState::in_generation(&self.manifest, rel_path)
+        match self.entry(rel_path) {
+            Some(EntryV2::Regular { content, size, .. }) => DiskState::Present {
+                content: *content,
+                size: *size,
+            },
+            _ => DiskState::Absent,
+        }
+    }
+}
+
+fn apply_fills(
+    path: &RelPath,
+    content: &ContentHash,
+    planes: &mut EntryPlanes,
+    fill: &super::readiness::FillMap,
+) {
+    for plane in FamilyPlane::ALL {
+        if matches!(planes.get(plane), Some(PlaneState::Pending { .. })) {
+            if let Some(key) = fill.get(path, content, plane) {
+                *planes.get_mut(plane) = Some(PlaneState::ready(key));
+            }
+        }
     }
 }
 
@@ -159,18 +461,27 @@ pub enum WatcherState {
 /// Supplies plane attachments for an entry the switch creates because disk
 /// went back to the old generation's bytes. The old generation is pinned for
 /// the whole switch, so its keys are protected and nothing is recomputed.
-pub type CarryFromGeneration<'a> = dyn Fn(&RelPath, &OpenGeneration) -> LiveEntry + 'a;
+pub type CarryFromGeneration<'a> = dyn Fn(&RelPath, &ComposedGeneration) -> LiveEntry + 'a;
 
 type Entries = BTreeMap<RelPath, LiveEntry>;
+
+/// Checkout-specific readiness overrides for the recorded content hash.
+/// Equal disk bytes do not erase the override; changed bytes cannot use it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanePatch {
+    pub content: ContentHash,
+    pub planes: EntryPlanes,
+}
 
 /// The per-root live delta. Owned by the root actor; callers serialize access
 /// with the root's index write lock.
 #[derive(Debug)]
 pub struct LiveDelta {
-    base: Arc<OpenGeneration>,
+    base: Arc<ComposedGeneration>,
     epoch: u64,
     version: u64,
     entries: Arc<Entries>,
+    readiness: Arc<BTreeMap<RelPath, PlanePatch>>,
     journal: Vec<JournalRecord>,
     intent: Arc<BTreeMap<RelPath, u64>>,
     intent_version: u64,
@@ -186,10 +497,11 @@ pub type RootIgnoreFiles = BTreeMap<RelPath, DiskState>;
 /// The delta as a builder read it at version `v`.
 #[derive(Clone, Debug)]
 pub struct DeltaCut {
-    pub base: Arc<OpenGeneration>,
+    pub base: Arc<ComposedGeneration>,
     pub epoch: u64,
     pub version: u64,
     entries: Arc<Entries>,
+    readiness: Arc<BTreeMap<RelPath, PlanePatch>>,
 }
 
 impl DeltaCut {
@@ -201,10 +513,12 @@ impl DeltaCut {
 /// A successor delta derived against a new generation, waiting for its swap.
 #[derive(Debug)]
 pub struct SuccessorDraft {
-    successor: Arc<OpenGeneration>,
+    expected_base: Arc<ComposedGeneration>,
+    successor: Arc<ComposedGeneration>,
     epoch: u64,
     cut_version: u64,
     entries: Entries,
+    readiness: BTreeMap<RelPath, PlanePatch>,
 }
 
 impl SuccessorDraft {
@@ -223,12 +537,13 @@ pub enum SwitchError {
 }
 
 impl LiveDelta {
-    pub fn new(base: Arc<OpenGeneration>) -> Self {
+    pub fn new(base: Arc<ComposedGeneration>) -> Self {
         Self {
             base,
             epoch: 0,
             version: 0,
             entries: Arc::new(Entries::new()),
+            readiness: Arc::new(BTreeMap::new()),
             journal: Vec::new(),
             intent: Arc::new(BTreeMap::new()),
             intent_version: 0,
@@ -244,7 +559,7 @@ impl LiveDelta {
         self.root_ignore_files = files.map(Arc::new);
     }
 
-    pub fn base(&self) -> &Arc<OpenGeneration> {
+    pub fn base(&self) -> &Arc<ComposedGeneration> {
         &self.base
     }
 
@@ -263,12 +578,34 @@ impl LiveDelta {
     pub fn set_watcher(&mut self, watcher: WatcherState) {
         if self.watcher != watcher {
             self.version += 1;
+            if watcher != WatcherState::Healthy {
+                self.bump_epoch();
+            }
         }
         self.watcher = watcher;
     }
 
     pub fn entry(&self, rel_path: &RelPath) -> Option<&LiveEntry> {
         self.entries.get(rel_path)
+    }
+
+    pub fn set_readiness(&mut self, path: RelPath, patch: PlanePatch) {
+        self.version += 1;
+        let disk = self
+            .entries
+            .get(&path)
+            .map_or_else(|| self.base.disk_state(&path), |entry| entry.disk);
+        self.journal.retain(|record| record.rel_path != path);
+        self.journal.push(JournalRecord {
+            version: self.version,
+            rel_path: path.clone(),
+            disk,
+        });
+        Arc::make_mut(&mut self.readiness).insert(path, patch);
+    }
+
+    pub fn readiness(&self) -> &BTreeMap<RelPath, PlanePatch> {
+        &self.readiness
     }
 
     pub fn journal(&self) -> &[JournalRecord] {
@@ -314,6 +651,17 @@ impl LiveDelta {
     /// applied. Queries match such paths on their current bytes.
     pub fn record_intent(&mut self, rel_path: RelPath) -> u64 {
         self.intent_version += 1;
+        self.version += 1;
+        let disk = self
+            .entries
+            .get(&rel_path)
+            .map_or_else(|| self.base.disk_state(&rel_path), |entry| entry.disk);
+        self.journal.retain(|record| record.rel_path != rel_path);
+        self.journal.push(JournalRecord {
+            version: self.version,
+            rel_path: rel_path.clone(),
+            disk,
+        });
         Arc::make_mut(&mut self.intent).insert(rel_path, self.intent_version);
         self.intent_version
     }
@@ -345,6 +693,7 @@ impl LiveDelta {
             epoch: self.epoch,
             version: self.version,
             entries: Arc::clone(&self.entries),
+            readiness: Arc::clone(&self.readiness),
         }
     }
 
@@ -357,9 +706,12 @@ impl LiveDelta {
                 intent_version: self.intent_version,
                 epoch: self.epoch,
                 entries: Arc::clone(&self.entries),
+                readiness: Arc::clone(&self.readiness),
                 intent: Arc::clone(&self.intent),
                 watcher: self.watcher,
                 root_ignore_files: self.root_ignore_files.clone(),
+                install_cut: None,
+                readers: None,
             }),
         }
     }
@@ -378,6 +730,9 @@ impl LiveDelta {
                 current: self.epoch,
             });
         }
+        if !Arc::ptr_eq(&draft.expected_base, &self.base) {
+            return Err(SwitchError::BaseChanged);
+        }
         let replay = self
             .journal
             .iter()
@@ -394,13 +749,80 @@ impl LiveDelta {
                 carry,
                 &mut draft.entries,
             );
+            rederive_readiness(
+                &path,
+                self.readiness.get(&path),
+                &draft.successor,
+                &mut draft.readiness,
+            );
         }
         self.base = draft.successor;
         self.entries = Arc::new(draft.entries);
+        self.readiness = Arc::new(draft.readiness);
         // One successor is in flight at a time per root, so nothing older than
         // the swap is needed again.
         self.journal.clear();
         Ok(())
+    }
+
+    pub fn from_snapshot(snapshot: &Snapshot) -> Self {
+        let inner = &snapshot.inner;
+        Self {
+            base: inner.generation.clone(),
+            epoch: inner.epoch,
+            version: inner.delta_version,
+            entries: inner.entries.clone(),
+            readiness: inner.readiness.clone(),
+            journal: Vec::new(),
+            intent: inner.intent.clone(),
+            intent_version: inner.intent_version,
+            watcher: inner.watcher,
+            root_ignore_files: inner.root_ignore_files.clone(),
+        }
+    }
+
+    /// Replay paths delivered since a strict walk began. A path's latest intent
+    /// remains pending even if it has not yet supplied a stable content read.
+    pub fn replay_onto(&self, snapshot: &Snapshot, cut: &InstallCut) -> Result<Self, SwitchError> {
+        if self.epoch != cut.epoch {
+            return Err(SwitchError::EpochChanged {
+                cut: cut.epoch,
+                current: self.epoch,
+            });
+        }
+        if !Arc::ptr_eq(&self.base, &cut.resident) {
+            return Err(SwitchError::BaseChanged);
+        }
+        let mut next = Self::from_snapshot(snapshot);
+        for record in self
+            .journal
+            .iter()
+            .filter(|record| record.version > cut.version)
+        {
+            let entry = self
+                .entries
+                .get(&record.rel_path)
+                .cloned()
+                .unwrap_or_else(|| carry_disk_state_only(&record.rel_path, &self.base));
+            next.apply(record.rel_path.clone(), entry);
+            if let Some(patch) = self.readiness.get(&record.rel_path) {
+                next.set_readiness(record.rel_path.clone(), patch.clone());
+            }
+        }
+        let intent = Arc::make_mut(&mut next.intent);
+        intent.retain(|path, _| self.intent.contains_key(path));
+        intent.extend(
+            self.intent
+                .iter()
+                .filter(|(_, version)| **version > cut.intent_version)
+                .map(|(path, version)| (path.clone(), *version)),
+        );
+        next.intent_version = self.intent_version;
+        next.epoch = self.epoch;
+        next.version = self.version;
+        next.watcher = self.watcher;
+        next.journal.clear();
+        Ok(next)
     }
 }
 
@@ -412,6 +834,18 @@ impl LiveEntries for LiveDelta {
     fn live_state(&self, rel_path: &RelPath) -> Option<&DiskState> {
         self.entries.get(rel_path).map(|entry| &entry.disk)
     }
+    fn readiness_patch(&self, path: &RelPath, plane: FamilyPlane) -> Option<&PlaneState> {
+        let patch = self.readiness.get(path)?;
+        let disk = self
+            .entries
+            .get(path)
+            .map_or_else(|| self.base.disk_state(path), |entry| entry.disk);
+        if matches!(disk, DiskState::Present { content, .. } if content == patch.content) {
+            patch.planes.get(plane)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -420,7 +854,7 @@ mod mutation_tests {
     use crate::views::manifest_v2::{ManifestHeader, Producers};
 
     fn delta() -> LiveDelta {
-        LiveDelta::new(Arc::new(OpenGeneration::new(
+        LiveDelta::new(Arc::new(ComposedGeneration::new(
             "base",
             ManifestV2::new(ManifestHeader {
                 producers: Producers {
@@ -434,6 +868,186 @@ mod mutation_tests {
             }),
             None,
         )))
+    }
+
+    struct LeaseAdapter {
+        resident: std::sync::atomic::AtomicBool,
+        releases: std::sync::atomic::AtomicUsize,
+    }
+    impl super::super::contracts::PlaneAdapter for LeaseAdapter {
+        fn plane(&self) -> FamilyPlane {
+            FamilyPlane::Trigram
+        }
+        fn producer(&self) -> String {
+            "test".into()
+        }
+        fn applies_to(&self, _: &RelPath) -> bool {
+            true
+        }
+        fn open_generation(
+            &self,
+            _: &super::super::contracts::ViewAccess,
+            _: &Arc<ComposedGeneration>,
+        ) -> Result<(), super::super::contracts::PlaneError> {
+            self.resident
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn release_generation(&self, _: &super::super::contracts::ViewAccess, _: &str) {
+            self.releases
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.resident
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn readiness(
+            &self,
+            _: &super::super::contracts::ViewAccess,
+            _: &Snapshot,
+        ) -> super::super::readiness::PlaneReadiness {
+            super::super::readiness::PlaneReadiness::Ready {
+                pending: 0,
+                failed: 0,
+            }
+        }
+    }
+
+    #[test]
+    fn retiring_reader_lease_cannot_remove_its_replacement() {
+        use std::sync::atomic::Ordering;
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let registry =
+            super::super::registry::FamilyRegistry::open(storage.path(), "leases").unwrap();
+        let owner = registry
+            .register_view_with_storage(storage.path(), "worker", root.path())
+            .unwrap();
+        let access = super::super::contracts::ViewAccess::Owner(owner);
+        let concrete = Arc::new(LeaseAdapter {
+            resident: false.into(),
+            releases: 0.into(),
+        });
+        let adapter: Arc<dyn super::super::contracts::PlaneAdapter> = concrete.clone();
+        let generation = delta().base().clone();
+        let old = PlaneReaders::open(&access, generation.clone(), std::slice::from_ref(&adapter))
+            .unwrap();
+        let key = old.adapters[0].key.clone();
+        let weak = Arc::downgrade(&old.adapters[0]);
+        let mut cache = reader_cache().lock().unwrap();
+        let (done, completed) = std::sync::mpsc::channel();
+        let retiring = std::thread::spawn(move || {
+            drop(old);
+            done.send(()).unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while weak.strong_count() != 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "the old destructor must be waiting for the cache lock"
+        );
+        adapter.open_generation(&access, &generation).unwrap();
+        let replacement = Arc::new(AdapterLease {
+            key: key.clone(),
+            adapter,
+            access,
+            generation,
+        });
+        cache.insert(key, Arc::downgrade(&replacement));
+        drop(cache);
+        completed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        retiring.join().unwrap();
+        assert_eq!(concrete.releases.load(Ordering::SeqCst), 0);
+        assert!(concrete.resident.load(Ordering::SeqCst));
+        drop(replacement);
+        assert_eq!(concrete.releases.load(Ordering::SeqCst), 1);
+        assert!(!concrete.resident.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn locked_install_replays_observed_bytes_deletions_attachments_and_readiness() {
+        let mut live = delta();
+        let cut = InstallCut {
+            seq: 0,
+            resident: live.base().clone(),
+            epoch: live.epoch(),
+            version: live.version(),
+            intent_version: 0,
+        };
+        let changed = RelPath::new(b"changed.rs".to_vec()).unwrap();
+        let transient = RelPath::new(b"transient.rs".to_vec()).unwrap();
+        let mut manifest = live.base().flatten().unwrap();
+        for path in [&changed, &transient] {
+            manifest
+                .insert(
+                    path.clone(),
+                    EntryV2::regular(
+                        ContentHash::of(b"builder bytes"),
+                        13,
+                        EntryPlanes::default(),
+                    ),
+                )
+                .unwrap();
+        }
+        let draft =
+            LiveDelta::new(Arc::new(ComposedGeneration::new("draft", manifest, None))).snapshot();
+        let disk = DiskState::of_bytes(b"latest delivered bytes");
+        let mut latest = LiveEntry::new(disk, 2);
+        latest
+            .attachments
+            .insert(FamilyPlane::Trigram, Arc::new(42_usize));
+        live.apply(changed.clone(), latest);
+        live.set_readiness(
+            changed.clone(),
+            PlanePatch {
+                content: ContentHash::of(b"latest delivered bytes"),
+                planes: EntryPlanes {
+                    semantic: Some(PlaneState::pending("dependency changed")),
+                    ..Default::default()
+                },
+            },
+        );
+        live.apply(
+            transient.clone(),
+            LiveEntry::new(DiskState::of_bytes(b"temporary"), 3),
+        );
+        live.apply(transient.clone(), LiveEntry::new(DiskState::Absent, 4));
+        let next = live.replay_onto(&draft, &cut).unwrap();
+        assert_eq!(next.snapshot().disk_state(&changed), disk);
+        assert_eq!(next.snapshot().disk_state(&transient), DiskState::Absent);
+        assert_eq!(
+            next.entry(&changed).unwrap().attachments[&FamilyPlane::Trigram]
+                .downcast_ref::<usize>(),
+            Some(&42)
+        );
+        assert_eq!(next.readiness()[&changed], live.readiness()[&changed]);
+        assert_eq!(next.version(), live.version());
+    }
+
+    #[test]
+    fn draft_refuses_a_different_base_at_the_same_epoch() {
+        let mut delta = delta();
+        let cut = delta.cut();
+        let stale = derive_successor(&cut, cut.base.clone(), &carry_disk_state_only);
+        let other = Arc::new(ComposedGeneration::new(
+            "other",
+            cut.base.flatten().unwrap(),
+            None,
+        ));
+        delta
+            .replay_and_swap(
+                derive_successor(&cut, other, &carry_disk_state_only),
+                &carry_disk_state_only,
+            )
+            .unwrap();
+        assert_eq!(
+            delta.replay_and_swap(stale, &carry_disk_state_only),
+            Err(SwitchError::BaseChanged)
+        );
+        assert_eq!(delta.base().name(), "other");
     }
 
     #[test]
@@ -572,36 +1186,65 @@ mod mutation_tests {
 /// whose entry differs between the two generations. Paths outside this set
 /// are equal in both generations and had no live entry, so disk equals the
 /// successor there.
-pub fn rebase_paths(cut: &DeltaCut, successor: &OpenGeneration) -> BTreeSet<RelPath> {
+pub fn rebase_paths(cut: &DeltaCut, successor: &ComposedGeneration) -> BTreeSet<RelPath> {
     let mut paths = cut.keys().cloned().collect::<BTreeSet<_>>();
-    paths.extend(cut.base.manifest().diff_paths(successor.manifest()));
+    paths.extend(cut.readiness.keys().cloned());
+    paths.extend(cut.base.diff_paths(successor));
     paths
 }
 
 /// Derives the successor delta of `cut` against `successor`.
 pub fn derive_successor(
     cut: &DeltaCut,
-    successor: Arc<OpenGeneration>,
+    successor: Arc<ComposedGeneration>,
     carry: &CarryFromGeneration<'_>,
 ) -> SuccessorDraft {
     let mut entries = Entries::new();
+    let mut readiness = BTreeMap::new();
     for path in rebase_paths(cut, &successor) {
         let observed = cut.entries.get(&path).cloned();
         rederive_path(&path, observed, &cut.base, &successor, carry, &mut entries);
+        rederive_readiness(&path, cut.readiness.get(&path), &successor, &mut readiness);
     }
     SuccessorDraft {
+        expected_base: cut.base.clone(),
         successor,
         epoch: cut.epoch,
         cut_version: cut.version,
         entries,
+        readiness,
+    }
+}
+
+fn rederive_readiness(
+    path: &RelPath,
+    patch: Option<&PlanePatch>,
+    successor: &ComposedGeneration,
+    readiness: &mut BTreeMap<RelPath, PlanePatch>,
+) {
+    match patch {
+        Some(patch)
+            if successor.entry(path).and_then(EntryV2::content) != Some(patch.content)
+                || FamilyPlane::ALL.into_iter().any(|plane| {
+                    patch
+                        .planes
+                        .get(plane)
+                        .is_some_and(|state| successor.plane_readiness(path, plane) != Some(state))
+                }) =>
+        {
+            readiness.insert(path.clone(), patch.clone());
+        }
+        _ => {
+            readiness.remove(path);
+        }
     }
 }
 
 fn rederive_path(
     path: &RelPath,
     observed: Option<LiveEntry>,
-    old: &Arc<OpenGeneration>,
-    successor: &Arc<OpenGeneration>,
+    old: &Arc<ComposedGeneration>,
+    successor: &Arc<ComposedGeneration>,
     carry: &CarryFromGeneration<'_>,
     entries: &mut Entries,
 ) {
@@ -619,20 +1262,141 @@ fn rederive_path(
 
 /// A carry function that attaches nothing: the entry records only the old
 /// generation's disk state.
-pub fn carry_disk_state_only(path: &RelPath, generation: &OpenGeneration) -> LiveEntry {
+pub fn carry_disk_state_only(path: &RelPath, generation: &ComposedGeneration) -> LiveEntry {
     LiveEntry::new(generation.disk_state(path), 0)
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct SnapshotInner {
-    generation: Arc<OpenGeneration>,
+    generation: Arc<ComposedGeneration>,
     delta_version: u64,
     intent_version: u64,
     epoch: u64,
     entries: Arc<Entries>,
+    readiness: Arc<BTreeMap<RelPath, PlanePatch>>,
     intent: Arc<BTreeMap<RelPath, u64>>,
     watcher: WatcherState,
     root_ignore_files: Option<Arc<RootIgnoreFiles>>,
+    install_cut: Option<InstallCut>,
+    readers: Option<Arc<PlaneReaders>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct InstallCut {
+    pub seq: u64,
+    pub resident: Arc<ComposedGeneration>,
+    pub epoch: u64,
+    pub version: u64,
+    pub intent_version: u64,
+}
+
+/// A lease on resident adapters. Query snapshots retain this lease, so removing
+/// the driver's old bundle cannot invalidate a lazy open by an old query.
+pub struct PlaneReaders {
+    generation: Arc<ComposedGeneration>,
+    adapters: Vec<Arc<AdapterLease>>,
+}
+
+struct AdapterLease {
+    key: ReaderCacheKey,
+    adapter: Arc<dyn super::contracts::PlaneAdapter>,
+    access: super::contracts::ViewAccess,
+    generation: Arc<ComposedGeneration>,
+}
+
+impl Drop for AdapterLease {
+    fn drop(&mut self) {
+        let mut cache = reader_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A new lease can replace a zero-strong-count weak entry while this
+        // destructor waits for the lock. Never remove that new resident.
+        if !cache
+            .get(&self.key)
+            .is_some_and(|lease| lease.strong_count() != 0)
+        {
+            cache.remove(&self.key);
+            self.adapter
+                .release_generation(&self.access, &self.generation.resident_key());
+        }
+    }
+}
+
+type ReaderCacheKey = (usize, String, String, String);
+type ReaderCache = std::sync::Mutex<BTreeMap<ReaderCacheKey, std::sync::Weak<AdapterLease>>>;
+
+fn reader_cache() -> &'static ReaderCache {
+    static CACHE: std::sync::OnceLock<ReaderCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+impl fmt::Debug for PlaneReaders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PlaneReaders")
+            .field("generation", &self.generation.name())
+            .finish()
+    }
+}
+
+impl PlaneReaders {
+    pub fn open_available(
+        access: &super::contracts::ViewAccess,
+        generation: Arc<ComposedGeneration>,
+        adapters: &[Arc<dyn super::contracts::PlaneAdapter>],
+    ) -> (Arc<Self>, Vec<super::contracts::PlaneError>) {
+        let mut readers = Self {
+            generation: generation.clone(),
+            adapters: Vec::new(),
+        };
+        let mut errors = Vec::new();
+        for adapter in adapters {
+            match Self::open(access, generation.clone(), std::slice::from_ref(adapter)) {
+                Ok(open) => readers.adapters.extend(open.adapters.iter().cloned()),
+                Err(error) => errors.push(error),
+            }
+        }
+        (Arc::new(readers), errors)
+    }
+
+    pub fn open(
+        access: &super::contracts::ViewAccess,
+        generation: Arc<ComposedGeneration>,
+        adapters: &[Arc<dyn super::contracts::PlaneAdapter>],
+    ) -> Result<Arc<Self>, super::contracts::PlaneError> {
+        let mut readers = Self {
+            generation,
+            adapters: Vec::new(),
+        };
+        for adapter in adapters {
+            let key = (
+                Arc::as_ptr(adapter) as *const () as usize,
+                access.family().to_owned(),
+                access.scope().to_owned(),
+                readers.generation.resident_key(),
+            );
+            let mut cache = reader_cache()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.retain(|_, lease| lease.strong_count() != 0);
+            let lease = match cache.get(&key).and_then(std::sync::Weak::upgrade) {
+                Some(lease) => lease,
+                None => {
+                    adapter.open_generation(access, &readers.generation)?;
+                    let lease = Arc::new(AdapterLease {
+                        key: key.clone(),
+                        adapter: adapter.clone(),
+                        access: access.clone(),
+                        generation: readers.generation.clone(),
+                    });
+                    cache.insert(key, Arc::downgrade(&lease));
+                    lease
+                }
+            };
+            drop(cache);
+            readers.adapters.push(lease);
+        }
+        Ok(Arc::new(readers))
+    }
 }
 
 /// Where a path's answer comes from in one snapshot. Exactly one source per
@@ -651,7 +1415,21 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub fn generation(&self) -> &Arc<OpenGeneration> {
+    pub fn install_cut(&self) -> Option<&InstallCut> {
+        self.inner.install_cut.as_ref()
+    }
+    pub fn with_install_cut(mut self, cut: InstallCut) -> Self {
+        Arc::make_mut(&mut self.inner).install_cut = Some(cut);
+        self
+    }
+    pub fn with_readers(mut self, readers: Arc<PlaneReaders>) -> Self {
+        Arc::make_mut(&mut self.inner).readers = Some(readers);
+        self
+    }
+    pub fn readers(&self) -> Option<&Arc<PlaneReaders>> {
+        self.inner.readers.as_ref()
+    }
+    pub fn generation(&self) -> &Arc<ComposedGeneration> {
         &self.inner.generation
     }
 
@@ -689,11 +1467,30 @@ impl Snapshot {
         self.inner.entries.iter()
     }
 
+    pub fn readiness_patches(&self) -> &BTreeMap<RelPath, PlanePatch> {
+        &self.inner.readiness
+    }
+
+    pub fn plane_readiness(&self, path: &RelPath, plane: FamilyPlane) -> Option<&PlaneState> {
+        if let Some(patch) = self.inner.readiness.get(path) {
+            if matches!(self.disk_state(path), DiskState::Present { content, .. } if content == patch.content)
+            {
+                if let Some(state) = patch.planes.get(plane) {
+                    return Some(state);
+                }
+            }
+        }
+        if self.inner.entries.contains_key(path) {
+            return None;
+        }
+        self.generation().plane_readiness(path, plane)
+    }
+
     pub fn source(&self, rel_path: &RelPath) -> Source<'_> {
         if let Some(entry) = self.inner.entries.get(rel_path) {
             return Source::Live(entry);
         }
-        match self.inner.generation.manifest().get(rel_path) {
+        match self.inner.generation.entry(rel_path) {
             Some(entry) => Source::Generation(entry),
             None => Source::Absent,
         }
@@ -710,7 +1507,7 @@ impl Snapshot {
     /// Every path the snapshot considers present, with its content.
     pub fn membership(&self) -> BTreeMap<RelPath, DiskState> {
         let mut members = BTreeMap::new();
-        for (path, entry) in self.inner.generation.manifest().entries() {
+        for (path, entry) in self.inner.generation.entries() {
             if let EntryV2::Regular { content, size, .. } = entry {
                 members.insert(
                     path.clone(),
@@ -747,5 +1544,409 @@ impl LiveEntries for Snapshot {
 
     fn live_state(&self, rel_path: &RelPath) -> Option<&DiskState> {
         self.inner.entries.get(rel_path).map(|entry| &entry.disk)
+    }
+    fn readiness_patch(&self, path: &RelPath, plane: FamilyPlane) -> Option<&PlaneState> {
+        let patch = self.inner.readiness.get(path)?;
+        if matches!(self.disk_state(path), DiskState::Present { content, .. } if content == patch.content)
+        {
+            patch.planes.get(plane)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod composition_tests {
+    use super::super::manifest_v2::{BaseHeader, PublishedFrontier};
+    use super::super::readiness::{self, FillMap, PlaneReadiness};
+    use super::*;
+
+    fn path(name: &str) -> RelPath {
+        RelPath::new(name.as_bytes().to_vec()).unwrap()
+    }
+    fn header() -> ManifestHeader {
+        ManifestHeader {
+            producers: Producers {
+                trigram: "tri".into(),
+                semantic: Some("sem".into()),
+                callgraph: super::super::callgraph::PRODUCER.into(),
+            },
+            head_tree: None,
+            ignore_fingerprint: None,
+            segment: Some("11".repeat(32)),
+        }
+    }
+    fn planes(state: PlaneState) -> EntryPlanes {
+        EntryPlanes {
+            trigram: Some(state.clone()),
+            semantic: Some(state.clone()),
+            callgraph: Some(state),
+        }
+    }
+    fn entry(bytes: &[u8], state: PlaneState) -> EntryV2 {
+        EntryV2::regular(ContentHash::of(bytes), bytes.len() as u64, planes(state))
+    }
+    fn ready() -> PlaneState {
+        PlaneState::Ready {
+            key: "22".repeat(32),
+        }
+    }
+    fn worker() -> ManifestV2 {
+        let mut header = header();
+        header.segment = None;
+        ManifestV2::new_v3(
+            header,
+            Some(BaseHeader {
+                scope: "base".into(),
+                membership_digest: "33".repeat(32),
+                identity_digest: "44".repeat(32),
+                bound_generation: "base-generation".into(),
+            }),
+            PublishedFrontier {
+                delta_cut_version: 7,
+                watcher_epoch: 2,
+                published_at_ms: 50,
+                verified_frontier: None,
+            },
+        )
+    }
+    fn base() -> Arc<ComposedGeneration> {
+        let mut manifest = ManifestV2::new_v3(header(), None, PublishedFrontier::default());
+        for name in ["inherited.rs", "deleted.rs", "replaced.rs", "exception.rs"] {
+            manifest
+                .insert(
+                    path(name),
+                    entry(name.as_bytes(), PlaneState::pending("base fill")),
+                )
+                .unwrap();
+        }
+        Arc::new(ComposedGeneration::new("base-generation", manifest, None))
+    }
+
+    #[test]
+    fn composed_answers_equal_independently_flattened_manifest_for_every_plane() {
+        let base = base();
+        let mut delta = worker();
+        delta.set(path("deleted.rs"), None).unwrap();
+        delta
+            .set(path("replaced.rs"), Some(entry(b"replacement", ready())))
+            .unwrap();
+        delta
+            .set(path("added.rs"), Some(entry(b"addition", ready())))
+            .unwrap();
+        delta
+            .set_readiness_override(path("exception.rs"), planes(ready()))
+            .unwrap();
+        let composed = ComposedGeneration::compose("worker", delta, base, None).unwrap();
+        let mut flat = ManifestV2::new(header());
+        flat.insert(
+            path("inherited.rs"),
+            entry(b"inherited.rs", PlaneState::pending("base fill")),
+        )
+        .unwrap();
+        flat.insert(path("exception.rs"), entry(b"exception.rs", ready()))
+            .unwrap();
+        flat.insert(path("replaced.rs"), entry(b"replacement", ready()))
+            .unwrap();
+        flat.insert(path("added.rs"), entry(b"addition", ready()))
+            .unwrap();
+        let flat = ComposedGeneration::new("flat", flat, None);
+        assert_eq!(
+            composed.entries().collect::<Vec<_>>(),
+            flat.entries().collect::<Vec<_>>()
+        );
+        assert_eq!(composed.membership(), flat.membership());
+        assert_eq!(composed.segment_ids(), flat.segment_ids());
+        let live = LiveDelta::new(Arc::new(ComposedGeneration::new(
+            "empty",
+            ManifestV2::new(header()),
+            None,
+        )));
+        for name in [
+            "inherited.rs",
+            "deleted.rs",
+            "replaced.rs",
+            "exception.rs",
+            "added.rs",
+            "unknown.rs",
+        ] {
+            let path = path(name);
+            assert_eq!(composed.entry(&path), flat.entry(&path));
+            assert_eq!(composed.disk_state(&path), flat.disk_state(&path));
+            for plane in FamilyPlane::ALL {
+                assert_eq!(
+                    composed.plane_readiness(&path, plane),
+                    flat.plane_readiness(&path, plane)
+                );
+                assert_eq!(
+                    readiness::plane_readiness(
+                        plane,
+                        Some(&composed),
+                        &live,
+                        &FillMap::default(),
+                        &|_| true
+                    ),
+                    readiness::plane_readiness(
+                        plane,
+                        Some(&flat),
+                        &live,
+                        &FillMap::default(),
+                        &|_| true
+                    )
+                );
+            }
+        }
+        // The graph projection is honest about the one inherited pending member.
+        assert!(super::super::callgraph::project_manifest(&composed).is_err());
+        assert_eq!(composed.flatten().unwrap(), flat.flatten().unwrap());
+    }
+
+    #[test]
+    fn partial_overrides_preserve_other_planes_and_delta_none_does_not_inherit() {
+        let path = path("partial.rs");
+        let replaced = self::path("replaced.rs");
+        let original = EntryPlanes {
+            trigram: Some(ready()),
+            semantic: Some(PlaneState::pending("base semantic")),
+            callgraph: Some(PlaneState::Failed {
+                reason: "extractor failed".into(),
+                producer: "extractor".into(),
+            }),
+        };
+        let mut manifest = ManifestV2::new(header());
+        manifest
+            .insert(
+                path.clone(),
+                EntryV2::regular(ContentHash::of(b"same"), 4, original.clone()),
+            )
+            .unwrap();
+        manifest
+            .insert(
+                replaced.clone(),
+                EntryV2::regular(ContentHash::of(b"old"), 3, original.clone()),
+            )
+            .unwrap();
+        let base = Arc::new(ComposedGeneration::new("base", manifest, None));
+        let mut delta = worker();
+        delta
+            .set_readiness_override(
+                path.clone(),
+                EntryPlanes {
+                    semantic: Some(ready()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        delta
+            .set(
+                replaced.clone(),
+                Some(EntryV2::regular(
+                    ContentHash::of(b"new"),
+                    3,
+                    EntryPlanes::default(),
+                )),
+            )
+            .unwrap();
+        let composed = ComposedGeneration::compose("worker", delta, base, None).unwrap();
+        assert_eq!(
+            composed.plane_readiness(&path, FamilyPlane::Trigram),
+            original.trigram.as_ref()
+        );
+        assert_eq!(
+            composed.plane_readiness(&path, FamilyPlane::Semantic),
+            Some(&ready())
+        );
+        assert_eq!(
+            composed.plane_readiness(&path, FamilyPlane::Callgraph),
+            original.callgraph.as_ref()
+        );
+        for plane in FamilyPlane::ALL {
+            assert_eq!(composed.plane_readiness(&replaced, plane), None);
+        }
+    }
+
+    #[test]
+    fn worker_queue_excludes_inherited_base_work_but_counts_its_gap() {
+        let mut delta = worker();
+        delta
+            .set_readiness_override(
+                path("exception.rs"),
+                planes(PlaneState::pending("dependency changed")),
+            )
+            .unwrap();
+        let composed =
+            Arc::new(ComposedGeneration::compose("worker", delta, base(), None).unwrap());
+        let live = LiveDelta::new(composed.clone());
+        for plane in FamilyPlane::ALL {
+            assert_eq!(
+                readiness::plane_readiness(
+                    plane,
+                    Some(&composed),
+                    &live,
+                    &FillMap::default(),
+                    &|_| true
+                ),
+                PlaneReadiness::Ready {
+                    pending: 4,
+                    failed: 0
+                }
+            );
+            let work = readiness::work_queue(
+                plane,
+                "producer",
+                Some(&composed),
+                &live,
+                &FillMap::default(),
+                &|_| true,
+            );
+            assert_eq!(
+                work.iter()
+                    .map(|item| item.rel_path.clone())
+                    .collect::<Vec<_>>(),
+                vec![path("exception.rs")]
+            );
+        }
+    }
+
+    #[test]
+    fn equality_preserves_readiness_and_rebase_drops_only_satisfied_patches() {
+        let base = base();
+        let path = path("exception.rs");
+        let mut live = LiveDelta::new(base.clone());
+        live.set_readiness(
+            path.clone(),
+            PlanePatch {
+                content: ContentHash::of(b"exception.rs"),
+                planes: planes(ready()),
+            },
+        );
+        live.apply(path.clone(), LiveEntry::new(base.disk_state(&path), 1));
+        assert!(live.entry(&path).is_none());
+        assert!(live.readiness().contains_key(&path));
+        assert!(rebase_paths(&live.cut(), &base).contains(&path));
+        let draft = derive_successor(&live.cut(), base.clone(), &carry_disk_state_only);
+        live.replay_and_swap(draft, &carry_disk_state_only).unwrap();
+        assert!(live.readiness().contains_key(&path));
+        let mut next = base.flatten().unwrap();
+        next.set(path.clone(), Some(entry(b"exception.rs", ready())))
+            .unwrap();
+        let next = Arc::new(ComposedGeneration::new("filled", next, None));
+        let draft = derive_successor(&live.cut(), next, &carry_disk_state_only);
+        live.replay_and_swap(draft, &carry_disk_state_only).unwrap();
+        assert!(live.readiness().is_empty());
+    }
+
+    #[test]
+    fn a_readiness_patch_never_vouches_for_changed_content() {
+        let path = path("exception.rs");
+        let mut manifest = base().flatten().unwrap();
+        manifest
+            .set(path.clone(), Some(entry(b"exception.rs", ready())))
+            .unwrap();
+        let base = Arc::new(ComposedGeneration::new("ready-base", manifest, None));
+        let mut live = LiveDelta::new(base);
+        live.set_readiness(
+            path.clone(),
+            PlanePatch {
+                content: ContentHash::of(b"exception.rs"),
+                planes: planes(ready()),
+            },
+        );
+        live.apply(
+            path.clone(),
+            LiveEntry::new(DiskState::of_bytes(b"changed bytes"), 1),
+        );
+        assert!(live.readiness().contains_key(&path));
+        for plane in FamilyPlane::ALL {
+            assert_eq!(live.snapshot().plane_readiness(&path, plane), None);
+        }
+    }
+
+    #[test]
+    fn fold_persists_only_worker_override_fills_and_keeps_the_base_reference() {
+        use super::super::readiness::{Admission, Completion, WorkItem};
+        let base = base();
+        let path = path("exception.rs");
+        let mut delta = worker();
+        delta
+            .set_readiness_override(
+                path.clone(),
+                EntryPlanes {
+                    semantic: Some(PlaneState::pending("worker dependency")),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let composed = ComposedGeneration::compose("worker", delta, base.clone(), None).unwrap();
+        let key = crate::blob_store::v2::FamilyKey::new(FamilyPlane::Semantic, [0x55; 32]);
+        let completion = Completion {
+            item: WorkItem {
+                plane: FamilyPlane::Semantic,
+                rel_path: path.clone(),
+                content: ContentHash::of(b"exception.rs"),
+                producer: "sem".into(),
+            },
+            key,
+        };
+        let mut fill = FillMap::default();
+        assert_eq!(
+            fill.admit(&completion, "sem", None, Some(&composed)),
+            Admission::Installed
+        );
+        let folded = readiness::fold(&composed, &header().producers, [], &fill).unwrap();
+        assert_eq!(folded.base_header(), composed.base_header());
+        assert!(folded.is_empty());
+        assert_eq!(folded.ready_keys().collect::<Vec<_>>(), vec![key]);
+        let next = ComposedGeneration::compose("folded", folded, base, None).unwrap();
+        assert_eq!(
+            next.plane_readiness(&path, FamilyPlane::Semantic),
+            Some(&PlaneState::ready(&key))
+        );
+        assert!(next
+            .plane_readiness(&self::path("inherited.rs"), FamilyPlane::Semantic)
+            .unwrap()
+            .is_pending());
+    }
+
+    #[test]
+    fn v3_sections_roundtrip_and_ready_keys_include_deduplicated_overrides() {
+        let mut delta = worker();
+        delta
+            .set(path("added.rs"), Some(entry(b"added", ready())))
+            .unwrap();
+        delta.set(path("deleted.rs"), None).unwrap();
+        delta
+            .set_readiness_override(path("exception.rs"), planes(ready()))
+            .unwrap();
+        let bytes = delta.to_json_bytes().unwrap();
+        assert_eq!(ManifestV2::from_json_bytes(&bytes).unwrap(), delta);
+        let keys: Vec<_> = delta.ready_keys().collect();
+        assert_eq!(keys.len(), 3);
+        delta.set(path("added.rs"), None).unwrap();
+        assert_eq!(delta.ready_keys().collect::<Vec<_>>(), keys);
+        let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json["readiness_overrides"][0]["rel_path"] = json["entries"][0]["rel_path"].clone();
+        assert!(ManifestV2::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "a worker must be opened with ComposedGeneration::compose")]
+    fn a_worker_cannot_be_opened_as_a_flat_generation() {
+        ComposedGeneration::new("worker", worker(), None);
+    }
+
+    #[test]
+    fn composition_rejects_base_chains_and_missing_override_members() {
+        let first = Arc::new(ComposedGeneration::compose("first", worker(), base(), None).unwrap());
+        assert!(ComposedGeneration::compose("chain", worker(), first, None).is_err());
+        let mut delta = worker();
+        delta
+            .set_readiness_override(path("unknown.rs"), planes(ready()))
+            .unwrap();
+        assert!(ComposedGeneration::compose("bad", delta, base(), None).is_err());
+        let mut incompatible = worker();
+        incompatible.header_mut().producers.trigram = "other policy".into();
+        assert!(ComposedGeneration::compose("incompatible", incompatible, base(), None).is_err());
     }
 }

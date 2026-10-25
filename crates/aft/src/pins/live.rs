@@ -129,6 +129,17 @@ impl LivePin {
         Ok(())
     }
 
+    /// A completed fill may leave its live pin only after durable publication
+    /// protects it. Unpublished override keys survive even if content equality
+    /// removed their corresponding live entry.
+    pub fn trim_published(
+        &mut self,
+        published: &BTreeSet<String>,
+        keep: impl Fn(&str) -> bool,
+    ) -> Result<(), PinError> {
+        self.trim(|key| keep(key) || !published.contains(key))
+    }
+
     pub fn len(&self) -> usize {
         self.keys.len()
     }
@@ -212,6 +223,26 @@ mod tests {
                 .family_key()
             })
             .collect()
+    }
+
+    #[test]
+    fn override_fill_stays_live_until_durable_publication_protects_it() {
+        let view = tempfile::tempdir().unwrap();
+        let mut pin = LivePin::create_in(view.path(), "family".into(), "worker".into()).unwrap();
+        let key = keys(1)[0];
+        pin.protect(&[key]).unwrap();
+        pin.trim_published(&BTreeSet::new(), |_| false).unwrap();
+        assert_eq!(
+            pin.len(),
+            1,
+            "content equality cannot retire an unpublished override key"
+        );
+        assert!(fs::read_to_string(pin.keys_path())
+            .unwrap()
+            .contains(&key.to_hex()));
+        pin.trim_published(&BTreeSet::from([key.to_hex()]), |_| false)
+            .unwrap();
+        assert!(pin.is_empty());
     }
 
     #[test]

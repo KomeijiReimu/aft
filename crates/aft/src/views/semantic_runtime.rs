@@ -34,7 +34,7 @@ use super::intent::{WriteIntent, WriteIntentListener, WritePhase};
 use super::manifest_v2::Producers;
 use super::registry::{FamilyRegistry, ViewRegistration};
 use super::semantic::{FillBudget, FillReport, SemanticPlane, SemanticProducer, SemanticQuery};
-use super::snapshot::{DiskState, LiveDelta, OpenGeneration, Snapshot};
+use super::snapshot::{ComposedGeneration, DiskState, LiveDelta, Snapshot};
 
 /// Producer written into the manifest header for the trigram and callgraph
 /// planes, which this semantic-only runtime does not register.
@@ -62,7 +62,7 @@ struct PrototypeBase {
     storage: PathBuf,
     family: String,
     producer: String,
-    generation: Arc<OpenGeneration>,
+    generation: Arc<ComposedGeneration>,
 }
 
 impl PrototypeBase {
@@ -82,15 +82,11 @@ fn base_ref_ready(snapshot: &Snapshot) -> bool {
     snapshot.generation().name() != "empty"
         && snapshot.live_entries().next().is_none()
         && snapshot.pending_intent().next().is_none()
-        && snapshot
-            .generation()
-            .manifest()
-            .entries()
-            .all(|(path, entry)| {
-                matches!(entry, EntryV2::Regular { planes, .. }
+        && snapshot.generation().entries().all(|(path, entry)| {
+            matches!(entry, EntryV2::Regular { planes, .. }
                 if !super::semantic::applies_to(path)
                     || matches!(planes.semantic, Some(PlaneState::Ready { .. })))
-            })
+        })
 }
 
 fn base_ref_stable(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
@@ -315,7 +311,10 @@ impl CheckoutSemantic {
         {
             return;
         }
-        let mut manifest = snapshot.generation().manifest().clone();
+        let mut manifest = snapshot
+            .generation()
+            .flatten()
+            .expect("valid composed generation");
         // A worktree's .git file names its private administrative directory;
         // unlike source or ignore files, those bytes never enter semantic keys.
         manifest
@@ -328,7 +327,7 @@ impl CheckoutSemantic {
             storage: self.owner.registry().storage().to_path_buf(),
             family: self.owner.family().to_owned(),
             producer: self.plane.semantic_producer().id(),
-            generation: Arc::new(OpenGeneration::new(name, manifest, None)),
+            generation: Arc::new(ComposedGeneration::new(name, manifest, None)),
         });
         let mut bases = lock(prototype_bases());
         bases.retain(|base| base.strong_count() > 0);
@@ -352,7 +351,10 @@ impl CheckoutSemantic {
                     &producer,
                 )
             })?;
-        let snapshot = LiveDelta::new(Arc::clone(&base.generation)).snapshot();
+        let cut = self.driver.installed_snapshot().install_cut()?.clone();
+        let snapshot = LiveDelta::new(Arc::clone(&base.generation))
+            .snapshot()
+            .with_install_cut(cut);
         if !base_ref_ready(&snapshot) {
             return None;
         }
@@ -365,7 +367,7 @@ impl CheckoutSemantic {
         // but do not derive attachments or fold inherited-ready entries. Any
         // delta or unsupported observation sends the whole bind strict.
         let files = ConfiguredMembershipWalker.files(&self.root).ok()?;
-        let manifest = base.generation.manifest();
+        let manifest = &base.generation;
         let mut members = std::collections::BTreeSet::new();
         for absolute in files {
             let path =

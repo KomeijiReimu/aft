@@ -12,6 +12,143 @@ use std::sync::atomic::AtomicUsize;
 /// row, and the marker row saying the run's vector matches that chunk row.
 const ROWS_PER_ONE_CHUNK_FILE: u64 = 3;
 
+/// The test prints public setup, query answers, a v3 file inventory and exact
+/// reader-floor bytes. Query expectations come from an independent cold index,
+/// not the view.
+#[test]
+fn composition_no_marker_boundary_record() {
+    use crate::migration::prune_legacy::{
+        prune_legacy, CensusFinding, ProcessCensus, PruneExit, PruneOptions,
+    };
+    use crate::root_cache::StoragePaths;
+    struct NoProcesses;
+    impl ProcessCensus for NoProcesses {
+        fn take(&self) -> Result<Vec<CensusFinding>, String> {
+            Ok(Vec::new())
+        }
+    }
+    // Inventory names and sizes without opening another descriptor on a live
+    // SQLite file set. The reader floor is a separately encoded JSON file.
+    fn inventory(root: &Path, path: &Path, files: &mut std::collections::BTreeMap<String, u64>) {
+        if !path.exists() {
+            return;
+        }
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                inventory(root, &path, files);
+            } else {
+                files.insert(
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    std::fs::metadata(&path).unwrap().len(),
+                );
+            }
+        }
+    }
+    let mut answers = Vec::new();
+    for views in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let temp = std::fs::canonicalize(temp.path()).unwrap();
+        let storage = temp.join("storage");
+        let root = temp.join("project");
+        write_tree(&root, FILES);
+        std::fs::create_dir_all(&storage).unwrap();
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(storage.clone()),
+                ..Default::default()
+            },
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "composition-boundary", "command": "configure", "project_root": root, "storage_dir": storage,
+            "harness": "runner", "session_id": "alfonso:sidekick-00000000-0000-4001-98dd-383a2dbeca78",
+            "config": [{ "tier": "user", "source": "/u/aft.jsonc", "doc": serde_json::json!({
+                "views": { "enabled": views }, "indexes": { "trigram": false, "semantic": true, "callgraph": false },
+                "semantic": { "backend": "openai_compatible", "model": "boundary-no-network", "base_url": "http://127.0.0.1:1", "timeout_ms": 50 }
+            }).to_string() }]
+        })).unwrap();
+        let response = crate::commands::configure::handle_configure(&request, &ctx);
+        assert!(response.success, "{}", response.data);
+        crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+        assert!(
+            ctx.semantic_refresh_sender().is_none(),
+            "the sidekick fixture must not start an embedding worker"
+        );
+        let answer = if views {
+            let family = crate::search_index::artifact_cache_key(&root);
+            let scope = crate::path_identity::project_scope_key(&root);
+            let runtime = CheckoutSemantic::new(
+                &StoragePaths::same(&storage),
+                &family,
+                &scope,
+                &root,
+                producer(),
+                Weak::new(),
+            )
+            .unwrap();
+            runtime.load().unwrap();
+            refresh(&runtime, &Model::default());
+            let result = query(&runtime, "alpha cache");
+            assert!(result.complete(), "{result:?}");
+            let rows = rows(&root, &result.results);
+            let registry = super::super::registry::FamilyRegistry::open(&storage, &family).unwrap();
+            super::super::eviction::enforce(&registry, Default::default()).unwrap();
+            rows
+        } else {
+            cold(&root, "alpha cache").0
+        };
+        assert!(!answer.is_empty());
+        for _ in 0..2 {
+            let report = crate::storage_retention::run_pass_with_budget_for_test(
+                &StoragePaths::same(&storage),
+                Duration::from_secs(120),
+            );
+            assert!(report.timings_ms.contains_key("blobs_v3"), "{report:?}");
+        }
+        let floor_before = std::fs::read(storage.join("reader-floor.json")).unwrap();
+        let mut before = Default::default();
+        inventory(&storage, &storage.join("blobs/v3"), &mut before);
+        let mut out = Vec::new();
+        let exit = prune_legacy(
+            &storage,
+            &PruneOptions {
+                yes: false,
+                now: std::time::SystemTime::now(),
+            },
+            &NoProcesses,
+            None,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(exit, PruneExit::Clean);
+        assert!(String::from_utf8(out).unwrap().contains("Dry run"));
+        let mut v3 = Default::default();
+        inventory(&storage, &storage.join("blobs/v3"), &mut v3);
+        assert_eq!(before, v3, "dry-run must not mutate the v3 namespace");
+        assert_eq!(
+            std::fs::read(storage.join("reader-floor.json")).unwrap(),
+            floor_before
+        );
+        assert!(!storage.join("views-harness.marker").exists());
+        assert!(
+            !storage.join("blobs/v3").exists(),
+            "an unrouted entrypoint wrote v3 without the marker"
+        );
+        let floor = std::fs::read_to_string(storage.join("reader-floor.json")).unwrap();
+        assert!(!floor.contains("views_v3"));
+        eprintln!(
+            "COMPOSITION_BOUNDARY_RECORD {}",
+            serde_json::json!({ "views": views, "answers": answer, "v3_files": v3, "floor": floor })
+        );
+        answers.push(answer);
+    }
+    assert_eq!(answers[0], answers[1]);
+}
+
 #[test]
 fn lane_paused_view_fill_waits_without_rechunking_and_resumes() {
     use crate::semantic_index::{lane_pause_chunk_calls, with_lane_pause_clock, PauseRetryScope};
@@ -1075,7 +1212,7 @@ fn base_ref_does_not_inherit_private_git_administration() {
     write_tree(root.path(), FILES);
     let runtime = base_ref_runtime(storage.path(), "builder", root.path());
     refresh(&runtime, &Model::default());
-    let mut manifest = runtime.installed().generation().manifest().clone();
+    let mut manifest = runtime.installed().generation().flatten().unwrap().clone();
     let git = super::super::RelPath::from_os_path(Path::new(".git")).unwrap();
     let bytes = b"gitdir: /private/checkout/administration\n";
     manifest
@@ -1088,12 +1225,13 @@ fn base_ref_does_not_inherit_private_git_administration() {
             ),
         )
         .unwrap();
-    let snapshot = LiveDelta::new(Arc::new(OpenGeneration::new(
+    let snapshot = LiveDelta::new(Arc::new(ComposedGeneration::new(
         "git-file-builder",
         manifest,
         None,
     )))
-    .snapshot();
+    .snapshot()
+    .with_install_cut(runtime.installed().install_cut().unwrap().clone());
     runtime
         .driver()
         .install(
@@ -1104,10 +1242,11 @@ fn base_ref_does_not_inherit_private_git_administration() {
         .unwrap();
     runtime.remember_base();
     let pin = lock(&runtime.base_ref_pin).as_ref().cloned().unwrap();
-    assert!(pin.generation.manifest().get(&git).is_none());
+    assert!(pin.generation.flatten().unwrap().get(&git).is_none());
     assert!(pin
         .generation
-        .manifest()
+        .flatten()
+        .unwrap()
         .get(&super::super::RelPath::from_os_path(Path::new("src/alpha.rs")).unwrap())
         .is_some());
 }
@@ -1794,12 +1933,14 @@ fn family_fill_rechecks_completed_work_after_acquiring_claim() {
     assert_eq!(
         a.installed()
             .generation()
-            .manifest()
+            .flatten()
+            .unwrap()
             .to_json_bytes()
             .unwrap(),
         b.installed()
             .generation()
-            .manifest()
+            .flatten()
+            .unwrap()
             .to_json_bytes()
             .unwrap()
     );
@@ -2208,7 +2349,8 @@ fn pending_semantic(runtime: &CheckoutSemantic) -> usize {
     runtime
         .installed()
         .generation()
-        .manifest()
+        .flatten()
+        .unwrap()
         .entries()
         .filter(|(_, entry)| {
             entry
@@ -2312,7 +2454,8 @@ fn large_semantic_materialization_batches_pins_and_touches() {
     let manifest = runtime
         .installed()
         .generation()
-        .manifest()
+        .flatten()
+        .unwrap()
         .to_json_bytes()
         .unwrap();
     let store = runtime
@@ -2322,7 +2465,8 @@ fn large_semantic_materialization_batches_pins_and_touches() {
     let blobs: Vec<_> = runtime
         .installed()
         .generation()
-        .manifest()
+        .flatten()
+        .unwrap()
         .ready_keys()
         .map(|key| (key, store.get(&key).unwrap().unwrap()))
         .collect();
@@ -2331,7 +2475,8 @@ fn large_semantic_materialization_batches_pins_and_touches() {
         runtime
             .installed()
             .generation()
-            .manifest()
+            .flatten()
+            .unwrap()
             .to_json_bytes()
             .unwrap(),
         manifest
@@ -2405,14 +2550,20 @@ fn large_checkout_edit_counts_source_work_and_preserves_outputs() {
         cold(&root, "rewritten item").0
     );
     let snapshot = runtime.installed();
-    let manifest = snapshot.generation().manifest().to_json_bytes().unwrap();
+    let manifest = snapshot
+        .generation()
+        .flatten()
+        .unwrap()
+        .to_json_bytes()
+        .unwrap();
     let store = runtime
         .owner
         .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
         .unwrap();
     let blobs: Vec<_> = snapshot
         .generation()
-        .manifest()
+        .flatten()
+        .unwrap()
         .ready_keys()
         .map(|key| (key, store.get(&key).unwrap().unwrap()))
         .collect();
@@ -2421,7 +2572,8 @@ fn large_checkout_edit_counts_source_work_and_preserves_outputs() {
         runtime
             .installed()
             .generation()
-            .manifest()
+            .flatten()
+            .unwrap()
             .to_json_bytes()
             .unwrap(),
         manifest

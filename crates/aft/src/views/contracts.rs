@@ -29,7 +29,7 @@ use crate::blob_store::v2::FamilyPlane;
 
 use super::readiness::PlaneReadiness;
 use super::registry::{ReaderRegistration, ViewRegistration};
-use super::snapshot::{OpenGeneration, Snapshot};
+use super::snapshot::{ComposedGeneration, Snapshot};
 use super::RelPath;
 
 /// Durability boundaries of view construction. V3-only boundaries are appended
@@ -208,11 +208,21 @@ pub trait PlaneAdapter: Send + Sync {
     fn open_generation(
         &self,
         access: &ViewAccess,
-        generation: &Arc<OpenGeneration>,
+        generation: &Arc<ComposedGeneration>,
     ) -> Result<(), PlaneError>;
 
     /// Drops resident state for a generation that no snapshot holds.
     fn release_generation(&self, access: &ViewAccess, generation: &str);
+
+    /// Called only after durable pointer publication for this generation succeeded.
+    /// Opening draft readers must not drop live protection for unpublished fills.
+    fn generation_published(
+        &self,
+        _access: &ViewAccess,
+        _generation: &Arc<ComposedGeneration>,
+    ) -> Result<(), PlaneError> {
+        Ok(())
+    }
 
     /// This plane's readiness for the view `access` names, as of `snapshot`.
     ///

@@ -55,7 +55,7 @@ impl GenerationIndex {
             .iter()
             .map(|file| (&file.rel_path, file.content))
             .collect::<BTreeMap<_, _>>();
-        for (path, entry) in snapshot.generation().manifest().entries() {
+        for (path, entry) in snapshot.generation().entries() {
             let Some(content) = entry.content() else {
                 continue;
             };
@@ -63,7 +63,9 @@ impl GenerationIndex {
                 continue;
             }
             let key = crate::blob_store::v2::TrigramKey { content, policy }.family_key();
-            if entry.plane_state(FamilyPlane::Trigram)
+            if snapshot
+                .generation()
+                .plane_readiness(path, FamilyPlane::Trigram)
                 != Some(&super::readiness::PlaneState::ready(&key))
             {
                 continue;
@@ -85,12 +87,11 @@ impl GenerationIndex {
         payloads: &BTreeMap<ContentHash, TrigramPayload>,
     ) -> Result<Self, String> {
         if segment.policy_fingerprint() != policy.fingerprint()
-            || snapshot.generation().manifest().header().producers.trigram
-                != policy.fingerprint_hex()
+            || snapshot.generation().header().producers.trigram != policy.fingerprint_hex()
         {
             return Err("trigram producer mismatch".into());
         }
-        let manifest = snapshot.generation().manifest();
+        let manifest = snapshot.generation();
         let mut overlay = BTreeMap::new();
         let base = segment
             .files()
@@ -99,7 +100,7 @@ impl GenerationIndex {
             .collect::<BTreeMap<_, _>>();
         for path in base.keys() {
             if manifest
-                .get(path)
+                .entry(path)
                 .and_then(|entry| entry.content())
                 .is_none()
             {
@@ -383,7 +384,7 @@ pub type Publisher = dyn Fn(
         &super::contracts::ViewAccess,
         &Snapshot,
         bool,
-    ) -> Result<Arc<super::snapshot::OpenGeneration>, super::contracts::PlaneError>
+    ) -> Result<Arc<super::snapshot::ComposedGeneration>, super::contracts::PlaneError>
     + Send
     + Sync;
 pub type Opener = dyn Fn(
@@ -489,6 +490,7 @@ impl TrigramDriver {
         Ok(super::first_load::ReconciledCheckout {
             revision: revision(&delta),
             entries: walk.entries,
+            cut: None,
         })
     }
     pub fn revision(&self, _: &super::contracts::ViewAccess) -> u64 {
@@ -499,7 +501,7 @@ impl TrigramDriver {
         access: &super::contracts::ViewAccess,
         snapshot: &Snapshot,
         seed_derived: bool,
-    ) -> Result<Arc<super::snapshot::OpenGeneration>, super::contracts::PlaneError> {
+    ) -> Result<Arc<super::snapshot::ComposedGeneration>, super::contracts::PlaneError> {
         self.validate(access)?;
         (self.publish)(access, snapshot, seed_derived)
     }
@@ -737,11 +739,7 @@ impl TrigramAdapter {
     ) -> Result<GenerationIndex, super::contracts::PlaneError> {
         let id = snapshot
             .generation()
-            .manifest()
-            .header()
-            .segment
-            .as_ref()
-            .and_then(|id| crate::blob_store::v2::parse_hex32(id))
+            .segment_id()
             .ok_or_else(|| plane_error("generation has no trigram segment"))?;
         let segment_key = (access.family().to_string(), id);
         let cached = {
@@ -811,14 +809,14 @@ impl super::contracts::PlaneAdapter for TrigramAdapter {
     fn open_generation(
         &self,
         access: &super::contracts::ViewAccess,
-        generation: &Arc<super::snapshot::OpenGeneration>,
+        generation: &Arc<super::snapshot::ComposedGeneration>,
     ) -> Result<(), super::contracts::PlaneError> {
         let snapshot = super::snapshot::LiveDelta::new(generation.clone()).snapshot();
         let index = Arc::new(self.open_index(access, &snapshot)?);
         self.residents
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert((access.scope().into(), generation.name().into()), index);
+            .insert((access.scope().into(), generation.resident_key()), index);
         Ok(())
     }
     fn release_generation(&self, access: &super::contracts::ViewAccess, generation: &str) {
@@ -836,7 +834,7 @@ impl super::contracts::PlaneAdapter for TrigramAdapter {
         let Some(index) = residents
             .get(&(
                 access.scope().to_owned(),
-                snapshot.generation().name().to_owned(),
+                snapshot.generation().resident_key(),
             ))
             .cloned()
         else {
@@ -853,7 +851,6 @@ impl super::contracts::PlaneAdapter for TrigramAdapter {
         let pending = index.candidates(snapshot, &members, "").direct.len();
         let failed = snapshot
             .generation()
-            .manifest()
             .entries()
             .filter(|(path, entry)| {
                 !matches!(snapshot.source(path), Source::Live(_))
@@ -893,7 +890,7 @@ mod tests {
     }
     use super::super::contracts::{PlaneAdapter, ViewAccess};
     use super::super::manifest_v2::{ManifestHeader, ManifestV2, Producers};
-    use super::super::snapshot::{LiveDelta, OpenGeneration};
+    use super::super::snapshot::{ComposedGeneration, LiveDelta};
     use super::*;
 
     fn fixture() -> (
@@ -929,7 +926,11 @@ mod tests {
             ignore_fingerprint: None,
             segment: Some(crate::blob_store::v2::to_hex(&segment.id)),
         });
-        let delta = LiveDelta::new(Arc::new(OpenGeneration::new("generation", manifest, None)));
+        let delta = LiveDelta::new(Arc::new(ComposedGeneration::new(
+            "generation",
+            manifest,
+            None,
+        )));
         let adapter = Arc::new(TrigramAdapter::new(storage.path().to_path_buf(), policy));
         (storage, root, ViewAccess::Owner(owner), adapter, delta)
     }

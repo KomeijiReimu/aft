@@ -377,6 +377,27 @@ pub fn build_from_blobs(
     assemble(policy, inputs)
 }
 
+/// Materialize the logical membership, including inherited files and excluding
+/// worker tombstones. The payload source retains ownership of its SQLite handle.
+pub fn build_from_generation(
+    source: &impl PayloadSource,
+    generation: &super::snapshot::ComposedGeneration,
+    policy: &TrigramPolicy,
+) -> SegmentResult<SegmentBytes> {
+    let members: Vec<_> = generation
+        .entries()
+        .filter_map(|(path, entry)| match entry {
+            super::manifest_v2::EntryV2::Regular { content, size, .. } => Some(SegmentMember {
+                rel_path: path.clone(),
+                content: *content,
+                size: *size,
+            }),
+            _ => None,
+        })
+        .collect();
+    build_from_blobs(source, &members, policy)
+}
+
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Writes `segment` into the family directory under the protocol above. The

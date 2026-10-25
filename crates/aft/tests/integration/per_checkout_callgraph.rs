@@ -87,7 +87,12 @@ fn query_fixture(with_graph: bool) -> QueryFixture {
         let database = views.derived_path(&name.to_string()).unwrap();
         std::fs::create_dir_all(database.parent().unwrap()).unwrap();
         let store = view.open_store(FamilyPlane::Callgraph).unwrap();
-        callgraph::materialize(&database, &manifest, &BlobReader(store.reader())).unwrap();
+        callgraph::materialize(
+            &database,
+            &OpenGeneration::new("projected", manifest.clone(), None),
+            &BlobReader(store.reader()),
+        )
+        .unwrap();
         let prepared = views.prepare_v2(&name, None, &manifest, None).unwrap();
         views.commit_v2(prepared, None).unwrap();
         let marker =
@@ -271,6 +276,7 @@ impl FirstLoadDriver for Driver {
         let mut live = LiveEntry::new(DiskState::of_bytes(&self.source), self.revision(access));
         callgraph::attach(&mut live, &self.source, "typescript")?;
         Ok(ReconciledCheckout {
+            cut: None,
             revision: self.revision(access),
             entries: BTreeMap::from([(RelPath::new(b"fixture.ts").unwrap(), live)]),
         })
@@ -323,7 +329,11 @@ impl FirstLoadDriver for Driver {
         let views = view.view_store().map_err(error)?;
         let database = views.derived_path(&name.to_string()).map_err(error)?;
         std::fs::create_dir_all(database.parent().unwrap()).map_err(error)?;
-        callgraph::materialize(&database, &manifest, &BlobReader(store.reader()))?;
+        callgraph::materialize(
+            &database,
+            &OpenGeneration::new("projected", manifest.clone(), None),
+            &BlobReader(store.reader()),
+        )?;
         let prepared = views
             .prepare_v2(&name, None, &manifest, None)
             .map_err(error)?;
@@ -460,7 +470,8 @@ fn store_clone_pins_old_blobs_after_swap_and_gc() {
     let held_store = reader.store.clone();
     let old_name = old.name().to_string();
     let key_hex = old
-        .manifest()
+        .flatten()
+        .unwrap()
         .entries()
         .find_map(|(_, e)| match e.plane_state(FamilyPlane::Callgraph) {
             Some(PlaneState::Ready { key }) => Some(key.clone()),
@@ -475,7 +486,12 @@ fn store_clone_pins_old_blobs_after_swap_and_gc() {
     let name = GenerationName::for_manifest(&empty).unwrap();
     let database = views.derived_path(&name.to_string()).unwrap();
     let store = view.open_store(FamilyPlane::Callgraph).unwrap();
-    callgraph::materialize(&database, &empty, &BlobReader(store.reader())).unwrap();
+    callgraph::materialize(
+        &database,
+        &OpenGeneration::new("empty", empty.clone(), None),
+        &BlobReader(store.reader()),
+    )
+    .unwrap();
     let prepared = views
         .prepare_v2(&name, Some(&old_name), &empty, None)
         .unwrap();
