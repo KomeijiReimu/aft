@@ -565,6 +565,7 @@ pub enum RefusalCode {
     AdminTier,
     ManifestBelowFloor,
     ManifestRegressed,
+    ManifestUnavailable,
     SeamSchemaMismatch,
     UnboundIdentity,
     BypassAuditUnavailable,
@@ -583,13 +584,14 @@ pub enum RefusalCode {
 }
 
 impl RefusalCode {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::WorkerNativeGh,
         Self::WorkerWriteRefused,
         Self::Unclassified,
         Self::AdminTier,
         Self::ManifestBelowFloor,
         Self::ManifestRegressed,
+        Self::ManifestUnavailable,
         Self::SeamSchemaMismatch,
         Self::UnboundIdentity,
         Self::BypassAuditUnavailable,
@@ -615,6 +617,7 @@ impl RefusalCode {
             Self::AdminTier => "gh_shim_admin_tier",
             Self::ManifestBelowFloor => "gh_shim_manifest_below_floor",
             Self::ManifestRegressed => "gh_shim_manifest_regressed",
+            Self::ManifestUnavailable => "gh_shim_manifest_unavailable",
             Self::SeamSchemaMismatch => "gh_shim_seam_schema_mismatch",
             Self::UnboundIdentity => "gh_shim_unbound_identity",
             Self::BypassAuditUnavailable => "gh_shim_bypass_audit_unavailable",
@@ -871,9 +874,9 @@ fn run_with(
     // by any bot, and upstream `gh` would run it under the operator's own
     // login. Decide that before the rung probe: the answer does not depend on
     // the governance daemon, and a bound target falls through to the governed
-    // path below unchanged. Without a signed manifest (a public installation,
-    // or one that never verified) there are no bindings to compare against,
-    // so those keep passing through as before.
+    // path below unchanged. Without a signed manifest there are no bindings to
+    // compare against; the fallback below separately checks whether this machine
+    // was previously provisioned before allowing upstream execution.
     if let ManifestResolution::Active(manifest) = &initial_manifest {
         if let Some(status) =
             worker_reads::dispatch(args, manifest, &cwd, &paths, &mut read_identity)
@@ -914,7 +917,14 @@ fn run_with(
             ),
             ManifestResolution::Regressed { .. }
             | ManifestResolution::Invalid(_)
-            | ManifestResolution::Dormant => GovernanceDisposition::Delegate,
+            | ManifestResolution::Dormant => {
+                return dispatch_without_valid_manifest(
+                    args,
+                    &paths,
+                    invalid_manifest_problem.as_ref(),
+                    delegate,
+                )
+            }
         };
         return match disposition {
             GovernanceDisposition::Unavailable(agent_binding) => {
@@ -948,8 +958,7 @@ fn run_with(
 
     // A valid manifest gates R3 both during fresh discovery and when a cached
     // R3 determination is reused. If it disappears or fails validation between
-    // those two moments, the whole invocation falls back to R2 passthrough
-    // instead of a classification-shaped refusal.
+    // those two moments, use the same unavailable-manifest gate as below R3.
     let manifest = match resolve_manifest(&paths, now) {
         ManifestResolution::Active(manifest) => manifest,
         ManifestResolution::Regressed { manifest, problem } => {
@@ -967,13 +976,13 @@ fn run_with(
             if let Some(status) = captured_now() {
                 return status;
             }
-            return delegate_after_invalid_manifest_notice(args, &problem, delegate);
+            return dispatch_without_valid_manifest(args, &paths, Some(&problem), delegate);
         }
         ManifestResolution::Dormant => {
             if let Some(status) = captured_now() {
                 return status;
             }
-            return delegate(args);
+            return dispatch_without_valid_manifest(args, &paths, None, delegate);
         }
     };
     let classification = classify(args, &manifest, current_platform());
@@ -4446,14 +4455,56 @@ fn resolve_manifest(paths: &StatePaths, now: u64) -> ManifestResolution {
     }
 }
 
+fn manifest_state_was_provisioned(root: &Path) -> bool {
+    [
+        "last-valid-manifest.json",
+        "manifest-version-high-water.json",
+    ]
+    .iter()
+    .any(|name| match fs::symlink_metadata(root.join(name)) {
+        Ok(_) => true,
+        // An unreadable record cannot establish that this is a public,
+        // never-provisioned installation. Only absence permits that fallback.
+        Err(error) => error.kind() != io::ErrorKind::NotFound,
+    })
+}
+
+fn dispatch_without_valid_manifest(
+    args: &[OsString],
+    paths: &StatePaths,
+    problem: Option<&ManifestProblem>,
+    delegate: impl FnOnce(&[OsString]) -> i32,
+) -> i32 {
+    // The agent may select an empty override. Check the default location too,
+    // without constructing StatePaths there: that constructor tightens permissions.
+    let default_root = gh_shim_state_dir_from(
+        None,
+        crate::environment::non_empty_os_var("XDG_STATE_HOME").as_deref(),
+        crate::environment::non_empty_os_var("HOME").as_deref(),
+    );
+    if (manifest_state_was_provisioned(&paths.root)
+        || manifest_state_was_provisioned(&default_root))
+        && !is_unbound_safe(args)
+    {
+        return refuse(
+            RefusalCode::ManifestUnavailable,
+            "no valid signed routing manifest is available; GitHub writes are refused to prevent use of the operator's credentials. Repair or activate the manifest before retrying. Reads remain available.",
+        );
+    }
+    match problem {
+        Some(problem) => delegate_after_invalid_manifest_notice(args, problem, delegate),
+        None => delegate(args),
+    }
+}
+
 fn delegate_after_invalid_manifest_notice(
     args: &[OsString],
     problem: &ManifestProblem,
     delegate: impl FnOnce(&[OsString]) -> i32,
 ) -> i32 {
-    // Missing manifests identify public installations and must remain silent.
-    // An installed but invalid manifest instead signals a misconfigured
-    // governed seat, so say which ambient identity will execute the fallback.
+    // An invalid artifact gets a notice on permitted fallback, explaining which
+    // ambient identity upstream gh will use. Missing-manifest passthrough stays
+    // silent only when the unavailable-manifest gate permits it.
     eprintln!(
         "gh-shim: manifest invalid ({}); executing with ambient gh credentials",
         problem.fallback_notice_reason().replace(['\n', '\r'], " ")
@@ -11270,10 +11321,14 @@ mod tests {
 
     #[test]
     fn refusal_and_self_report_codes_are_separate_closed_sets() {
-        assert_eq!(RefusalCode::ALL.len(), 21);
+        assert_eq!(RefusalCode::ALL.len(), 22);
         assert_eq!(
             RefusalCode::WorkerWriteRefused.as_str(),
             crate::gh_shim_speech::WORKER_WRITE_CODE
+        );
+        assert_eq!(
+            RefusalCode::ManifestUnavailable.as_str(),
+            "gh_shim_manifest_unavailable"
         );
         assert_eq!(
             RefusalCode::WorkerNativeGh.as_str(),
