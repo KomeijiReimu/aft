@@ -6,7 +6,7 @@ use crate::db::access_grants::ScopeKey;
 
 use super::{Code, Refusal, ScopeRole};
 
-/// Only validated daemon evidence can construct a permanent tuple end.
+/// Only validated daemon evidence can create a permanent end record for a scope.
 #[derive(Clone, Debug)]
 pub(crate) struct ValidatedEnd {
     key: ScopeKey,
