@@ -133,10 +133,21 @@ impl ConfigSources {
         tiers: &[ConfigTier],
         connected: &Config,
     ) -> Self {
-        let owns_user_watch = user_config_path.is_some() && process_user_config_path().is_none();
-        let user_path = user_config_path.or_else(process_user_config_path);
         let project_path =
             crate::subc_config::project_config_read_path(project_root, connected.harness.as_ref());
+        Self::from_observed_paths(user_config_path, project_path, tiers, connected)
+    }
+
+    /// Record the source paths selected by a trusted local observation without
+    /// probing them again. Reload must watch the same files that supplied tiers.
+    pub(crate) fn from_observed_paths(
+        user_config_path: Option<PathBuf>,
+        project_path: PathBuf,
+        tiers: &[ConfigTier],
+        connected: &Config,
+    ) -> Self {
+        let owns_user_watch = user_config_path.is_some() && process_user_config_path().is_none();
+        let user_path = user_config_path.or_else(process_user_config_path);
         let source_for = |tier: &'static str, path: Option<PathBuf>| {
             let used = tiers.iter().find(|candidate| candidate.tier == tier);
             let from_file = match (used, path.as_ref()) {

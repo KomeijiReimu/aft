@@ -3769,8 +3769,9 @@ async fn teardown_installed_route(
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
     // Only the consumer's own close withdraws held permission asks. A
-    // higher-epoch rebind keeps the logical route, and a transport drop never
-    // reaches here, so their asks stay open for the retried call.
+    // higher-epoch allocation is a new daemon route/client handle. AFT retains
+    // scoped permission work by its call identity, not by that old route handle.
+    // A transport drop never reaches here.
     if cancellation_reason == "Goodbye" {
         consent::note_route_closed(channel);
     }
@@ -3828,8 +3829,9 @@ async fn teardown_installed_route(
         )
         .await?;
     }
-    // A higher-epoch replacement keeps replayable work because the logical
-    // route remains live. A route that actually closes keeps only calls that
+    // AFT keeps registered native work across higher-epoch replacement using
+    // its retained call/job records; the daemon does not preserve the old handle.
+    // An explicit close keeps only calls that
     // already started; pre-execution work has no response to replay and must
     // not retain scheduler capacity or an epoch-reader admission.
     let work_disposition = if replacement_root.is_some() {
@@ -6986,6 +6988,7 @@ fn route_bind_error_code_for_configure_response(response: &Response) -> &'static
         // contention); the client retries the bind rather than treating the
         // root as permanently divergent.
         Some("cache_key_probe_failed") => "cache_key_probe_failed",
+        Some("config_unknown") => "config_unknown",
         // Actor lifecycle gaps are transient from the daemon/client viewpoint:
         // a fresh bind can create or join a healthy actor, so do not classify
         // them as permanent config divergence.
@@ -7900,22 +7903,40 @@ async fn handle_control_request(
             // The resolver selects only this bind's harness override before it
             // applies the unchanged user/project trust boundary.
             metrics.mark_frame_loop_wait("disk/local_config", None);
-            let local_tiers = crate::subc_config::read_local_cortexkit_config_tiers(
-                user_config_path,
-                Path::new(&bind_project_root),
-            );
+            // Invalid harnesses still reach configure's existing typed refusal.
+            let active_harness = bind_harness.parse::<crate::harness::Harness>().ok();
+            let prepared_config = match active_harness.as_ref() {
+                Some(harness) => match crate::subc_config::PreparedBindConfig::read(
+                    user_config_path,
+                    Path::new(&bind_project_root),
+                    harness,
+                ) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(error) => {
+                        let code = if error.code == "config_rejected" {
+                            "config_divergence"
+                        } else {
+                            error.code
+                        };
+                        return send_route_bind_error(tx, frame, code, &error.to_string(), metrics)
+                            .await;
+                    }
+                },
+                None => None,
+            };
+            let local_tiers = prepared_config
+                .as_ref()
+                .map_or(&[][..], |snapshot| snapshot.tiers());
             let config_tiers: Vec<Value> = local_tiers
                 .iter()
                 .map(|t| json!({ "tier": t.tier, "source": t.source, "doc": t.doc }))
                 .collect();
             // Let configure return its structured invalid-harness error rather
             // than panicking while computing this optional registration setting.
-            let active_harness = bind_harness.parse::<crate::harness::Harness>().ok();
-            let bind_config = crate::config_resolve::resolve_config_for_harness(
-                &local_tiers,
-                active_harness.as_ref(),
-            )
-            .config;
+            let bind_config = prepared_config
+                .as_ref()
+                .map(|snapshot| snapshot.resolved().clone())
+                .unwrap_or_default();
             let diagnostics_on_edit = bind_config.diagnostics_on_edit;
             let bind_disabled_tools = Arc::new(bind_config.disabled_tools);
             let configure_json = json!({
@@ -8005,7 +8026,13 @@ async fn handle_control_request(
                     Arc::new(move |ctx| {
                         log_ctx::with_session(Some(configure_session.clone()), || {
                             let bind_started = Instant::now();
-                            let response = dispatch(configure_req.clone(), ctx);
+                            let response = match prepared_config.as_ref() {
+                                Some(snapshot) => crate::subc_config::with_prepared_bind_config(
+                                    Arc::clone(snapshot),
+                                    || dispatch(configure_req.clone(), ctx),
+                                ),
+                                None => dispatch(configure_req.clone(), ctx),
+                            };
                             if response.success {
                                 // Revoke matching standing publication before the
                                 // session is installed, but never on the frame loop.

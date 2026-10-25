@@ -18,6 +18,11 @@ use crate::harness::Harness;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+mod prepared;
+pub(crate) use prepared::{
+    current_prepared_bind_config, with_prepared_bind_config, PreparedBindConfig,
+};
+
 /// CortexKit user config home: `$XDG_CONFIG_HOME/cortexkit/aft.jsonc`, falling
 /// back to `~/.config/cortexkit/aft.jsonc`. Matches the shared CortexKit
 /// convention (`~/.config/cortexkit/<module>.jsonc`) alongside `subc.jsonc` and
@@ -64,11 +69,8 @@ fn cortexkit_project_config_path(project_root: &Path) -> PathBuf {
 /// Prefer the shared file, then the active harness's legacy files, without writes.
 /// Within a harness, aft.jsonc precedes aft.json. Without a plugin harness,
 /// OpenCode is checked before Pi, matching the TypeScript fallback ordering.
-pub fn project_config_read_path(project_root: &Path, harness: Option<&Harness>) -> PathBuf {
-    let canonical = cortexkit_project_config_path(project_root);
-    if canonical.exists() {
-        return canonical;
-    }
+fn project_config_candidates(project_root: &Path, harness: Option<&Harness>) -> Vec<PathBuf> {
+    let mut candidates = vec![cortexkit_project_config_path(project_root)];
     let directories = if matches!(harness, Some(Harness::Pi)) {
         [".pi", ".opencode"]
     } else {
@@ -76,13 +78,17 @@ pub fn project_config_read_path(project_root: &Path, harness: Option<&Harness>) 
     };
     for directory in directories {
         for filename in ["aft.jsonc", "aft.json"] {
-            let path = project_root.join(directory).join(filename);
-            if path.exists() {
-                return path;
-            }
+            candidates.push(project_root.join(directory).join(filename));
         }
     }
-    canonical
+    candidates
+}
+
+pub fn project_config_read_path(project_root: &Path, harness: Option<&Harness>) -> PathBuf {
+    project_config_candidates(project_root, harness)
+        .into_iter()
+        .find(|path| path.exists())
+        .unwrap_or_else(|| cortexkit_project_config_path(project_root))
 }
 
 pub fn legacy_project_config_location_notice(project_root: &Path, path: &Path) -> Option<String> {
