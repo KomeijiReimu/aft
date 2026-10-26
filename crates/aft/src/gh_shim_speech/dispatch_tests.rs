@@ -863,6 +863,7 @@ async fn bound_dispatch_refuses_a_sibling_cancel_committed_before_local_enqueue(
     let fixture = Fixture::new(false).await;
     let root = fixture.service.store.path().parent().unwrap().to_path_buf();
     let scope = fixture.head.clone();
+    let incarnation = fixture.incarnation.clone();
     let enqueued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let observer = enqueued.clone();
     fixture.partners(|partners| {
@@ -873,9 +874,19 @@ async fn bound_dispatch_refuses_a_sibling_cancel_committed_before_local_enqueue(
             let receipt = cancel_from_sibling(&root, &scope);
             assert_eq!(receipt["success"], true);
             assert_eq!(
-                receipt["killed"].as_array().unwrap().len(),
+                receipt["killed"].as_array().unwrap().len() as u64
+                    + receipt["already_finished"].as_u64().unwrap(),
                 1,
                 "{receipt:?}"
+            );
+            let marker = crate::db::gh_speech::Store::new(root.join("aft.db"))
+                .get(&incarnation)
+                .err()
+                .map(|error| error.reason);
+            assert_eq!(
+                marker,
+                Some("revoked".into()),
+                "cancellation must commit the speech marker before acknowledging: {receipt:?}"
             );
         }));
         partners.on_bound_enqueue = Some(Arc::new(move || {

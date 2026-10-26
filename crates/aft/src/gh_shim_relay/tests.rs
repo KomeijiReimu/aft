@@ -2235,7 +2235,8 @@ async fn validated_head_codemode_is_not_a_worker_write_but_invalid_head_is() {
                 .with_agent_id(Some("agent-fixture".into()))
                 .with_run_id(Some("program-a".into())),
         )
-        .with_owner_authorized(true);
+        .with_owner_authorized(true)
+        .with_expires_at_ms(Some(crate::db::call_ledger::now_ms() as u64 + 60_000));
     let launch = crate::gh_shim_speech::model::LaunchAuthority::codemode(
         head.clone(),
         run.clone(),
