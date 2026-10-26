@@ -992,3 +992,74 @@ fn typed_session_lookup_not_found_is_final_and_outages_are_unavailable() {
         }
     }
 }
+
+#[test]
+fn imported_undo_reads_back_through_ordinary_agent_paths() {
+    use super::{ExpectedState, FileRecord, SnapshotGroup};
+    use crate::{backup::BackupStore, harness::Harness};
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(repo.join("nested")).unwrap();
+    let agent_path = repo.join("file.bin");
+    std::fs::write(&agent_path, b"after").unwrap();
+    let mut ordinary = BackupStore::new();
+    ordinary.set_storage_dir_for_harness(temp.path().join("ordinary"), Harness::Pi, 0);
+    ordinary
+        .snapshot_with_op("ordinary", &agent_path, "ordinary", Some("ordinary-op"))
+        .unwrap();
+    ordinary.record_post_mutation_states();
+    let ordinary_preview = ordinary
+        .preview_latest_path("ordinary", &agent_path)
+        .unwrap();
+    // The first spelling is the plain absolute path used by an agent. The
+    // second exercises the same identity contract on Unix without depending on
+    // Windows-only verbatim prefixes or short-name availability.
+    for (index, projected_path) in [agent_path.clone(), repo.join("nested/../file.bin")]
+        .into_iter()
+        .enumerate()
+    {
+        let storage = temp.path().join(format!("imported-{index}"));
+        let key = super::registry::PortablePath {
+            project_id: "fixture-project".into(),
+            root_key: cortexkit_project_identity::RootKey::new(
+                cortexkit_project_identity::RootKeyKind::Label,
+                "fixture".into(),
+            ),
+            relative_path: "file.bin".into(),
+        };
+        let group = SnapshotGroup::Undo {
+            id: "imported-op".into(),
+            files: vec![FileRecord {
+                path: key,
+                id: "imported-entry".into(),
+                order: 1,
+                timestamp: 1,
+                mode: None,
+                before: Some(b"before".to_vec()),
+                expected: ExpectedState::capture(&agent_path).unwrap(),
+            }],
+        };
+        let mut imported = BackupStore::new();
+        imported.set_storage_dir_for_harness(storage.clone(), Harness::Pi, 0);
+        imported
+            .install_portable_undo("imported", &[(group, vec![projected_path.clone()])])
+            .unwrap();
+        drop(imported);
+        let mut imported = BackupStore::new();
+        imported.set_storage_dir_for_harness(storage, Harness::Pi, 0);
+        let history = imported.history("imported", &agent_path);
+        assert_eq!(history.len(), 1, "ordinary history could not find import: agent={agent_path:?}, projected={projected_path:?}, ordinary_preview={ordinary_preview:?}");
+        assert_eq!(history[0].content_bytes().unwrap().as_ref(), b"before");
+        assert_eq!(
+            imported
+                .preview_latest_path("imported", &agent_path)
+                .unwrap(),
+            ordinary_preview
+        );
+        assert_eq!(
+            std::fs::read(&agent_path).unwrap(),
+            b"after",
+            "read-back and preview must not write project files"
+        );
+    }
+}
