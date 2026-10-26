@@ -10,6 +10,9 @@
 //! matcher sets and 4096 bytes per material value are accepted; old matchers
 //! are never evicted to make room. JSON input remains capped at 1 MiB and grows
 //! only as body bytes arrive. Limits refuse new work rather than weaken scrub.
+//! On an approved target, a header placeholder whose label was not granted at
+//! launch refuses by label and host without fetching material. It is not added
+//! to the command's substitution set. Other destinations remain literal.
 //!
 //! # Memory boundary
 //!

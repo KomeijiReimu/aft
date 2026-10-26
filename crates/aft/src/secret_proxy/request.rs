@@ -139,6 +139,24 @@ async fn prepare_and_send(
                 .is_ok()
         })
         .collect();
+    // A runtime-built header label is not a launch grant. Refuse it before
+    // contacting the vault; other destinations and non-header text are literal.
+    if matches.iter().any(|matched| *matched) {
+        for value in parts.headers.values() {
+            for (offset, byte) in value.as_bytes().iter().enumerate() {
+                if *byte != b'{' {
+                    continue;
+                }
+                if let Some(placeholder) =
+                    secret_rules::placeholder::parse_at(value.as_bytes(), offset)
+                {
+                    if !rules.iter().any(|rule| rule.label == placeholder.label) {
+                        return Err(placeholder.label.to_owned());
+                    }
+                }
+            }
+        }
+    }
     let has_json = rules
         .iter()
         .zip(&matches)
