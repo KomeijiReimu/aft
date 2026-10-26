@@ -130,6 +130,13 @@ impl ComposedGeneration {
             ));
         }
         delta.ensure_producers(&base.header().producers)?;
+        for path in delta.tombstones() {
+            if base.entry(path).is_none() {
+                return Err(super::ViewError::InvalidManifest(
+                    "a worker tombstone must name an inherited base entry".into(),
+                ));
+            }
+        }
         let mut overrides = BTreeMap::new();
         for (path, patch) in delta.readiness_overrides() {
             let Some(EntryV2::Regular { .. }) = base.entry(path) else {
@@ -2206,6 +2213,13 @@ mod composition_tests {
             Some(&PlaneState::pending("repair inherited A")),
             "a fill for replaced B was attached to inherited A"
         );
+    }
+
+    #[test]
+    fn a_worker_tombstone_must_name_an_inherited_member() {
+        let mut delta = worker();
+        delta.set(path("not-in-base.rs"), None).unwrap();
+        assert!(ComposedGeneration::compose("nonmember-tombstone", delta, base(), None).is_err());
     }
 
     #[test]
