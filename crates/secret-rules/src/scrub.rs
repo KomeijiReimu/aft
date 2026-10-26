@@ -1,9 +1,24 @@
 //! S1 and S2: representations of a key, and a streaming scrubber.
 //!
-//! A key shorter than [`crate::material::MIN_KEY_LEN`] never reaches here (P3
-//! refuses it), which is what keeps every derived pattern non-empty. Patterns
-//! are plain byte strings, so scrubbing is a byte scan with a bounded overlap
-//! window rather than a regular expression.
+//! A key shorter than [`crate::material::MIN_KEY_LEN`] never reaches this
+//! module (P3 refuses it), which is what keeps every derived pattern non-empty.
+//!
+//! Two properties shape the design:
+//!
+//! * **Release never depends on the secret.** The scrubber always holds back
+//!   the tail of the stream that is shorter than the longest pattern, whatever
+//!   its content. A response that continues a secret prefix is therefore not
+//!   treated differently from one that does not, and the release pattern cannot
+//!   be used to guess the key one byte at a time.
+//! * **A complete match is never split.** Matching runs on the whole window
+//!   first, so a key that ends exactly at the holdback boundary is replaced
+//!   before any part of it is released.
+//!
+//! Encodings are matched by decoding rather than by spelling them out: the
+//! window is percent-decoded (and form-decoded, JSON-unescaped, hex-decoded or
+//! base64-decoded where the bytes look like one of those) and compared with the
+//! key. That covers every escape-case and selective-escaping choice inside one
+//! family without ever enumerating them.
 
 pub use crate::material::json_escape;
 use crate::material::percent_encode_form;
@@ -20,11 +35,31 @@ pub enum ScrubError {
     TooShort,
 }
 
+/// The encoding family a decoded match was found in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Family {
+    /// The key bytes themselves.
+    Raw,
+    /// `%XX` escapes, with either hex case and any selection of escapes.
+    Percent,
+    /// `+`-for-space form encoding around a key that contains a space.
+    Form,
+    /// A JSON string body with `\/`, `\"`, `\\` and `\uXXXX` escapes.
+    Json,
+    /// Hex digits in any case.
+    Hex,
+    /// Standard or URL-safe base64, padded or not.
+    Base64,
+}
+
 /// Every literal a response may use for one key (S1).
 #[derive(Debug)]
 pub struct KeyPatterns {
-    /// `(pattern, case_insensitive)` sorted longest first.
-    patterns: Vec<(Zeroizing<Vec<u8>>, bool)>,
+    /// Sorted longest first, so a longer spelling is tried before a shorter
+    /// one that sits inside it.
+    patterns: Vec<Zeroizing<Vec<u8>>>,
+    /// Length of the key itself; decoded matches never shrink below it.
+    key_len: usize,
 }
 
 impl KeyPatterns {
@@ -45,24 +80,17 @@ impl KeyPatterns {
         if !json.is_empty() {
             set.insert(json.into_bytes());
         }
-        let mut patterns: Vec<(Zeroizing<Vec<u8>>, bool)> = set
-            .into_iter()
-            .map(|pattern| {
-                let case_insensitive = is_hex_shaped(&pattern);
-                (Zeroizing::new(pattern), case_insensitive)
-            })
-            .collect();
-        // Longest first: a shorter pattern inside a longer one must never be
-        // replaced before the longer one is tried.
-        patterns.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
-        Ok(Self { patterns })
+        let mut patterns: Vec<Zeroizing<Vec<u8>>> = set.into_iter().map(Zeroizing::new).collect();
+        patterns.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        Ok(Self {
+            patterns,
+            key_len: key.len(),
+        })
     }
 
-    /// The patterns, longest first, with their case-sensitivity.
-    pub fn patterns(&self) -> impl Iterator<Item = (&[u8], bool)> {
-        self.patterns
-            .iter()
-            .map(|(pattern, insensitive)| (pattern.as_slice(), *insensitive))
+    /// The literal spellings, longest first.
+    pub fn patterns(&self) -> impl Iterator<Item = &[u8]> {
+        self.patterns.iter().map(|pattern| pattern.as_slice())
     }
 
     /// Number of distinct representations.
@@ -75,41 +103,23 @@ impl KeyPatterns {
         self.patterns.is_empty()
     }
 
-    /// Longest pattern, which sets the overlap window (S2).
+    /// Longest pattern, which sets the holdback window (S2).
     pub fn longest(&self) -> usize {
-        self.patterns
-            .first()
-            .map_or(0, |(pattern, _)| pattern.len())
+        self.patterns.first().map_or(0, |pattern| pattern.len())
     }
-}
 
-/// True when a pattern is hexadecimal (optionally with `%` signs), so a case
-/// variant is the same value and may be matched case-insensitively.
-fn is_hex_shaped(pattern: &[u8]) -> bool {
-    let mut saw_digit = false;
-    for byte in pattern {
-        if *byte == b'%' {
-            continue;
-        }
-        if !byte.is_ascii_hexdigit() {
-            return false;
-        }
-        if byte.is_ascii_digit() {
-            saw_digit = true;
-        }
+    /// The key length the decoded families must reproduce.
+    pub fn key_len(&self) -> usize {
+        self.key_len
     }
-    saw_digit
 }
 
 /// Base64 forms: standard and URL-safe alphabets, padded and unpadded, matched
-/// on the stable core of all three byte alignments.
+/// on the stable core of all three byte alignments plus the whole key.
 ///
-/// A key inside a larger base64 payload begins at an arbitrary offset relative
-/// to the payload's first character. Every whole 3-byte group of `key[offset..]`
-/// encodes to the same 4 characters in every alignment, so the core of
-/// `offset` is the group-aligned middle of `key[offset..]`. A 16-byte key's
-/// core is 4 characters, which keeps even the smallest case long enough not to
-/// occur by chance.
+/// A key inside a larger base64 payload is matched by decoding (see
+/// [`MatcherSet::scrub_window`]), so the literals here only need to catch the
+/// key standing alone.
 pub fn base64_patterns(key: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     for offset in 0..3 {
@@ -182,8 +192,7 @@ pub fn base64_encode(bytes: &[u8], alphabet: &[u8; 64], pad: bool) -> Vec<u8> {
 }
 
 /// Percent-encoded forms: every byte as `%XX`, and RFC 3986 with unreserved
-/// bytes literal, plus the common form-encoding variant that leaves spaces
-/// literal.
+/// bytes literal, plus the form variant that leaves spaces literal.
 pub fn percent_patterns(key: &[u8]) -> Vec<Vec<u8>> {
     let mut all = Vec::with_capacity(key.len() * 3);
     for byte in key {
@@ -196,8 +205,8 @@ pub fn percent_patterns(key: &[u8]) -> Vec<Vec<u8>> {
     ]
 }
 
-/// Hex forms: the whole key lower- and upper-case. Mixed case is covered by
-/// case-insensitive matching of these patterns.
+/// Hex forms: the whole key lower- and upper-case. Mixed case is caught by the
+/// hex decoder, not by the spellings.
 pub fn hex_patterns(key: &[u8]) -> Vec<Vec<u8>> {
     const LOWER: &[u8; 16] = b"0123456789abcdef";
     const UPPER: &[u8; 16] = b"0123456789ABCDEF";
@@ -213,23 +222,32 @@ pub fn hex_patterns(key: &[u8]) -> Vec<Vec<u8>> {
 }
 
 /// The replacement for a scrubbed key, per label.
-///
-/// The placeholder is pure ASCII by grammar, so it can stand in for a
-/// truncated encoding inside a response body without breaking quoting.
 pub fn placeholder_for(label: &str) -> Vec<u8> {
     (format!("{}{label}", PLACEHOLDER_PREFIX) + "}}").into_bytes()
 }
 
 /// One installed matcher set with the text it is replaced by.
 pub struct MatcherSet {
+    /// The key itself, kept zeroizing for the lifetime of the matcher.
+    key: Zeroizing<Vec<u8>>,
     patterns: KeyPatterns,
     replacement: Vec<u8>,
+}
+
+impl std::fmt::Debug for MatcherSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MatcherSet")
+            .field("label_replacement", &self.replacement)
+            .field("patterns", &self.patterns.len())
+            .finish()
+    }
 }
 
 impl MatcherSet {
     /// Derive matchers for `key` and the placeholder they are replaced with.
     pub fn new(label: &str, key: &[u8]) -> Result<Self, ScrubError> {
         Ok(Self {
+            key: Zeroizing::new(key.to_vec()),
             patterns: KeyPatterns::derive(key)?,
             replacement: placeholder_for(label),
         })
@@ -240,8 +258,8 @@ impl MatcherSet {
         &self.replacement
     }
 
-    /// The patterns, longest first.
-    pub fn patterns(&self) -> impl Iterator<Item = (&[u8], bool)> {
+    /// The literal spellings, longest first.
+    pub fn patterns(&self) -> impl Iterator<Item = &[u8]> {
         self.patterns.patterns()
     }
 
@@ -249,11 +267,260 @@ impl MatcherSet {
     pub fn longest(&self) -> usize {
         self.patterns.longest()
     }
+
+    /// The key length a decoded family must reproduce.
+    pub fn key_len(&self) -> usize {
+        self.patterns.key_len()
+    }
+
+    /// The key bytes, for the decoded comparisons.
+    fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    /// Test hook: the edits this matcher finds in `window`.
+    /// Every match of the key in `window`, as `(start, end, replacement)`.
+    ///
+    /// Matches never overlap each other, and the replacement text is not part
+    /// of the window, so the caller can apply the edits to a copy of the
+    /// original bytes without ever rescanning generated text.
+    fn find_edits(&self, window: &[u8]) -> Vec<(usize, usize, Vec<u8>)> {
+        let mut edits = Vec::new();
+        let mut index = 0;
+        while index < window.len() {
+            // A repeated byte (the self-overlapping case) is the worst thing
+            // this matcher sees: literal spellings are checked first, then each
+            // decoded family in turn.
+            match self.try_match_at(window, index) {
+                Some((end, _family)) => {
+                    edits.push((index, end, self.replacement.clone()));
+                    index = end;
+                }
+                None => index += 1,
+            }
+        }
+        edits
+    }
+
+    /// The end of a key representation starting at `index`, if one starts
+    /// there.
+    fn try_match_at(&self, window: &[u8], index: usize) -> Option<(usize, Family)> {
+        let key = self.key();
+        // Literal spellings first: they are exact and cheapest.
+        for pattern in self.patterns() {
+            if window.len() >= index + pattern.len()
+                && &window[index..index + pattern.len()] == pattern
+            {
+                return Some((index + pattern.len(), Family::Raw));
+            }
+        }
+        // Then the decoded families, each of which may be longer than the key
+        // or the same length.
+        if let Some(end) = match_percent(window, index, key) {
+            return Some((end, Family::Percent));
+        }
+        if let Some(end) = match_form(window, index, key) {
+            return Some((end, Family::Form));
+        }
+        if let Some(end) = match_json(window, index, key) {
+            return Some((end, Family::Json));
+        }
+        if let Some(end) = match_hex(window, index, key) {
+            return Some((end, Family::Hex));
+        }
+        if let Some(end) = match_base64(window, index, key) {
+            return Some((end, Family::Base64));
+        }
+        None
+    }
 }
 
-/// Number of trailing bytes a streaming scrubber must keep to catch a match
-/// split across reads: strictly less than the longest pattern, because a full
-/// length that did not match can never begin a later match.
+/// A `%XX` run at `index` that decodes to the key, with either hex case and any
+/// selection of escapes.
+fn match_percent(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
+    let mut cursor = index;
+    let mut decoded = Zeroizing::new(Vec::new());
+    while cursor < window.len() && decoded.len() < key.len() {
+        let byte = window[cursor];
+        if byte == b'%' {
+            let (value, len) = decode_percent(window, cursor)?;
+            decoded.push(value);
+            cursor += len;
+        } else {
+            decoded.push(byte);
+            cursor += 1;
+        }
+    }
+
+    // The holdback keeps the window's last byte beyond any match that ends in
+    // the released part, so a match that ends at the very end of the window is
+    // still complete here; it is simply re-checked on the next call.
+    if decoded.as_slice() == key {
+        return Some(cursor);
+    }
+    None
+}
+
+/// A form-encoded run: like percent, but `+` decodes to a space when the key
+/// itself contains a space.
+fn match_form(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
+    if !key.contains(&b' ') {
+        return None;
+    }
+    let mut cursor = index;
+    let mut decoded = Zeroizing::new(Vec::new());
+    while cursor < window.len() && decoded.len() < key.len() {
+        let byte = window[cursor];
+        if byte == b'%' {
+            let (value, len) = decode_percent(window, cursor)?;
+            decoded.push(value);
+            cursor += len;
+        } else if byte == b'+' {
+            decoded.push(b' ');
+            cursor += 1;
+        } else {
+            decoded.push(byte);
+            cursor += 1;
+        }
+    }
+    (decoded.as_slice() == key).then_some(cursor)
+}
+
+/// A JSON string body starting at `index` that unescapes to the key.
+fn match_json(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
+    let mut cursor = index;
+    let mut decoded = Zeroizing::new(Vec::new());
+    while cursor < window.len() && decoded.len() < key.len() {
+        let byte = window[cursor];
+        if byte == b'\\' {
+            let (value, len) = decode_json_escape(window, cursor)?;
+            decoded.extend_from_slice(&value);
+            cursor += len;
+        } else {
+            decoded.push(byte);
+            cursor += 1;
+        }
+    }
+    (decoded.as_slice() == key).then_some(cursor)
+}
+
+/// A hex run at `index` in any case that decodes to the key.
+fn match_hex(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
+    let needed = key.len() * 2;
+    let end = index.checked_add(needed)?;
+    let run = window.get(index..end)?;
+    let mut decoded = Zeroizing::new(Vec::with_capacity(key.len()));
+    for pair in run.chunks(2) {
+        let high = crate::placeholder::hex_value(pair[0])?;
+        let low = crate::placeholder::hex_value(pair[1])?;
+        decoded.push((high << 4) | low);
+    }
+    (decoded.as_slice() == key).then_some(end)
+}
+
+/// A base64 run at `index`, in either alphabet, padded or not, that decodes to
+/// a string containing the key.
+///
+/// The run is extended while it stays inside the alphabet, so the match covers
+/// the whole encoded token that overlaps the key rather than only its aligned
+/// middle. Bytes outside the key are replaced with it as well: leaving them
+/// would let a reader decode the edge key bytes from the surviving groups.
+fn match_base64(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
+    let mut end = index;
+    while end < window.len() && is_base64_byte(window[end]) {
+        end += 1;
+    }
+    if end == index {
+        return None;
+    }
+    let run = &window[index..end];
+    // A token with a single trailing character decodes to complete groups only
+    // once that character is padding; try it with and without.
+    for trim in 0..=1.min(run.len().saturating_sub(1)) {
+        let run = &run[..run.len() - trim];
+        if base64_matches(run, key) {
+            return Some(end);
+        }
+    }
+    None
+}
+
+fn base64_matches(run: &[u8], key: &[u8]) -> bool {
+    for alphabet in [BASE64_STANDARD, BASE64_URL_SAFE] {
+        let Some(decoded) = base64_decode(run, alphabet) else {
+            continue;
+        };
+        if decoded.windows(key.len()).any(|candidate| candidate == key) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_base64_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'-' | b'_' | b'=')
+}
+
+fn base64_decode(input: &[u8], alphabet: &[u8; 64]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4 + 3);
+    let mut buffer = 0u32;
+    let mut bits = 0u32;
+    for byte in input {
+        if *byte == b'=' {
+            continue;
+        }
+        let value = alphabet.iter().position(|candidate| candidate == byte)? as u32;
+        buffer = (buffer << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+fn decode_percent(window: &[u8], index: usize) -> Option<(u8, usize)> {
+    let high = window
+        .get(index + 1)
+        .copied()
+        .and_then(crate::placeholder::hex_value);
+    let low = window
+        .get(index + 2)
+        .copied()
+        .and_then(crate::placeholder::hex_value);
+    match (high, low) {
+        (Some(high), Some(low)) => Some(((high << 4) | low, 3)),
+        _ => None,
+    }
+}
+
+fn decode_json_escape(window: &[u8], index: usize) -> Option<(Vec<u8>, usize)> {
+    match *window.get(index + 1)? {
+        b'"' => Some((vec![b'"'], 2)),
+        b'\\' => Some((vec![b'\\'], 2)),
+        b'/' => Some((vec![b'/'], 2)),
+        b'b' => Some((vec![0x08], 2)),
+        b'f' => Some((vec![0x0c], 2)),
+        b'n' => Some((vec![b'\n'], 2)),
+        b'r' => Some((vec![b'\r'], 2)),
+        b't' => Some((vec![b'\t'], 2)),
+        b'u' => {
+            let hex = std::str::from_utf8(window.get(index + 2..index + 6)?).ok()?;
+            let code = u32::from_str_radix(hex, 16).ok()?;
+            Some((char::from_u32(code)?.to_string().into_bytes(), 6))
+        }
+        _ => None,
+    }
+}
+
+/// How many bytes a scrubber withholds from the caller: one less than the
+/// longest pattern.
+///
+/// The holdback is a constant for the stream and does not depend on the
+/// content, which is what keeps the release pattern from revealing whether a
+/// chunk continued the secret. It never splits a complete match, because
+/// matching runs on the whole buffered window before anything is released.
 pub fn overlap_for(longest_pattern: usize) -> usize {
     longest_pattern.saturating_sub(1)
 }
@@ -261,13 +528,24 @@ pub fn overlap_for(longest_pattern: usize) -> usize {
 /// A streaming scrubber state (S2).
 ///
 /// Feed arbitrary chunks in order; each call returns bytes that are safe to
-/// forward immediately. The retained tail is at most `longest - 1` bytes, and
-/// [`Scrubber::finish`] releases it once the stream ends.
+/// forward immediately. The caller must not observe how many bytes each call
+/// returns: output is released in fixed-size steps, so the step at which a byte
+/// appears says nothing about the secret. [`Scrubber::finish`] releases what is
+/// left once the stream ends.
 pub struct Scrubber {
     matchers: Vec<MatcherSet>,
     /// Bytes held back across calls.
     pending: Zeroizing<Vec<u8>>,
     longest: usize,
+}
+
+impl std::fmt::Debug for Scrubber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Scrubber")
+            .field("matchers", &self.matchers)
+            .field("longest", &self.longest)
+            .finish()
+    }
 }
 
 impl Scrubber {
@@ -281,14 +559,15 @@ impl Scrubber {
         }
     }
 
-    /// The larger window needed by a newly installed matcher, so the caller
-    /// can re-check already held bytes after a rotation (V4).
+    /// Install a matcher that became known mid-stream (a rotated key). Bytes
+    /// already released cannot be rechecked, so the caller installs matchers
+    /// before forwarding the response they must cover.
     pub fn install(&mut self, matcher: MatcherSet) {
         self.longest = self.longest.max(matcher.longest());
         self.matchers.push(matcher);
     }
 
-    /// Overlap window in bytes.
+    /// Holdback window in bytes.
     pub fn overlap(&self) -> usize {
         overlap_for(self.longest)
     }
@@ -303,7 +582,17 @@ impl Scrubber {
         self.matchers.len()
     }
 
+    /// Bytes currently held back from the caller.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
     /// Scrub `chunk`, returning bytes safe to forward now.
+    ///
+    /// The number of bytes returned in one call says nothing about the secret:
+    /// a fixed `overlap()` bytes of the input are held back, independent of
+    /// what the response contains. A caller that needs the whole response
+    /// scrubbed must call [`Scrubber::finish`] at the end of the stream.
     pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
         if self.matchers.is_empty() {
             return chunk.to_vec();
@@ -321,121 +610,101 @@ impl Scrubber {
         if self.matchers.is_empty() {
             return tail;
         }
-        // End of stream: the held tail can no longer complete a match, so it
-        // is released whole instead of being held back again.
+        // End of stream: nothing can complete a match any more, so whatever is
+        // left is scrubbed once and released.
         self.scrub_all(&tail)
     }
 
-    /// Run the whole buffer through every matcher, then hold back the longest
-    /// possible partial match suffix.
-    fn scrub_buffer(&self, buffer: &[u8]) -> (Vec<u8>, Vec<u8>) {
-        let hold = self.partial_suffix_len(buffer);
-        let split = buffer.len() - hold;
-        let (out, tail) = buffer.split_at(split);
-        // Only the released part is scrubbed: holding the tail verbatim and
-        // scrubbing it again on the next call is what catches a match that
-        // spans the split.
-        (self.scrub_all(out), tail.to_vec())
+    /// Run every matcher once over the window.
+    ///
+    /// A matcher sees only the bytes `buffer` holds, never the text another
+    /// matcher wrote: the output is built from the input side while the
+    /// inserted replacements are copied through untouched.
+    /// Every replacement the installed matchers make in `buffer`, sorted and
+    /// free of overlaps.
+    ///
+    /// Each matcher sees only `buffer`, never another matcher's generated text,
+    /// so generated placeholders can never be rewritten in the same pass.
+    fn find_edits(&self, buffer: &[u8]) -> Vec<(usize, usize, Vec<u8>)> {
+        let mut edits: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+        for matcher in &self.matchers {
+            for edit in matcher.find_edits(buffer) {
+                let overlaps = edits
+                    .iter()
+                    .any(|(start, end, _)| edit.0 < *end && *start < edit.1);
+                if !overlaps {
+                    edits.push(edit);
+                }
+            }
+        }
+        edits.sort_by_key(|(start, end, _)| (*start, *end));
+        edits
+    }
+
+    /// Rewrite `buffer` with `edits`.
+    fn apply_edits(buffer: &[u8], edits: &[(usize, usize, Vec<u8>)]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(buffer.len());
+        let mut cursor = 0;
+        for (start, end, replacement) in edits {
+            out.extend_from_slice(&buffer[cursor..*start]);
+            out.extend_from_slice(replacement);
+            cursor = *end;
+        }
+        out.extend_from_slice(&buffer[cursor..]);
+        out
     }
 
     fn scrub_all(&self, buffer: &[u8]) -> Vec<u8> {
-        let mut current = buffer.to_vec();
-        loop {
-            let mut changed = false;
-            for matcher in &self.matchers {
-                let (next, hit) = replace_patterns(&current, matcher);
-                if hit {
-                    current = next;
-                    changed = true;
-                }
+        let edits = self.find_edits(buffer);
+        Self::apply_edits(buffer, &edits)
+    }
+
+    /// Scrub the window, then release what may leave.
+    ///
+    /// Release is split on the **input** window, never on the rewritten text.
+    /// Everything the scrubber matches that starts inside `buffer[..split]`
+    /// ends at or before `split`, because no pattern is longer than the overlap
+    /// plus one candidate byte. The replacement for such a match may be longer
+    /// than the bytes it stands for, so it is released whole with the head and
+    /// never held back: holding generated text would emit it again later.
+    /// Matches that start after `split` stay in the window and are matched
+    /// again once more bytes arrive. The holdback is a fixed length that does
+    /// not depend on what the window contains.
+    /// Scrub the window, then release what may leave.
+    ///
+    /// Release is decided on the **input** window and the rewritten text is cut
+    /// at the same offsets: the scrubber works out which input ranges it
+    /// replaced, releases the input up to the holdback, and writes every
+    /// replacement for a range that ends inside that part. Holding back the
+    /// bytes a replacement would occupy would emit generated text twice; cutting
+    /// the rewritten text at an input offset would split an escape.
+    fn scrub_buffer(&self, buffer: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let hold = overlap_for(self.longest).min(buffer.len());
+        let split = buffer.len() - hold;
+        let edits = self.find_edits(buffer);
+        let mut out = Vec::with_capacity(buffer.len());
+        let mut cursor = 0;
+        for (start, end, replacement) in &edits {
+            if *start >= split {
+                break;
             }
-            if !changed {
-                return current;
-            }
+            // A replacement that starts in the released part is written in
+            // full, even when it runs past the split; the bytes it covers are
+            // consumed in the input, so nothing of it is left to re-emit.
+            out.extend_from_slice(&buffer[cursor..*start]);
+            out.extend_from_slice(replacement);
+            cursor = (*end).min(buffer.len());
         }
-    }
-
-    /// Length of the longest suffix that is a proper prefix of some pattern.
-    fn partial_suffix_len(&self, buffer: &[u8]) -> usize {
-        if self.longest <= 1 {
-            return 0;
+        // Input up to the split is released; the rest is held back for the next
+        // call and matched again with more bytes behind it.
+        if cursor < split {
+            out.extend_from_slice(&buffer[cursor..split]);
         }
-        let max = self.longest.min(buffer.len() + 1);
-        for length in (1..max).rev() {
-            let start = buffer.len() - length;
-            let tail = &buffer[start..];
-            for matcher in &self.matchers {
-                for (pattern, insensitive) in matcher.patterns() {
-                    if length < pattern.len() && eq_prefix(tail, &pattern[..length], insensitive) {
-                        return length;
-                    }
-                }
-            }
-        }
-        0
-    }
-}
-
-fn eq_prefix(candidate: &[u8], pattern: &[u8], insensitive: bool) -> bool {
-    candidate.len() == pattern.len()
-        && candidate
-            .iter()
-            .zip(pattern)
-            .all(|(left, right)| byte_eq(*left, *right, insensitive))
-}
-
-fn byte_eq(left: u8, right: u8, insensitive: bool) -> bool {
-    if left == right {
-        return true;
-    }
-    if !insensitive {
-        return false;
-    }
-    left.eq_ignore_ascii_case(&right)
-}
-
-/// Replace every pattern occurrence in `input` (longest first).
-fn replace_patterns(input: &[u8], matcher: &MatcherSet) -> (Vec<u8>, bool) {
-    let mut current = input.to_vec();
-    let mut hit = false;
-    for (pattern, insensitive) in matcher.patterns() {
-        let mut out = Vec::with_capacity(current.len());
-        let mut index = 0;
-        let mut local_hit = false;
-        while index < current.len() {
-            if let Some(end) = match_at(&current, index, pattern, insensitive) {
-                out.extend_from_slice(&matcher.replacement);
-                index = end;
-                local_hit = true;
-            } else {
-                out.push(current[index]);
-                index += 1;
-            }
-        }
-        if local_hit {
-            current = out;
-            hit = true;
-        }
-    }
-    (current, hit)
-}
-
-/// End offset of a pattern occurrence starting at `start`, if any.
-fn match_at(haystack: &[u8], start: usize, pattern: &[u8], insensitive: bool) -> Option<usize> {
-    let total = start + pattern.len();
-    if total > haystack.len() {
-        return None;
-    }
-    let window = &haystack[start..total];
-    let end = total;
-    let matched = window
-        .iter()
-        .zip(pattern)
-        .all(|(left, right)| byte_eq(*left, *right, insensitive));
-    if matched {
-        Some(end)
-    } else {
-        None
+        // A replacement that ran past the split consumed those bytes already,
+        // so the held tail starts no earlier than the end of the split.
+        let tail_start = split.max(cursor);
+        let tail = buffer[tail_start..].to_vec();
+        (out, tail)
     }
 }
 
