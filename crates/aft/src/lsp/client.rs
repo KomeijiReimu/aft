@@ -417,7 +417,68 @@ pub enum ServerState {
     Exited,
 }
 
-/// Events sent from background reader threads into the main loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ServerInstanceId(u64);
+
+impl ServerInstanceId {
+    pub(crate) fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(
+            NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .expect("LSP server instance ids exhausted"),
+        )
+    }
+}
+
+/// A manager receipt identifies the server instance whose reader produced the
+/// event. Managed readers always stamp it before enqueueing; startup deferral,
+/// replay and runtime dispatch must preserve it so a retired reader cannot
+/// mutate or signal for a replacement. Only manager-local observations and
+/// synthetic test events may omit the instance; public standalone events keep
+/// their payload shape and never enter the manager's channel directly.
+#[derive(Debug, Clone)]
+pub(crate) struct ReceivedLspEvent {
+    pub(crate) event: LspEvent,
+    pub(crate) instance: Option<ServerInstanceId>,
+}
+
+impl From<LspEvent> for ReceivedLspEvent {
+    fn from(event: LspEvent) -> Self {
+        Self {
+            event,
+            instance: None,
+        }
+    }
+}
+
+pub(crate) enum LspEventSender {
+    Standalone(Sender<LspEvent>),
+    Managed {
+        sender: Sender<ReceivedLspEvent>,
+        instance: ServerInstanceId,
+    },
+}
+
+impl LspEventSender {
+    fn send(&self, event: LspEvent) -> Result<(), ()> {
+        match self {
+            Self::Standalone(sender) => sender.send(event).map_err(|_| ()),
+            Self::Managed { sender, instance } => {
+                #[cfg(all(test, unix))]
+                super::manager::instance_regression_tests::pause_reader(*instance);
+                sender
+                    .send(ReceivedLspEvent {
+                        event,
+                        instance: Some(*instance),
+                    })
+                    .map_err(|_| ())
+            }
+        }
+    }
+}
+
+/// Events sent from background reader threads into the main loop. Manager-owned
+/// readers send these payloads inside a private instance-stamped receipt.
 #[derive(Debug, Clone)]
 pub enum LspEvent {
     /// A manager-owned document pull completed; the epoch prevents a later
@@ -898,6 +959,7 @@ impl WorkDoneAnalysis {
 
 /// A client connected to one language server process.
 pub struct LspClient {
+    pub(crate) instance: ServerInstanceId,
     analysis_progress: WorkDoneAnalysis,
     pub(crate) runtime_note: Option<String>,
     pub(crate) rust_cargo_disabled_for_worker: bool,
@@ -1035,7 +1097,7 @@ impl LspClient {
             binary,
             args,
             env,
-            event_tx,
+            LspEventSender::Standalone(event_tx),
             child_registry,
             None,
             false,
@@ -1049,7 +1111,7 @@ impl LspClient {
         binary: &Path,
         args: &[String],
         env: &HashMap<String, String>,
-        event_tx: Sender<LspEvent>,
+        event_tx: LspEventSender,
         child_registry: LspChildRegistry,
         reclaim_root: Option<&Path>,
         worker_policy: bool,
@@ -1074,12 +1136,16 @@ impl LspClient {
         binary: &Path,
         args: &[String],
         env: &HashMap<String, String>,
-        event_tx: Sender<LspEvent>,
+        event_tx: LspEventSender,
         child_registry: LspChildRegistry,
         reclaim_root: Option<&Path>,
         worker_policy: bool,
         capacity: &Arc<RustAnalyzerCapacity>,
     ) -> io::Result<Self> {
+        let instance = match &event_tx {
+            LspEventSender::Standalone(_) => ServerInstanceId::next(),
+            LspEventSender::Managed { instance, .. } => *instance,
+        };
         let worker_policy = kind == ServerKind::Rust && worker_policy;
         let rust_analyzer_permit = worker_policy.then(|| capacity.acquire()).transpose()?;
         #[cfg(windows)]
@@ -1329,6 +1395,7 @@ impl LspClient {
         let rust_analyzer_quiescent = !matches!(&kind, ServerKind::Rust);
         child_registry.mark_client_live(child_pid);
         Ok(Self {
+            instance,
             _rust_analyzer_permit: rust_analyzer_permit,
             rust_cargo_disabled_for_worker: worker_policy,
             runtime_note: None,
