@@ -622,7 +622,7 @@ async fn production_foreground_forwards_while_reconnected_background_is_guarded(
     let mut routes = scopes_for("unconfirmed-post", Some(stamp.clone()));
     routes.speech = Some(service);
     let transport = FakeTransport::scoped();
-    assert!(crate::gh_shim_speech::partner::require_plex_guards(false).is_err());
+    assert!(crate::gh_shim_speech::partner::require_reserved_send().is_err());
     let answer = relay(
         &transport,
         RelayCall {

@@ -999,7 +999,7 @@ impl Service {
 }
 
 impl Service {
-    pub(crate) fn require_plex_guards(&self, codemode: bool) -> Result<(), Refusal> {
+    pub(crate) fn require_posting_guards(&self, codemode: bool) -> Result<(), Refusal> {
         #[cfg(test)]
         if let Some(partners) = self.test_partners() {
             return if partners.expect_placed.is_some()
@@ -1014,7 +1014,8 @@ impl Service {
                 ))
             };
         }
-        super::partner::require_plex_guards(codemode)
+        super::partner::require_plex_guards(codemode)?;
+        super::partner::require_reserved_send()
     }
 
     #[cfg(test)]

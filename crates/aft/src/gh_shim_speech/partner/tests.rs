@@ -96,12 +96,15 @@ fn run_scope_is_not_in_the_nonce_fingerprint_but_expect_is() {
 }
 
 #[test]
-fn unconfirmed_plex_placement_cannot_authorize_classic_or_codemode_forwarding() {
+fn placed_plex_guards_do_not_override_the_unpublished_reserved_send_seam() {
     for codemode in [false, true] {
-        let err = require_plex_guards(codemode).unwrap_err();
+        require_plex_guards(codemode).unwrap();
+        let err = require_reserved_send().unwrap_err();
         assert_eq!(err.code, Code::AuthorityUnavailable);
         assert_eq!(err.reason, "guard_unsupported");
     }
+    assert_eq!(PLEX_EXPECT_PLACED_COMMIT, Some("ee7e5acf2b0b"));
+    assert_eq!(PLEX_RUN_SCOPE_PLACED_COMMIT, Some("ee7e5acf2b0b"));
     assert_eq!(SUBC_RESERVATION_LAST_CHECKED, "0.32.3");
 }
 

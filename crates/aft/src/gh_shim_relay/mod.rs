@@ -929,7 +929,7 @@ async fn post_captured(
             "serving_lock_unavailable",
         ));
     }
-    service.require_plex_guards(launch.run.is_some())?;
+    service.require_posting_guards(launch.run.is_some())?;
     let ticket = params
         .get("ticket")
         .and_then(Value::as_str)

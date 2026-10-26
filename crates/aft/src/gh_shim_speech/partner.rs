@@ -1,4 +1,4 @@
-//! Partner wire contracts; unplaced guards and unpublished queue APIs fail closed.
+//! Partner wire contracts; unpublished queue APIs remain fail closed.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -11,20 +11,26 @@ use super::model::Binding;
 use super::{Code, Refusal, ScopeRole};
 
 // Placement is a release decision, never a command argument or inherited env flag.
-const PLEX_EXPECT_PLACED_COMMIT: Option<&str> = None;
-const PLEX_RUN_SCOPE_PLACED_COMMIT: Option<&str> = None;
-pub(crate) const PLEX_REVIEWED_NOT_PLACED: &str = "ee7e5ac";
+const PLEX_EXPECT_PLACED_COMMIT: Option<&str> = Some("ee7e5acf2b0b");
+const PLEX_RUN_SCOPE_PLACED_COMMIT: Option<&str> = Some("ee7e5acf2b0b");
 pub(crate) const SUBC_RESERVATION_LAST_CHECKED: &str = "0.32.3";
 
 pub(crate) fn require_plex_guards(codemode: bool) -> Result<(), Refusal> {
     if PLEX_EXPECT_PLACED_COMMIT.is_none() || (codemode && PLEX_RUN_SCOPE_PLACED_COMMIT.is_none()) {
-        log::debug!("PLEX atomic guard placement not confirmed (external Plexus commit {PLEX_REVIEWED_NOT_PLACED})");
+        log::debug!("PLEX atomic guard placement not confirmed");
         return Err(Refusal::new(
             Code::AuthorityUnavailable,
             "guard_unsupported",
         ));
     }
     Ok(())
+}
+
+pub(crate) fn require_reserved_send() -> Result<(), Refusal> {
+    Err(Refusal::new(
+        Code::AuthorityUnavailable,
+        "guard_unsupported",
+    ))
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
