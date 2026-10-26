@@ -6089,22 +6089,20 @@ mod grant_path_tests {
         use crate::exec_remote::wire_tests::Script;
         let (daemon, _dir, root, executor, ctx) =
             capture_fixture(Script::GatedAcceptanceThenExit).await;
-        let timing = BashTimingForTest::new(Instant::now());
+        let received_at = Instant::now();
+        let timing = BashTimingForTest::new(received_at);
         let mut rx = with_bash_timing_for_test(Some(timing.clone()), || {
             deadline_test_call_received(
                 &executor,
                 &root,
                 remote_runon_stub,
                 json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":600_000}),
-                Instant::now(),
+                received_at,
             )
         });
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            timing.capture_registered.notified(),
-        )
-        .await
-        .expect("task registration must publish its detach target");
+        tokio::time::timeout(Duration::from_secs(5), timing.capture_registered.notified())
+            .await
+            .expect("task registration must publish its detach target");
         let registered_at = Instant::now();
         let early = tokio::time::timeout(Duration::from_millis(900), rx.recv()).await;
         if early.is_err() {
@@ -6114,6 +6112,10 @@ mod grant_path_tests {
         }
         let done = early.unwrap().unwrap();
         assert!(registered_at.elapsed() < Duration::from_secs(1));
+        assert!(
+            received_at.elapsed() < Duration::from_secs(5),
+            "background runon must not wait for the 15-second foreground window"
+        );
         let response = done.response_for_test();
         let text = done.text_for_test().unwrap();
         let task_id = response.data["task_id"].as_str().unwrap().to_owned();
