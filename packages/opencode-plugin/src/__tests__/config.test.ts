@@ -564,6 +564,12 @@ describe("loadAftConfig", () => {
     const env = { HOME: join(fixture.root, "home"), XDG_CONFIG_HOME: fixture.xdgConfigHome };
     const github = () => JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout).github;
 
+    for (const enabled of [true, false]) {
+      writeFileSync(fixture.userConfigPath, JSON.stringify({ gh_read: { enabled } }));
+      expect(github()).toMatchObject({ read: enabled });
+      writeFileSync(fixture.userConfigPath, JSON.stringify({ gh_shim: { enabled } }));
+      expect(github()).toMatchObject({ shim: enabled });
+    }
     writeFileSync(
       fixture.userConfigPath,
       JSON.stringify({ github: { read: false }, gh_read: { enabled: true } }),

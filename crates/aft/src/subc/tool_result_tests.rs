@@ -1393,12 +1393,19 @@ fn tool_result_fixtures_release_descriptors() {
             tool_result_real_reply_validation_report,
         ),
     ];
+    // Measure every fixture after warming its caches. Nightly stress adds
+    // repetitions to expose intermittent or accumulating descriptor leaks.
+    let rounds = if std::env::var("AFT_STRESS").as_deref() == Ok("1") {
+        20
+    } else {
+        2
+    };
     let mut leaks = Vec::new();
     for (name, fixture) in cases {
         fixture(); // Initialize legitimate process-wide caches before measuring.
         let initial = fixture_descriptor_targets();
         let before: usize = initial.values().sum();
-        for round in 0..20 {
+        for round in 0..rounds {
             let prior: usize = fixture_descriptor_targets().values().sum();
             fixture();
             let current: usize = fixture_descriptor_targets().values().sum();
@@ -1420,7 +1427,7 @@ fn tool_result_fixtures_release_descriptors() {
     }
     assert!(
         leaks.is_empty(),
-        "fixtures retained descriptors after twenty runs: {leaks:#?}"
+        "fixtures retained descriptors after {rounds} runs: {leaks:#?}"
     );
 }
 

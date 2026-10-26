@@ -278,12 +278,18 @@ describe("GitHub release lookups", () => {
           controller.abort();
           return new Response("failure", { status: 500 });
         }) as typeof fetch;
-        await installerFixture(versionChecks)._resolveTargetTagForTesting(
+        const result = await installerFixture(versionChecks)._resolveTargetTagForTesting(
           clangd,
           config,
           fakeFetch,
           controller.signal,
         );
+        expect(result).toEqual({
+          tag: null,
+          assets: [],
+          blockedByGrace: false,
+          reason: "github releases probe failed",
+        });
         const observed = signals.get(branch === "cached" ? "tag" : "list");
         expect(observed).toBeInstanceOf(AbortSignal);
         expect(observed?.aborted).toBe(true);

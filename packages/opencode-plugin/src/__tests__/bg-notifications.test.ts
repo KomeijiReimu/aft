@@ -2458,6 +2458,13 @@ describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
     await sleep(50);
 
     expect(promptAsync).toHaveBeenCalledTimes(2);
+    const firstIdentity = (promptAsync.mock.calls[0][0] as { body: { messageID?: string } }).body
+      .messageID;
+    const retryIdentity = (promptAsync.mock.calls[1][0] as { body: { messageID?: string } }).body
+      .messageID;
+    expect(firstIdentity).toEqual(expect.any(String));
+    expect(firstIdentity).not.toBe("");
+    expect(retryIdentity).toBe(firstIdentity);
     expect(
       (promptAsync.mock.calls[0][0] as { body: { model?: unknown } }).body.model,
     ).toBeDefined();

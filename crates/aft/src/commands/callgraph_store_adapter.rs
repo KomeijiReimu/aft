@@ -3148,6 +3148,7 @@ mod trace_to_tests {
         frontier_query_count: RefCell<usize>,
         caller_count_queries: RefCell<usize>,
         caller_count_targets: RefCell<usize>,
+        caller_count_identities: RefCell<Vec<(String, String)>>,
         node_lookups: RefCell<usize>,
         stored_hashes: HashMap<String, String>,
     }
@@ -3167,6 +3168,7 @@ mod trace_to_tests {
                 frontier_query_count: RefCell::new(0),
                 caller_count_queries: RefCell::new(0),
                 caller_count_targets: RefCell::new(0),
+                caller_count_identities: RefCell::new(Vec::new()),
                 node_lookups: RefCell::new(0),
                 stored_hashes: HashMap::new(),
             }
@@ -3253,6 +3255,7 @@ mod trace_to_tests {
             *self.caller_frontier_target_count.borrow_mut() = 0;
             *self.caller_count_queries.borrow_mut() = 0;
             *self.caller_count_targets.borrow_mut() = 0;
+            self.caller_count_identities.borrow_mut().clear();
         }
     }
 
@@ -3350,6 +3353,9 @@ mod trace_to_tests {
         ) -> CallGraphResult<HashMap<(String, String), usize>> {
             *self.caller_count_queries.borrow_mut() += 1;
             *self.caller_count_targets.borrow_mut() = targets.len();
+            self.caller_count_identities
+                .borrow_mut()
+                .extend_from_slice(targets);
             Ok(targets
                 .iter()
                 .cloned()
@@ -3856,6 +3862,25 @@ mod trace_to_tests {
                             "{op}: width={width}, depth={depth}, include_tests={include_tests}"
                         );
                         assert_eq!(store.caller_count_target_count(), width);
+                        let identities = store.caller_count_identities.borrow();
+                        let actual: BTreeSet<_> = identities.iter().cloned().collect();
+                        let expected: BTreeSet<_> = (0..width)
+                            .map(|index| {
+                                (
+                                    format!("layer_{depth}_{index}.ts"),
+                                    format!("layer_{depth}_{index}"),
+                                )
+                            })
+                            .collect();
+                        assert_eq!(
+                            actual, expected,
+                            "{op}: boundary identities at depth {depth}"
+                        );
+                        assert_eq!(
+                            identities.len(),
+                            actual.len(),
+                            "{op}: duplicate boundary identity"
+                        );
                         println!(
                             "{op}: width={width}, depth={depth}, include_tests={include_tests}: boundary_calls=1 boundary_targets={width} frontier_calls={depth} omitted={truncated}"
                         );
