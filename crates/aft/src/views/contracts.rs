@@ -240,10 +240,13 @@ pub trait PlaneAdapter: Send + Sync {
 
     /// Called only after durable pointer publication for this generation succeeded.
     /// Opening draft readers must not drop live protection for unpublished fills.
+    /// `current` returns installed disk facts without I/O or building; sample it
+    /// after capturing a fill-state version so a concurrent completion is not lost.
     fn generation_published(
         &self,
         _access: &ViewAccess,
         _generation: &Arc<ComposedGeneration>,
+        _current: &dyn Fn() -> Snapshot,
     ) -> Result<(), PlaneError> {
         Ok(())
     }

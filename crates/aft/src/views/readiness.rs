@@ -119,6 +119,13 @@ impl FillMap {
         self.keys.values()
     }
 
+    /// Use on a new binding's copy: older readers can still need retired fills.
+    pub(super) fn retain_current(&mut self, snapshot: &super::snapshot::Snapshot) {
+        self.keys.retain(|(path, content, _), _| {
+            matches!(snapshot.disk_state(path), DiskState::Present { content: current, .. } if current == *content)
+        });
+    }
+
     /// Drops fills the given manifest already records as `Ready`.
     pub fn trim_folded(&mut self, manifest: &ComposedGeneration) {
         self.keys.retain(|(path, content, plane), key| {

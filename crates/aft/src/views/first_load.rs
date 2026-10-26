@@ -2053,6 +2053,7 @@ impl FirstLoadDriver for CheckoutDriver {
         let readers = PlaneReaders::open(access, generation.clone(), &self.adapters)?;
         let mut published = false;
         let mut progress = PublicationProgress::NotAttempted;
+        let mut retired_readers = Vec::new();
         let mut commit = || {
             let _publication_guard = self
                 .publication_transition
@@ -2067,7 +2068,20 @@ impl FirstLoadDriver for CheckoutDriver {
                 .commit_v2_before_sweep(prepared, None, || store.current_generation_read_only().map(|_| ()))
                 .map_err(|error| SiblingLoader::error(error.to_string()))
                 .and_then(|outcome| match outcome {
-                    super::manifest_v2::PublishV2::Published => { progress = PublicationProgress::Published; unpublished.complete(); published = true; Ok(()) },
+                    super::manifest_v2::PublishV2::Published => {
+                        progress = PublicationProgress::Published;
+                        unpublished.complete();
+                        published = true;
+                        self.owner.registry().note_publish(self.owner.scope()).map_err(|error| SiblingLoader::error(error.to_string()))?;
+                        for adapter in &self.adapters {
+                            adapter.generation_published(access, &generation, &|| self.installed_snapshot())?;
+                        }
+                        let rebound = readers.rebind(access)?;
+                        let retired = self.prepared_readers.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(generation.name().to_owned(), PreparedReaders { seq: snapshot.install_cut().map_or(0, |cut| cut.seq), readers: rebound });
+                        if let Some(retired) = retired { retired_readers.push(retired.readers); }
+                        Ok(())
+                    },
                     outcome @ (super::manifest_v2::PublishV2::Conflict { .. } | super::manifest_v2::PublishV2::EquivalentWinner { .. }) => {
                         progress = PublicationProgress::NotAttempted;
                         self.retry.store(true, std::sync::atomic::Ordering::Release);
@@ -2085,6 +2099,7 @@ impl FirstLoadDriver for CheckoutDriver {
             None => commit(),
         };
         drop(commit);
+        drop(retired_readers);
         if let Err(error) = publication {
             if progress != PublicationProgress::NotAttempted {
                 unpublished.complete();
@@ -2096,36 +2111,7 @@ impl FirstLoadDriver for CheckoutDriver {
         if !published {
             return Err(SiblingLoader::error("publication fence did not commit"));
         }
-        let finish = (|| {
-            self.owner
-                .registry()
-                .note_publish(self.owner.scope())
-                .map_err(|error| SiblingLoader::error(error.to_string()))?;
-            for adapter in &self.adapters {
-                adapter.generation_published(access, &generation)?;
-            }
-            let readers = readers.rebind(access)?;
-            let retired = self
-                .prepared_readers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(
-                    generation.name().to_owned(),
-                    PreparedReaders {
-                        seq: snapshot.install_cut().map_or(0, |cut| cut.seq),
-                        readers,
-                    },
-                );
-            drop(retired);
-            Ok(generation)
-        })();
-        finish.map_err(|error: PlaneError| {
-            self.retry.store(true, std::sync::atomic::Ordering::Release);
-            SiblingLoader::error(format!(
-                "{CHECKOUT_CHANGED_BEFORE_INSTALL}: durable publication needs revalidation: {}",
-                error.reason
-            ))
-        })
+        Ok(generation)
     }
 }
 

@@ -499,10 +499,13 @@ type CacheKey = (String, [u8; 32], u64, bool);
 #[derive(Default)]
 struct ViewState {
     fill: FillMap,
+    // Ready fills can precede their first overlay; the arena's own reference
+    // alone is evictable, so each visible fill retains its immutable run.
+    fill_runs: BTreeMap<FamilyKey, Arc<crate::semantic_index::SemanticVectors>>,
     fill_version: u64,
     failed: BTreeMap<(RelPath, ContentHash), String>,
     tracker: FailureTracker,
-    live: Option<crate::pins::LivePin>,
+    live: Option<Arc<Mutex<crate::pins::LivePin>>>,
     active_fills: usize,
     cache: Option<(CacheKey, Arc<SemanticIndex>)>,
 }
@@ -642,6 +645,17 @@ impl SemanticPlane {
                 .entry((access.family().to_owned(), access.scope().to_owned()))
                 .or_default(),
         )
+    }
+
+    fn active_view(&self, access: &ViewAccess) -> (Arc<Mutex<ViewState>>, ActiveFill) {
+        // Publication cannot fork the current state between lookup and registration.
+        let mut views = lock(&self.views);
+        let view = views
+            .entry((access.family().to_owned(), access.scope().to_owned()))
+            .or_default()
+            .clone();
+        let active = ActiveFill::new(&view);
+        (view, active)
     }
 
     fn query_view(&self, access: &ViewAccess, snapshot: &Snapshot) -> Arc<Mutex<ViewState>> {
@@ -995,21 +1009,25 @@ impl SemanticPlane {
         let resident = self
             .pinned_resident(access.family(), access.scope(), snapshot)
             .ok_or_else(|| plane_error("semantic generation not resident"))?;
-        let view = self.view(&access);
+        let (view, _active_fill) = self.active_view(&access);
         let mut report = FillReport::default();
         // The view's state is locked only for short bookkeeping steps, never
         // across file reads, model calls or store writes, so queries and
         // publication of this checkout proceed while it fills.
-        let mut items = {
+        let needs_pin = lock(&view).live.is_none();
+        if needs_pin {
+            let pin = Arc::new(Mutex::new(
+                crate::pins::LivePin::create(owner)
+                    .map_err(|error| plane_error(error.to_string()))?,
+            ));
             let mut state = lock(&view);
             if state.live.is_none() {
-                state.live = Some(
-                    crate::pins::LivePin::create(owner)
-                        .map_err(|error| plane_error(error.to_string()))?,
-                );
+                state.live = Some(pin.clone());
             }
-            self.work_items(&state, &resident, snapshot, true)
-        };
+            drop(state);
+            drop(pin);
+        }
+        let mut items = self.work_items(&lock(&view), &resident, snapshot, true);
         report.queued = items.len();
         super::io::WORK
             .semantic_fills
@@ -1100,10 +1118,10 @@ impl SemanticPlane {
             else {
                 continue;
             };
-            if arena.get(&key).is_some() {
+            if let Some(run) = arena.get(&key) {
                 report.resident_hits += 1;
-                ready.push((item.clone(), key));
-            } else if arena
+                ready.push((item.clone(), key, run));
+            } else if let Some(run) = arena
                 .load(
                     &store.reader(),
                     &key,
@@ -1112,10 +1130,9 @@ impl SemanticPlane {
                     &self.producer,
                 )
                 .map_err(plane_error)?
-                .is_some()
             {
                 report.stored_hits += 1;
-                ready.push((item.clone(), key));
+                ready.push((item.clone(), key, run));
             } else if let Some(claim) = {
                 #[cfg(test)]
                 run_before_claim_for_test();
@@ -1124,10 +1141,10 @@ impl SemanticPlane {
                 // A previous owner can finish and release its claim between
                 // our store miss and acquiring this claim. Recheck under the
                 // claim or a completed key would be embedded a second time.
-                if arena.get(&key).is_some() {
+                if let Some(run) = arena.get(&key) {
                     report.resident_hits += 1;
-                    ready.push((item.clone(), key));
-                } else if arena
+                    ready.push((item.clone(), key, run));
+                } else if let Some(run) = arena
                     .load(
                         &store.reader(),
                         &key,
@@ -1136,10 +1153,9 @@ impl SemanticPlane {
                         &self.producer,
                     )
                     .map_err(plane_error)?
-                    .is_some()
                 {
                     report.stored_hits += 1;
-                    ready.push((item.clone(), key));
+                    ready.push((item.clone(), key, run));
                 } else {
                     claimed.push((item.clone(), relative.clone(), group, claim));
                 }
@@ -1208,7 +1224,7 @@ impl SemanticPlane {
         // the linear pin-write bound. Unattempted keys are harmless protection.
         let keys = ready
             .iter()
-            .map(|(_, key)| *key)
+            .map(|(_, key, _)| *key)
             .chain(to_embed.iter().map(|(_, _, _, claim)| *claim.key()))
             .chain(
                 chunks
@@ -1218,7 +1234,6 @@ impl SemanticPlane {
             )
             .collect::<Vec<_>>();
         let store_started = Instant::now();
-        let _active_fill = ActiveFill::new(&view);
         protect(&view, &keys)?;
         report.timing.store_write += store_started.elapsed();
         let mut pending = to_embed.into_iter().zip(chunks).peekable();
@@ -1357,9 +1372,9 @@ impl SemanticPlane {
                                     );
                                 }
                                 run.strip_embed_text();
-                                arena.install(key, run);
+                                let run = arena.install(key, run);
                                 report.embedded_keys += 1;
-                                ready.push((item, key));
+                                ready.push((item, key, run));
                             }
                             Ok(PutOrTouch::Quarantined) => report.failed += 1,
                             // Another process stored a payload under the
@@ -1371,7 +1386,7 @@ impl SemanticPlane {
                                 if let Some(hook) = lock(&self.after_conflict).take() {
                                     hook();
                                 }
-                                if arena
+                                if let Some(run) = arena
                                     .load(
                                         &store.reader(),
                                         &key,
@@ -1380,10 +1395,9 @@ impl SemanticPlane {
                                         &self.producer,
                                     )
                                     .map_err(plane_error)?
-                                    .is_some()
                                 {
                                     report.stored_hits += 1;
-                                    ready.push((item, key));
+                                    ready.push((item, key, run));
                                 } else {
                                     // The winning row can disappear before the
                                     // reload. Keep the work pending and visible
@@ -1448,8 +1462,9 @@ impl SemanticPlane {
             arena.wait_released(&key, budget.shared_wait);
             report.timing.shared_wait += wait_started.elapsed();
             let lookup_started = Instant::now();
-            if arena.get(&key).is_some()
-                || arena
+            let run = match arena.get(&key) {
+                Some(run) => Some(run),
+                None => arena
                     .load(
                         &store.reader(),
                         &key,
@@ -1457,11 +1472,11 @@ impl SemanticPlane {
                         &payload_producer,
                         &self.producer,
                     )
-                    .map_err(plane_error)?
-                    .is_some()
-            {
+                    .map_err(plane_error)?,
+            };
+            if let Some(run) = run {
                 report.shared_waits += 1;
-                ready.push((item, key));
+                ready.push((item, key, run));
             }
             report.timing.file_lookup += lookup_started.elapsed();
         }
@@ -1648,7 +1663,11 @@ fn chunk_store_error(error: crate::blob_store::v2::StoreError, report: &mut Fill
 fn admit_ready(
     view: &Mutex<ViewState>,
     store: &FamilyStore,
-    ready: Vec<(WorkItem, FamilyKey)>,
+    ready: Vec<(
+        WorkItem,
+        FamilyKey,
+        Arc<crate::semantic_index::SemanticVectors>,
+    )>,
     producer: &str,
     current: &dyn Fn() -> Snapshot,
     report: &mut FillReport,
@@ -1656,7 +1675,7 @@ fn admit_ready(
     if ready.is_empty() {
         return Ok(());
     }
-    let keys = ready.iter().map(|(_, key)| *key).collect::<Vec<_>>();
+    let keys = ready.iter().map(|(_, key, _)| *key).collect::<Vec<_>>();
     protect(view, &keys)?;
     // GC may have won before the live-pin write. Do not admit a missing row.
     let swept = store
@@ -1668,7 +1687,7 @@ fn admit_ready(
     let now = current();
     let mut state = lock(view);
     let installed_before = report.installed;
-    for (item, key) in ready {
+    for (item, key, run) in ready {
         if swept.contains(&key) {
             continue;
         }
@@ -1679,7 +1698,10 @@ fn admit_ready(
             live.as_ref(),
             Some(now.generation()),
         ) {
-            Admission::Installed => report.installed += 1,
+            Admission::Installed => {
+                state.fill_runs.insert(key, run);
+                report.installed += 1;
+            }
             Admission::DroppedContent | Admission::DroppedProducer => report.dropped += 1,
         }
     }
@@ -1691,12 +1713,14 @@ fn admit_ready(
 }
 
 fn protect(view: &Mutex<ViewState>, keys: &[FamilyKey]) -> Result<(), PlaneError> {
-    match lock(view).live.as_mut() {
-        Some(pin) => pin
-            .protect(keys)
-            .map_err(|error| plane_error(error.to_string())),
-        None => Err(plane_error("semantic fill has no live pin")),
-    }
+    let pin = lock(view)
+        .live
+        .clone()
+        .ok_or_else(|| plane_error("semantic fill has no live pin"))?;
+    let result = lock(&pin)
+        .protect(keys)
+        .map_err(|error| plane_error(error.to_string()));
+    result
 }
 
 #[cfg(test)]
@@ -2057,9 +2081,23 @@ impl SemanticPlane {
     pub fn unbind(&self, access: &ViewAccess) {
         let family = access.family().to_owned();
         let scope = access.scope().to_owned();
-        lock(&self.views).remove(&(family.clone(), scope.clone()));
-        lock(&self.residents).retain(|(f, s, _), _| *f != family || *s != scope);
-        for arena in lock(&self.arenas).values() {
+        let retired_view = lock(&self.views).remove(&(family.clone(), scope.clone()));
+        let mut retired_residents = Vec::new();
+        {
+            let mut residents = lock(&self.residents);
+            residents.retain(|(f, s, _), resident| {
+                if *f == family && *s == scope {
+                    retired_residents.push(resident.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        drop(retired_view);
+        drop(retired_residents);
+        let arenas = lock(&self.arenas).values().cloned().collect::<Vec<_>>();
+        for arena in arenas {
             arena.trim();
         }
     }
@@ -2119,45 +2157,88 @@ impl PlaneAdapter for SemanticPlane {
         &self,
         access: &ViewAccess,
         generation: &Arc<ComposedGeneration>,
+        current: &dyn Fn() -> Snapshot,
     ) -> Result<(), PlaneError> {
-        if let ViewAccess::Owner(_) = access {
-            let view = self.view(access);
+        let ViewAccess::Owner(owner) = access else {
+            return Ok(());
+        };
+        let view = self.view(access);
+        let (version, mut fill, mut runs, failed) = {
             let mut state = lock(&view);
-            let before = state.fill.len();
-            state.fill.trim_folded(generation);
-            if state.fill.len() != before {
-                state.fill_version += 1;
-            }
-            let keep = state
-                .fill
-                .keys()
-                .map(FamilyKey::to_hex)
-                .collect::<HashSet<_>>();
-            if keep.is_empty() && state.active_fills == 0 {
-                // Chunk-cache keys have no manifest edge. Once no fill needs
-                // this pin, release its files instead of rewriting an empty list.
-                state.live.take();
+            if state.active_fills != 0 {
                 return Ok(());
             }
-            if let Some(pin) = state.live.as_mut() {
-                let published = generation
-                    .ready_keys()
-                    .iter()
-                    .map(FamilyKey::to_hex)
-                    .collect();
-                pin.trim_published(&published, |key| keep.contains(key))
-                    .map_err(|error| plane_error(error.to_string()))?;
+            if state.fill.is_empty() {
+                let retired = state.live.take();
+                drop(state);
+                drop(retired);
+                return Ok(());
             }
+            (
+                state.fill_version,
+                state.fill.clone(),
+                state.fill_runs.clone(),
+                state.failed.clone(),
+            )
+        };
+        let before = fill.len();
+        fill.trim_folded(generation);
+        fill.retain_current(&current());
+        if fill.len() == before {
+            return Ok(());
         }
+        let keep = fill.keys().copied().collect::<HashSet<_>>();
+        runs.retain(|key, _| keep.contains(key));
+        let pin = if keep.is_empty() {
+            None
+        } else {
+            let mut pin = crate::pins::LivePin::create(owner)
+                .map_err(|error| plane_error(error.to_string()))?;
+            pin.protect(&keep.iter().copied().collect::<Vec<_>>())
+                .map_err(|error| plane_error(error.to_string()))?;
+            Some(Arc::new(Mutex::new(pin)))
+        };
+        // Held readers keep the previous maps, run owners, cache and pin. Only
+        // new bindings see the trimmed copy, and pin I/O happens outside state locks.
+        let key = (access.family().to_owned(), access.scope().to_owned());
+        let retired = {
+            let mut views = lock(&self.views);
+            if views
+                .get(&key)
+                .is_some_and(|existing| Arc::ptr_eq(existing, &view))
+            {
+                let mut state = lock(&view);
+                if state.active_fills == 0 && state.fill_version == version {
+                    let replacement = Arc::new(Mutex::new(ViewState {
+                        fill,
+                        fill_runs: runs,
+                        fill_version: version + 1,
+                        failed,
+                        tracker: std::mem::take(&mut state.tracker),
+                        live: pin.clone(),
+                        active_fills: 0,
+                        cache: None,
+                    }));
+                    views.insert(key, replacement)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        drop(retired);
+        drop(pin);
         Ok(())
     }
 
     fn release_generation(&self, access: &ViewAccess, generation: &str) {
-        lock(&self.residents).remove(&(
+        let retired = lock(&self.residents).remove(&(
             access.family().to_owned(),
             access.scope().to_owned(),
             generation.to_owned(),
         ));
+        drop(retired);
         self.arena(access.family()).trim();
     }
 
@@ -2433,6 +2514,12 @@ mod tests {
         ))
     }
 
+    fn live_pin_path(view: &Mutex<ViewState>) -> std::path::PathBuf {
+        let pin = lock(view).live.clone().unwrap();
+        let path = lock(&pin).keys_path().to_path_buf();
+        path
+    }
+
     #[test]
     fn opening_draft_readers_keeps_unpublished_fill_protection() {
         let storage = tempfile::tempdir().unwrap();
@@ -2462,9 +2549,11 @@ mod tests {
                     .admit(&completion, &plane.producer.id(), Some(&disk), None),
                 Admission::Installed
             );
-            state.live = Some(crate::pins::LivePin::create(&checkout.owner).unwrap());
-            state.live.as_mut().unwrap().protect(&[key]).unwrap();
+            state.live = Some(Arc::new(Mutex::new(
+                crate::pins::LivePin::create(&checkout.owner).unwrap(),
+            )));
         }
+        protect(&view, &[key]).unwrap();
         let mut manifest =
             super::super::manifest_v2::ManifestV2::new(snapshot.generation().header().clone());
         manifest
@@ -2483,12 +2572,17 @@ mod tests {
         let draft = Arc::new(ComposedGeneration::new("unpublished-draft", manifest, None));
         let _draft_reader = plane.open_reader(&checkout.access, &draft).unwrap();
         assert_eq!(lock(&view).fill.len(), 1);
-        assert!(lock(&view).live.as_ref().unwrap().keys_path().exists());
+        assert!(live_pin_path(&view).exists());
+        assert_eq!(lock(&plane.view(&checkout.access)).fill.len(), 1);
         plane
-            .generation_published(&checkout.access, &draft)
+            .generation_published(&checkout.access, &draft, &|| snapshot.clone())
             .unwrap();
-        assert!(lock(&view).fill.is_empty());
-        assert!(lock(&view).live.is_none());
+        assert!(lock(&plane.view(&checkout.access)).fill.is_empty());
+        assert_eq!(
+            lock(&view).fill.len(),
+            1,
+            "held reader state was trimmed in place"
+        );
     }
 
     #[test]
@@ -2500,14 +2594,18 @@ mod tests {
         let snapshot = checkout.load();
         let view = plane.view(&checkout.access);
         let active = ActiveFill::new(&view);
-        lock(&view).live = Some(crate::pins::LivePin::create(&checkout.owner).unwrap());
+        lock(&view).live = Some(Arc::new(Mutex::new(
+            crate::pins::LivePin::create(&checkout.owner).unwrap(),
+        )));
         let key = plane
             .producer
             .key(b"pending bytes", &RelPath::new(b"new.rs".to_vec()).unwrap());
         protect(&view, &[key]).unwrap();
-        let path = lock(&view).live.as_ref().unwrap().keys_path().to_path_buf();
+        let path = live_pin_path(&view);
         plane
-            .generation_published(&checkout.access, snapshot.generation())
+            .generation_published(&checkout.access, snapshot.generation(), &|| {
+                snapshot.clone()
+            })
             .unwrap();
         assert!(
             path.exists(),
@@ -2515,12 +2613,110 @@ mod tests {
         );
         drop(active);
         plane
-            .generation_published(&checkout.access, snapshot.generation())
+            .generation_published(&checkout.access, snapshot.generation(), &|| {
+                snapshot.clone()
+            })
             .unwrap();
         assert!(
             !path.exists(),
             "the idle pin may be released after publication"
         );
+    }
+
+    #[test]
+    fn a_real_fill_registers_before_lookup_and_publication_cleanup() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        write_tree(root.path(), FILES);
+        let plane = new_plane(storage.path(), "model-a");
+        let checkout = ready_checkout(storage.path(), root.path(), &plane);
+        write_tree(
+            root.path(),
+            &[("src/alpha.rs", "fn early_fill_changed() {}\n")],
+        );
+        checkout
+            .driver
+            .record_absolute_change(&root.path().join("src/alpha.rs"));
+        let snapshot = checkout.load();
+        let checking = plane.clone();
+        let access = checkout.access.clone();
+        let during = snapshot.clone();
+        before_claim_for_test(move || {
+            let state = checking.query_view(&access, &during);
+            assert!(
+                lock(&state).active_fills > 0,
+                "publication could remove the setup pin before fill registration"
+            );
+            checking
+                .generation_published(&access, during.generation(), &|| during.clone())
+                .unwrap();
+            assert!(lock(&state).live.is_some());
+        });
+        assert_eq!(
+            checkout
+                .fill(&snapshot, &Model::default(), "model-a")
+                .installed,
+            1
+        );
+    }
+
+    #[test]
+    fn held_filled_snapshot_survives_publication_and_trim_without_prior_overlay() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        write_tree(root.path(), FILES);
+        let plane = new_plane(storage.path(), "model-a");
+        let checkout = ready_checkout(storage.path(), root.path(), &plane);
+        let edited = "pub fn alpha_replaced() -> u8 { 7 }\n";
+        write_tree(root.path(), &[("src/alpha.rs", edited)]);
+        checkout
+            .driver
+            .record_absolute_change(&root.path().join("src/alpha.rs"));
+        let held = checkout.load();
+        assert_eq!(
+            checkout.fill(&held, &Model::default(), "model-a").installed,
+            1
+        );
+        let file = RelPath::new(b"src/alpha.rs".to_vec()).unwrap();
+        let key = plane.producer.key(edited.as_bytes(), &file);
+        let arena = plane.arena("family");
+        let payload_work = (arena.decode_count(), arena.store_reads());
+        let pin_path = live_pin_path(&plane.query_view(&checkout.access, &held));
+        arena.trim();
+        assert!(
+            arena.get(&key).is_some(),
+            "a never-overlaid admitted fill had no strong owner"
+        );
+        let published = checkout.load();
+        assert!(lock(&plane.view(&checkout.access)).fill.is_empty());
+        assert!(
+            pin_path.exists(),
+            "publication removed protection still needed by a held reader"
+        );
+        let answer = checkout.query(&held, "model-a", "alpha");
+        assert!(
+            answer.complete(),
+            "held fill was retired before its reader: {answer:?}"
+        );
+        assert_eq!(
+            rows(root.path(), &answer.results),
+            cold(root.path(), "model-a", "alpha")
+        );
+        assert_eq!(
+            (arena.decode_count(), arena.store_reads()),
+            payload_work,
+            "old reader reopened store rows"
+        );
+        drop(published);
+        plane.unbind(&checkout.access);
+        drop(checkout);
+        arena.trim();
+        assert!(arena.get(&key).is_some());
+        assert!(pin_path.exists());
+        drop(held);
+        arena.trim();
+        assert!(arena.get(&key).is_none());
+        assert!(!pin_path.exists());
     }
 
     #[test]
