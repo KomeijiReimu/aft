@@ -156,6 +156,8 @@ pub struct StoreCallerGroup {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreCallerEntry {
+    #[serde(skip_serializing_if = "is_false")]
+    pub test_status_unknown: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relation: Option<&'static str>,
     pub symbol: String,
@@ -601,7 +603,7 @@ pub fn callers_result(
             .then(left.caller.symbol.cmp(&right.caller.symbol))
     });
     let pre_filter_count = sites.len();
-    let test_filter_note = unknown_test_note(&sites, include_tests);
+    let mut test_filter_note = unknown_test_note(&sites, include_tests);
     let hidden_tests = sites
         .iter()
         .filter(|site| callsite_is_from_test(site))
@@ -656,6 +658,9 @@ pub fn callers_result(
             .entry(site.caller.file.clone())
             .or_default()
             .push(StoreCallerEntry {
+                test_status_unknown: site.caller.lang == crate::parser::LangId::Rust
+                    && site.caller_is_test.is_none()
+                    && !is_test_file(&site.caller.file),
                 relation: (site.kind == "callback_ref").then_some("callback_reference"),
                 symbol: site.caller.symbol.clone(),
                 line: site.line,
@@ -672,6 +677,17 @@ pub fn callers_result(
         Vec::new()
     };
     let via_count = via_entries.len();
+    let unknown_macro_callers = via_entries
+        .iter()
+        .filter(|(_, entry)| entry.test_status_unknown)
+        .count();
+    if !include_tests && unknown_macro_callers > 0 {
+        let note = format!("Test-ness could not be determined for {unknown_macro_callers} macro caller sites; they remain visible.");
+        test_filter_note = Some(match test_filter_note {
+            Some(existing) => format!("{existing} {note}"),
+            None => note,
+        });
+    }
     for (file, entry) in via_entries {
         groups.entry(file).or_default().push(entry);
     }
@@ -745,13 +761,16 @@ fn macro_via_entries(
         return Ok(Vec::new());
     }
 
-    let name_match = |symbol: String, line: u32, via: Option<String>| StoreCallerEntry {
-        relation: None,
-        symbol,
-        line,
-        approximate: Some(true),
-        resolved_by: Some("name_match".to_string()),
-        via,
+    let name_match = |symbol: String, line: u32, via: Option<String>, test_status_unknown: bool| {
+        StoreCallerEntry {
+            test_status_unknown,
+            relation: None,
+            symbol,
+            line,
+            approximate: Some(true),
+            resolved_by: Some("name_match".to_string()),
+            via,
+        }
     };
     let mut entries = Vec::new();
     let mut macros = BTreeSet::new();
@@ -759,8 +778,12 @@ fn macro_via_entries(
         let Some(macro_name) = site.local_name else {
             continue;
         };
-        if include_tests || !is_test_file(&site.file) {
-            entries.push((site.file, name_match(macro_name.clone(), site.line, None)));
+        if include_tests || !(is_test_file(&site.file) || site.is_test == Some(true)) {
+            let unknown = site.is_test.is_none() && !is_test_file(&site.file);
+            entries.push((
+                site.file,
+                name_match(macro_name.clone(), site.line, None, unknown),
+            ));
         }
         macros.insert(macro_name);
     }
@@ -770,7 +793,7 @@ fn macro_via_entries(
             break;
         }
         for site in store.ref_sites_named("call", &macro_name, remaining)? {
-            if (!include_tests && is_test_file(&site.file))
+            if (!include_tests && (is_test_file(&site.file) || site.is_test == Some(true)))
                 || listed.contains(&(site.file.clone(), site.line))
             {
                 continue;
@@ -778,9 +801,10 @@ fn macro_via_entries(
             let symbol = site
                 .caller_symbol
                 .unwrap_or_else(|| "<top-level>".to_string());
+            let unknown = site.is_test.is_none() && !is_test_file(&site.file);
             entries.push((
                 site.file,
-                name_match(symbol, site.line, Some(macro_name.clone())),
+                name_match(symbol, site.line, Some(macro_name.clone()), unknown),
             ));
         }
     }
@@ -3064,12 +3088,13 @@ fn dedup_call_site_count(sites: Vec<StoreCallSite>) -> usize {
         .len()
 }
 
-fn call_site_key(site: &StoreCallSite) -> (String, u32, String, String) {
+fn call_site_key(site: &StoreCallSite) -> (String, u32, String, String, String) {
     (
         site.caller.file.clone(),
         site.line,
         site.target_file.clone(),
         site.target_symbol.clone(),
+        site.kind.clone(),
     )
 }
 

@@ -8935,7 +8935,7 @@ impl CallGraphStore {
         self.refresh_read_marker()?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         self.ensure_ready(&conn)?;
-        let mut stmt = conn.prepare_cached("SELECT r.caller_file, n.scoped_name, r.line, n.is_test FROM refs r JOIN files f ON f.path=r.caller_file LEFT JOIN nodes n ON n.id=r.caller_node WHERE r.kind='call' AND (?1='' OR (r.short_name=?1 AND r.full_ref LIKE '%.%')) AND f.lang=?2 AND r.status='unresolved' AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.ref_id=r.ref_id AND e.kind='call') GROUP BY r.caller_file, r.byte_start, r.byte_end ORDER BY r.caller_file, r.byte_start")?;
+        let mut stmt = conn.prepare_cached("SELECT r.caller_file, n.scoped_name, r.line, n.is_test FROM refs r JOIN files f ON f.path=r.caller_file LEFT JOIN nodes n ON n.id=r.caller_node WHERE r.kind IN ('call','construction') AND (?1='' OR (r.short_name=?1 AND r.full_ref LIKE '%.%')) AND f.lang=?2 AND r.status='unresolved' AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.ref_id=r.ref_id AND e.kind='call') GROUP BY r.caller_file, r.byte_start, r.byte_end ORDER BY r.caller_file, r.byte_start")?;
         let rows = stmt.query_map(params![name, lang_label(language)], |row| {
             Ok(StoreRefSite {
                 is_test: row.get(3)?,
@@ -10291,7 +10291,7 @@ fn direct_caller_counts_for_tuples(
                  JOIN refs r ON r.ref_id = e.ref_id
                  JOIN nodes src ON src.id = e.source_node
                  JOIN files src_file ON src_file.path = src.file_path
-                 GROUP BY e.target_file, e.target_symbol, src.file_path, e.line
+                  GROUP BY e.target_file, e.target_symbol, src.file_path, e.line, e.kind
              )
              SELECT target_file, target_symbol, COUNT(*)
              FROM deduped
@@ -10979,7 +10979,11 @@ pub fn live_callgraph_edge_snapshot(
 
     let mut edges = BTreeSet::new();
     for (caller_file, data) in &file_data {
-        for (caller_symbol, call_sites) in &data.calls_by_symbol {
+        for (caller_symbol, call_sites) in data
+            .calls_by_symbol
+            .iter()
+            .chain(&data.value_refs_by_symbol)
+        {
             for call_site in call_sites {
                 let resolution = graph.resolve_cross_file_edge(
                     &call_site.full_callee,
@@ -10987,7 +10991,7 @@ pub fn live_callgraph_edge_snapshot(
                     caller_file,
                     &data.import_block,
                 );
-                let (target_file, target_symbol) = match resolution {
+                let (target_file, mut target_symbol) = match resolution {
                     EdgeResolution::Resolved { file, symbol } => (file, symbol),
                     EdgeResolution::Unresolved { callee_name } => {
                         if !callgraph::is_bare_callee(&call_site.full_callee, &callee_name) {
@@ -11003,6 +11007,43 @@ pub fn live_callgraph_edge_snapshot(
                         (caller_file.clone(), target_symbol)
                     }
                 };
+                let target_data = graph.build_file(&target_file)?;
+                let mut kind = if data.value_refs_by_symbol.contains_key(caller_symbol)
+                    && data.value_refs_by_symbol[caller_symbol].contains(call_site)
+                {
+                    "value_ref"
+                } else {
+                    "call"
+                };
+                match call_site.kind {
+                    callgraph::CallSiteKind::CallbackReference => kind = "callback_ref",
+                    callgraph::CallSiteKind::Construction => {
+                        if target_data
+                            .symbol_metadata_for(&target_symbol)
+                            .is_some_and(|meta| meta.kind == SymbolKind::Class)
+                        {
+                            let constructor = format!("{target_symbol}::constructor");
+                            if target_data.symbol_metadata.contains_key(&constructor) {
+                                target_symbol = constructor;
+                            } else {
+                                kind = "value_ref";
+                            }
+                        }
+                    }
+                    callgraph::CallSiteKind::Call => {}
+                }
+                if kind != "call"
+                    && data.lang != LangId::Go
+                    && !target_data
+                        .symbol_metadata_for(&target_symbol)
+                        .is_some_and(|meta| {
+                            matches!(meta.kind, SymbolKind::Function | SymbolKind::Method)
+                                || (call_site.kind == callgraph::CallSiteKind::Construction
+                                    && meta.kind == SymbolKind::Class)
+                        })
+                {
+                    continue;
+                }
                 if target_file == *caller_file && target_symbol == *caller_symbol {
                     continue;
                 }
@@ -11011,7 +11052,7 @@ pub fn live_callgraph_edge_snapshot(
                     source_symbol: caller_symbol.clone(),
                     target_file: relative_path(project_root, &target_file),
                     target_symbol,
-                    kind: "call".to_string(),
+                    kind: kind.to_string(),
                     line: call_site.line,
                 });
             }
@@ -21826,14 +21867,14 @@ fn reexport_consumer_refs(
     )?;
     let mut calls_of = conn.prepare_cached(
         "SELECT ref_id, short_name FROM refs
-         WHERE caller_file = ?1 AND kind IN ('call', 'value_ref')",
+         WHERE caller_file = ?1 AND kind IN ('call', 'construction', 'callback_ref', 'value_ref')",
     )?;
     // Fully qualified Rust calls (`crate::git::clone()`) reach a barrel without
     // any import row; when the barrel cannot place the name they are stored
     // as resolved to the barrel itself.
     let mut resolved_to = conn.prepare_cached(
         "SELECT ref_id, caller_file, short_name FROM refs
-         WHERE target_file = ?1 AND kind IN ('call', 'value_ref')",
+         WHERE target_file = ?1 AND kind IN ('call', 'construction', 'callback_ref', 'value_ref')",
     )?;
     for (barrel, names) in &barrels {
         let resolved = resolved_to

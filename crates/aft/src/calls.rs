@@ -637,7 +637,9 @@ fn js_callback_is_shadowed(source: &str, argument: tree_sitter::Node<'_>, name: 
                             .child_by_field_name("name")
                             .is_some_and(|n| &source[n.byte_range()] == name)
                         {
-                            return true;
+                            return !binding.child_by_field_name("value").is_some_and(|value| {
+                                matches!(value.kind(), "arrow_function" | "function_expression")
+                            });
                         }
                     }
                 }

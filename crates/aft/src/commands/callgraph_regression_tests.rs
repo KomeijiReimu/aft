@@ -72,6 +72,29 @@ fn callgraph_callback_references_are_labelled_in_ts_js_and_rust() {
 }
 
 #[test]
+fn callgraph_callback_import_alias_arrow_and_direct_call_stay_distinct() {
+    let (_temp, store) = fixture(&[("helper.ts", "export function transform() {}\n"), ("main.ts", "import { transform as callback } from './helper';\nfunction process() { items.map(callback); callback(); }\n")]);
+    assert_eq!(callers(&store, "helper.ts", "transform", false), "2 caller dependencies · 1 file group\nmain.ts\n  ↳ process:2\n  ↳ process:2 (callback reference)");
+    let (_temp, store) = fixture(&[(
+        "main.ts",
+        "const transform = () => 1;\nfunction process() { items.map(transform); }\n",
+    )]);
+    assert_eq!(
+        callers(&store, "main.ts", "transform", false),
+        "1 caller dependency · 1 file group\nmain.ts\n  ↳ process:2 (callback reference)"
+    );
+    let (_temp, store) = fixture(&[(
+        "main.ts",
+        "function transform() {}\nfunction process(transform) { items.map(transform); }\n",
+    )]);
+    let result = callers_result(&store, Path::new("main.ts"), "transform", 5, false).unwrap();
+    assert!(
+        result.callers.is_empty(),
+        "a parameter must not bind to the same-named function"
+    );
+}
+
+#[test]
 fn callgraph_construction_targets_only_explicit_constructor_and_method_owner() {
     for file in ["main.ts", "main.js"] {
         let source = "function helper() {}\nfunction ctorHelper() {}\nclass Service {\n  constructor() { ctorHelper(); }\n  step() { helper(); }\n}\nclass Empty { step() { helper(); } }\nfunction make() { new Service(); new Empty(); }\n";
@@ -80,6 +103,7 @@ fn callgraph_construction_targets_only_explicit_constructor_and_method_owner() {
             callers(&store, file, "Service::constructor", false),
             format!("1 caller · 1 file group\n{file}\n  ↳ make:8")
         );
+        assert_eq!(impact(&store, file, "ctorHelper", false), format!("2 affected call sites · 1 file\n{file}:4\n  ↳ Service::constructor\n  constructor() {{ ctorHelper(); }}\n{file}:8\n  ↳ make\n  function make() {{ new Service(); new Empty(); }}"));
         assert_eq!(
             callers(&store, file, "Empty", false),
             "0 callers · 0 file groups"

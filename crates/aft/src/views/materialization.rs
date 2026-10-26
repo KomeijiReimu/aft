@@ -1222,7 +1222,22 @@ fn materialize_reading(
                 pending_edges.push(PendingEdgeRow {
                     kind: match row.kind {
                         join::BlobRefKind::Construction
-                            if !edge_target_symbol.ends_with("::constructor") =>
+                            if !target_node
+                                .as_deref()
+                                .map(|id| {
+                                    transaction
+                                        .query_row(
+                                            "SELECT kind FROM nodes WHERE id = ?1",
+                                            [id],
+                                            |row| row.get::<_, String>(0),
+                                        )
+                                        .optional()
+                                })
+                                .transpose()?
+                                .flatten()
+                                .is_some_and(|kind| {
+                                    matches!(kind.as_str(), "function" | "method")
+                                }) =>
                         {
                             "value_ref"
                         }

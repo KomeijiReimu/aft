@@ -583,7 +583,7 @@ pub(crate) fn resolve_symbol_query_in_data(
     }
 }
 
-/// A single call site within a function body.
+/// A call or function-value dependency site owned by a symbol.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallSite {
     pub kind: CallSiteKind,
@@ -1509,9 +1509,24 @@ fn rust_item_is_test(source: &str, root: tree_sitter::Node<'_>, byte: usize) -> 
         return None;
     }
     let mut node = root.descendant_for_byte_range(byte, byte)?;
+    let mut item = node;
+    while let Some(parent) = item.parent() {
+        if item.kind() == "attribute_item" {
+            while let Some(next) = item.next_named_sibling() {
+                item = next;
+                if item.kind() != "attribute_item" && !item.is_extra() {
+                    break;
+                }
+            }
+            node = item;
+            break;
+        }
+        item = parent;
+    }
     while let Some(parent) = node.parent() {
         let mut sibling = node.prev_named_sibling();
-        while let Some(attribute) = sibling.filter(|n| n.kind() == "attribute_item") {
+        while let Some(attribute) = sibling.filter(|n| n.kind() == "attribute_item" || n.is_extra())
+        {
             let text = source[attribute.byte_range()]
                 .split_whitespace()
                 .collect::<String>();
@@ -1688,14 +1703,6 @@ pub(crate) fn build_file_data_from_tree(
         HashMap::new()
     };
 
-    for site in calls_by_symbol.values_mut().flatten() {
-        if root
-            .descendant_for_byte_range(site.byte_start, site.byte_end)
-            .is_some_and(|node| node.kind() == "new_expression")
-        {
-            site.kind = CallSiteKind::Construction;
-        }
-    }
     for site in value_refs_by_symbol.values_mut().flatten() {
         if root
             .descendant_for_byte_range(site.byte_start, site.byte_end)
@@ -1730,6 +1737,15 @@ pub(crate) fn build_file_data_from_tree(
             if !sites.is_empty() {
                 calls_by_symbol.insert(default_export.symbol.clone(), sites);
             }
+        }
+    }
+
+    for site in calls_by_symbol.values_mut().flatten() {
+        if root
+            .descendant_for_byte_range(site.byte_start, site.byte_end)
+            .is_some_and(|node| node.kind() == "new_expression")
+        {
+            site.kind = CallSiteKind::Construction;
         }
     }
 
