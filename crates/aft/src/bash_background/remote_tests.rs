@@ -7086,7 +7086,7 @@ async fn runon_draining_twice_then_accepts_and_discloses_wait() {
         )
         .unwrap();
     let first = clock.now();
-    clock.expect_sleep(first, first + 150).await;
+    clock.expect_sleep(first, first + 1000).await;
     let waiting = registry.observed_status(&task_id, "session", 8192).unwrap();
     assert_eq!(waiting.info.status, BgTaskStatus::Starting, "{waiting:?}");
     assert_eq!(
@@ -7099,10 +7099,10 @@ async fn runon_draining_twice_then_accepts_and_discloses_wait() {
             .contains("draining for maintenance; retrying (attempt 2"),
         "{waiting:?}"
     );
-    clock.advance(150);
-    clock.expect_sleep(first + 150, first + 300).await;
+    clock.advance(5000);
+    clock.expect_sleep(first + 5000, first + 6000).await;
     assert_eq!(exec_runs(&daemon).len(), 2);
-    clock.advance(150);
+    clock.advance(5000);
     let done = terminal(&registry, &task_id).await;
     assert_eq!(done.exit_code, Some(0), "{done:?}");
     assert!(!done.output_preview.contains("local-proof"));
@@ -7269,6 +7269,12 @@ pub(super) struct DrainingClock {
 impl DrainingClock {
     pub(super) fn now(&self) -> u64 {
         *self.ticks.borrow()
+    }
+
+    pub(super) fn retry_jitter_ms(&self, max: u64) -> u64 {
+        let jitter = self.retry_jitter_ms.load(Ordering::SeqCst);
+        assert!(jitter <= max, "injected jitter {jitter} exceeds {max}");
+        jitter
     }
 
     pub(super) async fn sleep_until(&self, from: u64, until: u64) {
@@ -7447,7 +7453,11 @@ async fn assert_zero_hint_waits_for_floor(signer: bool) {
     if !signer {
         clock.expect_sleep(first + 4999, first + 5000).await;
     }
-    assert_eq!(exec_runs(&daemon).len(), 1, "must wait at least five seconds");
+    assert_eq!(
+        exec_runs(&daemon).len(),
+        1,
+        "must wait at least five seconds"
+    );
     clock.advance(1);
     let done = terminal(&registry, &task).await;
     assert_eq!(done.exit_code, Some(0), "{done:?}");
@@ -7473,7 +7483,9 @@ async fn runon_retry_backoff_large_hints_are_not_shortened() {
         let registry = registry();
         let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
         let first = clock.now();
-        clock.expect_sleep(first, first + if signer { 30_000 } else { 1000 }).await;
+        clock
+            .expect_sleep(first, first + if signer { 30_000 } else { 1000 })
+            .await;
         clock.advance(29_999);
         if !signer {
             clock.expect_sleep(first + 29_999, first + 30_000).await;
@@ -7497,10 +7509,15 @@ async fn runon_retry_backoff_simultaneous_refusals_resubmit_at_different_times()
             clock.set_retry_jitter_ms(jitter);
             let daemon = daemon(retry_backoff_script(signer, 5000), "exec-remote/v1").await;
             let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
-            clock.expect_sleep(first, first + if signer { 5000 + jitter } else { 1000 }).await;
+            clock
+                .expect_sleep(first, first + if signer { 5000 + jitter } else { 1000 })
+                .await;
             if !signer {
                 let saved = read_task(&registry.task(&task).unwrap().paths.json).unwrap();
-                assert_eq!(saved.remote.unwrap().retry.unwrap().next_retry_at_ms, Some(first + 5000 + jitter));
+                assert_eq!(
+                    saved.remote.unwrap().retry.unwrap().next_retry_at_ms,
+                    Some(first + 5000 + jitter)
+                );
             }
             tasks.push((daemon, task));
         }
@@ -7508,7 +7525,11 @@ async fn runon_retry_backoff_simultaneous_refusals_resubmit_at_different_times()
         clock.advance(5000);
         for (index, (daemon, task)) in tasks.iter().enumerate() {
             if index > 0 {
-                assert_eq!(exec_runs(daemon).len(), 1, "later retries must still be waiting");
+                assert_eq!(
+                    exec_runs(daemon).len(),
+                    1,
+                    "later retries must still be waiting"
+                );
                 clock.advance(500);
             }
             assert_eq!(terminal(&registry, task).await.exit_code, Some(0));
@@ -7566,10 +7587,10 @@ async fn runon_draining_retry_after_is_honoured() {
     let registry = registry();
     let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
     let first = clock.now();
-    clock.expect_sleep(first, first + 300).await;
+    clock.expect_sleep(first, first + 1000).await;
     clock.advance(100);
     assert_eq!(exec_runs(&daemon).len(), 1, "must not resubmit early");
-    clock.advance(200);
+    clock.advance(4900);
     let done = terminal(&registry, &task).await;
     assert_eq!(done.exit_code, Some(0));
     assert_eq!(exec_runs(&daemon).len(), 2);
@@ -7611,7 +7632,7 @@ async fn runon_draining_kill_stops_retries() {
     let registry = registry();
     let task_id = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
     let first = clock.now();
-    clock.expect_sleep(first, first + 500).await;
+    clock.expect_sleep(first, first + 1000).await;
     let killing = registry.clone();
     let killed_id = task_id.clone();
     // With the retry clock frozen, a terminal kill proves cancellation woke
@@ -7684,7 +7705,7 @@ async fn runon_draining_restart_preserves_remaining_budget_and_request() {
             .unwrap(),
         request
     );
-    clock.advance(200);
+    clock.advance(5000);
     let done = terminal(&restarted, &task_id).await;
     assert_eq!(done.info.status, BgTaskStatus::Failed);
     assert_eq!(exec_runs(&daemon).len(), 1);
@@ -7722,8 +7743,8 @@ async fn runon_draining_restart_resubmits_and_accepts() {
     let restarted = registry();
     restarted.replay_session(dir.path(), "session").unwrap();
     let first = clock.now();
-    clock.expect_sleep(first, first + 200).await;
-    clock.advance(200);
+    clock.expect_sleep(first, first + 1000).await;
+    clock.advance(5000);
     let done = terminal(&restarted, &task).await;
     assert_eq!(done.exit_code, Some(0), "{done:?}");
     let requests = exec_runs(&daemon);
@@ -7741,10 +7762,16 @@ fn draining_default_backoff_is_bounded() {
         (5, 60000),
         (100, 60000),
     ] {
-        assert_eq!(draining_delay_ms(attempt, None), expected);
+        assert_eq!(draining_delay_ms(attempt, None, |_| 0), expected);
+        assert_eq!(
+            draining_delay_ms(attempt, None, |max| max),
+            expected + expected / 5
+        );
     }
-    assert_eq!(draining_delay_ms(100, Some(17)), 17);
-    assert_eq!(draining_delay_ms(1, Some(0)), 0);
+    assert_eq!(draining_delay_ms(100, Some(17), |_| 0), 5000);
+    assert_eq!(draining_delay_ms(1, Some(0), |max| max), 6000);
+    assert_eq!(draining_delay_ms(1, Some(30_000), |max| max), 36_000);
+    assert_eq!(draining_delay_ms(1, Some(u64::MAX), |max| max), u64::MAX);
 }
 
 #[tokio::test]
@@ -7841,8 +7868,8 @@ async fn runon_draining_network_retry_preserves_outbound_and_vcpu_request() {
         ),
         async {
             let first = clock.now();
-            clock.expect_sleep(first, first + 50).await;
-            clock.advance(50);
+            clock.expect_sleep(first, first + 1000).await;
+            clock.advance(5000);
         },
     );
     assert!(reply.success, "{reply:?}");
@@ -8130,15 +8157,15 @@ async fn bash_kill_scope_settles_when_paused_just_before_draining_resubmit() {
     let scope = owner_scope("draining-resubmit");
     let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
     let first = clock.now();
-    clock.expect_sleep(first, first + 200).await;
+    clock.expect_sleep(first, first + 1000).await;
     let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeResubmit);
-    clock.advance(200);
+    clock.advance(5000);
     gate.reached().await;
     let operation = start_kill_scope(&registry, &scope);
     pause_recorded(&registry, &task).await;
     gate.release();
     assert_pause_settles_promptly(&registry, operation, &task).await;
-    assert_eq!(clock.now(), first + 200);
+    assert_eq!(clock.now(), first + 5000);
     remote_worker_exited(&task).await;
     assert_paused(&registry, &task);
     assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
@@ -8206,7 +8233,7 @@ async fn bash_kill_scope_settles_when_restored_draining_retry_cannot_reconnect()
     let mut saved = read_task(&json).unwrap();
     saved.remote.as_mut().unwrap().connection_file = Some(dir.path().join("missing.json"));
     write_task(&json, &saved).unwrap();
-    clock.advance(200);
+    clock.advance(5000);
     let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeBudgetCheck);
     let restarted = registry();
     restarted.replay_session(dir.path(), "session").unwrap();
@@ -8972,7 +8999,7 @@ async fn bash_kill_scope_never_resubmits_a_due_saved_draining_retry() {
     original.detach();
     let (local_task, local_pid) = start_saved_term_ignoring_task(dir.path(), &scope).await;
     // The retry is due by the time the owner pauses the restarted module.
-    clock.advance(200);
+    clock.advance(5000);
     let reply = kill_scope_with_saved_tasks(dir.path(), &scope).await;
     assert_eq!(
         exec_runs(&daemon).len(),
@@ -9020,7 +9047,7 @@ async fn saved_due_draining_retry(
     .await;
     let json = original.task(&task_id).unwrap().paths.json.clone();
     original.detach();
-    clock.advance(200);
+    clock.advance(5000);
     (daemon, clock, task_id, json)
 }
 
@@ -10986,7 +11013,7 @@ async fn runon_signer_refusal_is_resubmitted_after_its_hint_and_only_success_is_
     let registry = registry();
     let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
     let first = clock.now();
-    clock.expect_sleep(first, first + 2000).await;
+    clock.expect_sleep(first, first + 5000).await;
     let waiting = registry.observed_status(&task, "session", 8192).unwrap();
     assert!(!waiting.info.status.is_terminal(), "{waiting:?}");
     assert!(waiting.remote_refusal.is_none(), "{waiting:?}");
@@ -10996,7 +11023,7 @@ async fn runon_signer_refusal_is_resubmitted_after_its_hint_and_only_success_is_
         "a foreground launch keeps waiting while the retry is pending"
     );
     assert_eq!(exec_runs(&daemon).len(), 1);
-    clock.advance(2000);
+    clock.advance(5000);
     let done = terminal(&registry, &task).await;
     assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
     assert_eq!(done.exit_code, Some(0), "{done:?}");
@@ -11022,20 +11049,20 @@ async fn runon_signer_hint_longer_than_the_admission_time_left_surfaces_the_refu
     )
     .await;
     let dir = tempfile::tempdir().unwrap();
-    // Room for one 2 s wait, counted from the first submission; the second
-    // refusal's hint is longer than the 1 s then left.
-    shorten_hinted_retry_budget(dir.path(), 3000);
+    // Room for one floored 5 s wait, counted from the first submission; the
+    // second refusal's delay is longer than the 1 s then left.
+    shorten_hinted_retry_budget(dir.path(), 6000);
     let mut clock = PausedDrainingClock::new(dir.path());
     let registry = registry();
     let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
     let first = clock.now();
-    clock.expect_sleep(first, first + 2000).await;
-    clock.advance(2000);
+    clock.expect_sleep(first, first + 5000).await;
+    clock.advance(5000);
     let done = terminal(&registry, &task).await;
     assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
     assert_runon_refusal(&refusal_response(done), SIGNER_REFUSED);
     assert_eq!(exec_runs(&daemon).len(), 2);
-    assert_eq!(clock.now(), first + 2000);
+    assert_eq!(clock.now(), first + 5000);
     assert_no_retry_sleep(&mut clock);
 }
 
@@ -11081,9 +11108,9 @@ async fn runon_signer_retries_stop_after_five_resubmissions() {
     let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
     let first = clock.now();
     for resubmission in 0..5 {
-        let from = first + resubmission * 100;
-        clock.expect_sleep(from, from + 100).await;
-        clock.advance(100);
+        let from = first + resubmission * 5000;
+        clock.expect_sleep(from, from + 5000).await;
+        clock.advance(5000);
     }
     let done = terminal(&registry, &task).await;
     assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
@@ -11112,7 +11139,7 @@ async fn runon_kill_during_a_signer_retry_wait_ends_the_task_without_resubmittin
     let registry = registry();
     let task_id = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
     let first = clock.now();
-    clock.expect_sleep(first, first + 2000).await;
+    clock.expect_sleep(first, first + 5000).await;
     let killing = registry.clone();
     let killed_id = task_id.clone();
     // With the retry clock frozen, a terminal kill proves cancellation woke
@@ -11127,7 +11154,7 @@ async fn runon_kill_during_a_signer_retry_wait_ends_the_task_without_resubmittin
     .unwrap();
     assert_eq!(killed.info.status, BgTaskStatus::Killed);
     assert_eq!(clock.now(), first);
-    clock.advance(2000);
+    clock.advance(5000);
     // Give a worker that wrongly kept waiting the chance to resubmit.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
@@ -11146,23 +11173,23 @@ async fn runon_signer_retry_follows_a_live_draining_resubmission() {
     let daemon = daemon(
         Script::DrainingThenSigner {
             signer_refusals: 1,
-            draining_after_ms: 500,
+            draining_after_ms: 10_000,
             signer_after_ms: 100,
         },
         "exec-remote/v1",
     )
     .await;
     let dir = tempfile::tempdir().unwrap();
-    shorten_hinted_retry_budget(dir.path(), 150);
+    shorten_hinted_retry_budget(dir.path(), 6000);
     let mut clock = PausedDrainingClock::new(dir.path());
     let registry = registry();
     let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
     let first = clock.now();
-    clock.expect_sleep(first, first + 500).await;
-    clock.advance(500);
-    clock.expect_sleep(first + 500, first + 600).await;
+    clock.expect_sleep(first, first + 1000).await;
+    clock.advance(10_000);
+    clock.expect_sleep(first + 10_000, first + 15_000).await;
     assert_eq!(exec_runs(&daemon).len(), 2);
-    clock.advance(100);
+    clock.advance(5000);
     let done = terminal(&registry, &task).await;
     assert_eq!(done.exit_code, Some(0), "{done:?}");
     assert!(done.remote_refusal.is_none(), "{done:?}");
@@ -11179,7 +11206,7 @@ async fn runon_signer_retry_follows_a_draining_resubmission_resumed_after_restar
     let daemon = crate::exec_remote::wire_tests::daemon_with_clients(
         Script::DrainingThenSigner {
             signer_refusals: 1,
-            draining_after_ms: 200,
+            draining_after_ms: 10_000,
             signer_after_ms: 100,
         },
         "exec-remote/v1",
@@ -11187,7 +11214,7 @@ async fn runon_signer_retry_follows_a_draining_resubmission_resumed_after_restar
     )
     .await;
     let dir = tempfile::tempdir().unwrap();
-    shorten_hinted_retry_budget(dir.path(), 150);
+    shorten_hinted_retry_budget(dir.path(), 6000);
     let mut clock = PausedDrainingClock::new(dir.path());
     stopped_draining_roots()
         .lock()
@@ -11199,11 +11226,11 @@ async fn runon_signer_retry_follows_a_draining_resubmission_resumed_after_restar
     let restarted = registry();
     restarted.replay_session(dir.path(), "session").unwrap();
     let first = clock.now();
-    clock.expect_sleep(first, first + 200).await;
-    clock.advance(200);
-    clock.expect_sleep(first + 200, first + 300).await;
+    clock.expect_sleep(first, first + 1000).await;
+    clock.advance(10_000);
+    clock.expect_sleep(first + 10_000, first + 15_000).await;
     assert_eq!(exec_runs(&daemon).len(), 2);
-    clock.advance(100);
+    clock.advance(5000);
     let done = terminal(&restarted, &task).await;
     assert_eq!(done.exit_code, Some(0), "{done:?}");
     assert!(done.remote_refusal.is_none(), "{done:?}");
@@ -11227,14 +11254,14 @@ async fn runon_signer_retry_that_wakes_after_the_deadline_surfaces_the_refusal()
     )
     .await;
     let dir = tempfile::tempdir().unwrap();
-    shorten_hinted_retry_budget(dir.path(), 3000);
+    shorten_hinted_retry_budget(dir.path(), 6000);
     let mut clock = PausedDrainingClock::new(dir.path());
     let registry = registry();
     let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
     let first = clock.now();
-    clock.expect_sleep(first, first + 2000).await;
-    // The worker wakes 5 s after the first submission, 2 s past its deadline.
-    clock.advance(5000);
+    clock.expect_sleep(first, first + 5000).await;
+    // The worker wakes 10 s after the first submission, 4 s past its deadline.
+    clock.advance(10_000);
     let done = terminal(&registry, &task).await;
     assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
     assert_runon_refusal(&refusal_response(done), SIGNER_REFUSED);
@@ -11243,7 +11270,7 @@ async fn runon_signer_retry_that_wakes_after_the_deadline_surfaces_the_refusal()
 }
 
 /// A zero hint on a job whose admission time is already used up sends
-/// nothing either, although it needs no wait at all.
+/// nothing either: the minimum retry delay exceeds the admission time left.
 #[tokio::test]
 async fn runon_signer_zero_hint_after_the_deadline_surfaces_the_refusal() {
     let daemon = daemon(
@@ -11350,14 +11377,14 @@ async fn bash_kill_scope_settles_while_signer_retry_waits() {
     let scope = owner_scope("signer-wait");
     let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
     let first = clock.now();
-    clock.expect_sleep(first, first + 2000).await;
+    clock.expect_sleep(first, first + 5000).await;
     assert_pause_settles_promptly(&registry, start_kill_scope(&registry, &scope), &task).await;
     // The retry clock never moved: cancellation, not the hint, woke the worker.
     assert_eq!(clock.now(), first);
     remote_worker_exited(&task).await;
     assert_paused(&registry, &task);
     // Give a worker that wrongly kept waiting its chance to resubmit.
-    clock.advance(2000);
+    clock.advance(5000);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
     assert_signer_retry_pause_saved(&registry.task(&task).unwrap().paths.json);
@@ -11374,15 +11401,15 @@ async fn bash_kill_scope_settles_when_paused_just_before_signer_resubmit() {
     let scope = owner_scope("signer-resubmit");
     let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
     let first = clock.now();
-    clock.expect_sleep(first, first + 2000).await;
+    clock.expect_sleep(first, first + 5000).await;
     let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeHintedResubmit);
-    clock.advance(2000);
+    clock.advance(5000);
     gate.reached().await;
     let operation = start_kill_scope(&registry, &scope);
     pause_recorded(&registry, &task).await;
     gate.release();
     assert_pause_settles_promptly(&registry, operation, &task).await;
-    assert_eq!(clock.now(), first + 2000);
+    assert_eq!(clock.now(), first + 5000);
     remote_worker_exited(&task).await;
     assert_paused(&registry, &task);
     assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
@@ -11437,7 +11464,7 @@ async fn bash_kill_scope_never_resubmits_a_saved_signer_refusal() {
     original.detach();
     let (local_task, local_pid) = start_saved_term_ignoring_task(dir.path(), &scope).await;
     // The hint has passed by the time the owner pauses the restarted module.
-    clock.advance(2000);
+    clock.advance(5000);
     let reply = kill_scope_with_saved_tasks(dir.path(), &scope).await;
     assert_eq!(
         exec_runs(&daemon).len(),
@@ -11511,8 +11538,8 @@ async fn bash_kill_scope_settles_when_paused_as_a_signer_resubmit_fails_unsent()
     let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeNoStartRefusal);
     let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
     let first = clock.now();
-    clock.expect_sleep(first, first + 2000).await;
-    clock.advance(2000);
+    clock.expect_sleep(first, first + 5000).await;
+    clock.advance(5000);
     gate.reached().await;
     let operation = start_kill_scope(&registry, &scope);
     pause_recorded(&registry, &task).await;
@@ -11545,8 +11572,8 @@ async fn bash_kill_scope_settles_when_paused_as_a_draining_resubmit_fails_unsent
     let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeNoStartRefusal);
     let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
     let first = clock.now();
-    clock.expect_sleep(first, first + 200).await;
-    clock.advance(200);
+    clock.expect_sleep(first, first + 1000).await;
+    clock.advance(5000);
     gate.reached().await;
     let operation = start_kill_scope(&registry, &scope);
     pause_recorded(&registry, &task).await;
