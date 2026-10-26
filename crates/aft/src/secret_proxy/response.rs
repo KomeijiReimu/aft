@@ -69,6 +69,16 @@ pub(super) async fn forward(
     state: Arc<State>,
     client_upgrade: Option<hyper::upgrade::OnUpgrade>,
 ) -> Result<Response<Body>, ()> {
+    // Hyper removes chunk framing, not arbitrary preceding transfer codings.
+    // Do not discard that declaration and pass its still-encoded bytes onward.
+    let mut transfers = response.headers().get_all("transfer-encoding").iter();
+    if transfers.next().is_some_and(|v| {
+        v.to_str()
+            .map_or(true, |s| !s.trim().eq_ignore_ascii_case("chunked"))
+    }) || transfers.next().is_some()
+    {
+        return Err(());
+    }
     if response.status() == StatusCode::SWITCHING_PROTOCOLS {
         if client_upgrade.is_none()
             || response.headers().contains_key("sec-websocket-extensions")
