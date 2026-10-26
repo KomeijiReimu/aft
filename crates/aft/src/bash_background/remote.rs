@@ -288,12 +288,47 @@ enum HintedRetryStep {
 }
 
 #[cfg(unix)]
-fn draining_delay_ms(attempt: u32, retry_after_ms: Option<u64>) -> u64 {
-    retry_after_ms.unwrap_or_else(|| {
-        5000_u64
-            .saturating_mul(1_u64 << attempt.saturating_sub(1).min(4))
-            .min(60000)
-    })
+fn draining_delay_ms(
+    attempt: u32,
+    retry_after_ms: Option<u64>,
+    jitter: impl FnOnce(u64) -> u64,
+) -> u64 {
+    let delay = retry_after_ms
+        .map(|hint| hint.max(5000))
+        .unwrap_or_else(|| {
+            5000_u64
+                .saturating_mul(1_u64 << attempt.saturating_sub(1).min(4))
+                .min(60000)
+        });
+    delay.saturating_add(jitter(delay / 5))
+}
+
+#[cfg(unix)]
+fn retry_jitter_for_task(_task: &BgTask) -> impl FnOnce(u64) -> u64 {
+    #[cfg(test)]
+    let clock = tests::task_draining_clock(_task);
+    move |max| {
+        #[cfg(test)]
+        if let Some(clock) = clock {
+            return clock.retry_jitter_ms(max);
+        }
+        // Reject the incomplete remainder of the u64 range so every millisecond
+        // in the inclusive jitter range has the same probability.
+        let range = max + 1;
+        let reject_below = range.wrapping_neg() % range;
+        loop {
+            let mut bytes = [0; 8];
+            if let Err(error) = getrandom::fill(&mut bytes) {
+                crate::slog_warn!("runon: retry jitter entropy unavailable: {error}");
+                // An entropy failure must not turn backoff into an immediate retry.
+                return max;
+            }
+            let sample = u64::from_ne_bytes(bytes);
+            if sample >= reject_below {
+                return sample % range;
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1606,6 +1641,7 @@ impl OutputSink for TaskSink {
     fn terminal(&mut self, record: &TerminalRecord, verdict: &Verdict) -> io::Result<()> {
         #[cfg(test)]
         let clock = tests::task_draining_clock(&self.task);
+        let jitter = retry_jitter_for_task(&self.task);
         self.commit(|r| {
             let resubmit_refusal = r.submission.as_ref().is_some_and(|s| s.resuming)
                 && matches!(verdict, Verdict::RunLocally { .. });
@@ -1629,11 +1665,11 @@ impl OutputSink for TaskSink {
                     #[cfg(test)]
                     let now = clock.as_ref().map_or(now, |clock| clock.now());
                     retry.first_refusal_at_ms.get_or_insert(now);
-                    retry.next_retry_at_ms =
-                        Some(now.saturating_add(draining_delay_ms(
-                            retry.attempts,
-                            record.retry_after_ms,
-                        )));
+                    retry.next_retry_at_ms = Some(now.saturating_add(draining_delay_ms(
+                        retry.attempts,
+                        record.retry_after_ms,
+                        jitter,
+                    )));
                 }
             }
         })?;
@@ -3238,9 +3274,10 @@ impl BgTaskRegistry {
     }
 
     /// Act on a refusal the runner marked transient with a retry hint: wait
-    /// for the hint, then send the same request again. The refusal is reported
-    /// unchanged when it carries no usable hint, the hint is longer than the
-    /// job's admission time left, that time has run out by the moment of
+    /// for the hint (at least five seconds) plus jitter, then send the same
+    /// request again. The refusal is reported unchanged when it carries no
+    /// usable hint, the jittered delay exceeds the job's admission time left,
+    /// that time has run out by the moment of
     /// resending, or the job was already resubmitted
     /// [`HINTED_RETRY_MAX_RESUBMITS`] times. A kill during the wait ends the
     /// task at once.
@@ -3274,8 +3311,9 @@ impl BgTaskRegistry {
         if retry.resubmits >= HINTED_RETRY_MAX_RESUBMITS {
             return Ok(HintedRetryStep::Surface);
         }
+        let delay = draining_delay_ms(1, Some(hint), retry_jitter_for_task(task));
         let now = draining_now_ms(root);
-        if hint > retry.deadline_ms.saturating_sub(now) {
+        if delay > retry.deadline_ms.saturating_sub(now) {
             return Ok(HintedRetryStep::Surface);
         }
         let reason = match &terminal.outcome {
@@ -3283,12 +3321,12 @@ impl BgTaskRegistry {
             _ => String::new(),
         };
         crate::slog_info!(
-            "runon: resubmitting job {} after its refusal before start (reason={reason} detail={} retry_after_ms={hint}); resubmission {} of at most {HINTED_RETRY_MAX_RESUBMITS}",
+            "runon: resubmitting job {} after its refusal before start (reason={reason} detail={} retry_after_ms={hint} delay_ms={delay}); resubmission {} of at most {HINTED_RETRY_MAX_RESUBMITS}",
             terminal.job_id,
             terminal.refusal_detail().unwrap_or_default(),
             retry.resubmits + 1,
         );
-        let until = now.saturating_add(hint);
+        let until = now.saturating_add(delay);
         // Stands in for the daemon stopping while it waits: the worker ends
         // and leaves only the refusal it has already saved.
         #[cfg(test)]
@@ -3341,9 +3379,8 @@ impl BgTaskRegistry {
                 self.cancel_draining_retry(task);
                 return Ok(HintedRetryStep::Ended);
             }
-            // The wait can end late, and a zero hint does not wait at all, so
-            // check the admission time again right before sending: once it has
-            // run out, report the saved refusal as it is.
+            // The wait can end late, so check the admission time again right
+            // before sending: once it has run out, report the saved refusal as it is.
             if draining_now_ms(root) >= retry.deadline_ms {
                 return Ok(HintedRetryStep::Surface);
             }
