@@ -22,7 +22,8 @@ use crate::context::{
 use crate::harness::Harness;
 use crate::log_ctx;
 use crate::lsp::registry::{
-    resolve_lsp_binary, resolve_server_binary, servers_for_file, ServerKind,
+    resolve_lsp_binary, resolve_server_binary, servers_for_file_in_pass, BiomeSelectionMemo,
+    ServerKind,
 };
 use crate::parser::{detect_language, LangId, SharedSymbolCache};
 use crate::protocol::{RawRequest, Response};
@@ -2113,12 +2114,16 @@ fn configured_lsp_binary_resolves(
     configured: &crate::config::UserServerDef,
     files: &[PathBuf],
     config: &crate::config::Config,
+    memo: &mut BiomeSelectionMemo,
 ) -> bool {
     let project_root = config.project_root.as_deref();
     for file in files {
-        if let Some(server) = servers_for_file(file, config).into_iter().find(|server| {
-            server.kind.id_str() == configured.id && server.binary == configured.binary
-        }) {
+        if let Some(server) = servers_for_file_in_pass(file, config, memo)
+            .into_iter()
+            .find(|server| {
+                server.kind.id_str() == configured.id && server.binary == configured.binary
+            })
+        {
             let workspace_root = if matches!(server.kind, ServerKind::Python | ServerKind::Ty) {
                 server.workspace_root_for_file_with_project_root(file, project_root)
             } else {
@@ -2620,9 +2625,12 @@ fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config
     let mut warned_binaries = HashSet::new();
 
     let project_root = config.project_root.as_deref();
+    // One memo for the whole pass: files that share folders share their Biome
+    // root and configuration lookups. A fresh one each pass sees config edits.
+    let mut biome_memo = BiomeSelectionMemo::default();
 
     for file in files {
-        for server in servers_for_file(&file, config) {
+        for server in servers_for_file_in_pass(file, config, &mut biome_memo) {
             let workspace_root = if matches!(server.kind, ServerKind::Python | ServerKind::Ty) {
                 server.workspace_root_for_file_with_project_root(file, project_root)
             } else {
@@ -2682,7 +2690,7 @@ fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config
             continue;
         }
 
-        if !configured_lsp_binary_resolves(server, files, config)
+        if !configured_lsp_binary_resolves(server, files, config, &mut biome_memo)
             && warned_binaries.insert(server.binary.clone())
         {
             warnings.push(json!({
@@ -2696,6 +2704,41 @@ fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config
 
     warnings.sort_by_key(|warning| warning.to_string());
     warnings
+}
+
+#[cfg(test)]
+#[test]
+fn lsp_warnings_probe_each_biome_folder_once_per_pass() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join("biome.json"), "{}").unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let files: Vec<PathBuf> = (0..25)
+        .map(|index| {
+            let file = root.join(format!("src/file{index}.ts"));
+            std::fs::write(&file, "").unwrap();
+            file
+        })
+        .collect();
+    let config = Config {
+        project_root: Some(root.clone()),
+        ..Default::default()
+    };
+    let walks = || crate::lsp::registry::BIOME_ROOT_WALKS.with(std::cell::Cell::get);
+    let probes = || crate::lsp::registry::BIOME_CONFIG_DIRECTORY_PROBES.with(std::cell::Cell::get);
+    let (walks_before, probes_before) = (walks(), probes());
+    detect_missing_lsp_binaries(&files, &config);
+    assert_eq!(
+        walks() - walks_before,
+        1,
+        "src resolved its Biome root once"
+    );
+    assert_eq!(
+        probes() - probes_before,
+        1,
+        "the root was searched for a configuration once"
+    );
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
