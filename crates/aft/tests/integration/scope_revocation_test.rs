@@ -2326,7 +2326,12 @@ fn worker_codemode_run_uses_the_workers_root_and_frozen_params_never_the_heads()
                 "{}",
                 reply_text(&reply)
             );
-            assert_eq!(any_code(&reply), "path_outside_root", "{}", reply_text(&reply));
+            assert_eq!(
+                any_code(&reply),
+                "path_outside_root",
+                "{}",
+                reply_text(&reply)
+            );
 
             // The worker freezes `confine: root` at its own catalog fetch.
             send_frame(

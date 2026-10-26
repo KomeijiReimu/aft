@@ -258,7 +258,10 @@ fn resolve_owner(
             ));
         }
         if stamp.attributes.flow_id.is_some() {
-            return Err(refuse("worker_run_flow", "a worker run cannot carry a flow"));
+            return Err(refuse(
+                "worker_run_flow",
+                "a worker run cannot carry a flow",
+            ));
         }
     }
     if !stamp.owner_authorized {

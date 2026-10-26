@@ -1,0 +1,1 @@
+- Codemode programs run by workers (mason, sidekick) can now call AFT tools: AFT declares `worker-runs/v1`, and each such call runs with only the worker's own root, grants, frozen settings and shell tasks, never those of the head agent it works for.
