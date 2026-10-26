@@ -31,6 +31,8 @@ use aft::protocol::Response;
 use aft::subc_format::{format_response_with_context, FormatContext, OutlineMode};
 use serde_json::{json, Map, Value};
 
+use crate::list_cut_item::extract_item_name;
+
 fn fixture_search_envelope(
     shown: usize,
     more_available: bool,
@@ -2323,38 +2325,7 @@ pub struct DiscoveredCut {
     pub snippet: String,
 }
 
-fn extract_item_name(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    let rest = [
-        "pub(crate) fn ",
-        "pub fn ",
-        "fn ",
-        "async fn ",
-        "pub async fn ",
-        "pub(crate) async fn ",
-        "pub(crate) const ",
-        "pub const ",
-        "const ",
-        "pub(crate) static ",
-        "pub static ",
-        "static ",
-        "pub(crate) struct ",
-        "pub struct ",
-        "struct ",
-        "pub(crate) enum ",
-        "pub enum ",
-        "enum ",
-    ]
-    .iter()
-    .find_map(|prefix| trimmed.strip_prefix(prefix))?;
-    let name = rest
-        .chars()
-        .take_while(|character| character.is_alphanumeric() || *character == '_')
-        .collect::<String>();
-    (!name.is_empty()).then_some(name)
-}
-
-fn enclosing_item(lines: &[&str], target: usize) -> String {
+pub(super) fn enclosing_item(lines: &[&str], target: usize) -> String {
     (0..=target)
         .rev()
         .find_map(|index| extract_item_name(lines[index]))

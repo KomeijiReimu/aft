@@ -5,6 +5,8 @@ use aft::list_envelope::{render_trailer, ListEnvelope, Reason, Total, Unit};
 use aft::list_surfaces::{ExclusionEntry, EXCLUSIONS, LIST_SURFACES};
 use serde_json::Value;
 
+use crate::list_cut_item::extract_item_name;
+
 /// Returns the path to `crates/aft/src`.
 fn aft_src_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -49,70 +51,7 @@ pub struct DiscoveredCut {
     pub snippet: String,
 }
 
-fn extract_item_name(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-
-    // Check fn
-    if let Some(rest) = trimmed
-        .strip_prefix("pub(crate) fn ")
-        .or_else(|| trimmed.strip_prefix("pub fn "))
-        .or_else(|| trimmed.strip_prefix("fn "))
-        .or_else(|| trimmed.strip_prefix("async fn "))
-        .or_else(|| trimmed.strip_prefix("pub async fn "))
-        .or_else(|| trimmed.strip_prefix("pub(crate) async fn "))
-    {
-        let name: String = rest
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
-        if !name.is_empty() {
-            return Some(name);
-        }
-    }
-
-    // Check const / static
-    if let Some(rest) = trimmed
-        .strip_prefix("pub(crate) const ")
-        .or_else(|| trimmed.strip_prefix("pub const "))
-        .or_else(|| trimmed.strip_prefix("const "))
-        .or_else(|| {
-            trimmed
-                .strip_prefix("pub(crate) static ")
-                .or_else(|| trimmed.strip_prefix("pub static "))
-                .or_else(|| trimmed.strip_prefix("static "))
-        })
-    {
-        let name: String = rest
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
-        if !name.is_empty() {
-            return Some(name);
-        }
-    }
-
-    // Check struct / enum
-    if let Some(rest) = trimmed
-        .strip_prefix("pub(crate) struct ")
-        .or_else(|| trimmed.strip_prefix("pub struct "))
-        .or_else(|| trimmed.strip_prefix("struct "))
-        .or_else(|| trimmed.strip_prefix("pub(crate) enum "))
-        .or_else(|| trimmed.strip_prefix("pub enum "))
-        .or_else(|| trimmed.strip_prefix("enum "))
-    {
-        let name: String = rest
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
-        if !name.is_empty() {
-            return Some(name);
-        }
-    }
-
-    None
-}
-
-fn find_enclosing_item(lines: &[&str], target_idx: usize) -> String {
+pub(crate) fn find_enclosing_item(lines: &[&str], target_idx: usize) -> String {
     for i in (0..=target_idx).rev() {
         if let Some(name) = extract_item_name(lines[i]) {
             return name;
