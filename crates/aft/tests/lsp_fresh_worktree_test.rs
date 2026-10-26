@@ -74,24 +74,46 @@ fn fresh_git_worktree_produces_typescript_diagnostics_without_installing() {
         lsp_paths_extra: vec![bin],
         ..Config::default()
     };
-    let mut manager = LspManager::new();
-    manager.ensure_file_open(&file, &config).unwrap();
-    manager.wait_for_diagnostics(&file, &config, Duration::from_secs(15));
-    let diagnostics = manager.get_diagnostics_for_file(&file);
+    let manager = parking_lot::Mutex::new(LspManager::new());
+    let (pre_snapshot, expected_versions) = {
+        let mut lsp = manager.lock();
+        lsp.drain_events();
+        let pre_snapshot = lsp.snapshot_pre_edit_state(&file);
+        let expected_versions = lsp
+            .notify_file_changed_versioned(&file, &std::fs::read_to_string(&file).unwrap(), &config)
+            .unwrap();
+        (pre_snapshot, expected_versions)
+    };
+    assert!(
+        !expected_versions.is_empty(),
+        "TypeScript server should match the file"
+    );
+    let result = aft::lsp::fresh_wait::wait_for_post_edit_diagnostics_unlocked(
+        || manager.lock(),
+        &file,
+        &expected_versions,
+        &pre_snapshot,
+        std::time::Instant::now() + Duration::from_secs(15),
+    );
+    assert!(
+        result.complete(),
+        "expected current TypeScript diagnostics: {result:?}"
+    );
+    let diagnostics = result.diagnostics;
     assert!(
         diagnostics
             .iter()
             .any(|d| d.message.contains("not assignable to type 'number'")),
         "expected TS2322, got {diagnostics:?}"
     );
-    let notes = manager.runtime_notes();
+    let notes = manager.lock().runtime_notes();
     assert!(
         notes
             .iter()
             .any(|n| n.contains("not the project's pinned TypeScript")),
         "{notes:?}"
     );
-    manager.shutdown_all();
+    manager.lock().shutdown_all();
     let mut after: Vec<_> = std::fs::read_dir(&fresh)
         .unwrap()
         .map(|e| e.unwrap().file_name())

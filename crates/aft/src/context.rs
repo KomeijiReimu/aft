@@ -14749,30 +14749,13 @@ impl AppContext {
                 err
             );
         }
-        let mut lsp = manager.lock();
-        let remaining = deadline.saturating_duration_since(Instant::now());
-
-        // Register the wake receiver while the manager is still locked. Events
-        // that raced with registration remain on the raw receiver; events won by
-        // another drain path wake this waiter after that path updates the store.
-        let mut wait = lsp.start_post_edit_diagnostics_wait(
+        crate::lsp::fresh_wait::wait_for_post_edit_diagnostics_unlocked(
+            || manager.lock(),
             file_path,
             &expected_versions,
             &pre_snapshot,
-            remaining,
-        );
-        let mut complete = lsp.poll_post_edit_diagnostics_wait(&mut wait, None);
-        drop(lsp);
-
-        while !complete && !wait.deadline_reached() {
-            // Waiting on channel activity does not require access to manager
-            // state, so other LSP operations can continue their bookkeeping.
-            let event = wait.next_event();
-            let mut lsp = manager.lock();
-            complete = lsp.poll_post_edit_diagnostics_wait(&mut wait, event);
-        }
-
-        manager.lock().finish_post_edit_diagnostics_wait(wait)
+            deadline,
+        )
     }
 
     /// Collect custom server root_markers from user config for use in
