@@ -85,7 +85,6 @@ fn path_normalization_removes_dot_segments_and_decodes_unreserved() {
         ("/repos/a/./b", "/repos/a/b"),
         ("/repos/a/../b", "/repos/b"),
         ("/repos/a/b/..", "/repos/a"),
-        ("/repos/a/%2E%2E/b", "/repos/b"),
         ("/repos/%61/b", "/repos/a/b"),
     ];
     for (input, expected) in cases {
@@ -96,6 +95,13 @@ fn path_normalization_removes_dot_segments_and_decodes_unreserved() {
     }
     assert_eq!(
         normalize_request_target("/repos/a/..;/admin"),
+        Err(TargetRefusal::AmbiguousPathSeparator)
+    );
+    // Escaped dots are a second spelling of a dot segment: AFT and the server
+    // could each normalise a different one, and a server that decodes twice
+    // would resolve the segment away, so they refuse (M2).
+    assert_eq!(
+        normalize_request_target("/repos/a/%2E%2E/b"),
         Err(TargetRefusal::AmbiguousPathSeparator)
     );
     assert_eq!(
@@ -231,27 +237,27 @@ fn a_redirect_hop_to_another_host_scheme_or_port_is_not_authorized() {
     let rules = [rule];
     let same = request("api.example.com", 443, "https", "/v1/next");
     assert_eq!(
-        evaluate_redirect(&rules, &same).0,
+        evaluate_redirect(&rules, &same)[0].outcome,
         RedirectOutcome::Authorized
     );
     let other_host = request("evil.example.com", 443, "https", "/v1/next");
     assert_eq!(
-        evaluate_redirect(&rules, &other_host).0,
+        evaluate_redirect(&rules, &other_host)[0].outcome,
         RedirectOutcome::NotAuthorized
     );
     let http = request("api.example.com", 443, "http", "/v1/next");
     assert_eq!(
-        evaluate_redirect(&rules, &http).0,
+        evaluate_redirect(&rules, &http)[0].outcome,
         RedirectOutcome::NotAuthorized
     );
     let other_port = request("api.example.com", 8443, "https", "/v1/next");
     assert_eq!(
-        evaluate_redirect(&rules, &other_port).0,
+        evaluate_redirect(&rules, &other_port)[0].outcome,
         RedirectOutcome::NotAuthorized
     );
     let outside = request("api.example.com", 443, "https", "/v2/next");
     assert_eq!(
-        evaluate_redirect(&rules, &outside).0,
+        evaluate_redirect(&rules, &outside)[0].outcome,
         RedirectOutcome::NotAuthorized
     );
 }

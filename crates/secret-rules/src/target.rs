@@ -108,10 +108,12 @@ pub fn canonical_host(host: &str) -> Result<String, TargetRefusal> {
     if host.contains(':') {
         return Err(TargetRefusal::MalformedAuthority);
     }
-    let (domain, trailing_dot) = match host.strip_suffix('.') {
-        Some(stripped) => (stripped, true),
-        None => (host, false),
-    };
+    // A trailing dot is a DNS spelling AFT does not model; a host that carries
+    // one is not the same authority as one that does not.
+    if host.ends_with('.') {
+        return Err(TargetRefusal::MalformedAuthority);
+    }
+    let (domain, trailing_dot) = (host, false);
     let ascii = idna::domain_to_ascii(domain).map_err(|_| TargetRefusal::MalformedAuthority)?;
     if ascii.is_empty() {
         return Err(TargetRefusal::MalformedAuthority);
@@ -200,7 +202,16 @@ pub fn canonicalize_path(path: &str) -> Result<CanonicalPath, TargetRefusal> {
             b'\\' | b';' => return Err(TargetRefusal::AmbiguousPathSeparator),
             b'%' => {
                 let (decoded, len) = decode_escape(bytes, index + 1)?;
-                if decoded == b'/' || decoded == b'\\' || decoded == b';' {
+                if decoded == b'/' || decoded == b'\\' || decoded == b';' || decoded == b'%' {
+                    // Separators and nested escapes would let a second decoding
+                    // layer read a different path than the one approved here.
+                    return Err(TargetRefusal::AmbiguousPathSeparator);
+                }
+                // A dot written as an escape (`%2E`) is a dot segment once
+                // decoded. It refuses for the same reason `..` does: AFT and
+                // the server would each normalise a different spelling, and a
+                // server that decodes twice would resolve the segment away.
+                if decoded == b'.' {
                     return Err(TargetRefusal::AmbiguousPathSeparator);
                 }
                 current.push(decoded);
@@ -320,12 +331,25 @@ pub struct ConnectAuthority {
 
 impl ConnectAuthority {
     /// Parse `host:port`, with bracketed IPv6 supported.
+    ///
+    /// Userinfo and any text after the host that is not a port refuse the
+    /// authority: the value AFT authorizes must be the value a client would
+    /// connect to.
     pub fn parse(authority: &str) -> Result<Self, TargetRefusal> {
+        if authority.is_empty() || authority.contains('@') {
+            return Err(TargetRefusal::MalformedAuthority);
+        }
         let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
             let Some((inner, tail)) = rest.split_once(']') else {
                 return Err(TargetRefusal::MalformedAuthority);
             };
-            let port = tail.strip_prefix(':').unwrap_or_default();
+            let port = match tail {
+                "" => return Err(TargetRefusal::MalformedAuthority),
+                tail => match tail.strip_prefix(':') {
+                    Some(port) => port,
+                    None => return Err(TargetRefusal::MalformedAuthority),
+                },
+            };
             (format!("[{inner}]"), port)
         } else {
             let Some((host, port)) = authority.rsplit_once(':') else {
@@ -333,6 +357,9 @@ impl ConnectAuthority {
             };
             (host.to_string(), port)
         };
+        if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(TargetRefusal::MalformedAuthority);
+        }
         let port: u16 = port
             .parse()
             .map_err(|_| TargetRefusal::MalformedAuthority)?;
@@ -381,15 +408,15 @@ fn parse_authority_with_default(
     value: &str,
     default_port: u16,
 ) -> Result<(String, u16), TargetRefusal> {
-    if value.is_empty() {
+    if value.is_empty() || value.contains('@') {
         return Err(TargetRefusal::MalformedAuthority);
     }
-    match ConnectAuthority::parse(value) {
-        Ok(parsed) => Ok((parsed.host, parsed.port)),
-        Err(err) => match value.rsplit_once(':') {
-            // No port: the default applies.
-            None => Ok((canonical_host(value)?, default_port)),
-            Some(_) => Err(err),
-        },
+    match value.rsplit_once(':') {
+        // No port: the default applies.
+        None => Ok((canonical_host(value)?, default_port)),
+        Some(_) => {
+            let parsed = ConnectAuthority::parse(value)?;
+            Ok((parsed.host, parsed.port))
+        }
     }
 }

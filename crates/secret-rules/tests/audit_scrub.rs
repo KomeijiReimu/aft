@@ -245,7 +245,7 @@ fn scrambled_escapes(key: &[u8], seed: u64) -> String {
         state = state
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        if state % 3 != 0 {
+        if !state.is_multiple_of(3) {
             out.push_str(&format!("%{byte:02x}"));
         } else {
             out.push(*byte as char);
@@ -436,7 +436,7 @@ fn the_independent_oracle_catches_the_encodings_under_test() {
         b"0123456789%61bcdef".to_vec(),
         b"30313233343536373839616263646566".to_vec(),
         base64_encode(
-            &[b'Z', b'Z']
+            &b"ZZ"
                 .iter()
                 .copied()
                 .chain(key.iter().copied())

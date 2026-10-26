@@ -1,6 +1,6 @@
 //! A1: the audit record schema, and that no field can hold key bytes.
 
-use secret_rules::{AuditRecordV1, Decision, ScopeRef};
+use secret_rules::{AuditReason, AuditRecordV1, Decision, ScopeRef};
 
 const KEY: &[u8] = b"sk-live-0123456789abcdef";
 
@@ -10,7 +10,7 @@ fn a_full_record_serializes_with_every_field_and_version_one() {
         1_760_000_000_000,
         "repo_key",
         Decision::Substituted,
-        "matched",
+        AuditReason::Matched,
         "req-1",
         "task-9",
     )
@@ -20,7 +20,7 @@ fn a_full_record_serializes_with_every_field_and_version_one() {
         reference: "ref-1".to_string(),
     }))
     .with_rule("api.example.com", 443, "/v1", "header:x-api-key");
-    let json = record.to_json_line();
+    let json = record.to_json_line().expect("clean record serializes");
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed["v"], 1);
     assert_eq!(parsed["timestamp_ms"], 1_760_000_000_000u64);
@@ -44,11 +44,11 @@ fn a_launch_refusal_record_has_null_rule_fields_and_null_scope() {
         1_760_000_000_001,
         "repo_key",
         Decision::Refused,
-        "secrets_sandbox_required",
+        AuditReason::Refused,
         "req-2",
         "task-9",
     );
-    let json = record.to_json_line();
+    let json = record.to_json_line().expect("clean record serializes");
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     for field in ["scope", "host", "port", "matched_prefix", "location_kind"] {
         assert!(parsed[field].is_null(), "{field} must be null");
@@ -77,12 +77,12 @@ fn no_record_field_can_hold_key_bytes() {
         1,
         "repo_key",
         Decision::Literal,
-        "not_whole_value",
+        AuditReason::NotWholeValue,
         "req-3",
         "task-9",
     )
     .with_rule("api.example.com", 443, "/v1", "query:key");
-    let json = record.to_json_line();
+    let json = record.to_json_line().expect("clean record serializes");
     assert!(
         !json.contains(key_text),
         "record must not contain the key: {json}"
@@ -126,7 +126,7 @@ fn records_round_trip_through_serde() {
         7,
         "repo_key",
         Decision::Substituted,
-        "matched",
+        AuditReason::Matched,
         "req-4",
         "fetch-1#2",
     );

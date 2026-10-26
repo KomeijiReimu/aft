@@ -81,56 +81,82 @@ pub fn split_absolute(url: &str) -> Result<(String, String, u16, String), Target
     Ok((scheme, host, port, target))
 }
 
+/// Split `host[:port]` from an authority.
+///
+/// The parse is strict on purpose: userinfo (`user@host`) and any text that is
+/// neither the host nor a decimal port refuse the URL. A lenient parse here
+/// would let the authority AFT authorizes differ from the one a browser-style
+/// URL consumer connects to.
 fn split_host_port(authority: &str) -> Result<(String, u16), TargetRefusal> {
+    if authority.is_empty() || authority.contains('@') {
+        return Err(TargetRefusal::MalformedAuthority);
+    }
     if let Some(rest) = authority.strip_prefix('[') {
         let Some((inner, tail)) = rest.split_once(']') else {
             return Err(TargetRefusal::MalformedAuthority);
         };
-        let port = match tail.strip_prefix(':') {
-            Some(port) => port
-                .parse()
-                .map_err(|_| TargetRefusal::MalformedAuthority)?,
-            None => 443,
+        let port = match tail {
+            "" => 443,
+            tail => match tail.strip_prefix(':') {
+                Some(port) => parse_port(port)?,
+                // Anything else after the bracket is not part of the authority.
+                None => return Err(TargetRefusal::MalformedAuthority),
+            },
         };
         return Ok((canonical_host(&format!("[{inner}]"))?, port));
     }
     match authority.rsplit_once(':') {
-        Some((host, port)) => {
-            let port = port
-                .parse()
-                .map_err(|_| TargetRefusal::MalformedAuthority)?;
-            Ok((canonical_host(host)?, port))
-        }
+        Some((host, port)) => Ok((canonical_host(host)?, parse_port(port)?)),
         None => Ok((canonical_host(authority)?, 443)),
     }
 }
 
-/// Decide whether a redirect hop may receive `rules`' keys.
-///
-/// The second element names, per rule, why it was not authorized.
-pub fn evaluate_redirect(
-    rules: &[LabelRule],
-    hop: &RequestTarget<'_>,
-) -> (RedirectOutcome, Vec<RequestRefusal>) {
-    let mut authorized = false;
-    let mut refusals = Vec::new();
-    for rule in rules {
-        let target = RuleTarget {
-            host: &rule.host,
-            port: rule.port,
-            path_prefix: &rule.path_prefix,
-        };
-        match hop.matches(&target) {
-            Ok(_) => authorized = true,
-            Err(err) => refusals.push(RequestRefusal::TargetMismatch(err)),
-        }
+fn parse_port(port: &str) -> Result<u16, TargetRefusal> {
+    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(TargetRefusal::MalformedAuthority);
     }
-    let outcome = if authorized {
-        RedirectOutcome::Authorized
-    } else {
-        RedirectOutcome::NotAuthorized
-    };
-    (outcome, refusals)
+    port.parse().map_err(|_| TargetRefusal::MalformedAuthority)
+}
+
+/// How one label's key behaves across a redirect hop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedirectDecision {
+    /// The label whose rule was evaluated.
+    pub label: String,
+    /// Whether this label's key may be substituted at the hop.
+    pub outcome: RedirectOutcome,
+    /// Why this label was not authorized, when it was not.
+    pub refusal: Option<RequestRefusal>,
+}
+
+/// Decide, **per label**, whether a redirect hop may receive that label's key.
+///
+/// A hop is authorized for one label only when that label's own rule covers it.
+/// There is deliberately no aggregate verdict: a hop that matches label A says
+/// nothing about whether label B's key may be sent there.
+pub fn evaluate_redirect(rules: &[LabelRule], hop: &RequestTarget<'_>) -> Vec<RedirectDecision> {
+    rules
+        .iter()
+        .map(|rule| {
+            let target = RuleTarget {
+                host: &rule.host,
+                port: rule.port,
+                path_prefix: &rule.path_prefix,
+            };
+            match hop.matches(&target) {
+                Ok(_) => RedirectDecision {
+                    label: rule.label.clone(),
+                    outcome: RedirectOutcome::Authorized,
+                    refusal: None,
+                },
+                Err(err) => RedirectDecision {
+                    label: rule.label.clone(),
+                    outcome: RedirectOutcome::NotAuthorized,
+                    refusal: Some(RequestRefusal::TargetMismatch(err)),
+                },
+            }
+        })
+        .collect()
 }
 
 /// True when a `Location` value still mentions the label's placeholder, so a

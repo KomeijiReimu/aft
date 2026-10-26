@@ -10,6 +10,7 @@ use super::{
     LabelOutcome, LabelRule, Location, RequestRefusal, RequestView, MAX_SUBSTITUTABLE_BODY,
 };
 use crate::material::encode_for_location;
+use zeroize::Zeroizing;
 
 /// True for `application/json` and any `+json` subtype (P4).
 pub fn is_json_content_type(content_type: &str) -> bool {
@@ -27,13 +28,13 @@ pub(crate) struct JsonResult {
     /// One outcome per rule, in rule order.
     pub outcomes: Vec<LabelOutcome>,
     /// The body to send upstream, when a pointer changed it.
-    pub rewritten_body: Option<Vec<u8>>,
+    pub rewritten_body: Option<Zeroizing<Vec<u8>>>,
 }
 
 pub(crate) fn evaluate(
     request: &RequestView<'_>,
     rules: &[&LabelRule],
-    key: &[u8],
+    keys: &[(String, Vec<u8>)],
 ) -> Result<JsonResult, RequestRefusal> {
     // P4: an oversized body, any Content-Encoding, and a non-JSON
     // Content-Type refuse the request before anything is parsed.
@@ -47,16 +48,33 @@ pub(crate) fn evaluate(
     {
         return Err(RequestRefusal::ContentEncodingPresent);
     }
-    let content_type = request
+    // Exactly one Content-Type may decide how the body is read: two fields that
+    // disagree would let a server take a different view of the body than AFT.
+    let mut content_types = request
         .headers
         .iter()
-        .find(|field| field.name.eq_ignore_ascii_case("content-type"))
-        .map(|field| String::from_utf8_lossy(field.bytes(request.body)).into_owned());
-    let Some(content_type) = content_type else {
+        .filter(|field| field.name.eq_ignore_ascii_case("content-type"))
+        .map(|field| match field.value_range {
+            Some((start, end)) => {
+                String::from_utf8_lossy(request.body.get(start..end).unwrap_or_default())
+                    .into_owned()
+            }
+            None => String::from_utf8_lossy(field.borrowed.unwrap_or_default()).into_owned(),
+        });
+    let Some(content_type) = content_types.next() else {
         return Err(RequestRefusal::JsonContentTypeMissing);
     };
+    if content_types.next().is_some() {
+        return Err(RequestRefusal::DuplicateField);
+    }
     if !is_json_content_type(&content_type) {
         return Err(RequestRefusal::JsonContentTypeMissing);
+    }
+
+    // Duplicate member names make the pointer's meaning depend on the parser
+    // that reads the body, so they refuse before any value is chosen.
+    if duplicate_member(request.body) {
+        return Err(RequestRefusal::DuplicateField);
     }
 
     let value: serde_json::Value = if request.body.is_empty() {
@@ -72,14 +90,24 @@ pub(crate) fn evaluate(
             outcomes.push(LabelOutcome::OutOfScope);
             continue;
         };
+        let key = keys
+            .iter()
+            .find(|(label, _)| label == &rule.label)
+            .map(|(_, key)| key.as_slice())
+            .ok_or(RequestRefusal::MissingMaterial)?;
         outcomes.push(evaluate_pointer(
-            request, &value, rule, pointer, key, &mut edits,
+            request.body,
+            &value,
+            rule,
+            pointer,
+            key,
+            &mut edits,
         )?);
     }
     let rewritten_body = if edits.is_empty() {
         None
     } else {
-        Some(apply(request.body, &edits))
+        Some(Zeroizing::new(apply(request.body, &edits)))
     };
     Ok(JsonResult {
         outcomes,
@@ -87,14 +115,110 @@ pub(crate) fn evaluate(
     })
 }
 
+/// True when one object in `body` names the same member twice.
+///
+/// `serde_json` keeps the last value of a repeated member and gives no view of
+/// the earlier one, so the check runs on the raw bytes: every object's member
+/// names are collected as they are scanned.
+fn duplicate_member(body: &[u8]) -> bool {
+    let mut found = false;
+    walk_duplicates(body, &mut found);
+    found
+}
+
+/// Walk the whole body structurally and set `found` when any object names a
+/// member twice. Returns the position after the consumed value.
+fn walk_duplicates(bytes: &[u8], found: &mut bool) -> usize {
+    let mut position = 0;
+    while position < bytes.len() {
+        match bytes[position] {
+            b'"' => match scan_json_string(bytes, position) {
+                Some((_, next)) => position = next,
+                None => return position,
+            },
+            b'{' => {
+                position += 1;
+                let mut names: Vec<Vec<u8>> = Vec::new();
+                loop {
+                    position = skip_ws(bytes, position);
+                    match bytes.get(position) {
+                        Some(b'}') => {
+                            position += 1;
+                            break;
+                        }
+                        Some(b',') => {
+                            position += 1;
+                            continue;
+                        }
+                        Some(b'"') => {}
+                        _ => return position,
+                    }
+                    let Some((name, next)) = scan_json_string(bytes, position) else {
+                        return position;
+                    };
+                    position = skip_ws(bytes, next);
+                    if bytes.get(position) != Some(&b':') {
+                        return position;
+                    }
+                    position += 1;
+                    if names.contains(&name) {
+                        *found = true;
+                    }
+                    names.push(name);
+                    position = walk_duplicates(&bytes[position..], found) + position;
+                }
+            }
+            b'[' => {
+                position += 1;
+                loop {
+                    position = skip_ws(bytes, position);
+                    match bytes.get(position) {
+                        Some(b']') => {
+                            position += 1;
+                            break;
+                        }
+                        Some(b',') => {
+                            position += 1;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    let before = position;
+                    position = walk_duplicates(&bytes[position..], found) + position;
+                    if position == before {
+                        return position;
+                    }
+                }
+            }
+            b'}' | b']' | b',' => return position,
+            _ => {
+                while position < bytes.len()
+                    && !matches!(bytes[position], b',' | b'}' | b']' | b'[' | b'{' | b'"')
+                {
+                    position += 1;
+                }
+                return position;
+            }
+        }
+    }
+    position
+}
+
+fn skip_ws(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    index
+}
+
 struct Edit {
     start: usize,
     end: usize,
-    replacement: Vec<u8>,
+    replacement: Zeroizing<Vec<u8>>,
 }
 
 fn evaluate_pointer(
-    request: &RequestView<'_>,
+    body: &[u8],
     value: &serde_json::Value,
     rule: &LabelRule,
     pointer: &str,
@@ -110,7 +234,7 @@ fn evaluate_pointer(
         // A pointer that lands on a number, boolean, null, object or array is
         // a rule the request cannot satisfy. It is only ambiguous when the
         // placeholder itself is the value, so check the raw span first.
-        if let Some(raw) = raw_value(request.body, &tokens) {
+        if let Some(raw) = raw_value(body, &tokens) {
             if mentions_placeholder(&raw) {
                 return Err(RequestRefusal::NonStringJsonTarget);
             }
@@ -124,22 +248,21 @@ fn evaluate_pointer(
             Ok(LabelOutcome::OutOfScope)
         };
     }
-    let span =
-        find_string_contents(request.body, &tokens).ok_or(RequestRefusal::MalformedJsonBody)?;
+    let span = find_string_contents(body, &tokens).ok_or(RequestRefusal::MalformedJsonBody)?;
     let escaped = crate::material::json_escape(text.as_bytes());
-    if request.body.get(span.0..span.1) != Some(escaped.as_bytes()) {
+    if body.get(span.0..span.1) != Some(escaped.as_bytes()) {
         return Err(RequestRefusal::MalformedJsonBody);
     }
     let replacement = encode_for_location(key, &rule.label, &rule.location)?;
     edits.push(Edit {
         start: span.0,
         end: span.1,
-        replacement: replacement.clone(),
+        replacement: Zeroizing::new(replacement.clone()),
     });
     Ok(LabelOutcome::Substituted {
         byte_start: span.0,
         byte_end: span.1,
-        replacement,
+        replacement: Zeroizing::new(replacement),
     })
 }
 

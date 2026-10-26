@@ -4,12 +4,11 @@
 mod support;
 
 use secret_rules::{
-    apply_target_edits, audit, authority_matches_connect, canonical_host, check_admissible,
-    encode_for_location, evaluate_redirect, evaluate_request, is_json_content_type, is_label,
-    location_kind_token, mentions_label_loose, normalize_request_target, parse_at, parse_exact,
-    scan, scrub_bytes, split_absolute, AuditRecordV1, ConnectAuthority, Decision, HeaderField,
-    KeyPatterns, LabelRule, Location, MaterialRefusal, RequestRefusal, RequestTarget, RequestView,
-    ScopeRef, TargetRefusal,
+    apply_target_edits, authority_matches_connect, canonical_host, check_admissible,
+    encode_for_location, evaluate_redirect, evaluate_request_with_connect, mentions_label_loose,
+    normalize_request_target, parse_at, parse_exact, scan, scrub_bytes, split_absolute,
+    AuditReason, AuditRecordV1, ConnectAuthority, Decision, HeaderField, LabelRule, Location,
+    MaterialRefusal, RequestTarget, RequestView, ScopeRef, TargetRefusal,
 };
 use serde_json::{json, Map, Value};
 
@@ -72,28 +71,16 @@ fn a1_audit_vectors() {
 
 #[test]
 fn every_acceptance_group_has_vectors() {
-    support::check_groups_present(&[
-        "secret_rules_v1.json",
-        "secret_rules_p3.json",
-        "secret_rules_m1.json",
-        "secret_rules_m2.json",
-        "secret_rules_m3.json",
-        "secret_rules_m4.json",
-        "secret_rules_s1.json",
-        "secret_rules_s2.json",
-        "secret_rules_a1.json",
-    ]);
+    support::check_groups_present();
 }
 
 fn run_group(file: &str, group: &str) {
-    support::skip_missing_group(file, group);
     let mut failures = Vec::new();
     let mut total = 0usize;
-    let vectors = support::load(file);
-    if vectors.pointer(&format!("/groups/{group}")).is_none() {
-        return;
+    if let Err(err) = support::require_group(file, group) {
+        panic!("{err}");
     }
-    support::run_group(file, group, &mut failures, &mut total);
+    support::run_group(file, group, &mut run, &mut failures, &mut total);
     assert!(
         total > 0,
         "group {group} ran zero cases, which is not a pass"
@@ -223,7 +210,23 @@ fn run_request(case: &Value) -> Result<Value, String> {
         headers,
         body: Box::leak(body.into_boxed_slice()),
     };
-    let outcome = evaluate_request(&request, &target, &rules, &key);
+    let connect = ConnectAuthority::parse(&format!("{}:{}", target.host, target.port))
+        .map_err(|err| format!("{err:?}"))?;
+    // One key per label. A case may spell the keys out; otherwise every rule
+    // gets the case's single key.
+    let explicit = case["keys"].as_array().cloned().unwrap_or_default();
+    let keys: Vec<(String, Vec<u8>)> = if explicit.is_empty() {
+        rules
+            .iter()
+            .map(|rule| (rule.label.clone(), key.clone()))
+            .collect()
+    } else {
+        explicit
+            .iter()
+            .map(|entry| (support::string(&entry["label"]), support::key_bytes(entry)))
+            .collect()
+    };
+    let outcome = evaluate_request_with_connect(&request, &target, &connect, &rules, &keys);
     let mut arms = Vec::new();
     for label in outcome.labels.iter() {
         arms.push(match label {
@@ -241,9 +244,26 @@ fn run_request(case: &Value) -> Result<Value, String> {
         "refusal".to_string(),
         json!(outcome.refusal.map(|refusal| refusal.reason().to_string())),
     );
-    match outcome.rewritten_body {
+    // Header edits are part of the trace: a wrong replacement byte or offset in
+    // a header has to fail the vectors, not slip past the comparison.
+    if !outcome.header_edits.is_empty() {
+        let edits: Vec<Value> = outcome
+            .header_edits
+            .iter()
+            .map(|edit| {
+                // A borrowed value has no offsets into a request buffer; the
+                // replacement text is what the vectors check in that case.
+                json!({
+                    "name": edit.name,
+                    "replacement": support::lossy(&edit.replacement),
+                })
+            })
+            .collect();
+        out.insert("header_edits".to_string(), json!(edits));
+    }
+    match &outcome.rewritten_body {
         Some(body) => {
-            out.insert("body_out".to_string(), json!(support::lossy(&body)));
+            out.insert("body_out".to_string(), json!(support::lossy(body)));
         }
         None => {
             if !request.body.is_empty() {
@@ -345,20 +365,22 @@ fn run_redirect(case: &Value) -> Result<Value, String> {
         scheme: &scheme,
         target: &target,
     };
-    let (outcome, refusals) = evaluate_redirect(&rules, &hop);
-    Ok(json!({
-        "outcome": match outcome {
-            secret_rules::RedirectOutcome::Authorized => "authorized",
-            secret_rules::RedirectOutcome::NotAuthorized => "not_authorized",
-        },
-        "reasons": refusals
-            .iter()
-            .map(|refusal| match refusal {
-                RequestRefusal::TargetMismatch(err) => target_reason(err),
-                other => other.reason().to_string(),
-            })
-            .collect::<Vec<_>>(),
-    }))
+    let decisions = evaluate_redirect(&rules, &hop);
+    let authorized: Vec<String> = decisions
+        .iter()
+        .filter(|decision| decision.outcome == secret_rules::RedirectOutcome::Authorized)
+        .map(|decision| decision.label.clone())
+        .collect();
+    let reasons: Vec<String> = decisions
+        .iter()
+        .filter_map(|decision| {
+            decision
+                .refusal
+                .as_ref()
+                .map(|refusal| format!("{}:{}", decision.label, refusal.reason()))
+        })
+        .collect();
+    Ok(json!({ "authorized": authorized, "reasons": reasons }))
 }
 
 fn run_authority(case: &Value) -> Result<Value, String> {
@@ -378,14 +400,12 @@ fn run_authority(case: &Value) -> Result<Value, String> {
 fn run_scrub(case: &Value) -> Result<Value, String> {
     let key = support::key_bytes(case);
     let label = support::string(&case["label"]);
-    let patterns = KeyPatterns::derive(&key).map_err(|err| format!("{err:?}"))?;
     let input = support::string(&case["input"]);
     let scrubbed = scrub_bytes(&key, &label, input.as_bytes()).map_err(|err| format!("{err:?}"))?;
     let text = support::lossy(&scrubbed);
-    let leaked = patterns
-        .patterns()
-        .any(|(pattern, insensitive)| support::contains(&text, pattern, insensitive));
-    let _ = patterns.len();
+    // The detector shares no code with the matcher: a representation the
+    // matcher forgot cannot be forgotten here too.
+    let leaked = support::discloses(&key, &scrubbed);
     Ok(json!({
         "output": text,
         "leaked": leaked,
@@ -397,7 +417,6 @@ fn run_scrub_stream(case: &Value) -> Result<Value, String> {
     let label = support::string(&case["label"]);
     let input = support::string(&case["input"]);
     let chunk = case["chunk"].as_u64().unwrap_or(4) as usize;
-    let patterns = KeyPatterns::derive(&key).map_err(|err| format!("{err:?}"))?;
     let mut scrubber =
         secret_rules::Scrubber::new(vec![
             secret_rules::MatcherSet::new(&label, &key).map_err(|err| format!("{err:?}"))?
@@ -408,11 +427,9 @@ fn run_scrub_stream(case: &Value) -> Result<Value, String> {
     }
     out.extend_from_slice(&scrubber.finish());
     let text = support::lossy(&out);
-    // No representation of the key may survive the stream, not just the raw
-    // bytes: a split that lands inside an encoding would leave that one.
-    let leaked = patterns
-        .patterns()
-        .any(|(pattern, insensitive)| support::contains(&text, pattern, insensitive));
+    // A split inside an encoding must not leave that encoding behind, so the
+    // independent detector checks the assembled stream.
+    let leaked = support::discloses(&key, &out);
     Ok(json!({
         "output": text,
         "leaked": leaked,
@@ -427,11 +444,14 @@ fn run_audit(case: &Value) -> Result<Value, String> {
         "refused" => Decision::Refused,
         other => return Err(format!("bad decision {other}")),
     };
+    let reason_text = support::string(&case["reason"]);
+    let reason = AuditReason::parse(&reason_text)
+        .ok_or_else(|| format!("bad audit reason {reason_text:?}"))?;
     let mut record = AuditRecordV1::new(
         case["timestamp_ms"].as_u64().unwrap_or(0),
         support::string(&case["label"]),
         decision,
-        support::string(&case["reason"]),
+        reason,
         support::string(&case["request_id"]),
         support::string(&case["origin"]),
     );
@@ -450,21 +470,16 @@ fn run_audit(case: &Value) -> Result<Value, String> {
             support::string(&rule["location_kind"]),
         );
     }
-    let parsed: Value = serde_json::from_str(&record.to_json_line()).unwrap();
     let key = support::key_bytes(case);
-    let json = record.to_json_line();
-    let leaked = !key.is_empty()
-        && (json.contains(std::str::from_utf8(&key).unwrap_or_default())
-            || KeyPatterns::derive(&key)
-                .map(|patterns| {
-                    patterns.patterns().any(|(pattern, insensitive)| {
-                        support::contains(&json, pattern, insensitive)
-                    })
-                })
-                .unwrap_or(false));
-    let _ = audit::AUDIT_VERSION_V1;
-    let _ = is_json_content_type("application/json");
-    let _ = is_label("x");
-    let _ = location_kind_token(&Location::Bearer);
+    let json = record
+        .to_json_line_with_key(&key)
+        .map_err(|err| format!("{err:?}"))?;
+    let parsed: Value = serde_json::from_str(&json).unwrap();
+    let leaked = !key.is_empty() && support::discloses(&key, json.as_bytes());
     Ok(json!({ "record": parsed, "leaked": leaked }))
+}
+
+/// The request trace of one vector case, for the harness tests.
+pub fn request_trace(case: &Value) -> Result<Value, String> {
+    run(case)
 }
