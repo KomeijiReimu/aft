@@ -790,13 +790,40 @@ fn cancel_child() {
     let stamp: ScopeStamp =
         serde_json::from_str(&std::env::var("AFT_TEST_DISPATCH_CANCEL_SCOPE").unwrap()).unwrap();
     assert!(crate::root_cache::acquire_speech_serving_lease(Path::new(&root)).is_err());
+    let saved = saved_task_summary(Path::new(&root));
     let reply = crate::commands::bash_kill_scope::handle_bash_kill_scope_with_saved_tasks(
         json!({"scope":stamp}),
         Some(&stamp.owner),
         &[],
         Some(Path::new(&root)),
     );
-    println!("CANCEL_REPLY {}", serde_json::to_string(&reply).unwrap());
+    let mut receipt = serde_json::to_value(reply).unwrap();
+    receipt["_saved_before_cancel"] = json!(saved);
+    println!("CANCEL_REPLY {}", serde_json::to_string(&receipt).unwrap());
+}
+
+fn saved_task_summary(root: &Path) -> Vec<Value> {
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let kind = entry.file_type().unwrap();
+        if kind.is_dir() {
+            found.extend(saved_task_summary(&entry.path()));
+        } else if kind.is_file() && entry.path().extension() == Some(OsStr::new("json")) {
+            if let Ok(value) =
+                fs::read(entry.path()).map(|bytes| serde_json::from_slice::<Value>(&bytes))
+            {
+                if let Ok(value) = value {
+                    if value.get("task_id").is_some() {
+                        found.push(json!({"path":entry.path(),"task_id":value["task_id"],"status":value["status"],"scope":value["scope"],"child_pid":value["child_pid"]}));
+                    }
+                }
+            }
+        }
+    }
+    found
 }
 
 fn cancel_from_sibling(root: &Path, scope: &ScopeStamp) -> Value {
@@ -845,7 +872,11 @@ async fn bound_dispatch_refuses_a_sibling_cancel_committed_before_local_enqueue(
         partners.before_final_gate = Some(Arc::new(move || {
             let receipt = cancel_from_sibling(&root, &scope);
             assert_eq!(receipt["success"], true);
-            assert_eq!(receipt["killed"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                receipt["killed"].as_array().unwrap().len(),
+                1,
+                "{receipt:?}"
+            );
         }));
         partners.on_bound_enqueue = Some(Arc::new(move || {
             observer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -883,6 +914,16 @@ async fn bound_dispatch_queued_before_cancel_posts_once_and_cancel_discloses_the
     assert!(answer.ok, "{:?}", answer.data);
     let receipt = receipt.lock().unwrap().clone().unwrap();
     assert_eq!(receipt["success"], true);
+    assert_eq!(
+        fixture
+            .service
+            .store
+            .get(&fixture.incarnation)
+            .err()
+            .map(|error| error.reason),
+        Some("revoked".into()),
+        "{receipt:?}"
+    );
     assert_eq!(receipt["bot_writes_already_queued"], 1);
     assert_eq!(receipt["bot_write_revocation_warning"],"bot_writes_already_queued: 1 writes already queued for this command may still post; cancellation cannot unsend them.");
     assert_eq!(fixture.plex.state.lock().unwrap().posts.len(), 1);
