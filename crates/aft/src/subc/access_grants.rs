@@ -268,9 +268,9 @@ pub(super) fn head_scope(identity: &RouteIdentity) -> Option<ScopeKey> {
 }
 
 /// Whether this route's calls are a stamped Alfonso worker's: a `Worker`
-/// scope, or an `Ephemeral` (run) scope that names a parent and is not acting
-/// for a head. A codemode worker run is judged as the worker whose route it
-/// runs with.
+/// scope, or an `Ephemeral` (run) scope that names a parent. A codemode call
+/// is judged by its owner route instead: an agent run's call is never a
+/// worker's, and a worker run's call is exactly its worker's.
 pub(super) fn alfonso_worker(identity: &RouteIdentity) -> bool {
     // An agent run's codemode call acts for a head agent, never as a worker; a
     // worker run's call is exactly its worker's.

@@ -1518,8 +1518,9 @@ struct RouteIdentityData {
     /// a new generation of that work from obsolete routes. Optional
     /// `attributes.agent_id` and `attributes.run_id` identify the agent and its
     /// codemode run; a worker run carries `attributes.on_behalf_of_agent`
-    /// instead of `agent_id`, as attribution only. The GitHub CLI relay uses this identity for delegated bot
-    /// writes; lifetime controls confirm the run ended before terminating processes.
+    /// instead of `agent_id`, as attribution only. The GitHub CLI relay uses
+    /// this identity for delegated bot writes; lifetime controls confirm the
+    /// run ended before terminating processes.
     /// Absent on routes opened without a scope or by a daemon predating scopes.
     scope: Option<subc_protocol::scope::ScopeStamp>,
     call_mode: subc_protocol::call_mode::CallMode,
