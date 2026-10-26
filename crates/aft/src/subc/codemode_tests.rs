@@ -361,19 +361,74 @@ fn audit_read(req: RawRequest, ctx: &AppContext) -> Response {
 fn codemode_audit_line_is_written_once_per_admitted_call() {
     let f = fixture(run_stamp("agent-a", "head-a", Some("linked")));
     let file = f.head_root.as_path().join("audited.txt");
-    std::fs::write(&file, "audited contents\n").unwrap();
+    let (reply, lines) = audited_read(&f.routes, &f.head_root, &file);
+    assert!(reply.contains("audited contents"), "{reply}");
+    let audit: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("codemode call: tool=read"))
+        .collect();
+    assert_eq!(audit.len(), 1, "{lines:#?}");
+    for field in [
+        "agent_id=agent-a",
+        "run_id=run-1",
+        "head_session=head-a-session",
+    ] {
+        assert!(
+            audit[0].contains(field),
+            "{field} missing from {}",
+            audit[0]
+        );
+    }
+}
+
+#[test]
+fn worker_run_audit_line_names_on_behalf_of_agent_never_agent_id() {
+    let (f, worker_root) = worker_fixture(worker_run_stamp("worker-a", 5, Some("linked")));
+    let file = worker_root.as_path().join("audited.txt");
+    let (reply, lines) = audited_read(&f.routes, &worker_root, &file);
+    assert!(reply.contains("audited contents"), "{reply}");
+    let audit: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("codemode call: tool=read"))
+        .collect();
+    assert_eq!(audit.len(), 1, "{lines:#?}");
+    for field in [
+        "worker_run",
+        "on_behalf_of_agent=agent-a",
+        "run_id=run-w",
+        "worker_session=worker-session",
+    ] {
+        assert!(
+            audit[0].contains(field),
+            "{field} missing from {}",
+            audit[0]
+        );
+    }
+    assert!(!audit[0].contains("agent_id="), "{}", audit[0]);
+    assert!(!audit[0].contains("head-a-session"), "{}", audit[0]);
+}
+
+/// Admit a codemode `read` of `file` (written with known contents) on the run
+/// route (channel 9), run it on an executor rooted at `root`, and return the
+/// reply body with the log lines written meanwhile.
+fn audited_read(
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    root: &ProjectRootId,
+    file: &Path,
+) -> (String, Vec<String>) {
+    std::fs::write(file, "audited contents\n").unwrap();
     let ctx = crate::subc::test_support::test_ctx();
-    ctx.update_config(|config| config.project_root = Some(f.head_root.as_path().to_path_buf()));
+    ctx.update_config(|config| config.project_root = Some(root.as_path().to_path_buf()));
     let executor = Arc::new(Executor::new());
-    assert!(executor.register_actor(f.head_root.clone(), ctx));
-    let body = call("read", json!({"path": &file}));
-    let effective = owner(admit(&f.routes, channel(9), Some(&body)));
-    let routes = overlay(&f.routes, channel(9), effective);
+    assert!(executor.register_actor(root.clone(), ctx));
+    let body = call("read", json!({"path": file}));
+    let effective = owner(admit(routes, channel(9), Some(&body)));
+    let routes = overlay(routes, channel(9), effective);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    let (reply, lines) = crate::logging::capture_log_lines(|| {
+    crate::logging::capture_log_lines(|| {
         runtime.block_on(async {
             let frame = Frame::build(
                 FrameType::Request,
@@ -426,35 +481,14 @@ fn codemode_audit_line_is_written_once_per_admitted_call() {
             )
             .await
             .unwrap();
-            tokio::time::timeout(Duration::from_secs(10), replies.recv())
+            let reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
                 .await
                 .expect("the audited call terminates")
-                .expect("writer stays open")
+                .expect("writer stays open");
+            String::from_utf8_lossy(&reply.body).into_owned()
         })
-    });
-    assert!(
-        String::from_utf8_lossy(&reply.body).contains("audited contents"),
-        "{}",
-        String::from_utf8_lossy(&reply.body)
-    );
-    let audit: Vec<_> = lines
-        .iter()
-        .filter(|line| line.contains("codemode call: tool=read"))
-        .collect();
-    assert_eq!(audit.len(), 1, "{lines:#?}");
-    for field in [
-        "agent_id=agent-a",
-        "run_id=run-1",
-        "head_session=head-a-session",
-    ] {
-        assert!(
-            audit[0].contains(field),
-            "{field} missing from {}",
-            audit[0]
-        );
-    }
+    })
 }
-
 /// Change the agent-a head route (channel 1) in place.
 fn edit_head(f: &mut Fixture, change: impl FnOnce(&mut RouteIdentityData)) {
     let identity = f.routes.get_mut(&channel(1)).unwrap();

@@ -206,9 +206,9 @@ fn resolve_owner(
             None,
         ));
     };
-    let present = |value: &Option<String>| -> Option<&str> {
+    fn present(value: &Option<String>) -> Option<&str> {
         value.as_deref().filter(|value| !value.is_empty())
-    };
+    }
     let agent_id = present(&stamp.attributes.agent_id);
     let on_behalf_of_agent = present(&stamp.attributes.on_behalf_of_agent);
     let run_id = present(&stamp.attributes.run_id);
