@@ -1,0 +1,1 @@
+- Publishing a Rust project's call graph after an edit does far less work: AFT indexes each file's syntax once instead of re-walking it for every method call, with identical results.
