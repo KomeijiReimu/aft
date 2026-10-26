@@ -1,0 +1,16 @@
+[package]
+name = "secret-rules"
+version = "0.1.0"
+edition = "2021"
+description = "Placeholder grammar, key location rules, host/path matching and response scrubbing for agent secret use"
+license = "MIT"
+# Standalone on purpose: AFT links this crate today, basal will link it later,
+# so it must not depend on any other workspace crate.
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+idna = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = "1"
