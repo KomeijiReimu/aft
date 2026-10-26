@@ -1641,16 +1641,19 @@ pub(super) fn warn_slow_pending_binds(
                 in_flight_writer: None,
                 reader_admissions_while_promoted_writer_waited: 0,
             });
-        crate::slog_warn!(
-            "{}",
-            pending_bind_breadcrumb(
-                *route,
-                &pending.bind_root_id,
-                age,
-                &pending.configure_request_id,
-                &snapshot,
-            )
+        let breadcrumb = pending_bind_breadcrumb(
+            *route,
+            &pending.bind_root_id,
+            age,
+            &pending.configure_request_id,
+            &snapshot,
         );
+        // The frame loop serves every session, so tag the line with the
+        // session that requested this bind rather than whatever scope (if
+        // any) the thread happens to be in.
+        crate::log_ctx::with_session(pending.session.clone(), || {
+            crate::slog_warn!("{breadcrumb}");
+        });
     }
 }
 
