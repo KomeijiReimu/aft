@@ -2096,6 +2096,22 @@ impl LspManager {
             .values()
             .map(|r| Arc::clone(&r.signal))
             .collect();
+        self.wait_for_startup_signals(signals, deadline)
+    }
+
+    fn wait_for_file_startups(&mut self, file: &Path, config: &Config, deadline: Instant) -> bool {
+        let signals = expected_server_keys_for_file(file, config)
+            .into_iter()
+            .filter_map(|key| self.starting.get(&key).map(|r| Arc::clone(&r.signal)))
+            .collect();
+        self.wait_for_startup_signals(signals, deadline)
+    }
+
+    fn wait_for_startup_signals(
+        &mut self,
+        signals: Vec<Arc<StartSignal>>,
+        deadline: Instant,
+    ) -> bool {
         for signal in signals {
             loop {
                 self.publish_completed_starts();
@@ -2667,12 +2683,14 @@ impl LspManager {
     /// per server so the post-edit waiter can match `publishDiagnostics`
     /// against the exact version that this notification carried.
     ///
-    /// Returns: `Vec<(ServerKey, target_version)>`. `target_version` is the
-    /// `version` field on the `VersionedTextDocumentIdentifier` we just sent
-    /// (post-bump). For freshly-opened documents (`didOpen`) the version is
-    /// `0`. Servers that do not echo a document version cannot prove a report
-    /// describes this edit, so post-edit observation leaves them pending rather
-    /// than accepting a report merely because it arrived after the edit.
+    /// Returns `Vec<(ServerKey, target_version)>` for sent notifications or
+    /// versions reserved for startup replay. New documents start at version 0;
+    /// coalesced startup edits can make the first didOpen carry a later version.
+    /// A reserved version is not evidence of analysis: post-edit observation
+    /// still requires diagnostics matching that version. Servers that do not
+    /// echo a document version cannot prove a report describes this edit, so
+    /// observation leaves them pending rather than accepting a report merely
+    /// because it arrived after the edit.
     pub fn notify_file_changed_versioned(
         &mut self,
         file_path: &Path,
@@ -4477,7 +4495,7 @@ impl LspManager {
 
         // A locked notification may have admitted startup without waiting. An
         // explicit diagnostics wait must drive both startup and replay phases.
-        self.wait_for_startups(deadline);
+        self.wait_for_file_startups(&lookup_path, config, deadline);
 
         if self.server_key_for_file(&lookup_path, config).is_none() {
             return Vec::new();
@@ -4567,9 +4585,13 @@ impl LspManager {
         deadline: Option<Instant>,
     ) -> Result<Vec<PullFileResult>, LspError> {
         self.ensure_server_for_file_detailed(file_path, config);
-        self.wait_for_startups(deadline.unwrap_or_else(|| {
-            Instant::now() + super::client::HANDSHAKE_REQUEST_TIMEOUT + INITIALIZE_EXIT_WAIT
-        }));
+        self.wait_for_file_startups(
+            file_path,
+            config,
+            deadline.unwrap_or_else(|| {
+                Instant::now() + super::client::HANDSHAKE_REQUEST_TIMEOUT + INITIALIZE_EXIT_WAIT
+            }),
+        );
         let pulls = self.begin_file_pulls(file_path, config, deadline)?;
         Ok(pulls
             .into_iter()
