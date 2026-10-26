@@ -2641,7 +2641,10 @@ mod tests {
         let checking = plane.clone();
         let access = checkout.access.clone();
         let during = snapshot.clone();
+        let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = reached.clone();
         before_claim_for_test(move || {
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
             let state = checking.query_view(&access, &during);
             assert!(
                 lock(&state).active_fills > 0,
@@ -2657,6 +2660,10 @@ mod tests {
                 .fill(&snapshot, &Model::default(), "model-a")
                 .installed,
             1
+        );
+        assert!(
+            reached.load(std::sync::atomic::Ordering::SeqCst),
+            "the fixture did not reach the real pre-claim interleaving"
         );
     }
 
