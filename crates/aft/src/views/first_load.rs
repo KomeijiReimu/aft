@@ -1892,7 +1892,11 @@ impl FirstLoadDriver for CheckoutDriver {
                             Some(snapshot.generation()),
                             &installed_snapshot,
                             &Default::default(),
-                            &|_| true,
+                            &|path| {
+                                self.planes.iter().any(|bridge| {
+                                    bridge.plane() == plane && bridge.applies_to(path)
+                                })
+                            },
                         )
                     },
                 )
@@ -2800,6 +2804,39 @@ mod composite_tests {
                 "checkout repair"
             ))
         );
+    }
+
+    #[test]
+    fn coverage_does_not_invent_work_for_unregistered_planes() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        drop(
+            SiblingLoader::new(driver.clone(), vec![])
+                .load(&access)
+                .unwrap(),
+        );
+        let (current, revision) = driver.installed_cut();
+        std::fs::write(root.path().join("file.rs"), b"new bytes").unwrap();
+        let mut delta = super::super::snapshot::LiveDelta::new(current.generation().clone());
+        delta.apply(
+            RelPath::new(b"file.rs".to_vec()).unwrap(),
+            LiveEntry::new(DiskState::of_bytes(b"new bytes"), 1),
+        );
+        let snapshot = delta
+            .snapshot()
+            .with_install_cut(current.install_cut().unwrap().clone());
+        driver.install(&access, &snapshot, revision).unwrap();
+        let installed = driver.installed_bundle();
+        for plane in [FamilyPlane::Semantic, FamilyPlane::Callgraph] {
+            assert_eq!(
+                installed.coverage[&plane],
+                super::super::readiness::PlaneReadiness::Ready {
+                    pending: 0,
+                    failed: 0
+                }
+            );
+        }
     }
 
     #[test]
