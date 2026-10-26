@@ -1,0 +1,1 @@
+- Project folders holding nested linked worktrees no longer index those checkouts twice, keeping search and inspect fast without duplicate hits (#746, thanks @moynzzz).

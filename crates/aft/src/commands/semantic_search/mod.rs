@@ -7164,6 +7164,9 @@ fn collect_degraded_grep_files(
     // abort the daemon if a disappearing child mount reports ENXIO.
     let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
     let boundary = crate::walk_boundary::DeviceBoundary::for_root(project_root).ok();
+    // Skip nested linked worktrees of this repository; the walk root itself is
+    // always admitted (depth 0).
+    let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(project_root);
     let mut builder = ignore::WalkBuilder::new(project_root);
     builder.same_file_system(true).hidden(false);
     let walker = crate::context::apply_project_ignore_rules(&mut builder, project_root)
@@ -7186,7 +7189,8 @@ fn collect_degraded_grep_files(
                 if crate::project_content::is_excluded_with_file_type(
                     entry.path(),
                     file_type.as_ref(),
-                ) {
+                ) || crate::search_index::is_nested_worktree_entry(entry, &worktrees)
+                {
                     return false;
                 }
                 let name = entry.file_name().to_string_lossy();
