@@ -586,6 +586,7 @@ pub(crate) fn resolve_symbol_query_in_data(
 /// A single call site within a function body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallSite {
+    pub kind: CallSiteKind,
     /// The short callee name (last segment, e.g. "foo" for `utils.foo()`).
     pub callee_name: String,
     /// The full callee expression (e.g. "utils.foo" for `utils.foo()`).
@@ -597,9 +598,19 @@ pub struct CallSite {
     pub byte_end: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CallSiteKind {
+    #[default]
+    Call,
+    Construction,
+    CallbackReference,
+}
+
 /// Per-symbol metadata for entry point detection (avoids re-parsing).
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolMeta {
+    /// None means extraction could not establish whether the item is test code.
+    pub is_test: Option<bool>,
     /// The kind of symbol (function, class, method, etc).
     pub kind: SymbolKind,
     /// Whether this symbol is exported.
@@ -1468,6 +1479,7 @@ fn split_macro_body_calls(
             .entry(format!("{}!", body.name))
             .or_default()
             .push(CallSite {
+                kind: CallSiteKind::Call,
                 callee_name: short,
                 full_callee: full,
                 line,
@@ -1490,6 +1502,27 @@ fn collect_rust_value_refs_by_symbol(
         extract_rust_value_references(source, root),
         LangId::Rust,
     )
+}
+
+fn rust_item_is_test(source: &str, root: tree_sitter::Node<'_>, byte: usize) -> Option<bool> {
+    if root.has_error() {
+        return None;
+    }
+    let mut node = root.descendant_for_byte_range(byte, byte)?;
+    while let Some(parent) = node.parent() {
+        let mut sibling = node.prev_named_sibling();
+        while let Some(attribute) = sibling.filter(|n| n.kind() == "attribute_item") {
+            let text = source[attribute.byte_range()]
+                .split_whitespace()
+                .collect::<String>();
+            if text == "#[test]" || text == "#[cfg(test)]" {
+                return Some(true);
+            }
+            sibling = attribute.prev_named_sibling();
+        }
+        node = parent;
+    }
+    Some(false)
 }
 
 fn attribute_sites_to_symbols(
@@ -1530,6 +1563,7 @@ fn attribute_sites_to_symbols(
         }
 
         let site = CallSite {
+            kind: CallSiteKind::Call,
             callee_name: short,
             full_callee: full,
             line,
@@ -1537,8 +1571,20 @@ fn attribute_sites_to_symbols(
             byte_end,
         };
         let mut attributed = false;
+        let callable_owner = active_ranges.iter().any(|index| {
+            let range = &ranges[*index];
+            byte_end <= range.byte_end
+                && matches!(
+                    symbols[range.symbol_index].kind,
+                    SymbolKind::Function | SymbolKind::Method
+                )
+        });
         for range_index in &active_ranges {
             let range = &ranges[*range_index];
+            // Method bodies execute when the method is called, not when its class is constructed.
+            if callable_owner && symbols[range.symbol_index].kind == SymbolKind::Class {
+                continue;
+            }
             if byte_end <= range.byte_end {
                 sites_by_symbol[range.symbol_index].push(site.clone());
                 attributed = true;
@@ -1622,7 +1668,7 @@ pub(crate) fn build_file_data_from_tree(
     } else {
         collect_calls_by_symbol(&source, root, lang, &symbols, line_index)
     };
-    let value_refs_by_symbol = if lang == LangId::Rust {
+    let mut value_refs_by_symbol = if lang == LangId::Rust {
         collect_rust_value_refs_by_symbol(&source, root, &symbols, line_index)
     } else if lang == LangId::Go {
         attribute_sites_to_symbols(
@@ -1631,9 +1677,34 @@ pub(crate) fn build_file_data_from_tree(
             crate::calls::extract_go_value_references(source, root),
             lang,
         )
+    } else if matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
+        attribute_sites_to_symbols(
+            line_index,
+            &symbols,
+            crate::calls::extract_js_callback_references(source, root),
+            lang,
+        )
     } else {
         HashMap::new()
     };
+
+    for site in calls_by_symbol.values_mut().flatten() {
+        if root
+            .descendant_for_byte_range(site.byte_start, site.byte_end)
+            .is_some_and(|node| node.kind() == "new_expression")
+        {
+            site.kind = CallSiteKind::Construction;
+        }
+    }
+    for site in value_refs_by_symbol.values_mut().flatten() {
+        if root
+            .descendant_for_byte_range(site.byte_start, site.byte_end)
+            .and_then(|node| node.parent())
+            .is_some_and(|node| node.kind() == "arguments" || node.kind() == "argument_list")
+        {
+            site.kind = CallSiteKind::CallbackReference;
+        }
+    }
 
     let default_export = find_default_export(&source, root, path, lang);
 
@@ -1647,6 +1718,7 @@ pub(crate) fn build_file_data_from_tree(
                 .filter(|(_, short, _, _, _)| *short != default_export.symbol)
                 .map(
                     |(full, short, line, call_byte_start, call_byte_end)| CallSite {
+                        kind: CallSiteKind::Call,
                         callee_name: short,
                         full_callee: full,
                         line,
@@ -1693,6 +1765,15 @@ pub(crate) fn build_file_data_from_tree(
             (
                 identity.clone(),
                 SymbolMeta {
+                    is_test: if lang == LangId::Rust {
+                        rust_item_is_test(
+                            source,
+                            root,
+                            line_index.byte_offset(s.range.start_line, s.range.start_col),
+                        )
+                    } else {
+                        Some(false)
+                    },
                     kind: s.kind.clone(),
                     exported: s.exported,
                     signature: s.signature.clone(),
@@ -1718,6 +1799,7 @@ pub(crate) fn build_file_data_from_tree(
         symbol_metadata
             .entry(default_export.symbol.clone())
             .or_insert_with(|| SymbolMeta {
+                is_test: Some(false),
                 kind: default_export.kind.clone(),
                 exported: true,
                 signature: Some(first_line_signature(&source, &default_export.node)),
@@ -1736,6 +1818,7 @@ pub(crate) fn build_file_data_from_tree(
                     symbol_metadata.insert(
                         format!("{}!", &source[name.byte_range()]),
                         SymbolMeta {
+                            is_test: rust_item_is_test(source, root, node.start_byte()),
                             kind: SymbolKind::Function,
                             exported: false,
                             signature: None,
@@ -1755,6 +1838,7 @@ pub(crate) fn build_file_data_from_tree(
         symbol_metadata
             .entry(TOP_LEVEL_SYMBOL.to_string())
             .or_insert(SymbolMeta {
+                is_test: Some(false),
                 kind: SymbolKind::Function,
                 exported: false,
                 signature: None,
@@ -1772,6 +1856,7 @@ pub(crate) fn build_file_data_from_tree(
         symbol_metadata.insert(
             "<go-package-init>".to_string(),
             SymbolMeta {
+                is_test: Some(false),
                 kind: SymbolKind::Function,
                 exported: false,
                 signature: None,
@@ -4229,6 +4314,7 @@ mod tests {
                 .into_iter()
                 .map(
                     |(full, short, line, call_byte_start, call_byte_end)| CallSite {
+                        kind: CallSiteKind::Call,
                         callee_name: short,
                         full_callee: full,
                         line,
@@ -4259,6 +4345,7 @@ mod tests {
                     .any(|(start, end)| site.byte_start >= *start && site.byte_end <= *end)
             })
             .map(|site| CallSite {
+                kind: CallSiteKind::Call,
                 callee_name: site.short,
                 full_callee: site.full,
                 line: site.line,
@@ -4365,13 +4452,20 @@ def right():
                 &symbols,
                 &SourceLineIndex::new(source),
             );
-            assert_eq!(actual, reference, "call attribution changed for {name}");
+            let mut reference = reference;
+            reference.remove("Worker");
+            assert_eq!(
+                actual, reference,
+                "non-class call attribution changed for {name}"
+            );
 
-            let class_sites = actual.get("Worker").expect("class receives method calls");
+            assert!(
+                !actual.contains_key("Worker"),
+                "method bodies are not class-owned calls"
+            );
             let method_sites = actual
                 .get("Worker::run")
                 .expect("method receives its own calls");
-            assert!(class_sites.iter().any(|site| site.callee_name == "before"));
             assert!(method_sites.iter().any(|site| site.callee_name == "before"));
             let nested_sites = actual
                 .iter()
@@ -4429,6 +4523,7 @@ def right():
         symbol_metadata.insert(
             "BackupStore::total_disk_bytes".to_string(),
             SymbolMeta {
+                is_test: Some(false),
                 kind: SymbolKind::Method,
                 exported: true,
                 signature: None,
