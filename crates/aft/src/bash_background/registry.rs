@@ -1049,6 +1049,7 @@ struct ProjectReplaySessionScan {
     session_dir: PathBuf,
     entries: fs::ReadDir,
     seen_task_ids: HashSet<String>,
+    database_task_ids: HashSet<String>,
 }
 
 struct ProjectReplayScanCursor {
@@ -1058,6 +1059,9 @@ struct ProjectReplayScanCursor {
     known_sessions: HashSet<String>,
     current: Option<ProjectReplaySessionScan>,
     failures: HashMap<String, ProjectReplayFailure>,
+    database_tasks: HashSet<(String, String)>,
+    database_incomplete_reason: Option<&'static str>,
+    database_replay_failed: bool,
     #[cfg(test)]
     total_examined: usize,
 }
@@ -1071,6 +1075,9 @@ impl ProjectReplayScanCursor {
             known_sessions: HashSet::new(),
             current: None,
             failures: HashMap::new(),
+            database_tasks: HashSet::new(),
+            database_incomplete_reason: None,
+            database_replay_failed: false,
             #[cfg(test)]
             total_examined: 0,
         }
@@ -1133,6 +1140,8 @@ struct ProjectReplayDiskBatch {
     examined: usize,
     incomplete_reason: Option<&'static str>,
     retry_deferred: bool,
+    #[cfg(test)]
+    bundle_reads: Vec<String>,
 }
 
 pub(crate) struct RegistryInner {
@@ -5879,6 +5888,7 @@ impl BgTaskRegistry {
                     project_root.expect("project replay continuation requires a root"),
                     std::iter::empty(),
                     &HashSet::new(),
+                    false,
                 );
                 if !batch.retry_deferred || !batch.tasks.is_empty() {
                     crate::slog_info!(
@@ -5922,6 +5932,7 @@ impl BgTaskRegistry {
                         project_root,
                         disk_sessions,
                         &database_tasks,
+                        false,
                     )
                 } else {
                     let mut disk_tasks = Vec::new();
@@ -5938,6 +5949,8 @@ impl BgTaskRegistry {
                         examined: 0,
                         incomplete_reason: None,
                         retry_deferred: false,
+                        #[cfg(test)]
+                        bundle_reads: Vec::new(),
                     }
                 };
                 let mut merged = 0usize;
@@ -5970,6 +5983,7 @@ impl BgTaskRegistry {
                             project_root,
                             [session_id.to_string()],
                             &HashSet::new(),
+                            false,
                         );
                         if let Some(reason) = batch
                             .incomplete_reason
@@ -6007,6 +6021,7 @@ impl BgTaskRegistry {
                             project_root,
                             [session_id.to_string()],
                             &HashSet::new(),
+                            true,
                         );
                         if let Some(reason) = batch
                             .incomplete_reason
@@ -6032,6 +6047,7 @@ impl BgTaskRegistry {
                             project_root,
                             [session_id.to_string()],
                             &HashSet::new(),
+                            false,
                         );
                         if let Some(reason) = batch
                             .incomplete_reason
@@ -6618,11 +6634,21 @@ impl BgTaskRegistry {
         };
         let rows = if let Some(project_root) = project_root {
             let project_key = crate::path_identity::project_scope_key(project_root);
-            crate::db::bash_tasks::list_replayable_bash_tasks_for_project(
-                &conn,
-                &harness,
-                &project_key,
-            )
+            // Disk discovery skips every DB-owned task, so recover this
+            // project's indexed rows from every harness sharing the store.
+            crate::db::bash_tasks::bash_task_harnesses(&conn).and_then(|harnesses| {
+                let mut rows = Vec::new();
+                for harness in harnesses {
+                    rows.extend(
+                        crate::db::bash_tasks::list_replayable_bash_tasks_for_project(
+                            &conn,
+                            &harness,
+                            &project_key,
+                        )?,
+                    );
+                }
+                Ok(rows)
+            })
         } else {
             crate::db::bash_tasks::list_bash_tasks_for_session(&conn, &harness, session_id)
         };
@@ -6737,12 +6763,54 @@ impl BgTaskRegistry {
         Ok(tasks)
     }
 
+    fn replay_database_task_ids(&self, session_id: &str) -> Result<HashSet<String>, &'static str> {
+        let pool = self
+            .inner
+            .db_pool
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .ok_or("task database unavailable")?;
+        let conn = pool.lock().map_err(|_| "task database unavailable")?;
+        crate::db::bash_tasks::list_bash_task_ids_for_session(&conn, session_id).map_err(|error| {
+            crate::slog_warn!("bash replay ownership lookup failed for {session_id}: {error}");
+            "task database ownership lookup failed"
+        })
+    }
+
+    fn record_replay_discovery(
+        &self,
+        metadata: &PersistedTask,
+        paths: &TaskPaths,
+    ) -> Result<(), &'static str> {
+        let (harness, pool) = self
+            .db_harness_and_pool_for_session(&metadata.session_id)
+            .ok_or("task database unavailable")?;
+        let result = with_task_db_fence(&metadata.session_id, &metadata.task_id, || {
+            let harness = metadata.harness.as_deref().unwrap_or(&harness);
+            let row = metadata
+                .to_bash_task_row(harness, paths)
+                .map_err(|error| error.to_string())?;
+            let conn = pool.lock().map_err(|_| "db mutex poisoned".to_string())?;
+            crate::db::bash_tasks::insert_bash_task_if_missing(&conn, &row)
+                .map_err(|error| error.to_string())
+        });
+        result.map_err(|error| {
+            crate::slog_warn!(
+                "bash replay could not record disk task {}: {error}",
+                metadata.task_id
+            );
+            "disk task database recording failed"
+        })
+    }
+
     fn replay_session_from_disk_for_project(
         &self,
         storage_dir: &Path,
         project_root: &Path,
         sessions: impl IntoIterator<Item = String>,
         database_tasks: &HashSet<(String, String)>,
+        database_replay_failed: bool,
     ) -> ProjectReplayDiskBatch {
         let project_root = canonicalized_path(project_root);
         // Session directory names are hashed, and one session can contain tasks
@@ -6789,11 +6857,26 @@ impl BgTaskRegistry {
         }
         let cursor = scan_slot.as_mut().expect("project replay cursor installed");
         cursor.enqueue_sessions(sessions);
+        // Continuations do not repeat the project query. Keep its exclusions
+        // until the saved directory iterator is exhausted.
+        cursor.database_tasks.extend(database_tasks.iter().cloned());
+        cursor.database_replay_failed |= database_replay_failed;
+        if cursor.database_replay_failed {
+            // A failed row query may still leave ID-only lookups working.
+            // Those IDs cannot exclude files needed for disk recovery.
+            cursor.database_incomplete_reason = Some("project database replay failed");
+            cursor.database_tasks.clear();
+            if let Some(current) = cursor.current.as_mut() {
+                current.database_task_ids.clear();
+            }
+        }
 
         let started = Instant::now();
         let mut examined = 0usize;
         let mut tasks = Vec::new();
         let mut incomplete_reason = None;
+        #[cfg(test)]
+        let mut bundle_reads = Vec::new();
         loop {
             if cursor.current.is_none() && cursor.sessions.is_empty() {
                 break;
@@ -6817,11 +6900,26 @@ impl BgTaskRegistry {
                 let session_dir = session_tasks_dir(storage_dir, &session_id);
                 match fs::read_dir(&session_dir) {
                     Ok(entries) => {
+                        // The project query returns only tasks needing recovery.
+                        // Include all indexed IDs here, even completed tasks and
+                        // other projects, to avoid reopening their metadata files.
+                        let database_task_ids = match if cursor.database_replay_failed {
+                            Ok(HashSet::new())
+                        } else {
+                            self.replay_database_task_ids(&session_id)
+                        } {
+                            Ok(ids) => ids,
+                            Err(reason) => {
+                                cursor.database_incomplete_reason = Some(reason);
+                                HashSet::new()
+                            }
+                        };
                         cursor.current = Some(ProjectReplaySessionScan {
                             session_id,
                             session_dir,
                             entries,
                             seen_task_ids: HashSet::new(),
+                            database_task_ids,
                         });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -6918,7 +7016,15 @@ impl BgTaskRegistry {
                 }
                 (current.session_id.clone(), current.session_dir.clone())
             };
-            if database_tasks.contains(&(session_id.clone(), task_id.to_string()))
+            if cursor
+                .database_tasks
+                .contains(&(session_id.clone(), task_id.to_string()))
+                || cursor
+                    .current
+                    .as_ref()
+                    .expect("current session")
+                    .database_task_ids
+                    .contains(task_id)
                 || self.task_for_session(task_id, &session_id).is_some()
             {
                 continue;
@@ -6927,6 +7033,8 @@ impl BgTaskRegistry {
                 Ok(resolved) => resolved,
                 Err(_) => continue,
             };
+            #[cfg(test)]
+            bundle_reads.push(task_id.to_string());
             let metadata = match read_task_at(&resolved) {
                 Ok(metadata) => metadata,
                 Err(error) => {
@@ -6942,6 +7050,13 @@ impl BgTaskRegistry {
             {
                 continue;
             }
+            // Index every valid unindexed file before filtering by project or
+            // delivery state, so later replays do not decode the file again.
+            // An existing row may already record a client-acknowledged completion
+            // and must not be replaced with this older disk snapshot.
+            if let Err(reason) = self.record_replay_discovery(&metadata, &resolved.paths) {
+                cursor.database_incomplete_reason = Some(reason);
+            }
             if metadata.is_terminal() && metadata.completion_delivered {
                 continue;
             }
@@ -6955,6 +7070,9 @@ impl BgTaskRegistry {
         }
 
         let retry_deferred = cursor.retry_at().is_some();
+        if incomplete_reason.is_none() {
+            incomplete_reason = cursor.database_incomplete_reason;
+        }
         if retry_deferred {
             incomplete_reason = Some("session directory retry deferred");
         }
@@ -6966,6 +7084,8 @@ impl BgTaskRegistry {
             examined,
             incomplete_reason,
             retry_deferred,
+            #[cfg(test)]
+            bundle_reads,
         }
     }
 
@@ -17304,6 +17424,7 @@ mod tests {
             project.path(),
             [blocked_session.to_string(), healthy_session.to_string()],
             &HashSet::new(),
+            false,
         );
         fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(
@@ -17410,6 +17531,357 @@ mod tests {
             }),
             "the elapsed-time limit must report its reason: {time_logs:?}"
         );
+        registry.detach();
+    }
+
+    fn project_replay_history_fixture(
+        storage: &Path,
+        project: &Path,
+        db: &Arc<Mutex<TrackedConnection>>,
+    ) -> (String, Vec<String>) {
+        let session = "shared-history-session";
+        for index in 0..4003 {
+            let task_id = format!("bash-{index:016x}");
+            let paths = task_paths(storage, session, &task_id).unwrap();
+            let other_project = storage.join(format!("other-project-{}", index % 170));
+            let mut metadata = PersistedTask::starting(
+                task_id,
+                session.to_string(),
+                "finished fixture".to_string(),
+                other_project.clone(),
+                Some(other_project),
+                None,
+                true,
+                true,
+            );
+            metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+            metadata.completion_delivered = true;
+            write_task(&paths.json, &metadata).unwrap();
+        }
+        // Directory order is filesystem-dependent. Choose the live records from
+        // the actual tail, not from lexically high task IDs.
+        let ids = fs::read_dir(session_tasks_dir(storage, session))
+            .unwrap()
+            .filter_map(|entry| {
+                let name = entry.unwrap().file_name().into_string().unwrap();
+                let id = match name.split_once('.') {
+                    Some((id, "json")) => id,
+                    Some(_) => return None,
+                    None => &name,
+                };
+                validate_task_id(id).ok().map(|()| id.to_string())
+            })
+            .collect::<Vec<_>>();
+        let live = ids[4000..].to_vec();
+        for task_id in &live {
+            write_running_project_task(storage, project, session, task_id);
+        }
+        let conn = db.lock().unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        for task_id in &ids[..3993] {
+            let paths = task_paths(storage, session, task_id).unwrap();
+            let metadata = read_task(&paths.json).unwrap();
+            crate::db::bash_tasks::upsert_bash_task(
+                &tx,
+                &metadata.to_bash_task_row("opencode", &paths).unwrap(),
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        (session.to_string(), live)
+    }
+
+    fn drain_project_replay_fixture(
+        registry: &BgTaskRegistry,
+        storage: &Path,
+        project: &Path,
+        session: &str,
+    ) -> (Vec<String>, Vec<String>, usize) {
+        let mut merged = Vec::new();
+        let mut reads = Vec::new();
+        for pass in 1..=80 {
+            let batch = registry.replay_session_from_disk_for_project(
+                storage,
+                project,
+                [session.to_string()],
+                &HashSet::new(),
+                false,
+            );
+            if pass == 1 {
+                assert!(
+                    batch.tasks.is_empty(),
+                    "live tasks must be beyond the first budget"
+                );
+                assert_eq!(batch.incomplete_reason, Some("entry budget"));
+            }
+            reads.extend(batch.bundle_reads);
+            merged.extend(batch.tasks.into_iter().map(|task| task.task_id));
+            if !registry.project_replay_pending(storage, project) {
+                return (merged, reads, pass);
+            }
+        }
+        panic!(
+            "project replay did not finish within 80 passes; merged={merged:?}, bundle reads={}",
+            reads.len()
+        );
+    }
+
+    #[test]
+    fn project_replay_history_reads_only_unknown_bundles_and_records_them() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, db, _) = registry_with_db_and_frames(storage.path());
+        let (session, mut live) =
+            project_replay_history_fixture(storage.path(), project.path(), &db);
+        registry.set_project_replay_scan_budget_for_test(64, Duration::from_secs(60));
+        let (mut merged, reads, passes) =
+            drain_project_replay_fixture(&registry, storage.path(), project.path(), &session);
+        let unique = reads.iter().collect::<HashSet<_>>().len();
+        eprintln!("fixture: 4000 finished / 170 projects + 3 live; DB owns 3993; passes={passes}, bundle_reads={}, unique={unique}, rescans={}, merged={}", reads.len(), reads.len() - unique, merged.len());
+        merged.sort();
+        live.sort();
+        assert_eq!(
+            merged, live,
+            "all three late live tasks, and no delivered terminals, must merge"
+        );
+        assert_eq!(
+            reads.len(),
+            unique,
+            "continuations must never restart the prefix"
+        );
+        assert_eq!(
+            reads.len(),
+            10,
+            "known DB owners must be filtered before opening bundles"
+        );
+
+        let (_, second_reads, second_passes) =
+            drain_project_replay_fixture(&registry, storage.path(), project.path(), &session);
+        eprintln!(
+            "second replay: passes={second_passes}, bundle_reads={}",
+            second_reads.len()
+        );
+        assert!(
+            second_reads.is_empty(),
+            "valid discoveries must be recorded even for foreign projects and delivered terminals"
+        );
+        registry
+            .replay_session_for_project(storage.path(), &session, project.path())
+            .unwrap();
+        for task_id in &live {
+            assert!(
+                registry.task_for_session(task_id, &session).is_some(),
+                "a late live task must be restored into the registry"
+            );
+        }
+        assert_eq!(
+            registry.list(0).len(),
+            3,
+            "delivered and foreign bundles must not be resurrected"
+        );
+        assert!(registry.drain_completions().is_empty());
+        registry.detach();
+    }
+
+    #[test]
+    fn project_replay_backfill_cannot_overwrite_an_existing_row() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, db, _) = registry_with_db_and_frames(storage.path());
+        let session = "concurrent-backfill-session";
+        let task_id = "bash-000000000000feed";
+        write_running_project_task(storage.path(), project.path(), session, task_id);
+        let paths = task_paths(storage.path(), session, task_id).unwrap();
+        let stale = read_task(&paths.json).unwrap();
+        let mut current = stale.clone();
+        current.mark_terminal(BgTaskStatus::Completed, Some(42), None);
+        current.completion_delivered = true;
+        crate::db::bash_tasks::upsert_bash_task(
+            &db.lock().unwrap(),
+            &current.to_bash_task_row("opencode", &paths).unwrap(),
+        )
+        .unwrap();
+        registry.record_replay_discovery(&stale, &paths).unwrap();
+        let row =
+            crate::db::bash_tasks::get_bash_task(&db.lock().unwrap(), "opencode", session, task_id)
+                .unwrap()
+                .unwrap();
+        assert_eq!(row.status, "completed");
+        assert_eq!(row.exit_code, Some(42));
+        assert!(row.completion_delivered);
+        registry.detach();
+    }
+
+    #[test]
+    fn project_replay_restores_indexed_live_tasks_from_other_harnesses() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, db, _) = registry_with_db_and_frames(storage.path());
+        let session = "cross-harness-project-session";
+        let task_id = "bash-000000000000cafe";
+        write_running_project_task(storage.path(), project.path(), session, task_id);
+        let paths = task_paths(storage.path(), session, task_id).unwrap();
+        let mut metadata = read_task(&paths.json).unwrap();
+        metadata.harness = Some("pi".to_string());
+        write_task(&paths.json, &metadata).unwrap();
+        crate::db::bash_tasks::upsert_bash_task(
+            &db.lock().unwrap(),
+            &metadata.to_bash_task_row("pi", &paths).unwrap(),
+        )
+        .unwrap();
+        let other_project = tempfile::tempdir().unwrap();
+        let other_task = "bash-000000000000dada";
+        write_running_project_task(storage.path(), other_project.path(), session, other_task);
+        let other_paths = task_paths(storage.path(), session, other_task).unwrap();
+        let other = read_task(&other_paths.json).unwrap();
+        crate::db::bash_tasks::upsert_bash_task(
+            &db.lock().unwrap(),
+            &other.to_bash_task_row("pi", &other_paths).unwrap(),
+        )
+        .unwrap();
+        let rows = registry
+            .replay_session_from_db(session, Some(project.path()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the DB project filter must exclude unrelated live rows before recovery"
+        );
+        registry
+            .replay_session_for_project(storage.path(), session, project.path())
+            .unwrap();
+        assert!(registry.task_for_session(task_id, session).is_some());
+        assert!(registry.task_for_session(other_task, session).is_none());
+        registry.detach();
+    }
+
+    #[test]
+    fn project_replay_row_query_failure_does_not_skip_db_owned_bundles() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, db, _) = registry_with_db_and_frames(storage.path());
+        let session = "unreadable-row-project-session";
+        let task_id = "bash-000000000000babe";
+        write_running_project_task(storage.path(), project.path(), session, task_id);
+        let paths = task_paths(storage.path(), session, task_id).unwrap();
+        let metadata = read_task(&paths.json).unwrap();
+        crate::db::bash_tasks::upsert_bash_task(
+            &db.lock().unwrap(),
+            &metadata.to_bash_task_row("opencode", &paths).unwrap(),
+        )
+        .unwrap();
+        db.lock()
+            .unwrap()
+            .execute("UPDATE bash_tasks SET pid = 'unreadable'", [])
+            .unwrap();
+        assert_eq!(registry.replay_database_task_ids(session).unwrap().len(), 1);
+        registry.set_project_replay_scan_budget_for_test(1, Duration::from_secs(60));
+        registry
+            .replay_session_for_project(storage.path(), session, project.path())
+            .unwrap();
+        for _ in 0..8 {
+            if !registry
+                .continue_project_replay(storage.path(), session, project.path(), false)
+                .unwrap()
+            {
+                break;
+            }
+        }
+        assert!(
+            registry.task_for_session(task_id, session).is_some(),
+            "a successful ID lookup must not mask a failed row query"
+        );
+        registry.detach();
+    }
+
+    #[test]
+    fn project_replay_continuation_retains_initial_database_exclusions() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let session = "retained-exclusion-session";
+        let task_id = "bash-000000000000abba";
+        write_running_project_task(storage.path(), project.path(), session, task_id);
+        registry.set_project_replay_scan_budget_for_test(1, Duration::from_secs(60));
+        let initial = registry.replay_session_from_disk_for_project(
+            storage.path(),
+            project.path(),
+            [session.to_string()],
+            &HashSet::from([(session.to_string(), task_id.to_string())]),
+            false,
+        );
+        assert!(initial.bundle_reads.is_empty());
+        for _ in 0..8 {
+            let batch = registry.replay_session_from_disk_for_project(
+                storage.path(),
+                project.path(),
+                std::iter::empty(),
+                &HashSet::new(),
+                false,
+            );
+            assert!(
+                batch.bundle_reads.is_empty(),
+                "initial DB exclusions survive even when a later ownership lookup is unavailable"
+            );
+            if !registry.project_replay_pending(storage.path(), project.path()) {
+                return;
+            }
+        }
+        panic!("continuation did not exhaust the small fixture");
+    }
+
+    #[test]
+    fn project_replay_failed_recording_is_reported_and_retried() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, db, _) = registry_with_db_and_frames(storage.path());
+        let session = "recording-failure-session";
+        let task_id = "bash-000000000000face";
+        write_running_project_task(storage.path(), project.path(), session, task_id);
+        db.lock().unwrap().execute_batch(
+            "CREATE TRIGGER reject_discovery BEFORE INSERT ON bash_tasks BEGIN SELECT RAISE(FAIL, 'fixture recording refused'); END;"
+        ).unwrap();
+        for _ in 0..2 {
+            let batch = registry.replay_session_from_disk_for_project(
+                storage.path(),
+                project.path(),
+                [session.to_string()],
+                &HashSet::new(),
+                false,
+            );
+            assert_eq!(batch.bundle_reads, [task_id]);
+            assert_eq!(
+                batch.tasks.len(),
+                1,
+                "a recording failure must not lose the live task"
+            );
+            assert_eq!(
+                batch.incomplete_reason,
+                Some("disk task database recording failed")
+            );
+        }
+        db.lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_discovery")
+            .unwrap();
+        let recorded = registry.replay_session_from_disk_for_project(
+            storage.path(),
+            project.path(),
+            [session.to_string()],
+            &HashSet::new(),
+            false,
+        );
+        assert_eq!(recorded.bundle_reads, [task_id]);
+        assert_eq!(recorded.incomplete_reason, None);
+        let next = registry.replay_session_from_disk_for_project(
+            storage.path(),
+            project.path(),
+            [session.to_string()],
+            &HashSet::new(),
+            false,
+        );
+        assert!(next.bundle_reads.is_empty());
         registry.detach();
     }
 

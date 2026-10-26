@@ -153,6 +153,62 @@ pub fn upsert_bash_task(conn: &Connection, row: &BashTaskRow) -> rusqlite::Resul
     Ok(())
 }
 
+/// Backfill a disk-only task without replacing a row committed after discovery.
+pub fn insert_bash_task_if_missing(conn: &Connection, row: &BashTaskRow) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO bash_tasks (
+            harness, session_id, task_id, project_key, command, cwd, status,
+            exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
+            compressed, timeout_ms, completion_delivered, output_bytes, metadata
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+            ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+            ?15, ?16, ?17, ?18, ?19
+         ) ON CONFLICT(harness, session_id, task_id) DO NOTHING",
+        params![
+            row.harness,
+            row.session_id,
+            row.task_id,
+            row.project_key,
+            row.command,
+            row.cwd,
+            row.status,
+            row.exit_code,
+            row.pid,
+            row.pgid,
+            row.started_at,
+            row.completed_at,
+            row.stdout_path,
+            row.stderr_path,
+            row.compressed,
+            row.timeout_ms,
+            row.completion_delivered,
+            row.output_bytes,
+            row.metadata,
+        ],
+    )?;
+    Ok(())
+}
+
+/// IDs of all persisted rows for one session, across harnesses. No project,
+/// status or delivery filter: replay uses this set to skip metadata files
+/// already represented by authoritative database rows, without decoding them.
+pub fn list_bash_task_ids_for_session(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<std::collections::HashSet<String>> {
+    let mut ids = std::collections::HashSet::new();
+    let mut stmt =
+        conn.prepare("SELECT task_id FROM bash_tasks WHERE harness = ?1 AND session_id = ?2")?;
+    for harness in bash_task_harnesses(conn)? {
+        let rows = stmt.query_map(params![harness, session_id], |row| row.get::<_, String>(0))?;
+        for id in rows {
+            ids.insert(id?);
+        }
+    }
+    Ok(ids)
+}
+
 pub fn delete_delivered_terminal_bash_task(
     conn: &Connection,
     harness: &str,
