@@ -4056,6 +4056,15 @@ impl LspManager {
         config: &Config,
         timeout: std::time::Duration,
     ) -> Vec<StoredDiagnostic> {
+        // Notification startup used to finish before this relative observation
+        // timeout began. Preserve that separation when startup is asynchronous;
+        // callers with an absolute deadline still use wait_for_file_diagnostics.
+        let lookup_path = normalize_lookup_path(file_path);
+        self.wait_for_file_startups(
+            &lookup_path,
+            config,
+            Instant::now() + super::client::HANDSHAKE_REQUEST_TIMEOUT + INITIALIZE_EXIT_WAIT,
+        );
         let deadline = std::time::Instant::now() + timeout;
         self.wait_for_file_diagnostics(file_path, config, deadline)
     }

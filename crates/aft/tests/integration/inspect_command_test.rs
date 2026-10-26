@@ -3676,6 +3676,21 @@ fn open_with_lsp(ctx: &AppContext, file: &Path, content: &str) {
     let diagnostics = ctx
         .lsp()
         .wait_for_diagnostics(file, &config, Duration::from_secs(30));
+    if diagnostics.is_empty() {
+        let lsp = ctx.lsp();
+        let canonical = std::fs::canonicalize(file);
+        let uri = canonical
+            .as_ref()
+            .ok()
+            .map(|path| aft::lsp::position::path_to_uri(path));
+        eprintln!(
+            "empty LSP wait: input={file:?} canonical={canonical:?} uri={uri:?} active={:?} pending_startup={} document_open={} cached_diagnostics={} files={:?} exits={:?}",
+            lsp.active_server_keys(), lsp.has_pending_startups(),
+            lsp.document_is_open_for_test(file), lsp.get_all_diagnostics().len(),
+            lsp.get_all_diagnostics().iter().map(|diagnostic| &diagnostic.file).collect::<Vec<_>>(),
+            lsp.recent_server_exit_log_lines(),
+        );
+    }
     assert!(
         !diagnostics.is_empty(),
         "fake LSP should publish diagnostics for {file:?}"

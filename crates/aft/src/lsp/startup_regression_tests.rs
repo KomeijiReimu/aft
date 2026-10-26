@@ -398,8 +398,12 @@ fn notification_fixture() -> Fixture {
     let f = fixture();
     let binary = f.manager.lock().binary_overrides[&f.key.kind].clone();
     std::fs::write(&binary, r#"#!/usr/bin/env python3
-import json, sys
+import json, os, sys
 seen = []
+def write_message(message):
+    body = json.dumps(message).encode()
+    sys.stdout.buffer.write(('Content-Length: %d\r\n\r\n' % len(body)).encode() + body)
+    sys.stdout.buffer.flush()
 while True:
     headers = {}
     while True:
@@ -414,11 +418,15 @@ while True:
     method = message.get('method')
     if method in ('textDocument/didOpen', 'textDocument/didChange'):
         seen.append(message)
+        if os.environ.get('AFT_STARTUP_PUSH') == '1':
+            document = message['params']['textDocument']
+            write_message({'jsonrpc': '2.0', 'method': 'textDocument/publishDiagnostics', 'params': {
+                'uri': document['uri'], 'version': document['version'], 'diagnostics': [{
+                    'range': {'start': {'line': 0, 'character': 0}, 'end': {'line': 0, 'character': 1}},
+                    'severity': 1, 'message': 'startup replay diagnostic'}]}})
     if 'id' in message:
         result = {'capabilities': {}} if method == 'initialize' else seen if method == 'test/notifications' else None
-        body = json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': result}).encode()
-        sys.stdout.buffer.write(('Content-Length: %d\r\n\r\n' % len(body)).encode() + body)
-        sys.stdout.buffer.flush()
+        write_message({'jsonrpc': '2.0', 'id': message['id'], 'result': result})
     if method == 'exit':
         break
 "#).unwrap();
@@ -657,4 +665,38 @@ fn startup_notification_path_bound_rejects_instead_of_dropping() {
     }
     f.manager.lock().quiesce();
     pause.resume.send(()).unwrap();
+}
+
+#[test]
+fn relative_diagnostics_wait_keeps_its_observation_budget_after_startup() {
+    let f = notification_fixture();
+    f.manager.lock().set_extra_env("AFT_STARTUP_PUSH", "1");
+    let pause = pause_first_spawn(&f);
+    locked(&f, |manager| {
+        manager.notify_file_changed_versioned(&f.file, "content", &f.config)
+    })
+    .unwrap();
+    pause.entered.recv_timeout(WAIT).unwrap();
+    let (entered_tx, entered_rx) = unbounded();
+    let (done_tx, done_rx) = unbounded();
+    std::thread::scope(|scope| {
+        let waiting = scope.spawn(|| {
+            let mut manager = f.manager.lock();
+            entered_tx.send(()).unwrap();
+            let diagnostics =
+                manager.wait_for_diagnostics(&f.file, &f.config, Duration::from_millis(250));
+            done_tx.send(()).unwrap();
+            diagnostics
+        });
+        entered_rx.recv_timeout(WAIT).unwrap();
+        let returned_during_startup = done_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        pause.resume.send(()).unwrap();
+        let diagnostics = waiting.join().unwrap();
+        assert!(
+            !returned_during_startup,
+            "startup consumed the observation timeout"
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].message, "startup replay diagnostic");
+    });
 }
