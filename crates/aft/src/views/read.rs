@@ -607,6 +607,61 @@ pub fn open_foreign_generation(
 mod producer_tests {
 
     #[test]
+    fn foreign_open_refuses_unauthenticated_base_headers() {
+        use crate::views::manifest_v2::{
+            BaseHeader, GenerationName, ManifestHeader, ManifestV2, Producers, PublishV2,
+        };
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let registry =
+            crate::views::registry::FamilyRegistry::open(storage.path(), "unverified-base")
+                .unwrap();
+        let owner = registry
+            .register_view_with_storage(storage.path(), "worker", root.path())
+            .unwrap();
+        let producers = Producers {
+            trigram: "tri".into(),
+            semantic: None,
+            callgraph: "graph".into(),
+        };
+        let manifest = ManifestV2::new_v3(
+            ManifestHeader {
+                producers: producers.clone(),
+                head_tree: None,
+                ignore_fingerprint: None,
+                segment: None,
+            },
+            Some(BaseHeader {
+                scope: "not-authenticated".into(),
+                membership_digest: "11".repeat(32),
+                identity_digest: "22".repeat(32),
+                bound_generation: "diagnostic-only".into(),
+            }),
+            Default::default(),
+        );
+        // Seed an untrusted persisted header directly, bypassing the owner loader's refusal.
+        let store = owner.view_store().unwrap();
+        let name = GenerationName::for_manifest(&manifest).unwrap();
+        let prepared = store.prepare_v2(&name, None, &manifest, None).unwrap();
+        assert_eq!(
+            store.commit_v2(prepared, None).unwrap(),
+            PublishV2::Published
+        );
+        let reader = registry.register_reader("unverified-header").unwrap();
+        let error = super::open_foreign_generation(&reader, "worker", &producers).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("durable v3 base resolution is not wired"),
+            "{error}"
+        );
+        assert_eq!(
+            store.current_generation_read_only().unwrap(),
+            Some(name.to_string())
+        );
+    }
+
+    #[test]
     fn untracked_language_paths_do_not_read_source() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("untracked.rs");
