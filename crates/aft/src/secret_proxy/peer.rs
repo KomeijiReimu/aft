@@ -15,6 +15,13 @@ pub(super) fn is_session_leader(_pid: i32) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+pub(super) fn process_start_time(pid: i32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, fields) = stat.rsplit_once(") ")?;
+    fields.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
 fn session_pids(session: i32) -> Vec<i32> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
@@ -109,7 +116,7 @@ pub(super) fn authorized(socket: &TcpStream, session: i32) -> bool {
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-pub(super) use macos::{authorized, session_alive};
+pub(super) use macos::{authorized, process_start_time, session_alive};
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(super) fn authorized(_socket: &TcpStream, _session: i32) -> bool {
@@ -118,4 +125,9 @@ pub(super) fn authorized(_socket: &TcpStream, _session: i32) -> bool {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(super) fn session_alive(_session: i32) -> bool {
     false
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(super) fn process_start_time(_pid: i32) -> Option<u64> {
+    None
 }

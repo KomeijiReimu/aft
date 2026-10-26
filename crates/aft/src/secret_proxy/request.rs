@@ -64,7 +64,7 @@ async fn prepare_and_send(
     state: &Arc<State>,
 ) -> Result<Response<Body>, String> {
     let fail = || String::new();
-    if state.stopped.load(Ordering::Acquire) {
+    if state.stopped.load(Ordering::Acquire) || !state.generation_valid() {
         return Err(fail());
     }
     let target = request
@@ -181,6 +181,7 @@ async fn prepare_and_send(
                 continue;
             }
             if state.stopped.load(Ordering::Acquire)
+                || !state.generation_valid()
                 || crate::secret::vault::now_ms() >= grant.expires_at_ms
             {
                 return Err(rule.label.clone());
@@ -300,7 +301,7 @@ async fn prepare_and_send(
             }),
             Ordering::Release,
         );
-        if state.stopped.load(Ordering::Acquire) {
+        if state.stopped.load(Ordering::Acquire) || !state.generation_valid() {
             return Err(fail());
         }
         for (grant, matched) in state.config.grants.iter().zip(&matches) {

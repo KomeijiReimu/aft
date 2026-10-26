@@ -2,6 +2,8 @@
 //! labels and arms the new command session before releasing the child. The job
 //! owner retains the handle and reports process-tree end or the end of the
 //! configured lifetime SecretScope, either of which stops the proxy.
+//! The armed leader's start time pins its generation. Loss or replacement of
+//! that leader also stops the proxy, even if orphaned descendants remain.
 //!
 //! # Memory boundary
 //!
@@ -84,6 +86,7 @@ pub enum ProxyError {
 pub(crate) struct State {
     config: ProxyConfig,
     session: AtomicI32,
+    session_birth: std::sync::atomic::AtomicU64,
     stopped: AtomicBool,
     token: Zeroizing<String>,
     ca: rcgen::Certificate,
@@ -102,6 +105,24 @@ pub(crate) struct State {
 }
 
 impl State {
+    fn generation_valid(&self) -> bool {
+        let pid = self.session.load(Ordering::Acquire);
+        if pid <= 0 {
+            return false;
+        }
+        let current = peer::process_start_time(pid);
+        #[cfg(test)]
+        let current = {
+            let changed = self.test_identity_generation.load(Ordering::Acquire);
+            if changed != 0 {
+                Some(changed)
+            } else {
+                current
+            }
+        };
+        current.is_some_and(|birth| birth == self.session_birth.load(Ordering::Acquire))
+    }
+
     fn mark_stopped(&self) {
         let _gate = self.material_gate.lock();
         self.stopped.store(true, Ordering::Release);
@@ -229,6 +250,7 @@ impl SecretProxy {
         let state = Arc::new(State {
             config,
             session: AtomicI32::new(0),
+            session_birth: std::sync::atomic::AtomicU64::new(0),
             stopped: AtomicBool::new(false),
             token,
             ca,
@@ -298,16 +320,16 @@ impl SecretProxy {
     /// exec barrier. Connections handled while no session is armed are refused.
     pub fn arm_command(&self, pid: u32) -> Result<(), ProxyError> {
         let pid = i32::try_from(pid).map_err(|_| ProxyError::InvalidSession)?;
+        let _gate = self.state.material_gate.lock();
         if self.state.stopped.load(Ordering::Acquire) {
             return Err(ProxyError::Stopped);
         }
-        if !peer::is_session_leader(pid) {
+        if !peer::is_session_leader(pid) || self.state.session.load(Ordering::Acquire) != 0 {
             return Err(ProxyError::InvalidSession);
         }
-        self.state
-            .session
-            .compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| ProxyError::InvalidSession)?;
+        let birth = peer::process_start_time(pid).ok_or(ProxyError::InvalidSession)?;
+        self.state.session_birth.store(birth, Ordering::Release);
+        self.state.session.store(pid, Ordering::Release);
         Ok(())
     }
 
@@ -355,14 +377,14 @@ async fn serve(
             _ = stop.changed() => break,
             _ = monitor.tick() => {
                 let session = state.session.load(Ordering::Acquire);
-                if session > 0 && !peer::session_alive(session) { break; }
+                if session > 0 && (!state.generation_valid() || !peer::session_alive(session)) { break; }
             }
             accepted = listener.accept() => {
                 let Ok((socket, _)) = accepted else { break; };
                 let state = state.clone();
                 connections.spawn(async move {
                     let session = state.session.load(Ordering::Acquire);
-                    if session <= 0 || !peer::authorized(&socket, session) { return; }
+                    if session <= 0 || !state.generation_valid() || !peer::authorized(&socket, session) || !state.generation_valid() { return; }
                     let service = service_fn(move |request| connect(request, state.clone()));
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(TokioIo::new(socket), service).with_upgrades().await;

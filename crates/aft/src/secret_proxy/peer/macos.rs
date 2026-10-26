@@ -5,6 +5,13 @@ use libproc::libproc::proc_pid::{listpidinfo, pidinfo};
 use libproc::processes::{pids_by_type, ProcFilter};
 use tokio::net::TcpStream;
 
+pub(crate) fn process_start_time(pid: i32) -> Option<u64> {
+    let info = pidinfo::<BSDInfo>(pid, 0).ok()?;
+    info.pbi_start_tvsec
+        .checked_mul(1_000_000)?
+        .checked_add(info.pbi_start_tvusec)
+}
+
 fn session_pids(session: i32) -> Vec<i32> {
     pids_by_type(ProcFilter::All)
         .unwrap_or_default()
