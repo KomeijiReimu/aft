@@ -46,7 +46,7 @@ pub(crate) fn authorized(socket: &TcpStream, session: i32) -> bool {
                 continue;
             };
             if socket.psi.soi_protocol != libc::IPPROTO_TCP
-                || socket.psi.soi_family != libc::AF_INET as u32
+                || socket.psi.soi_family != libc::AF_INET
                 || !matches!(
                     SocketInfoKind::from(socket.psi.soi_kind),
                     SocketInfoKind::Tcp

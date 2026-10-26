@@ -2,6 +2,22 @@
 //! labels and arms the new command session before releasing the child. The job
 //! owner retains the handle and reports process-tree end or the end of the
 //! configured lifetime SecretScope, either of which stops the proxy.
+//!
+//! # Memory boundary
+//!
+//! Vault material, matcher patterns, overlap windows, and all proxy-created
+//! material-bearing request staging use zeroizing owners. This includes the Bytes owners behind
+//! substituted header values, query-bearing URIs, and JSON bodies. The rules
+//! evaluator plans locations with public dummy bytes, never real material.
+//!
+//! Third-party codec buffers are outside that ownership guarantee: rustls owns
+//! TLS plaintext/record buffers; h2 owns HTTP/2 stream and HPACK buffers; Hyper
+//! owns its HTTP/1 encoder write buffer; async-compression and its codec crates
+//! own decompression workspaces. These codecs allocate and manage their own
+//! buffers rather than accepting AFT's zeroizing owners. The proxy does not
+//! persist or log any of them, or format key-bearing requests or responses with
+//! `Debug` or `Display`. Zeroization is defence in depth in the daemon, not a claim
+//! that third-party protocol implementations erase every transient copy.
 
 mod peer;
 mod request;

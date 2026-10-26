@@ -1,6 +1,7 @@
 //! TCP has no portable peer credentials. Resolve the connecting socket's owner,
 //! then check the kernel session identity; the URL token is not an identity.
 
+#[cfg(not(target_os = "macos"))]
 use tokio::net::TcpStream;
 
 #[cfg(unix)]
