@@ -72,7 +72,7 @@
       "path_glob": "/repos/*/*/pulls/*",
       "tier": "governed",
       "platform": ["macos", "linux"],
-      "rationale": "routed as pr edit (author_scope own); title, body and base only"
+      "rationale": "routed as pr edit (author_scope own); title and body only, base refused"
     },
     {
       "method": "POST",

@@ -246,9 +246,10 @@ fn canonicalize_review_reply<R: Read>(
 }
 
 /// The REST edit of a pull request, `PATCH /repos/<owner>/<repo>/pulls/<n>`,
-/// admitting only `title`, `body` and `base`. It is routed as `pr edit`, so the
-/// route holder applies the same own-pull-request author check to both
-/// spellings.
+/// admitting only `title` and `body`. It is routed as `pr edit`, so the route
+/// holder applies the same own-pull-request author check to both spellings. A
+/// `base` field is refused like any other undeclared field: retargeting a pull
+/// request changes what it merges into, which is not speech.
 fn canonicalize_pull_edit<R: Read>(
     args: &[OsString],
     manifest_version: u64,
@@ -265,13 +266,13 @@ fn canonicalize_pull_edit<R: Read>(
     })?;
     let body = api_fields_payload(
         args,
-        PULL_PATCH_FIELDS,
+        PR_EDIT_BODY_FIELDS,
         "the governed pull request PATCH",
         stdin,
     )?;
     if body.is_empty() {
         return Err(CanonicalizeError::unclassified(
-            "the governed pull request PATCH needs a title, a body or a base",
+            "the governed pull request PATCH needs a title or a body",
         ));
     }
     let mut target = Map::new();

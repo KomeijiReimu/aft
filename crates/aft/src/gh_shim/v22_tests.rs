@@ -615,17 +615,61 @@ fn v22_pull_patch_is_routed_as_the_same_own_pr_edit() {
             "--input",
             "-",
         ],
-        r#"{"title":"T","body":"B","base":"stack/parent"}"#,
+        r#"{"title":"T","body":"B"}"#,
     )
     .unwrap();
     let wire = wire_of(request);
     assert_eq!(wire["action"], "pr edit");
     assert_eq!(wire["target"], json!({ "number": "7" }));
-    assert_eq!(
-        wire["body"],
-        json!({ "title": "T", "body": "B", "base": "stack/parent" })
-    );
+    assert_eq!(wire["body"], json!({ "title": "T", "body": "B" }));
     assert_eq!(wire["author_scope"], "own");
+    // Retargeting a pull request changes what it merges into, so `base` is
+    // refused in either payload spelling, alone or beside an admitted field.
+    for (raw, stdin) in [
+        (
+            vec![
+                "api",
+                "-X",
+                "PATCH",
+                "repos/cortexkit/aft/pulls/7",
+                "-f",
+                "base=x",
+            ],
+            "",
+        ),
+        (
+            vec![
+                "api",
+                "-X",
+                "PATCH",
+                "repos/cortexkit/aft/pulls/7",
+                "-f",
+                "title=T",
+                "-f",
+                "base=x",
+            ],
+            "",
+        ),
+        (
+            vec![
+                "api",
+                "-X",
+                "PATCH",
+                "repos/cortexkit/aft/pulls/7",
+                "--input",
+                "-",
+            ],
+            r#"{"title":"T","base":"x"}"#,
+        ),
+    ] {
+        let error = api_request(&raw, stdin).unwrap_err();
+        assert_eq!(error.code, RefusalCode::Unclassified, "{raw:?}");
+        assert_eq!(
+            error.text,
+            "base is not declared; the governed pull request PATCH admits only title, body",
+            "{raw:?}"
+        );
+    }
     for (raw, stdin) in [
         (
             vec![

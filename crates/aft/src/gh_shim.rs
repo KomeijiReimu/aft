@@ -185,17 +185,14 @@ const GRAPHQL_MUTATION_FORM: &str = "graphql-mutation";
 /// comment's review thread.
 const REVIEW_REPLY_PATH_GLOB: &str = "/repos/*/*/pulls/*/comments/*/replies";
 const REVIEW_REPLY_METHOD: &str = "POST";
-/// The REST edit of a pull request. Through the shim it carries only a title,
-/// a body and a base branch and is routed as `pr edit`, so it has the same
-/// own-pull-request author check.
+/// The REST edit of a pull request. Through the shim it carries only a title
+/// and a body and is routed as `pr edit`, so it has the same own-pull-request
+/// author check. Changing the base branch is refused: it changes what the pull
+/// request merges into, which is not speech.
 const PULL_EDIT_PATH_GLOB: &str = "/repos/*/*/pulls/*";
 const PULL_EDIT_METHOD: &str = "PATCH";
 /// The body fields a governed `pr edit` may carry, in manifest order.
 const PR_EDIT_BODY_FIELDS: &[&str] = &["title", "body"];
-/// The fields the pull request PATCH may carry. Besides the `pr edit` fields it
-/// admits `base`, which is how a stack re-parents a pull request after the one
-/// below it lands; it is still limited to the bot's own pull request.
-const PULL_PATCH_FIELDS: &[&str] = &["title", "body", "base"];
 /// `gh pr edit` flags that change labels. They have their own operator row
 /// (`GH_SHIM_BYPASS=operator`, labels and nothing else), so the governed
 /// route refuses them by name rather than as unknown flags.
@@ -4622,7 +4619,7 @@ fn is_reviewed_operator_row_admin_tuple(manifest_version: u64, tuple: &str) -> b
 
 /// True for the API rules that may be governed rather than admin: the v14
 /// own-comment PATCH, and from v22 the review-comment reply POST, the pull
-/// request PATCH (title, body, base), and the three stack writes. Every other
+/// request PATCH (title and body), and the three stack writes. Every other
 /// governed API rule stays undeclared, so a signed rule alone cannot widen raw
 /// API writes into bot speech.
 fn is_reviewed_governed_api_rule(manifest_version: u64, rule: &ApiRule) -> bool {
@@ -4652,7 +4649,7 @@ fn governed_api_canonicalization(rule: &ApiRule) -> Canonicalization {
         PULL_EDIT_PATH_GLOB => Canonicalization {
             argv_forms: strings(&["target-and-fields"]),
             target_fields: strings(&["number"]),
-            body_fields: strings(PULL_PATCH_FIELDS),
+            body_fields: strings(PR_EDIT_BODY_FIELDS),
         },
         STACK_CREATE_PATH_GLOB => Canonicalization {
             argv_forms: strings(&[FIELDS_ONLY_FORM]),
