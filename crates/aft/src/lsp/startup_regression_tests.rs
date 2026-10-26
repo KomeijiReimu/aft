@@ -404,6 +404,10 @@ def write_message(message):
     body = json.dumps(message).encode()
     sys.stdout.buffer.write(('Content-Length: %d\r\n\r\n' % len(body)).encode() + body)
     sys.stdout.buffer.flush()
+def register_watched_files():
+    write_message({'jsonrpc': '2.0', 'id': 'startup-watches', 'method': 'client/registerCapability', 'params': {
+        'registrations': [{'id': 'startup-watches', 'method': 'workspace/didChangeWatchedFiles',
+                           'registerOptions': {'watchers': [{'globPattern': '**/*'}]}}]}})
 while True:
     headers = {}
     while True:
@@ -416,15 +420,19 @@ while True:
         headers[key.lower()] = value.strip()
     message = json.loads(sys.stdin.buffer.read(int(headers['content-length'])))
     method = message.get('method')
-    if method in ('textDocument/didOpen', 'textDocument/didChange'):
+    if method == 'initialized' and os.environ.get('AFT_STARTUP_WATCHES') == '1':
+        register_watched_files()
+    if method == 'test/notifications' and message.get('params', {}).get('register_watches'):
+        register_watched_files()
+    if method in ('textDocument/didOpen', 'textDocument/didChange', 'workspace/didChangeWatchedFiles'):
         seen.append(message)
-        if os.environ.get('AFT_STARTUP_PUSH') == '1':
+        if method != 'workspace/didChangeWatchedFiles' and os.environ.get('AFT_STARTUP_PUSH') == '1':
             document = message['params']['textDocument']
             write_message({'jsonrpc': '2.0', 'method': 'textDocument/publishDiagnostics', 'params': {
                 'uri': document['uri'], 'version': document['version'], 'diagnostics': [{
                     'range': {'start': {'line': 0, 'character': 0}, 'end': {'line': 0, 'character': 1}},
                     'severity': 1, 'message': 'startup replay diagnostic'}]}})
-    if 'id' in message:
+    if 'id' in message and method is not None:
         result = {'capabilities': {}} if method == 'initialize' else seen if method == 'test/notifications' else None
         write_message({'jsonrpc': '2.0', 'id': message['id'], 'result': result})
     if method == 'exit':
@@ -441,13 +449,17 @@ impl lsp_types::request::Request for RecordedNotifications {
 }
 
 fn recorded_notifications(f: &Fixture) -> Vec<serde_json::Value> {
+    recorded_notifications_with(f, serde_json::json!({}))
+}
+
+fn recorded_notifications_with(f: &Fixture, params: serde_json::Value) -> Vec<serde_json::Value> {
     let request = f
         .manager
         .lock()
         .clients
         .get_mut(&f.key)
         .unwrap()
-        .start_request::<RecordedNotifications>(serde_json::json!({}))
+        .start_request::<RecordedNotifications>(params)
         .unwrap();
     serde_json::from_value(request.wait(WAIT).unwrap()).unwrap()
 }
@@ -699,4 +711,157 @@ fn relative_diagnostics_wait_keeps_its_observation_budget_after_startup() {
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].message, "startup replay diagnostic");
     });
+}
+
+#[test]
+fn watched_changes_during_startup_replay_latest_explicit_types_once() {
+    let f = notification_fixture();
+    f.manager.lock().set_extra_env("AFT_STARTUP_WATCHES", "1");
+    let pause = pause_first_spawn(&f);
+    locked(&f, |manager| {
+        manager.notify_file_changed_versioned(&f.file, "content", &f.config)
+    })
+    .unwrap();
+    pause.entered.recv_timeout(WAIT).unwrap();
+    let existing = f.file.with_file_name("existing.json");
+    let created = f.file.with_file_name("created.json");
+    let deleted = f.file.with_file_name("deleted.json");
+    for path in [&existing, &created] {
+        std::fs::write(path, "{}").unwrap();
+    }
+    locked(&f, |manager| {
+        manager.notify_files_watched_changed(
+            &[
+                (existing.clone(), FileChangeType::CHANGED),
+                (created.clone(), FileChangeType::CREATED),
+                (deleted.clone(), FileChangeType::CREATED),
+            ],
+            &f.config,
+        )
+    })
+    .unwrap();
+    locked(&f, |manager| {
+        manager
+            .notify_files_watched_changed(&[(deleted.clone(), FileChangeType::DELETED)], &f.config)
+    })
+    .unwrap();
+    assert_eq!(
+        f.manager.lock().pending_watched_changes[&f.key]
+            .changes
+            .len(),
+        3
+    );
+    pause.resume.send(()).unwrap();
+    let ready = ensure_server_for_file_detailed_unlocked(|| f.manager.lock(), &f.file, &f.config);
+    assert_eq!(ready.successful, vec![f.key.clone()]);
+    recorded_notifications(&f);
+    f.manager.lock().drain_events();
+    let messages = recorded_notifications(&f);
+    let watched: Vec<_> = messages
+        .iter()
+        .filter(|message| message["method"] == "workspace/didChangeWatchedFiles")
+        .collect();
+    assert_eq!(watched.len(), 1, "{messages:?}");
+    let changes = watched[0]["params"]["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 3);
+    for (name, kind) in [
+        ("existing.json", 2),
+        ("created.json", 1),
+        ("deleted.json", 3),
+    ] {
+        let change = changes
+            .iter()
+            .find(|change| change["uri"].as_str().unwrap().ends_with(name))
+            .unwrap();
+        assert_eq!(change["type"], kind);
+    }
+    f.manager.lock().drain_events();
+    assert_eq!(
+        recorded_notifications(&f)
+            .iter()
+            .filter(|message| message["method"] == "workspace/didChangeWatchedFiles")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn watched_changes_wait_for_late_registration_without_restarting_server() {
+    let f = notification_fixture();
+    let ready = ensure_server_for_file_detailed_unlocked(|| f.manager.lock(), &f.file, &f.config);
+    assert_eq!(ready.successful, vec![f.key.clone()]);
+    let pid = f.manager.lock().clients[&f.key].child_pid();
+    let path = f.file.with_file_name("late.json");
+    std::fs::write(&path, "{}").unwrap();
+    f.manager
+        .lock()
+        .notify_files_watched_changed(&[(path, FileChangeType::CREATED)], &f.config)
+        .unwrap();
+    assert!(recorded_notifications(&f).is_empty());
+    recorded_notifications_with(&f, serde_json::json!({"register_watches": true}));
+    f.manager.lock().drain_events();
+    let messages = recorded_notifications(&f);
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert_eq!(messages[0]["method"], "workspace/didChangeWatchedFiles");
+    assert_eq!(messages[0]["params"]["changes"][0]["type"], 1);
+    assert_eq!(f.manager.lock().clients[&f.key].child_pid(), pid);
+}
+
+#[test]
+fn cancelled_startup_drops_queued_watched_changes() {
+    let f = notification_fixture();
+    f.manager.lock().set_extra_env("AFT_STARTUP_WATCHES", "1");
+    let pause = pause_first_spawn(&f);
+    locked(&f, |manager| {
+        manager.ensure_server_for_file_detailed(&f.file, &f.config)
+    });
+    pause.entered.recv_timeout(WAIT).unwrap();
+    let path = f.file.with_file_name("cancelled.json");
+    std::fs::write(&path, "{}").unwrap();
+    f.manager
+        .lock()
+        .notify_files_watched_changed(&[(path, FileChangeType::CHANGED)], &f.config)
+        .unwrap();
+    assert!(!f.manager.lock().pending_watched_changes.is_empty());
+    f.manager.lock().quiesce();
+    assert!(f.manager.lock().pending_watched_changes.is_empty());
+    pause.resume.send(()).unwrap();
+    f.manager.lock().resume();
+    f.manager.lock().spawn_hook = None;
+    let ready = ensure_server_for_file_detailed_unlocked(|| f.manager.lock(), &f.file, &f.config);
+    assert_eq!(ready.successful, vec![f.key.clone()]);
+    recorded_notifications(&f);
+    f.manager.lock().drain_events();
+    assert!(recorded_notifications(&f).is_empty());
+}
+
+#[test]
+fn watcher_changes_during_startup_keep_kind_and_registration_filtering() {
+    let f = notification_fixture();
+    f.manager.lock().set_extra_env("AFT_STARTUP_WATCHES", "1");
+    let pause = pause_first_spawn(&f);
+    locked(&f, |manager| {
+        manager.ensure_server_for_file_detailed(&f.file, &f.config)
+    });
+    pause.entered.recv_timeout(WAIT).unwrap();
+    let path = f.file.with_file_name("watcher.json");
+    std::fs::write(&path, "{}").unwrap();
+    f.manager
+        .lock()
+        .forward_watcher_file_events(&[(path, FileChangeType::CREATED)], &[]);
+    assert_eq!(
+        f.manager.lock().pending_watched_changes[&f.key]
+            .changes
+            .len(),
+        1
+    );
+    pause.resume.send(()).unwrap();
+    let ready = ensure_server_for_file_detailed_unlocked(|| f.manager.lock(), &f.file, &f.config);
+    assert_eq!(ready.successful, vec![f.key.clone()]);
+    recorded_notifications(&f);
+    f.manager.lock().drain_events();
+    let messages = recorded_notifications(&f);
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert_eq!(messages[0]["method"], "workspace/didChangeWatchedFiles");
+    assert_eq!(messages[0]["params"]["changes"][0]["type"], 1);
 }

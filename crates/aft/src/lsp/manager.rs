@@ -1098,6 +1098,7 @@ pub struct LspManager {
     /// Server/root pairs for which we already logged that watched-file
     /// notifications are skipped because the capability is absent.
     watched_file_skip_logged: HashSet<ServerKey>,
+    pending_watched_changes: HashMap<ServerKey, PendingWatchedChanges>,
     /// rust-analyzer instances with a workspace reload running on a helper
     /// thread because the file watcher saw a Cargo manifest change (see
     /// [`spawn_watcher_rust_workspace_reload`]). The value collects the
@@ -1376,6 +1377,7 @@ impl LspManager {
             failed_spawns: HashMap::new(),
             transient_backoff: HashMap::new(),
             watched_file_skip_logged: HashSet::new(),
+            pending_watched_changes: HashMap::new(),
             watcher_rust_reloads: HashMap::new(),
             #[cfg(windows)]
             last_watched_file_notification_trace: "no watched-file notification attempted"
@@ -1948,6 +1950,7 @@ impl LspManager {
             .cancelled
             .load(std::sync::atomic::Ordering::Acquire)
         {
+            self.pending_watched_changes.remove(key);
             reservation.signal.finish();
             return;
         }
@@ -2052,11 +2055,10 @@ impl LspManager {
                 let worker = std::thread::Builder::new()
                     .name("lsp-startup".into())
                     .spawn(move || {
-                        let guard = StartupWorkerGuard(Arc::clone(&worker_signal));
+                        let guard = StartupWorkerGuard::new(Arc::clone(&worker_signal));
                         let timeout = prepared.inspect_initialize_timeout();
                         let result = prepared.run(Some(timeout));
-                        worker_signal.complete(result);
-                        drop(guard);
+                        guard.publish(|signal| signal.complete(result));
                         if let Some(manager) = owner.upgrade() {
                             manager.lock().publish_completed_starts();
                         }
@@ -2118,6 +2120,7 @@ impl LspManager {
                 }
             }
         }
+        self.flush_pending_watched_changes();
     }
 
     /// Wait for starts admitted by a locked call, including queued document
@@ -2259,7 +2262,7 @@ impl LspManager {
         let worker = std::thread::Builder::new()
             .name("lsp-startup-sync".into())
             .spawn(move || {
-                let guard = StartupWorkerGuard(Arc::clone(&worker_signal));
+                let guard = StartupWorkerGuard::new(Arc::clone(&worker_signal));
                 let result = replay_startup_notifications(
                     writer,
                     save,
@@ -2268,9 +2271,10 @@ impl LspManager {
                     &worker_signal,
                     jobs,
                 );
-                *worker_signal.replay_completion.lock() = Some(result);
-                worker_signal.finish();
-                drop(guard);
+                guard.publish(|signal| {
+                    *signal.replay_completion.lock() = Some(result);
+                    signal.finish();
+                });
                 if let Some(manager) = owner.upgrade() {
                     manager.lock().publish_completed_starts();
                 }
@@ -2333,6 +2337,9 @@ impl LspManager {
     /// Publish the final startup outcome for all waiters before releasing the reservation.
     fn complete_startup_outcome(&mut self, key: &ServerKey, outcome: Option<ServerAttemptResult>) {
         let ready = outcome.is_none();
+        if !ready {
+            self.pending_watched_changes.remove(key);
+        }
         if let Some(reservation) = self.starting.get(key) {
             *reservation.signal.outcome.lock() =
                 Some(outcome.unwrap_or_else(|| ServerAttemptResult::Ok {
@@ -3000,16 +3007,133 @@ impl LspManager {
         self.notify_file_changed(file_path, content, &Config::default())
     }
 
-    /// Notify every active server whose workspace contains at least one changed
-    /// path that watched files changed. This is intentionally workspace-scoped
-    /// rather than extension-scoped: configuration edits such as `package.json`
-    /// or `tsconfig.json` affect a server's project graph even though those
-    /// files may not be documents handled by the server itself.
+    /// Keep only the latest event for each path. Explicit LSP change kinds are
+    /// retained; inferring them again would turn CREATED into CHANGED.
+    fn queue_watched_change(
+        &mut self,
+        key: &ServerKey,
+        path: PathBuf,
+        kind: FileChangeType,
+        raw: Option<PathBuf>,
+        extra_config_markers: Vec<String>,
+    ) -> Result<(), LspError> {
+        let pid = self.clients.get(key).map(LspClient::child_pid);
+        let pending = self
+            .pending_watched_changes
+            .entry(key.clone())
+            .or_insert_with(|| PendingWatchedChanges {
+                generation: self.clients_generation,
+                pid,
+                changes: HashMap::new(),
+            });
+        if pending.generation != self.clients_generation
+            || pending.pid.is_some_and(|old| Some(old) != pid)
+        {
+            *pending = PendingWatchedChanges {
+                generation: self.clients_generation,
+                pid,
+                changes: HashMap::new(),
+            };
+        }
+        if !pending.changes.contains_key(&path)
+            && pending.changes.len() >= STARTUP_NOTIFICATION_PATH_CAP
+        {
+            return Err(LspError::ServerNotReady(
+                STARTUP_NOTIFICATION_QUEUE_FULL.into(),
+            ));
+        }
+        pending.changes.insert(
+            path,
+            PendingWatchedChange {
+                kind,
+                raw,
+                extra_config_markers,
+            },
+        );
+        Ok(())
+    }
+
+    /// Replay through the existing watched-file send paths only after the
+    /// client and its dynamic subscription are ready. Each batch stays bound
+    /// to its workspace, generation and client rather than broadcasting twice.
+    fn flush_pending_watched_changes(&mut self) {
+        if self.is_quiesced() {
+            return;
+        }
+        let keys: Vec<_> = self
+            .pending_watched_changes
+            .keys()
+            .filter(|key| {
+                !self.starting.contains_key(*key)
+                    && self
+                        .clients
+                        .get(*key)
+                        .is_some_and(LspClient::has_watched_file_registration)
+            })
+            .cloned()
+            .collect();
+        let mut reloads = Vec::new();
+        for key in keys {
+            let Some(pending) = self.pending_watched_changes.remove(&key) else {
+                continue;
+            };
+            let pid = self.clients.get(&key).map(LspClient::child_pid);
+            if pending.generation != self.clients_generation
+                || pending.pid.is_some_and(|old| Some(old) != pid)
+            {
+                continue;
+            }
+            let mut direct = Vec::new();
+            let mut forwarded: HashMap<Vec<String>, Vec<(PathBuf, FileChangeType)>> =
+                HashMap::new();
+            for (path, change) in pending.changes {
+                if let Some(raw) = change.raw {
+                    forwarded
+                        .entry(change.extra_config_markers)
+                        .or_default()
+                        .push((raw, change.kind));
+                } else {
+                    direct.push((path, change.kind));
+                }
+            }
+            if !direct.is_empty() {
+                if let Err(error) =
+                    self.notify_files_watched_changed_for_server(&direct, Some(&key))
+                {
+                    crate::slog_warn!("queued watched-file sync failed for {key:?}: {error}");
+                }
+            }
+            for (markers, changes) in forwarded {
+                reloads.extend(self.forward_watcher_file_events_for_server(
+                    &changes,
+                    &markers,
+                    Some(&key),
+                ));
+            }
+        }
+        if let Some(manager) = self.startup_owner.upgrade() {
+            spawn_watcher_rust_workspace_reloads(&manager, reloads);
+        }
+    }
+
+    /// Notify every active or starting server whose workspace contains a changed
+    /// path. Pending startup or registration retains the event's explicit kind.
     pub fn notify_files_watched_changed(
         &mut self,
         paths: &[(PathBuf, FileChangeType)],
         _config: &Config,
     ) -> Result<(), LspError> {
+        self.notify_files_watched_changed_for_server(paths, None)
+    }
+
+    fn notify_files_watched_changed_for_server(
+        &mut self,
+        paths: &[(PathBuf, FileChangeType)],
+        only_server: Option<&ServerKey>,
+    ) -> Result<(), LspError> {
+        if self.is_quiesced() {
+            return Err(LspError::ProjectClosed);
+        }
         #[cfg(windows)]
         let mut trace = vec![format!(
             "input_paths={paths:?}; active_keys={:?}",
@@ -3034,12 +3158,41 @@ impl LspManager {
         trace.push(format!("resolved_events={canonical_events:?}"));
 
         let mut first_error = None;
-        let keys: Vec<ServerKey> = self.clients.keys().cloned().collect();
+        let keys: Vec<ServerKey> = self
+            .clients
+            .keys()
+            .chain(self.starting.keys())
+            .filter(|key| only_server.is_none_or(|only| only == *key))
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         #[cfg(windows)]
         if keys.is_empty() {
             trace.push("outcome=no-active-client".to_string());
         }
         for key in keys {
+            if self.starting.contains_key(&key)
+                || !self
+                    .clients
+                    .get(&key)
+                    .is_some_and(LspClient::has_watched_file_registration)
+            {
+                for (path, typ) in &canonical_events {
+                    if path.starts_with(&key.root) {
+                        if let Err(error) =
+                            self.queue_watched_change(&key, path.clone(), *typ, None, Vec::new())
+                        {
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                }
+                #[cfg(windows)]
+                trace.push(format!(
+                    "key={key:?}; outcome=queued-until-ready-registration"
+                ));
+                continue;
+            }
             let mut changes = Vec::new();
             for (path, typ) in &canonical_events {
                 if !path.starts_with(&key.root) {
@@ -3142,8 +3295,20 @@ impl LspManager {
         events: &[(PathBuf, FileChangeType)],
         extra_config_markers: &[String],
     ) -> Vec<(ServerKey, Vec<PathBuf>)> {
+        self.forward_watcher_file_events_for_server(events, extra_config_markers, None)
+    }
+
+    fn forward_watcher_file_events_for_server(
+        &mut self,
+        events: &[(PathBuf, FileChangeType)],
+        extra_config_markers: &[String],
+        only_server: Option<&ServerKey>,
+    ) -> Vec<(ServerKey, Vec<PathBuf>)> {
         let mut rust_manifest_changes = Vec::new();
-        if events.is_empty() || self.clients.is_empty() {
+        if self.is_quiesced() {
+            return rust_manifest_changes;
+        }
+        if events.is_empty() || (self.clients.is_empty() && self.starting.is_empty()) {
             return rust_manifest_changes;
         }
         // A server's root and globs may spell a path either the way the
@@ -3157,7 +3322,15 @@ impl LspManager {
                 (path.as_path(), resolve_for_lsp_uri(path), *typ)
             })
             .collect();
-        let keys: Vec<ServerKey> = self.clients.keys().cloned().collect();
+        let keys: Vec<ServerKey> = self
+            .clients
+            .keys()
+            .chain(self.starting.keys())
+            .filter(|key| only_server.is_none_or(|only| only == *key))
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         for key in keys {
             let in_root: Vec<&(&Path, PathBuf, FileChangeType)> = events
                 .iter()
@@ -3180,7 +3353,28 @@ impl LspManager {
             let mut overflowed = false;
             let mut sent_to_registered_watcher: Vec<PathBuf> = Vec::new();
 
-            if let Some(client) = self.clients.get(&key) {
+            let waiting = self.starting.contains_key(&key)
+                || !self
+                    .clients
+                    .get(&key)
+                    .is_some_and(LspClient::has_watched_file_registration);
+            if waiting {
+                for (raw, resolved, typ) in &in_root {
+                    if let Err(error) = self.queue_watched_change(
+                        &key,
+                        resolved.clone(),
+                        *typ,
+                        Some(raw.to_path_buf()),
+                        extra_config_markers.to_vec(),
+                    ) {
+                        crate::slog_warn!(
+                            "queued watched-file forward failed for {key:?}: {error}"
+                        );
+                    }
+                }
+            }
+
+            if let Some(client) = self.clients.get(&key).filter(|_| !waiting) {
                 if client.has_watched_file_registration() {
                     let watchers = client.registered_file_watchers();
                     let is_config =
@@ -3890,6 +4084,14 @@ impl LspManager {
         !self.event_rx.is_empty()
             || !self.pending_diagnostic_observations.is_empty()
             || !self.ready_startup_events.is_empty()
+            || (!self.is_quiesced()
+                && self.pending_watched_changes.keys().any(|key| {
+                    !self.starting.contains_key(key)
+                        && self
+                            .clients
+                            .get(key)
+                            .is_some_and(LspClient::has_watched_file_registration)
+                }))
     }
 
     pub fn drain_events_bounded(&mut self, max_events: usize) -> DrainedLspEvents {
@@ -5364,6 +5566,8 @@ impl LspManager {
         self.server_binaries.retain(|server, _| keep(server));
         self.documents.retain(|server, _| keep(server));
         self.watched_file_skip_logged.retain(keep);
+        self.pending_watched_changes
+            .retain(|server, _| keep(server));
         self.latest_push_for_pull_servers
             .retain(|(server, _), _| keep(server));
         self.latest_pull_for_rust
@@ -6256,6 +6460,10 @@ impl LspManager {
             }
             _ => None,
         };
+        if matches!(event, LspEvent::ServerRequest { method, .. } if method == "client/registerCapability")
+        {
+            self.flush_pending_watched_changes();
+        }
         self.wake_post_edit_waiters();
         published_file
     }
@@ -8097,6 +8305,20 @@ struct StartReservation {
     replay_pid: Option<u32>,
 }
 
+/// Watched changes wait for an initialized client and its subscription without
+/// starting a server or changing an already-running client's readiness state.
+struct PendingWatchedChanges {
+    generation: u64,
+    pid: Option<u32>,
+    changes: HashMap<PathBuf, PendingWatchedChange>,
+}
+
+struct PendingWatchedChange {
+    kind: FileChangeType,
+    raw: Option<PathBuf>,
+    extra_config_markers: Vec<String>,
+}
+
 /// Wait through spawn and replay until a final startup outcome or the deadline.
 fn wait_for_startup_outcome<G>(
     lock: impl Fn() -> G,
@@ -8232,11 +8454,31 @@ pub fn start_applicable_server_unlocked(
 }
 
 /// Wake waiters if a startup worker unwinds before publishing a result.
-struct StartupWorkerGuard(Arc<StartSignal>);
+struct StartupWorkerGuard {
+    signal: Arc<StartSignal>,
+    armed: bool,
+}
+
+impl StartupWorkerGuard {
+    fn new(signal: Arc<StartSignal>) -> Self {
+        Self {
+            signal,
+            armed: true,
+        }
+    }
+
+    fn publish(mut self, publish: impl FnOnce(&StartSignal)) {
+        // Waking a waiter can advance this signal to the next replay phase.
+        // Disarm before publication instead of inferring ownership from that
+        // phase's shared completion flag when this worker is dropped.
+        self.armed = false;
+        publish(&self.signal);
+    }
+}
 impl Drop for StartupWorkerGuard {
     fn drop(&mut self) {
-        if !self.0.wait_until(Instant::now()) {
-            self.0.cancel();
+        if self.armed {
+            self.signal.cancel();
         }
     }
 }
@@ -11091,4 +11333,36 @@ pub(crate) fn settled_lsp<R>(
     }
     assert!(manager.wait_for_startups(Instant::now() + Duration::from_secs(30)));
     operation(manager)
+}
+
+#[cfg(test)]
+mod startup_worker_guard_tests {
+    use super::*;
+
+    #[test]
+    fn published_worker_cannot_cancel_the_next_replay_phase() {
+        let signal = Arc::new(StartSignal::default());
+        let guard = StartupWorkerGuard::new(Arc::clone(&signal));
+        guard.publish(|signal| {
+            signal.finish();
+            // A woken manager can consume completion and start another batch
+            // before the publishing worker's scope ends.
+            *signal.finished.lock().unwrap() = false;
+        });
+        assert!(!signal.cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(signal.outcome.lock().is_none());
+        assert!(!signal.wait_until(Instant::now()));
+    }
+
+    #[test]
+    fn unpublished_worker_releases_its_reservation_on_drop() {
+        let signal = Arc::new(StartSignal::default());
+        drop(StartupWorkerGuard::new(Arc::clone(&signal)));
+        assert!(signal.cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(signal.wait_until(Instant::now()));
+        assert!(matches!(
+            *signal.outcome.lock(),
+            Some(ServerAttemptResult::ProjectClosed)
+        ));
+    }
 }

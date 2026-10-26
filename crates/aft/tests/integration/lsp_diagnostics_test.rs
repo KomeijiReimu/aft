@@ -131,12 +131,19 @@ fn collect_watched_file_events(manager: &mut LspManager) -> serde_json::Value {
 }
 
 fn collect_watched_file_events_from_ctx(ctx: &AppContext) -> serde_json::Value {
-    let event = collect_event(&mut ctx.lsp(), |event| {
-        matches!(
-            event,
-            LspEvent::Notification { method, .. } if method == "custom/watchedFilesChanged"
-        )
-    })
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let event = loop {
+        // An asynchronous post-write hook may need this manager to send its
+        // queued changes. Do not retain the guard while waiting for its notification.
+        let drained = ctx.lsp().drain_events();
+        if let Some(event) = drained.into_iter().find(|event| matches!(
+            event, LspEvent::Notification { method, .. } if method == "custom/watchedFilesChanged"
+        )) { break Some(event); }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
     .unwrap_or_else(|| {
         #[cfg(windows)]
         panic!(
