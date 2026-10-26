@@ -591,7 +591,8 @@ impl SiblingLoader {
             for (path, entry) in checkout.entries {
                 delta.apply(path, entry);
             }
-            let mut snapshot = delta.snapshot();
+            let strict_epoch = checkout.cut.as_ref().map_or(delta.epoch(), |cut| cut.epoch);
+            let mut snapshot = delta.snapshot().with_reconciled_epoch(strict_epoch);
             if let Some(cut) = checkout.cut {
                 snapshot = snapshot.with_install_cut(cut);
             }
@@ -1583,6 +1584,35 @@ impl CheckoutDriver {
             )),
         }
     }
+
+    fn validate_install_identity(
+        &self,
+        snapshot: &Snapshot,
+        cut: &InstallCut,
+        live: &super::snapshot::LiveDelta,
+        installed: &InstalledBundle,
+    ) -> Result<(), PlaneError> {
+        if cut.seq != installed.seq || !Arc::ptr_eq(&cut.resident, &installed.composed) {
+            return Err(SiblingLoader::error(
+                "BaseChanged: installed bundle superseded",
+            ));
+        }
+        // A prior ignore-file record is not proof that the current membership
+        // epoch was walked. Only the completed strict walk carries this tag.
+        let strict = snapshot.reconciled_epoch() == Some(live.epoch());
+        if !installed.uncertain_paths.is_empty() && !strict {
+            return Err(SiblingLoader::error(format!(
+                "{CHECKOUT_CHANGED_BEFORE_INSTALL}: membership requires strict reconciliation"
+            )));
+        }
+        match live.watcher() {
+            super::snapshot::WatcherState::Healthy => Ok(()),
+            super::snapshot::WatcherState::Reconciling if strict => Ok(()),
+            _ => Err(SiblingLoader::error(format!(
+                "{CHECKOUT_CHANGED_BEFORE_INSTALL}: watcher is not healthy or strictly reconciled"
+            ))),
+        }
+    }
 }
 
 impl FirstLoadDriver for CheckoutDriver {
@@ -1599,7 +1629,12 @@ impl FirstLoadDriver for CheckoutDriver {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         live.replay_onto(snapshot, cut)
             .map(|_| ())
-            .map_err(|error| SiblingLoader::error(format!("{error:?}")))
+            .map_err(|error| SiblingLoader::error(format!("{error:?}")))?;
+        let installed = self
+            .installed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.validate_install_identity(snapshot, cut, &live, &installed)
     }
     fn producers(&self, _: &ViewAccess) -> Producers {
         self.producers.clone()
@@ -1765,11 +1800,7 @@ impl FirstLoadDriver for CheckoutDriver {
             .installed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if cut.seq != installed.seq || !Arc::ptr_eq(&cut.resident, &installed.composed) {
-            return Err(SiblingLoader::error(
-                "BaseChanged: installed bundle superseded",
-            ));
-        }
+        self.validate_install_identity(snapshot, cut, &live, &installed)?;
         let seq = installed.seq + 1;
         successor.set_watcher(super::snapshot::WatcherState::Healthy);
         let published = snapshot
@@ -2437,6 +2468,71 @@ mod composite_tests {
             installed_unlocked,
             "reader retirement ran while the installed lock was held"
         );
+    }
+
+    #[test]
+    fn install_never_promotes_overflowed_or_stopped_watchers() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        drop(
+            SiblingLoader::new(driver.clone(), vec![])
+                .load(&access)
+                .unwrap(),
+        );
+        for watcher in [
+            super::super::snapshot::WatcherState::Overflowed,
+            super::super::snapshot::WatcherState::Stopped,
+        ] {
+            driver.live.lock().unwrap().set_watcher(watcher);
+            driver.record_change(RelPath::new(b"file.rs".to_vec()).unwrap());
+            let (snapshot, revision) = driver.installed_cut();
+            assert!(driver.install(&access, &snapshot, revision).is_err());
+            assert_eq!(driver.live.lock().unwrap().watcher(), watcher);
+        }
+    }
+
+    #[test]
+    fn initial_reconciling_state_requires_a_completed_strict_walk() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        assert!(root.path().join("file.rs").is_file());
+        let (snapshot, revision) = driver.installed_cut();
+        assert!(snapshot.membership().is_empty());
+        assert!(driver.install(&access, &snapshot, revision).is_err());
+        assert_eq!(
+            driver.live.lock().unwrap().watcher(),
+            super::super::snapshot::WatcherState::Reconciling
+        );
+    }
+
+    #[test]
+    fn directory_uncertainty_survives_non_strict_install_until_a_full_walk() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        let loader = SiblingLoader::new(driver.clone(), vec![]);
+        drop(loader.load(&access).unwrap());
+        let directory = root.path().join("new-directory");
+        std::fs::create_dir(&directory).unwrap();
+        super::super::intent::WriteIntentListener::record_change(
+            &*driver,
+            &super::super::intent::WriteIntent::Directory(directory.clone()),
+            super::super::intent::WritePhase::Before,
+        );
+        let (snapshot, revision) = driver.installed_cut();
+        assert!(driver.install(&access, &snapshot, revision).is_err());
+        assert!(driver
+            .installed_bundle()
+            .uncertain_paths
+            .contains(&directory));
+        drop(
+            loader
+                .refresh(&access, snapshot.generation().clone())
+                .unwrap(),
+        );
+        assert!(driver.installed_bundle().uncertain_paths.is_empty());
     }
     #[test]
     fn composite_reconcile_omits_file_deleted_after_listing() {

@@ -788,6 +788,7 @@ impl LiveDelta {
                 watcher: self.watcher,
                 root_ignore_files: self.root_ignore_files.clone(),
                 install_cut: None,
+                reconciled_epoch: None,
                 readers: None,
             }),
         }
@@ -1558,6 +1559,7 @@ pub fn carry_disk_state_only(path: &RelPath, generation: &ComposedGeneration) ->
 
 #[derive(Clone, Debug)]
 struct SnapshotInner {
+    reconciled_epoch: Option<u64>,
     generation: Arc<ComposedGeneration>,
     delta_version: u64,
     intent_version: u64,
@@ -1854,6 +1856,15 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    pub(crate) fn with_reconciled_epoch(mut self, epoch: u64) -> Self {
+        Arc::make_mut(&mut self.inner).reconciled_epoch = Some(epoch);
+        self
+    }
+
+    pub(crate) fn reconciled_epoch(&self) -> Option<u64> {
+        self.inner.reconciled_epoch
+    }
+
     pub fn install_cut(&self) -> Option<&InstallCut> {
         self.inner.install_cut.as_ref()
     }
