@@ -273,7 +273,21 @@ impl StreamConsumer {
             StreamRecord::ReturnManifest(manifest) => {
                 self.check_job(manifest.job_id)?;
                 let seq = manifest.seq;
-                self.skip_expired_return_chunks(&manifest)?;
+                if self.skip_expired_return_chunks(&manifest)? {
+                    // A retained manifest buffered for gap recovery may sit at
+                    // this seq; by this reconnect the runner no longer keeps
+                    // the files and replays the manifest as expired. That
+                    // expired version is the one to deliver. Only this
+                    // transition replaces a buffered record: a later retained
+                    // replay never overwrites an expired one, and an identical
+                    // duplicate stays a no-op.
+                    if let Some(Pending::ReturnManifest(buffered)) = self.pending.get(&seq) {
+                        if !has_expired_entry(buffered) {
+                            self.pending.insert(seq, Pending::ReturnManifest(manifest));
+                            return self.drain(sink);
+                        }
+                    }
+                }
                 self.enqueue(seq, Pending::ReturnManifest(manifest), sink)
             }
             StreamRecord::Unknown { seq, .. } => self.consume_unknown(seq, sink),
@@ -317,25 +331,26 @@ impl StreamConsumer {
     /// mismatch when the entries carry counts stays lost output, as the
     /// contract decides. Any gap that does not match goes to the ordinary gap
     /// recovery first, as does one with a record received inside it.
-    fn skip_expired_return_chunks(&mut self, manifest: &ReturnManifest) -> Result<(), Error> {
+    /// Returns whether the gap was skipped.
+    fn skip_expired_return_chunks(&mut self, manifest: &ReturnManifest) -> Result<bool, Error> {
         let next = self.next_seq()?;
         if manifest.total_bytes != 0
             || manifest.seq <= next
             || self.pending.range(..manifest.seq).next().is_some()
             || !has_expired_entry(manifest)
         {
-            return Ok(());
+            return Ok(false);
         }
         let Some(last_output_seq) = self.point.as_ref().and_then(|p| p.last_output_seq) else {
-            return Ok(());
+            return Ok(false);
         };
         if !expired_gap_matches(manifest, last_output_seq) {
-            return Ok(());
+            return Ok(false);
         }
         if let Some(point) = self.point.as_mut() {
             point.last_seq = Some(manifest.seq - 1);
         }
-        Ok(())
+        Ok(true)
     }
 
     fn next_seq(&self) -> Result<u64, Error> {

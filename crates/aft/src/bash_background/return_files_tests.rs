@@ -859,3 +859,238 @@ mod receiving {
         assert!(kept_dir.exists(), "a directory with other files stays");
     }
 }
+
+/// A returned-file receiver driven by the real stream consumer, the way the
+/// remote task feeds it, so tests see which manifest version reaches it.
+#[cfg(unix)]
+mod through_the_stream {
+    use super::super::*;
+    use crate::bash_background::persistence::PinnedDir;
+    use crate::exec_remote::types::*;
+    use crate::exec_remote::{OutputSink, StreamConsumer, Verdict};
+    use sha2::Digest;
+    use std::fs;
+    use std::sync::Arc;
+
+    const DATA: &[u8] = b"0123456789";
+    const PATH: &str = "dist/app.bin";
+
+    fn job_id() -> Uuid {
+        "0192a64a-1234-7000-8000-000000000001".parse().unwrap()
+    }
+
+    struct ReceiverSink {
+        receiver: ReturnReceiver,
+        reports: Vec<Vec<ReturnedPath>>,
+        manifests_delivered: usize,
+    }
+
+    impl OutputSink for ReceiverSink {
+        fn accepted(&mut self, _: &Accepted) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn output(&mut self, _: u64, _: OutputStream, _: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn truncated(&mut self, _: u64) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn unknown_output(&mut self, _: u64, _: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn return_chunk(&mut self, chunk: &ReturnChunk) -> std::io::Result<()> {
+            self.receiver.chunk(chunk, &mut |_| Ok(()));
+            Ok(())
+        }
+        fn return_manifest(
+            &mut self,
+            manifest: &ReturnManifest,
+            expired_replay: Option<u64>,
+        ) -> std::io::Result<()> {
+            self.manifests_delivered += 1;
+            let report = self
+                .receiver
+                .manifest(manifest, expired_replay, &mut |_| Ok(()));
+            self.reports.push(report);
+            Ok(())
+        }
+        fn terminal(&mut self, _: &TerminalRecord, _: &Verdict) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn output(seq: u64) -> StreamRecord {
+        StreamRecord::Output(Output::new(
+            seq,
+            OutputStream::Stdout,
+            BytePayload(b"a".to_vec()),
+        ))
+    }
+
+    /// Bytes `from..to` of the file, as the chunk at `seq`.
+    fn chunk(seq: u64, from: usize, to: usize) -> StreamRecord {
+        StreamRecord::ReturnChunk(ReturnChunk::new(
+            job_id(),
+            seq,
+            0,
+            from as u64,
+            BytePayload(DATA[from..to].to_vec()),
+        ))
+    }
+
+    /// The manifest at `seq`, reporting the file returned.
+    fn retained(seq: u64) -> StreamRecord {
+        let sha = format!("{:x}", sha2::Sha256::digest(DATA));
+        StreamRecord::ReturnManifest(ReturnManifest::new(
+            job_id(),
+            seq,
+            vec![ReturnManifestEntry::returned(PATH, DATA.len() as u64, sha)],
+            DATA.len() as u64,
+            RETURN_CHUNKED_MAX_BYTES_CAP,
+        ))
+    }
+
+    /// The same manifest after the runner stopped keeping the file.
+    fn expired(seq: u64) -> StreamRecord {
+        StreamRecord::ReturnManifest(ReturnManifest::new(
+            job_id(),
+            seq,
+            vec![
+                ReturnManifestEntry::failed(PATH, ReturnPathsFailureCause::Expired)
+                    .with_size(DATA.len() as u64),
+            ],
+            0,
+            RETURN_CHUNKED_MAX_BYTES_CAP,
+        ))
+    }
+
+    fn terminal() -> StreamRecord {
+        StreamRecord::Terminal(TerminalRecord::new(
+            job_id(),
+            Outcome::Exit { code: 0 },
+            1,
+            0,
+            0,
+        ))
+    }
+
+    /// Deliver `first` on a new stream, which must stop for gap recovery,
+    /// then `replay` on the resumed stream, which must complete.
+    fn first_then_replay(
+        first: Vec<StreamRecord>,
+        replay: Vec<StreamRecord>,
+    ) -> (ReceiverSink, tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("project");
+        let private = base.join("private");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&private).unwrap();
+        let receiver = ReturnReceiver::new(
+            vec![PATH.to_string()],
+            1 << 20,
+            &root,
+            &root,
+            None,
+            Arc::new(PinnedDir::open(&private).unwrap()),
+            "task-1",
+        )
+        .unwrap();
+        let mut sink = ReceiverSink {
+            receiver,
+            reports: Vec::new(),
+            manifests_delivered: 0,
+        };
+        let mut consumer = StreamConsumer::new();
+        let accepted = StreamRecord::Accepted(Accepted::new(job_id(), 1));
+        let mut stopped = None;
+        for record in std::iter::once(accepted).chain(first) {
+            let bytes = serde_json::to_vec(&record).unwrap();
+            if let Err(error) = consumer.consume_bytes(&bytes, &mut sink) {
+                stopped = Some(error);
+                break;
+            }
+        }
+        let Some(crate::exec_remote::Error::RecoveryRequired { resume, .. }) = stopped else {
+            panic!("the first stream must stop for gap recovery: {stopped:?}");
+        };
+        let mut consumer = StreamConsumer::resume(resume.unwrap());
+        for record in replay {
+            let bytes = serde_json::to_vec(&record).unwrap();
+            consumer.consume_bytes(&bytes, &mut sink).unwrap();
+        }
+        consumer.finish().unwrap();
+        (sink, dir, root)
+    }
+
+    const EXPIRED_TEXT: &str =
+        "dist/app.bin: not returned (the server no longer keeps this job's files)";
+
+    #[test]
+    fn an_expired_replay_replaces_a_buffered_retained_manifest_at_the_same_seq() {
+        // The file's one chunk at seq 1 was lost, so the retained manifest at
+        // seq 2 is buffered for gap recovery. By the reconnect the runner no
+        // longer keeps the file and replays that manifest as expired.
+        let (sink, _dir, root) = first_then_replay(
+            vec![output(0), retained(2), terminal()],
+            vec![output(0), expired(2), terminal()],
+        );
+        assert_eq!(sink.manifests_delivered, 1);
+        let report = render_report(&sink.reports[0]);
+        assert!(report.contains(EXPIRED_TEXT), "{report}");
+        assert!(!report.contains("failed verification"), "{report}");
+        assert!(!root.join(PATH).exists());
+    }
+
+    #[test]
+    fn a_retained_replay_never_overwrites_a_buffered_expired_manifest() {
+        // An expired manifest at seq 3 after a two-seq gap, which its one
+        // derived chunk cannot account for, is buffered for gap recovery.
+        // The replay sends a retained manifest at seq 3 while that expired
+        // one is still buffered, then fills seqs 1 and 2; the retained one
+        // must not replace it.
+        let (sink, _dir, root) = first_then_replay(
+            vec![output(0), expired(3), terminal()],
+            vec![
+                output(0),
+                retained(3),
+                chunk(1, 0, 5),
+                chunk(2, 5, 10),
+                terminal(),
+            ],
+        );
+        assert_eq!(sink.manifests_delivered, 1);
+        let report = render_report(&sink.reports[0]);
+        assert!(report.contains(EXPIRED_TEXT), "{report}");
+        assert!(!root.join(PATH).exists());
+    }
+
+    #[test]
+    fn an_identical_retained_manifest_replay_is_delivered_once() {
+        // Buffered retained manifest, then the same manifest again with the
+        // lost chunk: delivered once, and the file placed.
+        let (sink, _dir, root) = first_then_replay(
+            vec![output(0), retained(2), terminal()],
+            vec![output(0), chunk(1, 0, 10), retained(2), terminal()],
+        );
+        assert_eq!(sink.manifests_delivered, 1);
+        assert_eq!(
+            sink.reports[0][0].outcome,
+            ReturnOutcome::Returned { bytes: 10 }
+        );
+        assert_eq!(fs::read(root.join(PATH)).unwrap(), DATA);
+    }
+
+    #[test]
+    fn an_identical_expired_manifest_replay_is_delivered_once() {
+        // Buffered expired manifest behind a gap it cannot account for, then
+        // the same expired manifest again once the gap is filled with output.
+        let (sink, _dir, _root) = first_then_replay(
+            vec![output(0), expired(3), terminal()],
+            vec![output(0), output(1), output(2), expired(3), terminal()],
+        );
+        assert_eq!(sink.manifests_delivered, 1);
+        let report = render_report(&sink.reports[0]);
+        assert!(report.contains(EXPIRED_TEXT), "{report}");
+    }
+}
