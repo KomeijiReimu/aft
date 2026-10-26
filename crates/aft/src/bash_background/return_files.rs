@@ -358,7 +358,10 @@ fn remove_empty_dir(dir: &std::path::Path) {
 #[cfg(unix)]
 pub(crate) use receiver::ReturnReceiver;
 #[cfg(all(unix, test))]
-pub(crate) use receiver::{with_before_publish_for_test, with_copy_for_test, STOPPED_FOR_TEST};
+pub(crate) use receiver::{
+    with_before_destination_walk_for_test, with_before_publish_for_test, with_copy_for_test,
+    STOPPED_FOR_TEST,
+};
 
 #[cfg(unix)]
 mod receiver {
@@ -820,6 +823,11 @@ mod receiver {
             record: &mut Recorder<'_>,
         ) -> Result<(OwnedFd, PathBuf, OsString), NotReturned> {
             let parent = resolve_parent(&self.root, &self.cwd.join(&self.paths[index]))?;
+            // The parent resolved inside the project; a sandboxed command may
+            // still swap a folder on the way for a symlink before it is
+            // opened. The walk below opens each folder from the project root
+            // without following symlinks, so that swap is refused too.
+            before_destination_walk_for_test();
             let relative = parent
                 .existing
                 .strip_prefix(&self.root)
@@ -946,6 +954,32 @@ mod receiver {
         let result = run();
         BEFORE_PUBLISH.with(|slot| *slot.borrow_mut() = None);
         result
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static BEFORE_DESTINATION_WALK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Run `hook` once, after the destination's parent is resolved and
+    /// before its folders are opened, for tests.
+    #[cfg(test)]
+    pub(crate) fn with_before_destination_walk_for_test<T>(
+        hook: impl FnOnce() + 'static,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        BEFORE_DESTINATION_WALK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        let result = run();
+        BEFORE_DESTINATION_WALK.with(|slot| *slot.borrow_mut() = None);
+        result
+    }
+
+    fn before_destination_walk_for_test() {
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_DESTINATION_WALK.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
     }
 
     fn before_publish_for_test(_temp: &Path) -> io::Result<()> {

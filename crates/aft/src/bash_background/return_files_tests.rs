@@ -634,6 +634,119 @@ mod receiving {
         assert!(!root.join("dist/app.bin").exists());
     }
 
+    /// A project with `link` a symlink to a folder outside it, and that
+    /// outside folder. Both are resolved paths.
+    fn project_with_outside_link() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("project");
+        let outside = base.join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        (dir, root, outside)
+    }
+
+    /// Return one verified file at `path` through a receiver rooted at
+    /// `root`: one chunk and a manifest that reports it returned.
+    fn return_one_file(root: &Path, path: &str) -> ReturnedPath {
+        use crate::exec_remote::types::*;
+        use sha2::Digest;
+        let job_id: Uuid = "0192a64a-1234-7000-8000-000000000001".parse().unwrap();
+        let data = b"from the server".to_vec();
+        let sha = format!("{:x}", sha2::Sha256::digest(&data));
+        let (_private_dir, private) = private_folder();
+        let mut receiver = ReturnReceiver::new(
+            vec![path.to_string()],
+            1 << 20,
+            root,
+            root,
+            None,
+            private.clone(),
+            "task-1",
+        )
+        .unwrap();
+        let chunk = ReturnChunk::new(job_id, 1, 0, 0, BytePayload(data.clone()));
+        receiver.chunk(&chunk, &mut |_| Ok(()));
+        let manifest = ReturnManifest::new(
+            job_id,
+            2,
+            vec![ReturnManifestEntry::returned(path, data.len() as u64, sha)],
+            data.len() as u64,
+            RETURN_CHUNKED_MAX_BYTES_CAP,
+        );
+        let mut report = receiver.manifest(&manifest, None, &mut |_| Ok(()));
+        assert_eq!(report.len(), 1);
+        report.remove(0)
+    }
+
+    fn assert_outside_refused(root: &Path, outside: &Path, path: &str) {
+        // The check made before the job is submitted refuses the path.
+        assert_eq!(
+            resolve_destination(root, &root.join(path)),
+            Err(NotReturned::OutsideProject),
+            "request-time check for {path}"
+        );
+        // So does placing a verified file there.
+        let entry = return_one_file(root, path);
+        assert_eq!(
+            entry.outcome,
+            ReturnOutcome::NotReturned {
+                reason: NotReturned::OutsideProject
+            },
+            "placement of {path}"
+        );
+        assert_eq!(
+            fs::read_dir(outside).unwrap().count(),
+            0,
+            "nothing was written outside the project for {path}"
+        );
+    }
+
+    #[test]
+    fn a_symlinked_folder_pointing_outside_the_project_is_refused() {
+        let (_dir, root, outside) = project_with_outside_link();
+        assert_outside_refused(&root, &outside, "link/out.txt");
+    }
+
+    #[test]
+    fn missing_folders_below_a_symlink_pointing_outside_are_refused() {
+        let (_dir, root, outside) = project_with_outside_link();
+        assert_outside_refused(&root, &outside, "link/new/deep.txt");
+        assert!(
+            !outside.join("new").exists(),
+            "no folder was created outside"
+        );
+    }
+
+    #[test]
+    fn a_parent_swapped_for_a_symlink_before_placement_is_refused() {
+        // The parent is a real folder in the project when it is resolved, and
+        // becomes a symlink to a folder outside before the destination folder
+        // is opened.
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("project");
+        let outside = base.join("outside");
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let (dist, target) = (root.join("dist"), outside.clone());
+        let entry = with_before_destination_walk_for_test(
+            move || {
+                fs::remove_dir(&dist).unwrap();
+                std::os::unix::fs::symlink(&target, &dist).unwrap();
+            },
+            || return_one_file(&root, "dist/out.txt"),
+        );
+        assert_eq!(
+            entry.outcome,
+            ReturnOutcome::NotReturned {
+                reason: NotReturned::OutsideProject
+            }
+        );
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
     #[test]
     fn a_job_without_a_manifest_returns_nothing() {
         let dir = tempfile::tempdir().unwrap();
