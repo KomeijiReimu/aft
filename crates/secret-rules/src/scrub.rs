@@ -355,7 +355,8 @@ pub(crate) fn replacement_discloses(replacement: &[u8], key: &[u8]) -> bool {
 ///
 /// The spans index the input only; a caller applies them to a copy of the
 /// original bytes and never rescans generated text. The scan is one pass:
-/// base64 tokens are decoded once each, and every other byte is tried once.
+/// each base64 token is decoded at four alignments, and every other byte is
+/// tried once.
 pub(crate) fn find_key_spans(
     window: &[u8],
     key: &[u8],
@@ -902,23 +903,14 @@ impl Scrubber {
 
     /// Scrub the window, then release what may leave.
     ///
-    /// Release is split on the **input** window, never on the rewritten text.
-    /// Everything the scrubber matches that starts inside `buffer[..split]`
-    /// ends at or before `split`, because no pattern is longer than the overlap
-    /// plus one candidate byte. The replacement for such a match may be longer
-    /// than the bytes it stands for, so it is released whole with the head and
-    /// never held back: holding generated text would emit it again later.
-    /// Matches that start after `split` stay in the window and are matched
-    /// again once more bytes arrive. The holdback is a fixed length that does
-    /// not depend on what the window contains.
-    /// Scrub the window, then release what may leave.
-    ///
-    /// Release is decided on the **input** window and the rewritten text is cut
-    /// at the same offsets: the scrubber works out which input ranges it
-    /// replaced, releases the input up to the holdback, and writes every
-    /// replacement for a range that ends inside that part. Holding back the
-    /// bytes a replacement would occupy would emit generated text twice; cutting
-    /// the rewritten text at an input offset would split an escape.
+    /// Release is decided on the **input** window, never on the rewritten
+    /// text. Input up to `split` (the window minus the fixed holdback) is
+    /// released. A replacement whose input span starts before `split` is
+    /// written in full, even when that span runs past `split`, and the bytes it
+    /// covers are consumed so they are never emitted again. A match that starts
+    /// at or after `split` stays in the held tail and is matched again once
+    /// more bytes arrive. The holdback length does not depend on what the
+    /// window contains.
     fn scrub_buffer(&self, buffer: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let hold = overlap_for(self.longest).min(buffer.len());
         let split = buffer.len() - hold;
@@ -963,7 +955,7 @@ mod tests {
 
     #[test]
     fn many_matches_are_aggregated_in_n_log_n_comparisons() {
-        // The closure check's shape: thousands of disjoint key tokens in one
+        // Many matches: thousands of disjoint key tokens in one
         // push. Two matchers make the cross-matcher overlap check run on every
         // candidate. `MDEyMzQ1Njc4OWFiY2RlZg` is the unpadded base64 of
         // `0123456789abcdef`; the second key appears raw.

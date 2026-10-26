@@ -297,12 +297,11 @@ pub fn canonicalize_path(path: &str) -> Result<CanonicalPath, TargetRefusal> {
 }
 
 /// Normalize a declared path prefix.
-/// Normalize a declared path prefix.
 ///
-/// Only a single trailing separator is dropped (it adds no segment). Every
-/// other spelling goes through the same normalizer as a request path, so a
-/// prefix that would broaden to a different location — `//`, `/.`, `/v1/..`, a
-/// prefix that is not absolute — refuses instead of silently matching `/`.
+/// The prefix must already be in its normalized spelling, which is then
+/// returned unchanged; `/` is the root. A prefix that would broaden to a
+/// different location (`//`, `/.`, `/v1/..`, a trailing separator, or a prefix
+/// that is not absolute) refuses instead of silently matching `/`.
 pub fn normalize_path_prefix(prefix: &str) -> Result<String, TargetRefusal> {
     if !prefix.starts_with('/') {
         return Err(TargetRefusal::MalformedPath);

@@ -537,7 +537,7 @@ mod tests {
 
     #[test]
     fn a_wide_object_costs_n_log_n_name_comparisons() {
-        // The closure check's counterexample: 80,000 distinct members, under
+        // A wide object of 80,000 distinct members, still under
         // the 1 MiB body cap. Comparing every new name with every earlier one
         // would take 3,199,960,000 comparisons.
         let members = 80_000usize;

@@ -1,5 +1,9 @@
 //! Regression tests for the second audit round: the leaks, evasions and DoS
 //! shapes the closure check named, each written as the cited counterexample.
+//!
+//! `itemN_` and `hN_` tests follow the review's numbered findings;
+//! `closureN_` tests follow the numbered "required closure work" list of the
+//! later closure check, which regroups those findings.
 
 mod support;
 
@@ -106,7 +110,7 @@ fn record_with_one(field: &str, text: &str) -> AuditRecordV1 {
     let pick = |name: &str| if name == field { text } else { clean };
     AuditRecordV1::new(
         1,
-        "repo_key",
+        pick("label"),
         Decision::Literal,
         AuditReason::Matched,
         pick("request_id"),
@@ -117,6 +121,7 @@ fn record_with_one(field: &str, text: &str) -> AuditRecordV1 {
 }
 
 const RECORD_FIELDS: &[&str] = &[
+    "label",
     "request_id",
     "origin",
     "owner",
@@ -128,7 +133,7 @@ const RECORD_FIELDS: &[&str] = &[
 ];
 
 #[test]
-fn item1_audit_debug_hides_the_key_in_every_field() {
+fn closure1_audit_debug_hides_the_key_in_every_field() {
     let text = String::from_utf8_lossy(MIN_KEY).into_owned();
     let record = record_with_everywhere(&text);
     for rendered in [
@@ -144,7 +149,7 @@ fn item1_audit_debug_hides_the_key_in_every_field() {
 }
 
 #[test]
-fn item1_header_edit_debug_hides_a_header_name_that_is_the_key() {
+fn closure1_header_edit_debug_hides_a_header_name_that_is_the_key() {
     let name = String::from_utf8_lossy(MIN_KEY).into_owned();
     let request = RequestView::new("/v1/x", vec![HeaderField::value(&name, PH.as_bytes())]);
     let outcome = evaluate_request_with_connect(
@@ -193,7 +198,7 @@ const RECORD_SPELLINGS: &[(&[u8], &str)] = &[
 ];
 
 #[test]
-fn item1_the_keyed_writer_refuses_every_spelling_in_every_field() {
+fn closure1_the_keyed_writer_refuses_every_spelling_in_every_field() {
     let unrelated: &[u8] = b"zzzzzzzzzzzzzzzz";
     for (key, text) in RECORD_SPELLINGS {
         for field in RECORD_FIELDS {
@@ -214,7 +219,7 @@ fn item1_the_keyed_writer_refuses_every_spelling_in_every_field() {
 }
 
 #[test]
-fn item1_the_keyed_writer_accepts_a_record_that_spells_no_key() {
+fn closure1_the_keyed_writer_accepts_a_record_that_spells_no_key() {
     let keys: Vec<&[u8]> = RECORD_SPELLINGS.iter().map(|(key, _)| *key).collect();
     let record = record_with_one("origin", "task-1");
     let json = record
@@ -379,7 +384,7 @@ fn item16_a_fragment_in_the_target_refuses() {
 }
 
 #[test]
-fn item6_the_redirect_path_validates_rules_against_a_matching_hop() {
+fn closure6_the_redirect_path_validates_rules_against_a_matching_hop() {
     use secret_rules::{evaluate_redirect, RedirectOutcome, RequestTarget, TargetRefusal};
     // The hop matches every rule's host, port and prefix, so each refusal
     // below can only come from rule validation.
@@ -424,7 +429,7 @@ fn item6_the_redirect_path_validates_rules_against_a_matching_hop() {
 }
 
 #[test]
-fn item6_a_fragment_anywhere_in_a_redirect_target_refuses() {
+fn closure6_a_fragment_anywhere_in_a_redirect_target_refuses() {
     use secret_rules::{evaluate_redirect, RedirectOutcome, RequestTarget, TargetRefusal};
     // The closure check's hop: a fragment after the query of an otherwise
     // matching target.
@@ -473,7 +478,7 @@ fn item6_a_fragment_anywhere_in_a_redirect_target_refuses() {
 }
 
 #[test]
-fn item6_a_query_fragment_refuses_in_the_request_evaluator() {
+fn closure6_a_query_fragment_refuses_in_the_request_evaluator() {
     let request = RequestView::new(
         "/v1/x?k=#frag",
         vec![HeaderField::value("X-A", PH.as_bytes())],
@@ -489,7 +494,7 @@ fn item6_a_query_fragment_refuses_in_the_request_evaluator() {
 }
 
 #[test]
-fn item6_the_standalone_prefix_helpers_never_widen_to_the_root() {
+fn closure6_the_standalone_prefix_helpers_never_widen_to_the_root() {
     use secret_rules::path_covers;
     use secret_rules::redirect::path_is_covered;
     for prefix in ["//", "///", "/v1/", "/v1/..", "/.", "", "v1"] {
@@ -560,7 +565,7 @@ fn item6_an_approved_target_for_an_evil_connect_is_not_authorized() {
 
 // --- item 15: known-answer tests for the independent detectors --------------
 
-/// One detector known answer: a name, a key and an output that spells it.
+/// One detector case: a name, a key and an output to check against it.
 fn case<'a>(name: &'a str, key: &'a [u8], output: &'a [u8]) -> (&'a str, &'a [u8], &'a [u8]) {
     (name, key, output)
 }
@@ -642,7 +647,7 @@ fn item15_each_decoder_has_known_answers() {
     }
 }
 
-// --- item 3: JSON surrogate pairs in the production scrubber ---------------
+// --- closure 3: JSON surrogate pairs in the production scrubber ---------------
 
 /// Four U+1F600 characters: sixteen UTF-8 bytes, an admissible key.
 const EMOJI_KEY: &str = "\u{1F600}\u{1F600}\u{1F600}\u{1F600}";
@@ -661,7 +666,7 @@ fn scrub_chunks(key: &[u8], chunks: &[&[u8]]) -> Vec<u8> {
 }
 
 #[test]
-fn item3_surrogate_pair_escaped_key_is_scrubbed_whole_split_and_byte_at_a_time() {
+fn closure3_surrogate_pair_escaped_key_is_scrubbed_whole_split_and_byte_at_a_time() {
     let key = EMOJI_KEY.as_bytes();
     for spelled in [
         r"\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00",
@@ -683,7 +688,7 @@ fn item3_surrogate_pair_escaped_key_is_scrubbed_whole_split_and_byte_at_a_time()
 }
 
 #[test]
-fn item3_lone_surrogates_are_not_the_key() {
+fn closure3_lone_surrogates_are_not_the_key() {
     // Not valid JSON for the key, so the text passes through unchanged.
     let body = r"\ud83d\ud83d\ud83d\ud83d\ude00";
     let out = scrub_bytes(EMOJI_KEY.as_bytes(), "x", body.as_bytes()).unwrap();
@@ -691,7 +696,7 @@ fn item3_lone_surrogates_are_not_the_key() {
 }
 
 #[test]
-fn item3_json_control_escapes_in_a_key_are_scrubbed() {
+fn closure3_json_control_escapes_in_a_key_are_scrubbed() {
     let key: &[u8] = b"ab\ncd\ref\x08gh\x0cij\tkl";
     let out = scrub_bytes(key, "x", br#"["ab\ncd\ref\bgh\fij\tkl"]"#).unwrap();
     assert_eq!(String::from_utf8_lossy(&out), r#"["{{ck-secret:x}}"]"#);
@@ -769,7 +774,7 @@ fn h2_a_key_that_is_its_labels_hex_refuses() {
     );
 }
 
-// --- item 4: no installation entry point accepts a disclosing replacement ---
+// --- closure 4: no installation entry point accepts a disclosing replacement ---
 
 /// The closure check's pairs: `(label, key)` where the label's placeholder
 /// spells the key. Each spelling is written out by hand.
@@ -786,7 +791,7 @@ const DISCLOSING_PAIRS: &[(&str, &[u8])] = &[
 const OTHER_KEY: &[u8] = b"zzzzzzzzzzzzzzzz";
 
 #[test]
-fn item4_the_request_evaluator_refuses_every_disclosing_label() {
+fn closure4_the_request_evaluator_refuses_every_disclosing_label() {
     for (label, key) in DISCLOSING_PAIRS {
         let placeholder = format!("{{{{ck-secret:{label}}}}}");
         let request = RequestView::new(
@@ -819,7 +824,7 @@ fn item4_the_request_evaluator_refuses_every_disclosing_label() {
 }
 
 #[test]
-fn item4_every_scrubber_entry_point_refuses_a_disclosing_replacement() {
+fn closure4_every_scrubber_entry_point_refuses_a_disclosing_replacement() {
     use secret_rules::{MatcherSet, ScrubError, Scrubber};
     let refused = Some(ScrubError::ReplacementDisclosesKey);
     for (label, key) in DISCLOSING_PAIRS {
@@ -862,7 +867,7 @@ fn item4_every_scrubber_entry_point_refuses_a_disclosing_replacement() {
 }
 
 #[test]
-fn item4_generated_replacements_disclose_no_installed_key() {
+fn closure4_generated_replacements_disclose_no_installed_key() {
     // Labels shaped like encodings, but of unrelated bytes: the hex of
     // sixteen `z`, and the base64 of `kzzkzzkzzkzzkzzk`.
     let installed: &[(&str, &[u8])] = &[
@@ -925,7 +930,7 @@ fn h1_unicode_escaped_key_survives_every_split() {
     }
 }
 
-// --- item 5: header reads come from header bytes; explicit bearer forms -----
+// --- closure 5: header reads come from header bytes; explicit bearer forms -----
 
 /// A Bearer-rule request whose Host is the range `[6, 21)` of `header_bytes`.
 fn host_case(header_bytes: &'static [u8], body: &'static [u8]) -> secret_rules::RequestOutcome {
@@ -948,7 +953,7 @@ fn host_case(header_bytes: &'static [u8], body: &'static [u8]) -> secret_rules::
 }
 
 #[test]
-fn item5_the_host_is_read_from_the_header_block_not_the_body() {
+fn closure5_the_host_is_read_from_the_header_block_not_the_body() {
     // Both buffers hold a host at `[6, 21)`; only the header block's counts.
     // `evl.example.com` and `api.example.com` are both fifteen bytes.
     let evil_header = host_case(b"Host: evl.example.com\r\n", br#"{"a":"api.example.com"}"#);
@@ -965,7 +970,7 @@ fn item5_the_host_is_read_from_the_header_block_not_the_body() {
 }
 
 #[test]
-fn item5_a_host_range_outside_the_header_block_refuses() {
+fn closure5_a_host_range_outside_the_header_block_refuses() {
     let body = b"api.example.com";
     let request = RequestView::from_header_block(
         "/v1/x",
@@ -1008,7 +1013,7 @@ fn content_type_case(
 }
 
 #[test]
-fn item5_a_body_cannot_forge_its_own_json_content_type() {
+fn closure5_a_body_cannot_forge_its_own_json_content_type() {
     // The closure check's input: the header says CBOR; the body's bytes at the
     // same offsets say `application/json`.
     let outcome = content_type_case(
@@ -1023,7 +1028,7 @@ fn item5_a_body_cannot_forge_its_own_json_content_type() {
 }
 
 #[test]
-fn item5_a_ranged_json_content_type_is_honoured_whatever_the_body_holds() {
+fn closure5_a_ranged_json_content_type_is_honoured_whatever_the_body_holds() {
     // The header says JSON; the body's bytes at `[14, 30)` are not a media type.
     let outcome = content_type_case(
         b"Content-Type: application/json\r\n",
@@ -1047,7 +1052,7 @@ fn bearer_outcome(field: HeaderField<'_>) -> secret_rules::RequestOutcome {
 }
 
 #[test]
-fn item5_a_borrowed_whole_bearer_value_is_rewritten_with_its_scheme() {
+fn closure5_a_borrowed_whole_bearer_value_is_rewritten_with_its_scheme() {
     for scheme in ["Bearer ", "bearer "] {
         let value = format!("{scheme}{PH}");
         let outcome = bearer_outcome(HeaderField::value("Authorization", value.as_bytes()));
@@ -1065,7 +1070,7 @@ fn item5_a_borrowed_whole_bearer_value_is_rewritten_with_its_scheme() {
 }
 
 #[test]
-fn item5_a_parsed_bearer_credential_is_replaced_by_the_key_alone() {
+fn closure5_a_parsed_bearer_credential_is_replaced_by_the_key_alone() {
     let outcome = bearer_outcome(HeaderField::bearer_credential(PH.as_bytes()));
     assert_eq!(outcome.refusal, None);
     let edit = outcome.header_edits.first().expect("a header edit");
@@ -1075,7 +1080,7 @@ fn item5_a_parsed_bearer_credential_is_replaced_by_the_key_alone() {
 }
 
 #[test]
-fn item5_a_scheme_less_wire_authorization_refuses() {
+fn closure5_a_scheme_less_wire_authorization_refuses() {
     // `Authorization: {{ck-secret:x}}` with no scheme, ranged and borrowed.
     let ranged = RequestView::from_header_block(
         "/v1/x",
