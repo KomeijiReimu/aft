@@ -306,7 +306,7 @@ recommended tool surface; experimental flags gate advanced behavior, not the too
 | `compressed` | boolean | Opt in/out of output compression for this call (default true; requires compression flag) |
 | `pty` | boolean | Run in a real PTY for interactive programs. Implies `background: true`. |
 | `ptyRows` / `ptyCols` | number | PTY dimensions (max 60 rows / 140 cols). Soft-ignored on non-PTY calls. |
-| `runon` | string | Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add ",net" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options). |
+| `runon` | string | Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add ",net" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options). `macos` sends the command to a macOS machine for builds and tests that need macOS (no vCPU or network options). |
 
 Calls admitted under the `worker` catalog preset set `NEXTEST_TEST_THREADS` and `RUST_TEST_THREADS` for local bash children from `../.cargo/alfonso-test-threads` (one decimal integer plus newline), defaulting to 4 when the file is missing, invalid, or above 256; valid values through 256 are preserved. Existing inherited or per-call values take precedence, and shell command prefixes still override them; head sessions and unscoped plugin worker flags receive no defaults, and exec-remote requests never carry these variables.
 
@@ -346,7 +346,10 @@ build server (ck-motor, reached through the Subconscious daemon's `exec-remote/v
 command starts. Without a count, the job gets 2 vCPUs. Add `,net` for outbound internet:
 `linux,net`, `linux,4c,net` and `linux,net,4c` are accepted; remote jobs are offline by default. A plan's
 `default_demand` may include these options too. `runon: "windows"` sends the command to a Windows
-build machine and runs it in Git Bash; it does not accept vCPU or network options. Duplicate
+build machine and runs it in Git Bash; it does not accept vCPU or network options. `runon: "macos"`
+sends the command to a macOS machine; it takes no vCPU or network options. Use it for builds and
+tests that need macOS (its sandbox, code signing or file watching) instead of running them on this
+machine; anything needing a service manager agent (such as a launchd agent) or a GUI session stays local. Duplicate
 options, unknown tokens and unsupported platforms are refused by name before dispatch. It runs
 there under `bash -c` in the same working directory, with the same timeout and the same
 environment, minus the secret-shaped and AFT/CortexKit control variables AFT strips before any
@@ -379,7 +382,7 @@ setting says.
 A call that sets `runon` is refused by name, and runs nowhere, when it cannot run remotely:
 the project turned remote runs off (`remote runs are off for this project`), the session has no
 remote runner (`this session has no remote runner`), the demand is not one AFT knows
-(`unknown runner demand`; the server only runs Linux), an option is malformed (for example,
+(`unknown runner demand`; AFT only runs Linux, macOS, and Windows jobs), an option is malformed (for example,
 `runon "linux,4" is not valid: options are net and a vCPU count as Nc, for example "linux,4c,net"`),
 or the call also sets `pty: true`, a
 PowerShell shell, or `sandbox: "host"`. On Windows `runon` is refused by name: remote dispatch
