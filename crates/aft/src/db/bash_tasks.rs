@@ -576,7 +576,7 @@ const PROCESS_ID_LOOKUP_CHUNK: usize = 500;
 
 /// Every distinct harness with a `bash_tasks` row, found by one index seek
 /// per harness rather than by reading the table.
-fn bash_task_harnesses(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+pub(crate) fn bash_task_harnesses(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     let mut stmt = conn.prepare("SELECT MIN(harness) FROM bash_tasks WHERE harness > ?1")?;
     let mut harnesses = Vec::new();
     let mut after = String::new();
