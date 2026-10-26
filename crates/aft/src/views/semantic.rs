@@ -905,7 +905,12 @@ impl SemanticPlane {
                 };
                 (applies_to(&path)
                     && (matches!(snapshot.source(&path), Source::Live(_))
-                        || snapshot.readiness_patches().contains_key(&path)
+                        || snapshot
+                            .readiness_patches()
+                            .get(&path)
+                            .is_some_and(|patch| {
+                                patch.content == content && patch.planes.semantic.is_some()
+                            })
                         || snapshot
                             .generation()
                             .owns_work(&path, FamilyPlane::Semantic))
@@ -3131,11 +3136,37 @@ mod tests {
         );
         let resident = plane.admit(&legacy.access, &composed).unwrap();
         assert_eq!(resident.legacy_summaries.len(), 1);
-        let snapshot = LiveDelta::new(composed).snapshot();
+        let mut live = LiveDelta::new(composed);
+        let snapshot = live.snapshot();
         let state = ViewState::default();
         assert!(plane
             .work_items(&state, &resident, &snapshot, true)
             .is_empty());
+        for name in ["src/summary.rs", "src/pending.rs"] {
+            let path = RelPath::new(name.as_bytes().to_vec()).unwrap();
+            let content = snapshot
+                .generation()
+                .entry(&path)
+                .unwrap()
+                .content()
+                .unwrap();
+            live.set_readiness(
+                path,
+                super::super::snapshot::PlanePatch {
+                    content,
+                    planes: EntryPlanes {
+                        trigram: Some(PlaneState::pending("worker trigram repair")),
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+        assert!(
+            plane
+                .work_items(&state, &resident, &live.snapshot(), true)
+                .is_empty(),
+            "a trigram-only live patch claimed inherited semantic work"
+        );
     }
 
     #[test]

@@ -236,7 +236,13 @@ impl ComposedGeneration {
 
     pub fn owns_work(&self, path: &RelPath, plane: FamilyPlane) -> bool {
         self.base.is_none()
-            || self.delta.get(path).is_some()
+            || self.delta.get(path).is_some_and(|entry| {
+                delta_owns_plane(
+                    self.base.as_ref().and_then(|base| base.entry(path)),
+                    entry,
+                    plane,
+                )
+            })
             || self
                 .delta
                 .readiness_overrides()
@@ -344,29 +350,50 @@ impl ComposedGeneration {
         for (path, entry) in updates {
             if let (Some(base), Some(entry)) = (&self.base, &entry) {
                 if let Some(inherited) = base.entry(&path) {
-                    let mut metadata = inherited.clone();
-                    if let (EntryV2::Regular { planes, .. }, Some(new_planes)) =
-                        (&mut metadata, entry.planes())
-                    {
-                        *planes = new_planes.clone();
-                    }
-                    if &metadata == entry {
-                        let patch = (entry != inherited)
-                            .then(|| entry.planes().cloned())
-                            .flatten();
-                        next.inherit(path, patch);
-                        continue;
+                    if same_entry_identity(inherited, entry) {
+                        let mut patch = EntryPlanes::default();
+                        let mut representable = true;
+                        for plane in FamilyPlane::ALL {
+                            if entry.plane_state(plane) != inherited.plane_state(plane) {
+                                match entry.plane_state(plane) {
+                                    Some(state) => *patch.get_mut(plane) = Some(state.clone()),
+                                    None => {
+                                        representable = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if representable {
+                            let patch = FamilyPlane::ALL
+                                .into_iter()
+                                .any(|plane| patch.get(plane).is_some())
+                                .then_some(patch);
+                            next.inherit(path, patch);
+                            continue;
+                        }
                     }
                 }
             }
             next.set(path, entry)?;
         }
         for (path, entry) in next.entries_mut() {
+            let owned = FamilyPlane::ALL.map(|plane| {
+                delta_owns_plane(
+                    self.base.as_ref().and_then(|base| base.entry(path)),
+                    entry,
+                    plane,
+                )
+            });
             if let EntryV2::Regular {
                 content, planes, ..
             } = entry
             {
-                apply_fills(path, content, planes, fill);
+                for (plane, owned) in FamilyPlane::ALL.into_iter().zip(owned) {
+                    if owned {
+                        apply_plane_fill(path, content, plane, planes.get_mut(plane), fill);
+                    }
+                }
             }
         }
         let overrides: Vec<_> = next
@@ -375,7 +402,12 @@ impl ComposedGeneration {
             .map(|(path, patch)| (path.clone(), patch.clone()))
             .collect();
         for (path, mut patch) in overrides {
-            if let Some(content) = self.entry(&path).and_then(EntryV2::content) {
+            if let Some(content) = self
+                .base
+                .as_ref()
+                .and_then(|base| base.entry(&path))
+                .and_then(EntryV2::content)
+            {
                 apply_fills(&path, &content, &mut patch, fill);
             }
             next.set_readiness_override(path, patch)?;
@@ -394,6 +426,55 @@ impl ComposedGeneration {
     }
 }
 
+fn same_entry_identity(inherited: &EntryV2, entry: &EntryV2) -> bool {
+    match (inherited, entry) {
+        (
+            EntryV2::Regular {
+                mode: a_mode,
+                content: a_content,
+                size: a_size,
+                git_oid: a_oid,
+                resolution_input: a_input,
+                ..
+            },
+            EntryV2::Regular {
+                mode: b_mode,
+                content: b_content,
+                size: b_size,
+                git_oid: b_oid,
+                resolution_input: b_input,
+                ..
+            },
+        ) => {
+            (a_mode, a_content, a_size, a_oid, a_input)
+                == (b_mode, b_content, b_size, b_oid, b_input)
+        }
+        _ => inherited == entry,
+    }
+}
+
+fn delta_owns_plane(inherited: Option<&EntryV2>, entry: &EntryV2, plane: FamilyPlane) -> bool {
+    // Clearing applicability needs a full entry because an absent override
+    // means inheritance. That representation must not claim unchanged planes.
+    inherited.is_none_or(|base| {
+        !same_entry_identity(base, entry) || base.plane_state(plane) != entry.plane_state(plane)
+    })
+}
+
+fn apply_plane_fill(
+    path: &RelPath,
+    content: &ContentHash,
+    plane: FamilyPlane,
+    state: &mut Option<PlaneState>,
+    fill: &super::readiness::FillMap,
+) {
+    if matches!(state, Some(PlaneState::Pending { .. })) {
+        if let Some(key) = fill.get(path, content, plane) {
+            *state = Some(PlaneState::ready(key));
+        }
+    }
+}
+
 fn apply_fills(
     path: &RelPath,
     content: &ContentHash,
@@ -401,11 +482,7 @@ fn apply_fills(
     fill: &super::readiness::FillMap,
 ) {
     for plane in FamilyPlane::ALL {
-        if matches!(planes.get(plane), Some(PlaneState::Pending { .. })) {
-            if let Some(key) = fill.get(path, content, plane) {
-                *planes.get_mut(plane) = Some(PlaneState::ready(key));
-            }
-        }
+        apply_plane_fill(path, content, plane, planes.get_mut(plane), fill);
     }
 }
 
@@ -1984,6 +2061,102 @@ mod composition_tests {
                 .unwrap();
         }
         Arc::new(ComposedGeneration::new("base-generation", manifest, None))
+    }
+
+    #[test]
+    fn fold_keeps_unchanged_inherited_planes_out_of_worker_overrides() {
+        for trigram in [Some(ready()), None] {
+            let base = base();
+            let file = path("inherited.rs");
+            let mut update = base.entry(&file).unwrap().clone();
+            let EntryV2::Regular { planes, .. } = &mut update else {
+                unreachable!()
+            };
+            planes.trigram = trigram.clone();
+            let composed =
+                ComposedGeneration::compose("worker", worker(), base.clone(), None).unwrap();
+            let folded = composed
+                .fold(
+                    &header().producers,
+                    [(file.clone(), Some(update))],
+                    &FillMap::default(),
+                )
+                .unwrap();
+            let next = Arc::new(ComposedGeneration::compose("next", folded, base, None).unwrap());
+            assert!(
+                !next.owns_work(&file, FamilyPlane::Semantic),
+                "a trigram-only fold claimed inherited semantic work"
+            );
+            assert_eq!(
+                next.plane_readiness(&file, FamilyPlane::Trigram),
+                trigram.as_ref()
+            );
+            let live = LiveDelta::new(next.clone());
+            assert!(readiness::work_queue(
+                FamilyPlane::Semantic,
+                "sem",
+                Some(&next),
+                &live,
+                &FillMap::default(),
+                &|_| true
+            )
+            .is_empty());
+        }
+    }
+
+    #[test]
+    fn fold_uses_post_update_content_when_applying_override_fills() {
+        use super::super::readiness::{Admission, Completion, WorkItem};
+        use crate::blob_store::v2::FamilyKey;
+        let base = base();
+        let file = path("replaced.rs");
+        let mut delta = worker();
+        delta
+            .set(
+                file.clone(),
+                Some(entry(b"B", PlaneState::pending("B fill"))),
+            )
+            .unwrap();
+        let composed = ComposedGeneration::compose("worker", delta, base.clone(), None).unwrap();
+        let key = FamilyKey::new(FamilyPlane::Semantic, [0x55; 32]);
+        let mut fills = FillMap::default();
+        let disk = DiskState::of_bytes(b"B");
+        assert_eq!(
+            fills.admit(
+                &Completion {
+                    item: WorkItem {
+                        plane: FamilyPlane::Semantic,
+                        rel_path: file.clone(),
+                        content: ContentHash::of(b"B"),
+                        producer: "sem".into()
+                    },
+                    key,
+                },
+                "sem",
+                Some(&disk),
+                Some(&composed)
+            ),
+            Admission::Installed
+        );
+        let mut restored = base.entry(&file).unwrap().clone();
+        let EntryV2::Regular { planes, .. } = &mut restored else {
+            unreachable!()
+        };
+        planes.semantic = Some(PlaneState::pending("repair inherited A"));
+        let folded = composed
+            .fold(
+                &header().producers,
+                [(file.clone(), Some(restored))],
+                &fills,
+            )
+            .unwrap();
+        let next = ComposedGeneration::compose("next", folded, base.clone(), None).unwrap();
+        assert_eq!(next.disk_state(&file), base.disk_state(&file));
+        assert_eq!(
+            next.plane_readiness(&file, FamilyPlane::Semantic),
+            Some(&PlaneState::pending("repair inherited A")),
+            "a fill for replaced B was attached to inherited A"
+        );
     }
 
     #[test]
