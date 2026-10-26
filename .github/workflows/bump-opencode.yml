@@ -98,6 +98,9 @@ jobs:
         if: steps.compare.outputs.drift == 'true'
         env:
           CAPTURE_VERSION: ${{ steps.latest.outputs.version }}
+          # The capture records which AFT commit produced it; pass it explicitly
+          # instead of reading it from git.
+          AFT_CAPTURE_SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           echo "Recapturing host1 provider and edit-family contracts for $CAPTURE_VERSION"
