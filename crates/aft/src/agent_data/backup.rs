@@ -218,30 +218,35 @@ impl BackupStore {
                     ExpectedState::Absent => PathFingerprint::Absent,
                     ExpectedState::File(hash) => PathFingerprint::Content(hash.clone()),
                 };
-                stacks.entry(path.clone()).or_default().push(BackupEntry {
-                    backup_id: file.id.clone(),
-                    content: BackupContent::Captured(
-                        file.before.clone().unwrap_or_default().into(),
-                    ),
-                    timestamp: file.timestamp,
-                    order: file.order,
-                    description: "imported undo".into(),
-                    op_id: Some(id.clone()),
-                    kind: if file.before.is_some() {
-                        BackupEntryKind::Content
-                    } else {
-                        BackupEntryKind::Tombstone
-                    },
-                    mode: file.mode,
-                    link_target: None,
-                    created_dirs: Vec::new(),
-                    post_state: Some(post_state),
-                    external_change_before: false,
-                    external_change_checkpoint: None,
-                    link_to: None,
-                    hardlink_detached: false,
-                    imported_guard: Some(guard),
-                });
+                // Share snapshot/lookup identity: a projected spelling can name
+                // a symlinked parent or omit Windows's canonical path prefix.
+                stacks
+                    .entry(canonicalize_key(path))
+                    .or_default()
+                    .push(BackupEntry {
+                        backup_id: file.id.clone(),
+                        content: BackupContent::Captured(
+                            file.before.clone().unwrap_or_default().into(),
+                        ),
+                        timestamp: file.timestamp,
+                        order: file.order,
+                        description: "imported undo".into(),
+                        op_id: Some(id.clone()),
+                        kind: if file.before.is_some() {
+                            BackupEntryKind::Content
+                        } else {
+                            BackupEntryKind::Tombstone
+                        },
+                        mode: file.mode,
+                        link_target: None,
+                        created_dirs: Vec::new(),
+                        post_state: Some(post_state),
+                        external_change_before: false,
+                        external_change_checkpoint: None,
+                        link_to: None,
+                        hardlink_detached: false,
+                        imported_guard: Some(guard),
+                    });
             }
         }
         for stack in stacks.values_mut() {

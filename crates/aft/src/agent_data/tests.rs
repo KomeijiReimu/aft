@@ -1011,13 +1011,22 @@ fn imported_undo_reads_back_through_ordinary_agent_paths() {
     let ordinary_preview = ordinary
         .preview_latest_path("ordinary", &agent_path)
         .unwrap();
-    // The first spelling is the plain absolute path used by an agent. The
-    // second exercises the same identity contract on Unix without depending on
-    // Windows-only verbatim prefixes or short-name availability.
-    for (index, projected_path) in [agent_path.clone(), repo.join("nested/../file.bin")]
-        .into_iter()
-        .enumerate()
+    let mut spellings = Vec::new();
+    // A symlinked checkout reproduces macOS's /var versus /private/var spelling
+    // on Unix. Windows can expand a plain C:\path spelling to a canonical
+    // \\?\C:\path key; parent components cover aliases without symlink rights.
+    #[cfg(unix)]
     {
+        let alias = temp.path().join("repo-alias");
+        std::os::unix::fs::symlink(&repo, &alias).unwrap();
+        let alias_path = alias.join("file.bin");
+        spellings.push((alias_path.clone(), alias_path));
+    }
+    spellings.extend([
+        (agent_path.clone(), agent_path.clone()),
+        (repo.join("nested/../file.bin"), agent_path.clone()),
+    ]);
+    for (index, (projected_path, lookup_path)) in spellings.into_iter().enumerate() {
         let storage = temp.path().join(format!("imported-{index}"));
         let key = super::registry::PortablePath {
             project_id: "fixture-project".into(),
@@ -1047,12 +1056,12 @@ fn imported_undo_reads_back_through_ordinary_agent_paths() {
         drop(imported);
         let mut imported = BackupStore::new();
         imported.set_storage_dir_for_harness(storage, Harness::Pi, 0);
-        let history = imported.history("imported", &agent_path);
-        assert_eq!(history.len(), 1, "ordinary history could not find import: agent={agent_path:?}, projected={projected_path:?}, ordinary_preview={ordinary_preview:?}");
+        let history = imported.history("imported", &lookup_path);
+        assert_eq!(history.len(), 1, "ordinary history could not find import: agent={lookup_path:?}, projected={projected_path:?}, ordinary_preview={ordinary_preview:?}");
         assert_eq!(history[0].content_bytes().unwrap().as_ref(), b"before");
         assert_eq!(
             imported
-                .preview_latest_path("imported", &agent_path)
+                .preview_latest_path("imported", &lookup_path)
                 .unwrap(),
             ordinary_preview
         );
