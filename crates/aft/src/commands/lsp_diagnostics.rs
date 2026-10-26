@@ -329,6 +329,7 @@ fn handle_directory_mode(
     };
 
     let mut server_status: Vec<ServerStatusEntry> = Vec::new();
+    crate::lsp::manager::wait_for_pending_startups_unlocked(|| ctx.lsp(), Some(&canonical));
     let mut all_complete = true;
 
     // Pull workspace diagnostics from active servers that support it. We
@@ -429,6 +430,7 @@ fn handle_global_mode(
     severity_filter: SeverityFilter,
     _wait_ms: u64,
 ) -> Response {
+    crate::lsp::manager::wait_for_pending_startups_unlocked(|| ctx.lsp(), None);
     let diagnostics: Vec<StoredDiagnostic> = {
         let lsp = ctx.lsp();
         lsp.get_all_diagnostics()

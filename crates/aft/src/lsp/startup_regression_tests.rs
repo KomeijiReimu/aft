@@ -548,6 +548,11 @@ fn unlocked_request_waits_until_startup_notification_replay_finishes() {
             done_tx.send(()).unwrap();
             result
         });
+        let existing = scope.spawn(|| {
+            let joined = wait_for_pending_startups_unlocked(|| f.manager.lock(), Some(&f.key.root));
+            done_tx.send(()).unwrap();
+            joined
+        });
         pause.resume.send(()).unwrap();
         entered_rx.recv_timeout(WAIT).unwrap();
         let mut lock_available = false;
@@ -582,9 +587,10 @@ fn unlocked_request_waits_until_startup_notification_replay_finishes() {
                 && drained.events.is_empty()
                 && drained.processed_events == 1;
         }
-        let returned_early = done_rx.try_recv().is_ok();
+        let returned_early = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
         resume_tx.send(()).unwrap();
         assert_eq!(waiting.join().unwrap().successful, vec![f.key.clone()]);
+        assert!(existing.join().unwrap());
         assert!(lock_available, "replay held the manager mutex");
         assert!(
             readiness_blocked,

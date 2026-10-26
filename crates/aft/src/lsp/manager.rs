@@ -8086,6 +8086,29 @@ where
     }
 }
 
+/// Join existing startups for a cache/workspace diagnostics request without
+/// starting servers for files the request has not opened.
+pub(crate) fn wait_for_pending_startups_unlocked<G>(
+    lock: impl Fn() -> G,
+    scope: Option<&Path>,
+) -> bool
+where
+    G: std::ops::DerefMut<Target = LspManager>,
+{
+    let deadline = Instant::now() + super::client::HANDSHAKE_REQUEST_TIMEOUT + INITIALIZE_EXIT_WAIT;
+    let signals: Vec<_> = lock()
+        .starting
+        .iter()
+        .filter(|(key, _)| {
+            scope.is_none_or(|scope| key.root.starts_with(scope) || scope.starts_with(&key.root))
+        })
+        .map(|(_, reservation)| Arc::clone(&reservation.signal))
+        .collect();
+    signals
+        .iter()
+        .all(|signal| wait_for_startup_outcome(&lock, signal, deadline).is_some())
+}
+
 /// Start or join one producer's reserved startup without holding the manager
 /// mutex across process creation, initialization, or waiting for completion.
 /// The request deadline limits waiting, not the worker's initialize handshake.
