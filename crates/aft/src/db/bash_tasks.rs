@@ -639,20 +639,47 @@ pub fn list_replayable_bash_tasks_for_project(
     harness: &str,
     project_key: &str,
 ) -> rusqlite::Result<Vec<BashTaskRow>> {
+    // Another registry can acknowledge delivery without rewriting the metadata
+    // snapshot. Recover that disagreement once to checkpoint the acknowledged
+    // state, but continue excluding fully checkpointed terminal tasks.
     let mut stmt = conn.prepare(
         "SELECT harness, session_id, task_id, project_key, command, cwd, status,
                 exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
                 compressed, timeout_ms, completion_delivered, output_bytes, metadata
          FROM bash_tasks
          WHERE harness = ?1 AND project_key = ?2
-           AND (status NOT IN ('completed', 'failed', 'killed', 'timed_out', 'fate_unknown')
-                OR completion_delivered = 0)
+            AND (status NOT IN ('completed', 'failed', 'killed', 'timed_out', 'fate_unknown')
+                 OR completion_delivered = 0
+                 OR CASE WHEN json_valid(metadata)
+                         THEN json_type(metadata, '$.completion_delivered') = 'false'
+                         ELSE 0 END)
          ORDER BY started_at ASC, task_id ASC",
     )?;
     let rows = stmt
         .query_map(params![harness, project_key], map_bash_task_row)?
         .collect();
     rows
+}
+
+/// Reconcile only the snapshot's delivery bit; a recovery snapshot must not
+/// replace newer status, output, or metadata committed by the task's owner.
+pub(crate) fn checkpoint_bash_task_acknowledgement(
+    conn: &Connection,
+    harness: &str,
+    session_id: &str,
+    task_id: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE bash_tasks
+         SET metadata = json_set(metadata, '$.completion_delivered', json('true'))
+         WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3
+           AND completion_delivered = 1
+           AND CASE WHEN json_valid(metadata)
+                    THEN json_type(metadata, '$.completion_delivered') = 'false'
+                    ELSE 0 END",
+        params![harness, session_id, task_id],
+    )?;
+    Ok(())
 }
 
 pub fn find_bash_task_for_project(
@@ -702,6 +729,77 @@ fn map_bash_task_row(row: &Row<'_>) -> rusqlite::Result<BashTaskRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_replay_includes_only_uncheckpointed_terminal_acknowledgements() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&temp.path().join("aft.db")).unwrap();
+        for (index, metadata) in [
+            r#"{"completion_delivered":false}"#,
+            r#"{"completion_delivered":true}"#,
+            "invalid JSON",
+            "{}",
+            r#"{"completion_delivered":0}"#,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let row = BashTaskRow {
+                harness: "opencode".into(),
+                session_id: "session".into(),
+                task_id: format!("bash-{index:016x}"),
+                project_key: "project".into(),
+                command: "true".into(),
+                cwd: ".".into(),
+                status: "completed".into(),
+                exit_code: Some(0),
+                pid: None,
+                pgid: None,
+                started_at: 1,
+                completed_at: Some(1),
+                stdout_path: None,
+                stderr_path: None,
+                compressed: false,
+                timeout_ms: None,
+                completion_delivered: true,
+                output_bytes: None,
+                metadata: metadata.into(),
+            };
+            upsert_bash_task(&conn, &row).unwrap();
+        }
+        let rows = list_replayable_bash_tasks_for_project(&conn, "opencode", "project").unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.task_id.as_str())
+                .collect::<Vec<_>>(),
+            ["bash-0000000000000000"],
+            "only the DB acknowledgement missing from the serialized snapshot needs recovery"
+        );
+        conn.execute(
+            "UPDATE bash_tasks SET status = 'failed', exit_code = 42,
+                 command = 'newer owner command',
+                 metadata = json_set(metadata, '$.owner_revision', 17)
+             WHERE task_id = 'bash-0000000000000000'",
+            [],
+        )
+        .unwrap();
+        checkpoint_bash_task_acknowledgement(&conn, "opencode", "session", "bash-0000000000000000")
+            .unwrap();
+        let checkpoint = get_bash_task(&conn, "opencode", "session", "bash-0000000000000000")
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.status, "failed");
+        assert_eq!(checkpoint.exit_code, Some(42));
+        assert_eq!(checkpoint.command, "newer owner command");
+        let snapshot: serde_json::Value = serde_json::from_str(&checkpoint.metadata).unwrap();
+        assert_eq!(snapshot["owner_revision"], 17);
+        assert_eq!(snapshot["completion_delivered"], true);
+        assert!(
+            list_replayable_bash_tasks_for_project(&conn, "opencode", "project")
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn persisted_gc_row_deletion_is_debug_logged_not_a_warning() {

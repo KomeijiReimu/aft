@@ -6420,10 +6420,11 @@ impl BgTaskRegistry {
             if let Some((harness, pool)) =
                 self.db_harness_and_pool_for_session(&metadata.session_id)
             {
+                let harness = metadata.harness.as_deref().unwrap_or(&harness);
                 let lookup = match pool.lock() {
                     Ok(conn) => crate::db::bash_tasks::get_bash_task(
                         &conn,
-                        &harness,
+                        harness,
                         &metadata.session_id,
                         &metadata.task_id,
                     )
@@ -6431,7 +6432,41 @@ impl BgTaskRegistry {
                     Err(_) => Err("db mutex poisoned".to_string()),
                 };
                 match lookup {
-                    Ok(Some(row)) => metadata.completion_delivered |= row.completion_delivered,
+                    Ok(Some(row)) => {
+                        let checkpoint_ack = row.completion_delivered
+                            && serde_json::from_str::<serde_json::Value>(&row.metadata)
+                                .ok()
+                                .is_some_and(|snapshot| {
+                                    snapshot
+                                        .get("completion_delivered")
+                                        .and_then(serde_json::Value::as_bool)
+                                        == Some(false)
+                                });
+                        metadata.completion_delivered |= row.completion_delivered;
+                        if checkpoint_ack {
+                            // Checkpoint only the authoritative acknowledgement,
+                            // not this potentially older recovery snapshot. The
+                            // next project replay can then skip the terminal row.
+                            let result =
+                                with_task_db_fence(&metadata.session_id, &metadata.task_id, || {
+                                    let conn =
+                                        pool.lock().map_err(|_| "db mutex poisoned".to_string())?;
+                                    crate::db::bash_tasks::checkpoint_bash_task_acknowledgement(
+                                        &conn,
+                                        harness,
+                                        &metadata.session_id,
+                                        &metadata.task_id,
+                                    )
+                                    .map_err(|error| error.to_string())
+                                });
+                            if let Err(error) = result {
+                                crate::slog_warn!(
+                                    "bash task replay could not checkpoint acknowledgement for {}: {error}",
+                                    metadata.task_id
+                                );
+                            }
+                        }
+                    }
                     Ok(None) => {}
                     Err(error) => {
                         *db_ack_lookup_unavailable = true;
@@ -25165,8 +25200,87 @@ mod tests {
                         .completion_delivered,
                     "rehydration lost the durable ack"
                 );
+                let checkpoint = crate::db::bash_tasks::get_bash_task(
+                    &db.lock().unwrap(),
+                    "opencode",
+                    "session",
+                    &task_id,
+                )
+                .unwrap()
+                .unwrap();
+                assert!(
+                    serde_json::from_str::<PersistedTask>(&checkpoint.metadata)
+                        .unwrap()
+                        .completion_delivered,
+                    "the DB snapshot must checkpoint the foreign acknowledgement"
+                );
+                let next_replay = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+                next_replay.set_harness(Harness::Opencode);
+                next_replay.set_db_pool(Arc::clone(&db));
+                next_replay
+                    .inner
+                    .persisted_gc_started
+                    .store(true, Ordering::SeqCst);
+                next_replay
+                    .replay_session_for_project(storage.path(), "session", storage.path())
+                    .unwrap();
+                assert!(
+                    next_replay.task_for_session(&task_id, "session").is_none(),
+                    "an already checkpointed terminal must not be rehydrated again"
+                );
+                assert!(next_replay.drain_completions().is_empty());
             }
         }
+    }
+
+    #[test]
+    fn project_replay_checkpoints_acknowledgement_from_the_recorded_harness() {
+        let storage = tempfile::tempdir().unwrap();
+        let (owner, db, _) = registry_with_db_and_frames(storage.path());
+        owner.set_harness(Harness::Pi);
+        let (task_id, task) =
+            insert_terminal_piped_task(&owner, &storage, "echo done", "done\n", "", false);
+        {
+            let mut queued = DeferredDbWrites::new(&owner, &task);
+            let mut state = task.lock_state().unwrap();
+            state.metadata.harness = Some("pi".to_string());
+            owner
+                .persist_task_locked(&task, &state.metadata, &mut queued)
+                .unwrap();
+        }
+        let foreign = BgTaskRegistry::default();
+        foreign.set_harness(Harness::Pi);
+        foreign.set_db_pool(Arc::clone(&db));
+        assert_eq!(
+            foreign.ack_completions_for_session(Some("session"), &[task_id.clone()]),
+            [task_id.clone()]
+        );
+
+        let replay = BgTaskRegistry::default();
+        replay.set_harness(Harness::Opencode);
+        replay.set_db_pool(Arc::clone(&db));
+        replay
+            .inner
+            .persisted_gc_started
+            .store(true, Ordering::SeqCst);
+        replay
+            .replay_session_for_project(storage.path(), "session", storage.path())
+            .unwrap();
+        assert!(replay.drain_completions().is_empty());
+        let checkpoint =
+            crate::db::bash_tasks::get_bash_task(&db.lock().unwrap(), "pi", "session", &task_id)
+                .unwrap()
+                .unwrap();
+        assert!(
+            serde_json::from_str::<PersistedTask>(&checkpoint.metadata)
+                .unwrap()
+                .completion_delivered
+        );
+        assert!(replay
+            .replay_session_from_db("session", Some(storage.path()))
+            .unwrap()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
