@@ -32,11 +32,11 @@ fn placeholder() -> &'static str {
 }
 
 #[test]
-fn bearer_substitutes_only_the_credential_of_an_exact_bearer_value() {
+fn bearer_rewrites_the_whole_value_and_keeps_the_scheme() {
     let rules = [rule(Location::Bearer)];
 
-    // A ranked header's value bytes live inside the request buffer, so the
-    // edit range starts after the `Bearer ` scheme.
+    // A ranged whole value is replaced whole: the edit covers the value's
+    // range and the replacement keeps the `Bearer ` scheme before the key.
     let text = format!("Host: x\r\nAuthorization: Bearer {}\r\n", placeholder());
     let start = text.find("Bearer ").unwrap();
     let value = HeaderField::ranged("Authorization", start, text.len() - 2);
@@ -45,15 +45,17 @@ fn bearer_substitutes_only_the_credential_of_an_exact_bearer_value() {
     let outcome = evaluate_request_with_connect(&request, &connect(), &rules, &keys(KEY));
     assert_eq!(outcome.refusal, None);
     assert_eq!(outcome.labels.len(), 1);
+    let mut expected = b"Bearer ".to_vec();
+    expected.extend_from_slice(KEY);
     match &outcome.labels[0] {
         LabelOutcome::Substituted {
             byte_start,
             byte_end,
             replacement,
         } => {
-            assert_eq!(*byte_start, start + "Bearer ".len());
+            assert_eq!(*byte_start, start);
             assert_eq!(*byte_end, text.len() - 2);
-            assert_eq!(replacement.as_slice(), KEY);
+            assert_eq!(replacement.as_slice(), expected.as_slice());
         }
         other => panic!("expected substitution, got {other:?}"),
     }

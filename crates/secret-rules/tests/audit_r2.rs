@@ -790,18 +790,51 @@ fn h1_unicode_escaped_key_survives_every_split() {
     }
 }
 
-// --- n2: header bytes and body bytes are separate ---------------------------
+// --- item 5: header reads come from header bytes; explicit bearer forms -----
 
-#[test]
-fn n2_a_body_cannot_decide_the_connect_host() {
-    let bearer = format!("Bearer {PH}");
-    let body = b"api.example.com";
+/// A Bearer-rule request whose Host is the range `[6, 21)` of `header_bytes`.
+fn host_case(header_bytes: &'static [u8], body: &'static [u8]) -> secret_rules::RequestOutcome {
+    let bearer: &'static str = Box::leak(format!("Bearer {PH}").into_boxed_str());
     let request = RequestView::from_header_block(
         "/v1/x",
         vec![
-            HeaderField::ranged("Host", 0, body.len()),
+            HeaderField::ranged("Host", 6, 21),
             HeaderField::value("Authorization", bearer.as_bytes()),
         ],
+        header_bytes,
+    )
+    .with_body(body);
+    evaluate_request_with_connect(
+        &request,
+        &connect(),
+        &[rule("x", Location::Bearer)],
+        &keys("x", MIN_KEY),
+    )
+}
+
+#[test]
+fn item5_the_host_is_read_from_the_header_block_not_the_body() {
+    // Both buffers hold a host at `[6, 21)`; only the header block's counts.
+    // `evl.example.com` and `api.example.com` are both fifteen bytes.
+    let evil_header = host_case(b"Host: evl.example.com\r\n", br#"{"a":"api.example.com"}"#);
+    assert_eq!(
+        evil_header.refusal,
+        Some(RequestRefusal::TargetMismatch(
+            secret_rules::TargetRefusal::AuthorityMismatch
+        ))
+    );
+    assert!(evil_header.header_edits.is_empty());
+    let good_header = host_case(b"Host: api.example.com\r\n", br#"{"a":"evl.example.com"}"#);
+    assert_eq!(good_header.refusal, None);
+    assert!(good_header.substituted());
+}
+
+#[test]
+fn item5_a_host_range_outside_the_header_block_refuses() {
+    let body = b"api.example.com";
+    let request = RequestView::from_header_block(
+        "/v1/x",
+        vec![HeaderField::ranged("Host", 0, body.len())],
         b"",
     )
     .with_body(body);
@@ -811,57 +844,117 @@ fn n2_a_body_cannot_decide_the_connect_host() {
         &[rule("x", Location::Bearer)],
         &keys("x", MIN_KEY),
     );
-    // The Host range points outside the (empty) header block, so the request
-    // is malformed; no body byte can stand in for a header value.
     assert_eq!(
         outcome.refusal,
         Some(RequestRefusal::TargetMismatch(
             secret_rules::TargetRefusal::AuthorityMismatch
         ))
     );
-    assert!(!outcome.substituted());
+}
+
+/// A JSON-rule request whose Content-Type is the range `[14, 30)` of
+/// `header_bytes`.
+fn content_type_case(
+    header_bytes: &'static [u8],
+    body: &'static [u8],
+) -> secret_rules::RequestOutcome {
+    let request = RequestView::from_header_block(
+        "/v1/x",
+        vec![HeaderField::ranged("Content-Type", 14, 30)],
+        header_bytes,
+    )
+    .with_body(body);
+    evaluate_request_with_connect(
+        &request,
+        &connect(),
+        &[rule("x", Location::Json("/key".to_string()))],
+        &keys("x", MIN_KEY),
+    )
 }
 
 #[test]
-fn n2_a_borrowed_bearer_credential_reports_no_offsets() {
-    let credential = PH.to_string();
-    let request = RequestView::new(
-        "/v1/x",
-        vec![HeaderField::value("Authorization", credential.as_bytes())],
+fn item5_a_body_cannot_forge_its_own_json_content_type() {
+    // The closure check's input: the header says CBOR; the body's bytes at the
+    // same offsets say `application/json`.
+    let outcome = content_type_case(
+        b"Content-Type: application/cbor\r\n",
+        br#"{"paddingxx":"application/json","key":"{{ck-secret:x}}"}"#,
     );
-    let outcome = evaluate_request_with_connect(
+    assert_eq!(
+        outcome.refusal,
+        Some(RequestRefusal::JsonContentTypeMissing)
+    );
+    assert_eq!(outcome.rewritten_body, None);
+}
+
+#[test]
+fn item5_a_ranged_json_content_type_is_honoured_whatever_the_body_holds() {
+    // The header says JSON; the body's bytes at `[14, 30)` are not a media type.
+    let outcome = content_type_case(
+        b"Content-Type: application/json\r\n",
+        br#"{"paddingxx":"text/plain-xxxxxx","key":"{{ck-secret:x}}"}"#,
+    );
+    assert_eq!(outcome.refusal, None);
+    assert_eq!(
+        outcome.rewritten_body.as_ref().map(|body| body.as_slice()),
+        Some(br#"{"paddingxx":"text/plain-xxxxxx","key":"0123456789abcdef"}"#.as_slice())
+    );
+}
+
+fn bearer_outcome(field: HeaderField<'_>) -> secret_rules::RequestOutcome {
+    let request = RequestView::new("/v1/x", vec![field]);
+    evaluate_request_with_connect(
         &request,
         &connect(),
         &[rule("x", Location::Bearer)],
         &keys("x", MIN_KEY),
-    );
+    )
+}
+
+#[test]
+fn item5_a_borrowed_whole_bearer_value_is_rewritten_with_its_scheme() {
+    for scheme in ["Bearer ", "bearer "] {
+        let value = format!("{scheme}{PH}");
+        let outcome = bearer_outcome(HeaderField::value("Authorization", value.as_bytes()));
+        assert_eq!(outcome.refusal, None);
+        let edit = outcome.header_edits.first().expect("a header edit");
+        assert_eq!(edit.kind, secret_rules::HeaderEditKind::WholeValue);
+        assert_eq!((edit.start, edit.end), (0, 0), "a borrowed value has no offsets");
+        let expected = format!("{scheme}0123456789abcdef");
+        assert_eq!(edit.replacement.as_slice(), expected.as_bytes());
+    }
+}
+
+#[test]
+fn item5_a_parsed_bearer_credential_is_replaced_by_the_key_alone() {
+    let outcome = bearer_outcome(HeaderField::bearer_credential(PH.as_bytes()));
+    assert_eq!(outcome.refusal, None);
     let edit = outcome.header_edits.first().expect("a header edit");
-    assert_eq!(
-        (edit.start, edit.end),
-        (0, 0),
-        "a borrowed value has no offsets"
-    );
+    assert_eq!(edit.kind, secret_rules::HeaderEditKind::BearerCredential);
+    assert_eq!((edit.start, edit.end), (0, 0));
     assert_eq!(edit.replacement.as_slice(), MIN_KEY);
 }
 
 #[test]
-fn n2_a_scheme_less_authorization_substitutes_only_the_credential() {
-    // A caller that split the scheme passes the credential alone; the edit then
-    // covers the caller's own bytes, never an offset into a buffer it did not
-    // supply.
-    let request = RequestView::from_header_block(
+fn item5_a_scheme_less_wire_authorization_refuses() {
+    // `Authorization: {{ck-secret:x}}` with no scheme, ranged and borrowed.
+    let ranged = RequestView::from_header_block(
         "/v1/x",
         vec![HeaderField::ranged("Authorization", 0, PH.len())],
         PH.as_bytes(),
     );
-    let outcome = evaluate_request_with_connect(
-        &request,
+    let ranged = evaluate_request_with_connect(
+        &ranged,
         &connect(),
         &[rule("x", Location::Bearer)],
         &keys("x", MIN_KEY),
     );
-    let edit = outcome.header_edits.first().expect("a header edit");
-    assert_eq!((edit.start, edit.end), (0, PH.len()));
+    let borrowed = bearer_outcome(HeaderField::value("Authorization", PH.as_bytes()));
+    for outcome in [ranged, borrowed] {
+        assert_eq!(outcome.refusal, Some(RequestRefusal::BearerSchemeMissing));
+        assert!(outcome.header_edits.is_empty());
+        assert!(!outcome.substituted());
+    }
 }
 
 // --- the first-round items that must stay closed ---------------------------

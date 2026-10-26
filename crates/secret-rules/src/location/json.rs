@@ -52,17 +52,12 @@ pub(crate) fn evaluate(
     }
     // Exactly one Content-Type may decide how the body is read: two fields that
     // disagree would let a server take a different view of the body than AFT.
+    // A ranged value is read from the header block, like every other header;
+    // reading it from the body would let the payload name its own media type.
     let mut content_types = request
-        .headers
-        .iter()
-        .filter(|field| field.name.eq_ignore_ascii_case("content-type"))
-        .map(|field| match field.value_range {
-            Some((start, end)) => {
-                String::from_utf8_lossy(request.body.get(start..end).unwrap_or_default())
-                    .into_owned()
-            }
-            None => String::from_utf8_lossy(field.borrowed.unwrap_or_default()).into_owned(),
-        });
+        .header_values("content-type")
+        .into_iter()
+        .map(|value| String::from_utf8_lossy(value).into_owned());
     let Some(content_type) = content_types.next() else {
         return Err(RequestRefusal::JsonContentTypeMissing);
     };

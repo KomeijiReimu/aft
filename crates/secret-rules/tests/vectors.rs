@@ -257,6 +257,10 @@ fn run_request(case: &Value) -> Result<Value, String> {
                 json!({
                     "name": edit.name,
                     "replacement": support::lossy(&edit.replacement),
+                    "kind": match edit.kind {
+                        secret_rules::HeaderEditKind::WholeValue => "whole_value",
+                        secret_rules::HeaderEditKind::BearerCredential => "bearer_credential",
+                    },
                 })
             })
             .collect();

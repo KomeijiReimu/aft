@@ -203,14 +203,14 @@ fn a_refusal_clears_every_key_bearing_outcome() {
 #[test]
 fn substituted_counts_a_bearer_or_header_edit() {
     let rules = [rule("repo_key", Location::Bearer)];
-    // A ranged header value only holds the credential; the scheme lives in the
-    // header line before it, exactly as a proxy parses an incoming request.
+    // A proxy that parsed the `Bearer` scheme itself passes the credential's
+    // range only, and says so.
     let buffer = format!("Authorization: Bearer {PLACEHOLDER}");
     let start = "Authorization: Bearer ".len();
     let header_block = Box::leak(buffer.clone().into_bytes().into_boxed_slice());
     let request = RequestView::from_header_block(
         "/v1/things",
-        vec![HeaderField::ranged("Authorization", start, buffer.len())],
+        vec![HeaderField::ranged_bearer_credential(start, buffer.len())],
         header_block,
     );
     let outcome = evaluate_request_with_connect(
@@ -235,6 +235,10 @@ fn substituted_counts_a_bearer_or_header_edit() {
         "the edit covers exactly the credential"
     );
     assert_eq!(header_edit.replacement.as_slice(), KEY);
+    assert_eq!(
+        header_edit.kind,
+        secret_rules::HeaderEditKind::BearerCredential
+    );
 }
 
 // --- item 8: authority parsing rejects userinfo and stray suffixes ----------

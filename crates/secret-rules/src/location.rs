@@ -25,7 +25,8 @@ use zeroize::Zeroizing;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Location {
     /// The `Authorization` value is exactly `Bearer <placeholder>`, with the
-    /// scheme matched case-insensitively.
+    /// scheme matched case-insensitively, or a credential the caller parsed
+    /// from such a value (see [`HeaderValueForm`]).
     Bearer,
     /// The whole value of the named header.
     Header(String),
@@ -98,6 +99,9 @@ pub enum RequestRefusal {
     FragmentInTarget,
     /// The label's placeholder would disclose an installed key.
     ReplacementDisclosesKey,
+    /// A whole `Authorization` value is this label's bare placeholder, with no
+    /// `Bearer` scheme. A bearer rule substitutes only `Bearer <placeholder>`.
+    BearerSchemeMissing,
 }
 
 impl From<MaterialRefusal> for RequestRefusal {
@@ -152,6 +156,7 @@ impl RequestRefusal {
             RequestRefusal::InvalidLabel => "invalid_label",
             RequestRefusal::FragmentInTarget => "fragment_in_target",
             RequestRefusal::ReplacementDisclosesKey => "replacement_discloses_key",
+            RequestRefusal::BearerSchemeMissing => "bearer_scheme_missing",
         }
     }
 }
@@ -222,7 +227,27 @@ impl std::fmt::Debug for Edit {
     }
 }
 
+/// What a [`HeaderEdit`]'s replacement stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderEditKind {
+    /// The replacement is the complete new field value. For a
+    /// [`Location::Bearer`] rule it keeps the `Bearer ` scheme exactly as the
+    /// request spelled it, followed by the key.
+    WholeValue,
+    /// The replacement is the bearer credential only, because the caller
+    /// passed the credential through [`HeaderField::bearer_credential`] or
+    /// [`HeaderField::ranged_bearer_credential`]; the caller keeps the scheme
+    /// it parsed.
+    BearerCredential,
+}
+
 /// One header value to replace, and what it becomes.
+///
+/// For a ranged field, `[start, end)` is the range the caller supplied in
+/// `header_bytes`, and `replacement` replaces exactly those bytes. For a
+/// borrowed field there are no offsets: `start` and `end` are both zero and the
+/// caller rewrites the field by name, using `replacement` as described by
+/// `kind`.
 ///
 /// `Debug` prints the name's length rather than the name: a header rule's name
 /// is caller-chosen text and is never checked against the keys.
@@ -232,6 +257,7 @@ pub struct HeaderEdit {
     pub start: usize,
     pub end: usize,
     pub replacement: Zeroizing<Vec<u8>>,
+    pub kind: HeaderEditKind,
 }
 
 impl std::fmt::Debug for HeaderEdit {
@@ -241,6 +267,7 @@ impl std::fmt::Debug for HeaderEdit {
             .field("start", &self.start)
             .field("end", &self.end)
             .field("replacement_len", &self.replacement.len())
+            .field("kind", &self.kind)
             .finish()
     }
 }
@@ -291,6 +318,18 @@ impl RequestOutcome {
     }
 }
 
+/// What the bytes of a [`HeaderField`] are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderValueForm {
+    /// The whole field value as it appears on the wire. An `Authorization`
+    /// value in this form must carry its `Bearer ` scheme to be substituted;
+    /// a bare placeholder with no scheme is refused.
+    WholeValue,
+    /// Only the credential of an `Authorization` value whose `Bearer` scheme
+    /// the caller has already parsed and will keep.
+    BearerCredential,
+}
+
 /// A header field of a request under evaluation.
 #[derive(Debug, Clone)]
 pub struct HeaderField<'a> {
@@ -301,24 +340,50 @@ pub struct HeaderField<'a> {
     /// The value bytes, for callers that evaluate a decision and rewrite it
     /// elsewhere (fetch).
     pub borrowed: Option<&'a [u8]>,
+    /// Whether the bytes are the whole value or a parsed bearer credential.
+    pub form: HeaderValueForm,
 }
 
 impl<'a> HeaderField<'a> {
-    /// A header whose value bytes are known but whose position is not.
+    /// A header whose whole value bytes are known but whose position is not.
     pub fn value(name: &'a str, value: &'a [u8]) -> Self {
         Self {
             name,
             value_range: None,
             borrowed: Some(value),
+            form: HeaderValueForm::WholeValue,
         }
     }
 
-    /// A header whose value is a range inside the request buffer.
+    /// A header whose whole value is a range inside the request buffer.
     pub fn ranged(name: &'a str, start: usize, end: usize) -> Self {
         Self {
             name,
             value_range: Some((start, end)),
             borrowed: None,
+            form: HeaderValueForm::WholeValue,
+        }
+    }
+
+    /// The credential of an `Authorization: Bearer` value, already split from
+    /// its scheme by the caller.
+    pub fn bearer_credential(credential: &'a [u8]) -> Self {
+        Self {
+            name: "Authorization",
+            value_range: None,
+            borrowed: Some(credential),
+            form: HeaderValueForm::BearerCredential,
+        }
+    }
+
+    /// The credential of an `Authorization: Bearer` value as a range inside
+    /// the request buffer; the range covers the credential only.
+    pub fn ranged_bearer_credential(start: usize, end: usize) -> Self {
+        Self {
+            name: "Authorization",
+            value_range: Some((start, end)),
+            borrowed: None,
+            form: HeaderValueForm::BearerCredential,
         }
     }
 }
@@ -386,11 +451,17 @@ impl<'a> RequestView<'a> {
         self.headers
             .iter()
             .filter(|field| field.name.eq_ignore_ascii_case(name))
-            .map(|field| match field.value_range {
-                Some((start, end)) => self.header_bytes.get(start..end).unwrap_or_default(),
-                None => field.borrowed.unwrap_or_default(),
-            })
+            .map(|field| self.field_value(field))
             .collect()
+    }
+
+    /// The bytes of one field: its range in `header_bytes`, or its borrowed
+    /// value. Never the body.
+    fn field_value<'b>(&'b self, field: &'b HeaderField<'_>) -> &'b [u8] {
+        match field.value_range {
+            Some((start, end)) => self.header_bytes.get(start..end).unwrap_or_default(),
+            None => field.borrowed.unwrap_or_default(),
+        }
     }
 }
 
@@ -481,12 +552,14 @@ fn replacement_collides(rule: &LabelRule, keys: &[(String, Vec<u8>)]) -> Option<
 
 /// What `evaluate_location` decided for one non-JSON rule.
 enum Decision {
-    /// A substitute decision with the value span inside the request buffer
-    /// and the location token the audit record needs.
+    /// A substitute decision with the value span inside the request buffer,
+    /// what the replacement stands for, and the location token the audit
+    /// record needs.
     Substituted {
         start: usize,
         end: usize,
         replacement: Vec<u8>,
+        kind: HeaderEditKind,
         location: String,
     },
     NotWhole,
@@ -504,44 +577,44 @@ fn decide_location<'q>(
     let placeholder = crate::placeholder::placeholder_text(&rule.label);
     match &rule.location {
         Location::Bearer => {
-            let values = request.header_values("authorization");
-            if values.len() > 1 {
+            let fields: Vec<&HeaderField<'_>> = request
+                .headers
+                .iter()
+                .filter(|field| field.name.eq_ignore_ascii_case("authorization"))
+                .collect();
+            if fields.len() > 1 {
                 return Err(RequestRefusal::DuplicateField);
             }
-            let Some(value) = values.first() else {
+            let Some(field) = fields.first() else {
                 return Ok(Decision::OutOfScope);
             };
-            // Where the credential sits says nothing about where the edit is:
-            // a caller that passes only the credential (no scheme, no value
-            // range) gets an edit that covers nothing and must rewrite by name,
-            // never by offset.
-            let range = value_range(request, "authorization")?;
-            let whole_value = value
-                .get(..6)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"Bearer"));
-            match bearer_form(value, &rule.label, whole_value) {
-                WholeValue::Whole => {
+            let value = request.field_value(field);
+            // A borrowed value has no offsets: the edit covers nothing and the
+            // caller rewrites the field by name.
+            let (start, end) = field.value_range.unwrap_or((0, 0));
+            match bearer_form(value, &rule.label, field.form) {
+                BearerForm::Whole { scheme_len } => {
                     check_admissible(key, &rule.label, &rule.location)?;
-                    let start = if whole_value {
-                        match range {
-                            Some((start, _)) => start + b"Bearer ".len(),
-                            None => 0,
-                        }
-                    } else {
-                        range.map(|(start, _)| start).unwrap_or(0)
+                    // A whole wire value is rewritten whole, keeping the
+                    // scheme as the request spelled it; a parsed credential is
+                    // replaced by the key alone and the caller keeps its scheme.
+                    let mut replacement = value[..scheme_len].to_vec();
+                    replacement.extend_from_slice(key);
+                    let kind = match field.form {
+                        HeaderValueForm::WholeValue => HeaderEditKind::WholeValue,
+                        HeaderValueForm::BearerCredential => HeaderEditKind::BearerCredential,
                     };
-                    let end = range
-                        .map(|(_, end)| end)
-                        .unwrap_or(whole_value as usize * start);
                     Ok(Decision::Substituted {
                         start,
                         end,
-                        replacement: key.to_vec(),
+                        replacement,
+                        kind,
                         location: "bearer".to_string(),
                     })
                 }
-                WholeValue::NotWhole => Ok(Decision::NotWhole),
-                WholeValue::Absent => Ok(Decision::OutOfScope),
+                BearerForm::SchemeMissing => Err(RequestRefusal::BearerSchemeMissing),
+                BearerForm::NotWhole => Ok(Decision::NotWhole),
+                BearerForm::Absent => Ok(Decision::OutOfScope),
             }
         }
         Location::Header(name) => {
@@ -562,6 +635,7 @@ fn decide_location<'q>(
                     start,
                     end,
                     replacement: key.to_vec(),
+                    kind: HeaderEditKind::WholeValue,
                     location: location_kind_token(&rule.location),
                 })
             } else if mentions_placeholder(value) {
@@ -589,6 +663,7 @@ fn decide_location<'q>(
                     start,
                     end,
                     replacement,
+                    kind: HeaderEditKind::WholeValue,
                     location: location_kind_token(&rule.location),
                 })
             } else if mentions_placeholder(&decoded) {
@@ -677,12 +752,12 @@ pub fn evaluate_request_with_connect(
                 start,
                 end,
                 replacement,
+                kind,
                 location,
             }) => {
-                let kind = &rule.location;
                 // A query or body edit is reported in its own place; only a
                 // header value becomes a header edit.
-                let header_name = match kind {
+                let header_name = match &rule.location {
                     Location::Bearer => Some("Authorization".to_string()),
                     Location::Header(name) => Some(name.to_ascii_lowercase()),
                     Location::Query(_) | Location::Json(_) => None,
@@ -693,6 +768,7 @@ pub fn evaluate_request_with_connect(
                         start,
                         end,
                         replacement: Zeroizing::new(replacement.clone()),
+                        kind,
                     });
                 }
                 let _ = location;
@@ -823,16 +899,9 @@ fn check_authority(
 ) -> Option<RequestRefusal> {
     let header = |name: &str| -> Vec<String> {
         request
-            .headers
-            .iter()
-            .filter(|field| field.name.eq_ignore_ascii_case(name))
-            .map(|field| {
-                let bytes = match field.value_range {
-                    Some((start, end)) => request.header_bytes.get(start..end).unwrap_or_default(),
-                    None => field.borrowed.unwrap_or_default(),
-                };
-                String::from_utf8_lossy(bytes).into_owned()
-            })
+            .header_values(name)
+            .into_iter()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
             .collect()
     };
     let hosts = header("host");
@@ -904,13 +973,9 @@ pub(crate) fn validate_rule(rule: &LabelRule) -> Option<RequestRefusal> {
     None
 }
 
-/// The byte range of a header value inside the request buffer.
-///
-/// A caller that only asks for a decision (fetch) passes no buffer, and then
-/// the decision is still made: the caller rewrites its own header block and
-/// does not need offsets.
 /// The byte range of a header value in the header block, when the caller
-/// supplied one.
+/// supplied one. A caller that only asks for a decision (fetch) passes
+/// borrowed values and no ranges; it rewrites its own header block by name.
 fn value_range(
     request: &RequestView<'_>,
     name: &str,
@@ -923,49 +988,59 @@ fn value_range(
 }
 
 #[derive(Debug)]
-enum WholeValue {
-    Whole,
+enum BearerForm {
+    /// The credential is exactly this label's placeholder. `scheme_len` bytes
+    /// of the value (`Bearer ` for a whole value, none for a parsed
+    /// credential) come before it and are kept in the replacement.
+    Whole { scheme_len: usize },
+    /// A whole wire value that is exactly this label's placeholder, with no
+    /// `Bearer` scheme at all.
+    SchemeMissing,
     NotWhole,
     Absent,
 }
 
-/// Decide how a bearer value relates to `label`.
+/// Decide how an `Authorization` value relates to `label`.
 ///
-/// `whole_value` says whether `value` is the complete field value (starting
-/// with the `Bearer` scheme) or only the credential: a proxy passes the whole
-/// value, while a caller that already split the scheme passes the credential.
-fn bearer_form(value: &[u8], label: &str, whole_value: bool) -> WholeValue {
-    let credential = if whole_value {
-        let has_scheme = value.len() >= 6 && value[..6].eq_ignore_ascii_case(b"Bearer");
-        if !has_scheme {
-            return if mentions_placeholder(value) {
-                WholeValue::NotWhole
-            } else {
-                WholeValue::Absent
-            };
-        }
-        match value.get(6..) {
-            Some(rest) if rest.first() == Some(&b' ') => &rest[1..],
-            _ => {
-                return if mentions_placeholder(value) {
-                    WholeValue::NotWhole
+/// `form` says whether `value` is the complete field value or a credential
+/// whose `Bearer` scheme the caller already parsed. A complete value must start
+/// with `Bearer ` (scheme case-insensitive); one that is the bare placeholder
+/// is not treated as a bearer credential, because the scheme it would be sent
+/// with is not known, and is refused instead.
+fn bearer_form(value: &[u8], label: &str, form: HeaderValueForm) -> BearerForm {
+    let is_this_placeholder = |text: &[u8]| {
+        std::str::from_utf8(text)
+            .ok()
+            .and_then(parse_exact)
+            .is_some_and(|parsed| parsed.label == label)
+    };
+    let (scheme_len, credential) = match form {
+        HeaderValueForm::BearerCredential => (0, value),
+        HeaderValueForm::WholeValue => {
+            let has_scheme = value
+                .get(..7)
+                .is_some_and(|scheme| scheme[..6].eq_ignore_ascii_case(b"Bearer") && scheme[6] == b' ');
+            if !has_scheme {
+                return if is_this_placeholder(value) {
+                    BearerForm::SchemeMissing
+                } else if mentions_placeholder(value) {
+                    BearerForm::NotWhole
                 } else {
-                    WholeValue::Absent
-                }
+                    BearerForm::Absent
+                };
             }
+            (7, &value[7..])
         }
-    } else {
-        value
     };
     // The credential must be exactly this label's placeholder. Anything else
     // that looks like a placeholder goes upstream literally rather than being
     // guessed at.
     let parsed_mark = std::str::from_utf8(credential).ok().and_then(parse_exact);
     match parsed_mark {
-        Some(parsed) if parsed.label == label => WholeValue::Whole,
-        Some(_) => WholeValue::NotWhole,
-        None if mentions_placeholder(credential) => WholeValue::NotWhole,
-        None => WholeValue::Absent,
+        Some(parsed) if parsed.label == label => BearerForm::Whole { scheme_len },
+        Some(_) => BearerForm::NotWhole,
+        None if mentions_placeholder(credential) => BearerForm::NotWhole,
+        None => BearerForm::Absent,
     }
 }
 
