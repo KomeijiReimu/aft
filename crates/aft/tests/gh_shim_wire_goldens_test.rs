@@ -1999,13 +1999,15 @@ fn v22_speech_rows_route_exactly_the_declared_requests_and_lookalikes_never_rout
     }
 }
 
-/// The same rows against a reviewed v22 payload draft, signed here with the
-/// dev key byte for byte, for the ceremony's round-trip record. Run with
+/// The same rows against an unsigned v22 manifest payload (the bytes that
+/// will later be signed for production), signed here with the dev key byte
+/// for byte, to record each routed request before the production signing.
+/// Run with
 /// `AFT_GH_SHIM_V22_RIG_PAYLOAD=<unsigned payload>` and
 /// `AFT_GH_SHIM_V22_RIG_EVIDENCE=<directory>`; each row's argv, exit code,
 /// output and routed request are written to the evidence directory.
 #[test]
-#[ignore = "ceremony evidence: needs a v22 payload draft path"]
+#[ignore = "manual evidence run: needs an unsigned v22 payload path"]
 fn v22_payload_draft_round_trip_records_each_routed_request() {
     let payload_path = std::env::var_os("AFT_GH_SHIM_V22_RIG_PAYLOAD")
         .map(PathBuf::from)
