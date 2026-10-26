@@ -117,9 +117,10 @@ pub fn mentions_label(text: &str, label: &str) -> bool {
 /// True when `text` mentions a placeholder whose label *contains*
 /// `raw_label`, comparing after URL percent-decoding and case folding.
 ///
-/// The launch scan sees raw command text and raw URLs; a mention such as
-/// `{{ck-secret:{{lc:Repo_Key}}}}` or `%7B%7Bck-secret%3Arepo_key%7D%7D` is
-/// still a mention. Labels are ASCII, so lowercasing cannot change lengths.
+/// The launch scan sees raw command text and raw URLs, so a mixed-case or
+/// percent-escaped mention such as
+/// `%7B%7Bck-secret%3ARepo%7D%7D` still counts. Labels are ASCII, so case folding
+/// cannot change lengths.
 pub fn mentions_label_loose(text: &str, raw_label: &str) -> bool {
     let lowered = raw_label.to_ascii_lowercase();
     if lowered.is_empty() {

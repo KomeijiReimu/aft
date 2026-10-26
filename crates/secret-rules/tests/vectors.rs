@@ -1,6 +1,5 @@
-//! Conformance vectors: the committed JSON runs the crate through every case
-//! the spec names, and compares the whole trace. This is the platform matrix
-//! entry point: the same file runs on Linux, macOS and Windows.
+//! Conformance vectors: each committed JSON case runs the crate and compares
+//! the whole trace. The same files run on Linux, macOS and Windows.
 
 mod support;
 

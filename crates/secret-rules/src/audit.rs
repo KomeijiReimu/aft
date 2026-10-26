@@ -46,7 +46,8 @@ pub struct AuditRecordV1 {
     pub v: u32,
     pub timestamp_ms: u64,
     pub label: String,
-    /// `None` when the call had no stamp (B2 precedence, V2).
+    /// `None` when the call carried no daemon stamp, so no scope was
+    /// available to name.
     pub scope: Option<ScopeRef>,
     /// `None` when no rule was evaluated.
     pub host: Option<String>,

@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-/// Groups every vector file must carry; the acceptance matrix names each one.
+/// Groups every vector file must carry.
 pub const REQUIRED_GROUPS: &[&str] = &[
     "P1", "P2", "P3", "P4", "M1", "M2", "M3", "M4", "S1", "S2", "A1",
 ];
