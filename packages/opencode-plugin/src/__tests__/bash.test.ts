@@ -1638,6 +1638,23 @@ describe("bash_status tool", () => {
     expect(text).not.toContain("remote job");
   });
 
+  test("bash_status shows AFT's incomplete-listing sentence exactly", async () => {
+    const sentence =
+      "AFT could not read every process in the task's group, so others may also be running.";
+    const { statusTool } = makeCtx(() => ({
+      success: true,
+      status: "timed_out",
+      exit_code: 124,
+      live_descendants: null,
+      live_descendants_unavailable: "listing_incomplete",
+      live_descendants_summary: sentence,
+    }));
+
+    const text = await statusTool.execute({ taskId: "bash-hidden" }, createMockSdkContext());
+
+    expect(text).toContain(`Task bash-hidden: timed_out (exit 124) · ${sentence}`);
+  });
+
   test("default sync cap rejects 120001 with the config knob in the error", async () => {
     const { watchTool } = makeCtx(() => ({ success: true, status: "completed", exit_code: 0 }));
 

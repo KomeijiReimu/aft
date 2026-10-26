@@ -1973,6 +1973,27 @@ describe("bash tool adapter", () => {
     expect(toolText(result)).not.toContain("remote job");
   });
 
+  test("bash_status shows AFT's incomplete-listing sentence exactly", async () => {
+    const sentence =
+      "AFT could not read every process in the task's group, so others may also be running.";
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const { bridge } = makeTrackableMockBridge({
+      status: "timed_out",
+      exit_code: 124,
+      live_descendants: null,
+      live_descendants_unavailable: "listing_incomplete",
+      live_descendants_summary: sentence,
+    });
+    registerBashTool(api, makeMockContext(bridge));
+
+    const result = await tools
+      .get("bash_status")!
+      .execute("call", { task_id: "bash-hidden" }, undefined, undefined, { cwd: projectRoot });
+
+    expect(toolText(result)).toContain(`Task bash-hidden: timed_out (exit 124) · ${sentence}`);
+  });
+
   test("bash_watch pattern substring returns waited matched details", async () => {
     const outputPath = await spill("alpha ready beta\n");
     try {

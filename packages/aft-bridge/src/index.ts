@@ -397,6 +397,8 @@ export type {
   BashCompletedFrame,
   BgCompletion,
   ConfigureWarningFrame,
+  LiveDescendant,
+  LiveDescendantsUnavailable,
   PermissionAskFrame,
   ProgressFrame,
   StatusCompression,
@@ -404,6 +406,7 @@ export type {
   StatusRemovalHealth,
   StatusResponse,
 } from "./protocol.js";
+export { LIVE_DESCENDANTS_UNAVAILABLE_REASONS } from "./protocol.js";
 export { findBinary, findBinarySync, isNativeExecutable, platformKey } from "./resolver.js";
 // --- reading a file at a git revision (`ref`) ---
 export {
