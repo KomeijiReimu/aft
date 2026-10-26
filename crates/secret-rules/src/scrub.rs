@@ -34,6 +34,10 @@ pub enum ScrubError {
     Empty,
     /// Fewer than the P3 minimum.
     TooShort,
+    /// A matcher's replacement text would spell an installed key (its own or
+    /// another matcher's) in a form the scrubber recognises, so writing it
+    /// into a response would disclose that key.
+    ReplacementDisclosesKey,
 }
 
 /// The encoding family a decoded match was found in.
@@ -269,12 +273,26 @@ impl std::fmt::Debug for MatcherSet {
 
 impl MatcherSet {
     /// Derive matchers for `key` and the placeholder they are replaced with.
+    ///
+    /// Refuses a label whose placeholder spells `key` (for example the key's
+    /// hex or base64 as the label): the placeholder is written into responses
+    /// unscanned, so it must not carry the key it stands for.
     pub fn new(label: &str, key: &[u8]) -> Result<Self, ScrubError> {
-        Ok(Self {
+        let matcher = Self {
             key: Zeroizing::new(key.to_vec()),
             patterns: KeyPatterns::derive(key)?,
             replacement: placeholder_for(label),
-        })
+        };
+        if matcher.discloses(&matcher.replacement) {
+            return Err(ScrubError::ReplacementDisclosesKey);
+        }
+        Ok(matcher)
+    }
+
+    /// True when `text` holds this matcher's key in any spelling the matcher
+    /// would scrub, including a literal that covers only part of the key.
+    fn discloses(&self, text: &[u8]) -> bool {
+        !self.find_spans(text).is_empty()
     }
 
     /// The replacement text.
@@ -312,6 +330,18 @@ impl MatcherSet {
     fn find_spans(&self, window: &[u8]) -> Vec<(usize, usize)> {
         find_key_spans(window, self.key(), &self.patterns.patterns)
     }
+}
+
+/// True when `replacement` spells `key` in any form a scrubber for `key`
+/// recognises: raw, `%XX`, form, JSON escapes, hex at any offset, base64 at
+/// any alignment, or one of the key's literal spellings.
+///
+/// A key too short to scrub is still searched for in its decoded forms.
+pub(crate) fn replacement_discloses(replacement: &[u8], key: &[u8]) -> bool {
+    let literals = KeyPatterns::derive(key)
+        .map(|patterns| patterns.patterns)
+        .unwrap_or_default();
+    !find_key_spans(replacement, key, &literals).is_empty()
 }
 
 /// Every span of `window` that spells `key`, sorted by start and free of
@@ -736,25 +766,39 @@ impl std::fmt::Debug for Scrubber {
 
 impl Scrubber {
     /// Build a scrubber over every installed matcher.
-    pub fn new(matchers: Vec<MatcherSet>) -> Self {
-        let longest = matchers
-            .iter()
-            .map(MatcherSet::longest_consumed)
-            .max()
-            .unwrap_or(0);
-        Self {
-            matchers,
+    ///
+    /// Refuses the set when any matcher's replacement spells any matcher's key
+    /// (see [`Scrubber::install`]).
+    pub fn new(matchers: Vec<MatcherSet>) -> Result<Self, ScrubError> {
+        let mut scrubber = Self {
+            matchers: Vec::with_capacity(matchers.len()),
             pending: Zeroizing::new(Vec::new()),
-            longest,
+            longest: 0,
+        };
+        for matcher in matchers {
+            scrubber.install(matcher)?;
         }
+        Ok(scrubber)
     }
 
     /// Install a matcher that became known mid-stream (a rotated key). Bytes
     /// already released cannot be rechecked, so the caller installs matchers
     /// before forwarding the response they must cover.
-    pub fn install(&mut self, matcher: MatcherSet) {
+    ///
+    /// Replacements are written into the response and never rescanned, so the
+    /// new matcher is refused when its replacement spells an installed key, or
+    /// when an installed replacement spells its key. The scrubber is unchanged
+    /// on refusal.
+    pub fn install(&mut self, matcher: MatcherSet) -> Result<(), ScrubError> {
+        let collides = self.matchers.iter().any(|installed| {
+            installed.discloses(&matcher.replacement) || matcher.discloses(&installed.replacement)
+        });
+        if collides || matcher.discloses(&matcher.replacement) {
+            return Err(ScrubError::ReplacementDisclosesKey);
+        }
         self.longest = self.longest.max(matcher.longest_consumed());
         self.matchers.push(matcher);
+        Ok(())
     }
 
     /// Holdback window in bytes.
@@ -907,7 +951,7 @@ impl Scrubber {
 
 /// Scrub a complete buffer with one key (convenience for tests and fetch).
 pub fn scrub_bytes(key: &[u8], label: &str, input: &[u8]) -> Result<Vec<u8>, ScrubError> {
-    let mut scrubber = Scrubber::new(vec![MatcherSet::new(label, key)?]);
+    let mut scrubber = Scrubber::new(vec![MatcherSet::new(label, key)?])?;
     let mut out = scrubber.push(input);
     out.extend_from_slice(&scrubber.finish());
     Ok(out)
@@ -929,7 +973,8 @@ mod tests {
         let mut scrubber = Scrubber::new(vec![
             MatcherSet::new("a", b"0123456789abcdef").unwrap(),
             MatcherSet::new("b", b"fedcba9876543210").unwrap(),
-        ]);
+        ])
+        .unwrap();
         crate::work::take();
         let mut out = scrubber.push(input.as_bytes());
         out.extend_from_slice(&scrubber.finish());

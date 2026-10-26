@@ -32,7 +32,7 @@ fn a_full_match_ending_exactly_at_the_push_boundary_is_scrubbed() {
     let key: &[u8] = b"0123456789abcdef";
     // Exactly one holdback worth of bytes before the match, so the match ends
     // at the end of the chunk and the caller is about to call finish().
-    let mut scrubber = Scrubber::new(vec![MatcherSet::new(LABEL, key).unwrap()]);
+    let mut scrubber = Scrubber::new(vec![MatcherSet::new(LABEL, key).unwrap()]).unwrap();
     let lead = vec![b'.'; 3];
     let mut out = scrubber.push(&lead);
     out.extend_from_slice(&scrubber.push(key));
@@ -47,7 +47,7 @@ fn every_chunk_partition_produces_the_same_output() {
     let whole = scrub(key, text);
     assert_eq!(whole, b"before {{ck-secret:x}} after");
     for chunk in 1..=text.len() {
-        let mut scrubber = Scrubber::new(vec![MatcherSet::new(LABEL, key).unwrap()]);
+        let mut scrubber = Scrubber::new(vec![MatcherSet::new(LABEL, key).unwrap()]).unwrap();
         let mut out = Vec::new();
         for piece in text.chunks(chunk) {
             out.extend_from_slice(&scrubber.push(piece));
@@ -64,7 +64,7 @@ fn a_key_made_of_one_repeated_byte_survives_no_partition() {
     text.extend_from_slice(&key);
     text.extend_from_slice(b"..");
     for chunk in 1..=text.len() {
-        let mut scrubber = Scrubber::new(vec![MatcherSet::new(LABEL, &key).unwrap()]);
+        let mut scrubber = Scrubber::new(vec![MatcherSet::new(LABEL, &key).unwrap()]).unwrap();
         let mut out = Vec::new();
         for piece in text.chunks(chunk) {
             out.extend_from_slice(&scrubber.push(piece));
@@ -84,8 +84,8 @@ fn a_key_made_of_one_repeated_byte_survives_no_partition() {
 fn output_does_not_depend_on_a_matching_prefix() {
     let key: &[u8] = b"sk-live-0123456789abcdef";
 
-    let mut matching = Scrubber::new(vec![MatcherSet::new(LABEL, key).unwrap()]);
-    let mut other = Scrubber::new(vec![MatcherSet::new(LABEL, key).unwrap()]);
+    let mut matching = Scrubber::new(vec![MatcherSet::new(LABEL, key).unwrap()]).unwrap();
+    let mut other = Scrubber::new(vec![MatcherSet::new(LABEL, key).unwrap()]).unwrap();
     let withheld_matching = matching.push(b"s");
     let withheld_other = other.push(b"x");
 
@@ -112,7 +112,7 @@ fn the_fixed_holdback_is_always_longest_consumed_minus_one() {
     // literal pattern.
     let longest = KeyPatterns::derive(key).unwrap().longest_consumed();
     assert!(longest > KeyPatterns::derive(key).unwrap().longest());
-    let mut scrubber = Scrubber::new(vec![MatcherSet::new(LABEL, key).unwrap()]);
+    let mut scrubber = Scrubber::new(vec![MatcherSet::new(LABEL, key).unwrap()]).unwrap();
     let mut seen = 0usize;
     for (position, byte) in b"some ordinary response text ".iter().enumerate() {
         seen += scrubber.push(&[*byte]).len();
@@ -268,39 +268,33 @@ fn json_escape_of_a_key_with_slashes_round_trips() {
 // --- item 10: generated replacements are never rescanned --------------------
 
 #[test]
-fn a_label_that_is_the_hex_of_its_own_key_does_not_loop() {
+fn a_label_that_is_the_hex_of_its_own_key_is_refused() {
     // The audit's counterexample: a deposited label that spells the key in
-    // hex. Scrubbing terminates, and the replacement is written once.
+    // hex. The placeholder is written into responses unscanned, so it would
+    // carry the key; installing that matcher refuses instead.
     let key: &[u8] = b"abcdefghijklmnop";
     let label = "6162636465666768696a6b6c6d6e6f70";
-    let input = b"abcdefghijklmnop!";
-    let out = scrub_bytes(key, label, input).expect("scrubbable");
-    // The key text itself may still appear inside the label name (the label is
-    // the key's hex, and this key contains hex digits), but no replacement is
-    // ever built from a replacement: the output length stays bounded and the
-    // placeholder occurs exactly once.
-    let placeholder = String::from_utf8_lossy(&out);
     assert_eq!(
-        placeholder.matches("{{ck-secret:").count(),
-        1,
-        "generated text was rescanned: {placeholder}"
+        scrub_bytes(key, label, b"abcdefghijklmnop!"),
+        Err(secret_rules::ScrubError::ReplacementDisclosesKey)
     );
 }
 
 #[test]
-fn a_replacement_inserted_in_one_pass_is_not_scrubbed_again() {
-    // The second matcher's key spans the whole placeholder the first one
-    // generates. A scrubber that rescans its own output would replace that
-    // label too; the generated placeholder must survive unchanged.
+fn a_key_spelled_by_another_matchers_replacement_is_refused() {
+    // The second matcher's key is the whole placeholder the first one
+    // generates. A scrubber that never rescans its output would still write
+    // that placeholder, which is the second key, so the pair refuses.
     let first: &[u8] = b"aaaaaaaaaaaaaaaa";
     let generated: &[u8] = b"{{ck-secret:other}}";
-    let mut scrubber = Scrubber::new(vec![
-        MatcherSet::new("other", first).unwrap(),
-        MatcherSet::new("aaaaaaaaaaaaaaaa", generated).unwrap(),
-    ]);
-    let mut out = scrubber.push(b"aaaaaaaaaaaaaaaa");
-    out.extend_from_slice(&scrubber.finish());
-    assert_eq!(out, b"{{ck-secret:other}}");
+    assert_eq!(
+        Scrubber::new(vec![
+            MatcherSet::new("other", first).unwrap(),
+            MatcherSet::new("aaaaaaaaaaaaaaaa", generated).unwrap(),
+        ])
+        .err(),
+        Some(secret_rules::ScrubError::ReplacementDisclosesKey)
+    );
 }
 
 // --- item 14: an independent decoder, not the production matcher set --------

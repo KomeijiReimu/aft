@@ -456,36 +456,24 @@ fn is_token_byte(byte: u8) -> bool {
         )
 }
 
-/// True when the placeholder this rule writes would disclose another installed
-/// key.
+/// True when the placeholder this rule writes would disclose an installed key.
 ///
 /// The replacement is generated text, so it is never rescanned; but the label
-/// itself is caller-supplied, and a label that spells a key (for example the
-/// key's hex) would write that key into every response it appears in. Such a
-/// pair refuses instead of being written.
+/// itself is caller-supplied, and a label that spells a key (its hex, its
+/// base64, or the key itself) would write that key into every response it
+/// appears in. The check covers every supplied key, the rule's own included,
+/// in every spelling the scrubber recognises; such a pair refuses instead of
+/// being written. A key that contains the whole placeholder refuses too, as
+/// P3 does for a rule's own key.
 fn replacement_collides(rule: &LabelRule, keys: &[(String, Vec<u8>)]) -> Option<RequestRefusal> {
     let placeholder = crate::placeholder::placeholder_text(&rule.label);
-    for (label, key) in keys {
-        // The rule's own key is admitted by P3, which refuses it when it
-        // appears in its own placeholder. The question here is whether this
-        // rule's replacement would disclose a key installed for *any* label,
-        // including its own when P3 let it through.
-        let _ = label;
-        if key.is_empty() {
-            continue;
-        }
-        let in_label = placeholder
-            .as_bytes()
-            .windows(key.len())
-            .any(|window| window == key.as_slice());
-        if in_label
-            || crate::material::key_is_substring_of_placeholder(key, &rule.label)
-            || crate::scrub::text_decodes_to_key(&placeholder, key)
-        {
-            return Some(RequestRefusal::ReplacementDisclosesKey);
-        }
-    }
-    None
+    keys.iter()
+        .any(|(_, key)| {
+            !key.is_empty()
+                && (crate::scrub::replacement_discloses(placeholder.as_bytes(), key)
+                    || crate::material::key_is_substring_of_placeholder(key, &rule.label))
+        })
+        .then_some(RequestRefusal::ReplacementDisclosesKey)
 }
 
 /// What `evaluate_location` decided for one non-JSON rule.

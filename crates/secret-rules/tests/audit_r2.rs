@@ -472,7 +472,7 @@ const EMOJI_KEY: &str = "\u{1F600}\u{1F600}\u{1F600}\u{1F600}";
 /// Scrub `input` in the given chunks with one `x` matcher for `key`.
 fn scrub_chunks(key: &[u8], chunks: &[&[u8]]) -> Vec<u8> {
     let mut scrubber =
-        secret_rules::Scrubber::new(vec![secret_rules::MatcherSet::new("x", key).unwrap()]);
+        secret_rules::Scrubber::new(vec![secret_rules::MatcherSet::new("x", key).unwrap()]).unwrap();
     let mut out = Vec::new();
     for chunk in chunks {
         out.extend_from_slice(&scrubber.push(chunk));
@@ -543,13 +543,11 @@ fn h2_a_label_that_spells_its_key_refuses() {
 }
 
 #[test]
-fn h2_a_key_that_contains_its_label_refuses() {
-    // The audit's pair reversed: the key spells the label, so P3 admits it (the
-    // key does not fit inside its placeholder) but the scrubber would rewrite
-    // the placeholder's own label text. The replacement that would be installed
-    // does not disclose the key, so P3's admission stands and the placeholder is
-    // the replacement; the refusal case is the one below, where the label
-    // spells the key.
+fn h2_a_key_that_contains_its_label_is_still_substituted() {
+    // The reverse of the pair above, and not a refusal case: the key
+    // `a-very-long-key-value` contains the label `x`, but the placeholder
+    // `{{ck-secret:x}}` does not spell the key, so the rule is substituted as
+    // usual. This guards against the collision check refusing too much.
     let key: &[u8] = b"a-very-long-key-value";
     let mut containing = rule("x", Location::Header("X-A".to_string()));
     containing.label = "x".to_string();
@@ -596,6 +594,117 @@ fn h2_a_key_that_is_its_labels_hex_refuses() {
     );
 }
 
+// --- item 4: no installation entry point accepts a disclosing replacement ---
+
+/// The closure check's pairs: `(label, key)` where the label's placeholder
+/// spells the key. Each spelling is written out by hand.
+const DISCLOSING_PAIRS: &[(&str, &[u8])] = &[
+    // The key's lowercase hex, aligned.
+    ("6162636465666768696a6b6c6d6e6f70", b"abcdefghijklmnop"),
+    // The same hex shifted by one character inside the label.
+    ("g6162636465666768696a6b6c6d6e6f70", b"abcdefghijklmnop"),
+    // The key's unpadded base64: `jzz` is `anp6`, the final `j` is `ag`.
+    ("anp6anp6anp6anp6anp6ag", b"jzzjzzjzzjzzjzzj"),
+];
+
+/// A key none of the labels above spells.
+const OTHER_KEY: &[u8] = b"zzzzzzzzzzzzzzzz";
+
+#[test]
+fn item4_the_request_evaluator_refuses_every_disclosing_label() {
+    for (label, key) in DISCLOSING_PAIRS {
+        let placeholder = format!("{{{{ck-secret:{label}}}}}");
+        let request = RequestView::new(
+            "/v1/x",
+            vec![HeaderField::value("X-A", placeholder.as_bytes())],
+        );
+        let header_rule = rule(label, Location::Header("X-A".to_string()));
+        // Against the rule's own key, and against another label's key.
+        for keys in [
+            vec![(label.to_string(), key.to_vec())],
+            vec![
+                (label.to_string(), OTHER_KEY.to_vec()),
+                ("plain".to_string(), key.to_vec()),
+            ],
+        ] {
+            let outcome =
+                evaluate_request_with_connect(&request, &connect(), &[header_rule.clone()], &keys);
+            assert_eq!(
+                outcome.refusal,
+                Some(RequestRefusal::ReplacementDisclosesKey),
+                "label {label}"
+            );
+            assert!(outcome.header_edits.is_empty(), "label {label}");
+        }
+    }
+}
+
+#[test]
+fn item4_every_scrubber_entry_point_refuses_a_disclosing_replacement() {
+    use secret_rules::{MatcherSet, ScrubError, Scrubber};
+    let refused = Some(ScrubError::ReplacementDisclosesKey);
+    for (label, key) in DISCLOSING_PAIRS {
+        // A matcher whose own placeholder spells its own key.
+        assert_eq!(MatcherSet::new(label, key).err(), refused, "label {label}");
+        assert_eq!(scrub_bytes(key, label, b"x").err(), refused, "label {label}");
+        // The label belongs to another key; the spelled key is installed
+        // under a plain label, before or after it.
+        let spelling = || MatcherSet::new(label, OTHER_KEY).unwrap();
+        let spelled = || MatcherSet::new("plain", key).unwrap();
+        assert_eq!(
+            Scrubber::new(vec![spelled(), spelling()]).err(),
+            refused,
+            "label {label}"
+        );
+        assert_eq!(
+            Scrubber::new(vec![spelling(), spelled()]).err(),
+            refused,
+            "label {label}"
+        );
+        let mut rotated = Scrubber::new(vec![spelled()]).unwrap();
+        assert_eq!(rotated.install(spelling()).err(), refused, "label {label}");
+        assert_eq!(rotated.matcher_count(), 1, "a refused install changed state");
+        let mut rotated = Scrubber::new(vec![spelling()]).unwrap();
+        assert_eq!(rotated.install(spelled()).err(), refused, "label {label}");
+        assert_eq!(rotated.matcher_count(), 1, "a refused install changed state");
+    }
+}
+
+#[test]
+fn item4_generated_replacements_disclose_no_installed_key() {
+    // Labels shaped like encodings, but of unrelated bytes: the hex of
+    // sixteen `z`, and the base64 of `kzzkzzkzzkzzkzzk`.
+    let installed: &[(&str, &[u8])] = &[
+        ("7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a", b"abcdefghijklmnop"),
+        ("a3p6a3p6a3p6a3p6a3p6aw", b"jzzjzzjzzjzzjzzj"),
+    ];
+    let mut scrubber = secret_rules::Scrubber::new(
+        installed
+            .iter()
+            .map(|(label, key)| secret_rules::MatcherSet::new(label, key).unwrap())
+            .collect(),
+    )
+    .unwrap();
+    let mut out = scrubber.push(b"a=abcdefghijklmnop b=jzzjzzjzzjzzjzzj");
+    out.extend_from_slice(&scrubber.finish());
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "a={{ck-secret:7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a}} b={{ck-secret:a3p6a3p6a3p6a3p6a3p6aw}}"
+    );
+    for (_, key) in installed {
+        assert!(
+            !support::discloses(key, &out),
+            "output discloses {}",
+            String::from_utf8_lossy(key)
+        );
+    }
+    // The independent detector does see the disclosing labels, so the check
+    // above is not vacuous.
+    for (label, key) in DISCLOSING_PAIRS {
+        assert!(support::discloses(key, label.as_bytes()), "label {label}");
+    }
+}
+
 // --- H1: a fully escaped representation streams intact ----------------------
 
 #[test]
@@ -612,7 +721,7 @@ fn h1_unicode_escaped_key_survives_every_split() {
     );
     for split in 0..=body.len() {
         let mut scrubber =
-            secret_rules::Scrubber::new(vec![secret_rules::MatcherSet::new("x", MIN_KEY).unwrap()]);
+            secret_rules::Scrubber::new(vec![secret_rules::MatcherSet::new("x", MIN_KEY).unwrap()]).unwrap();
         let mut out = scrubber.push(body.as_bytes().get(..split).unwrap_or_default());
         out.extend_from_slice(&scrubber.push(body.as_bytes().get(split..).unwrap_or_default()));
         out.extend_from_slice(&scrubber.finish());

@@ -168,7 +168,7 @@ fn a_match_split_across_reads_is_caught() {
     let payload = b"prefix sk-live 0123456789abcdef suffix".to_vec();
     let text = String::from_utf8(payload).unwrap();
     for split in 1..text.len() {
-        let mut scrubber = Scrubber::new(vec![MatcherSet::new(LABEL, key).unwrap()]);
+        let mut scrubber = Scrubber::new(vec![MatcherSet::new(LABEL, key).unwrap()]).unwrap();
         let mut out = scrubber.push(&text.as_bytes()[..split]);
         out.extend_from_slice(&scrubber.push(&text.as_bytes()[split..]));
         out.extend_from_slice(&scrubber.finish());
@@ -185,7 +185,7 @@ fn a_match_split_across_reads_is_caught() {
 fn a_match_split_across_three_reads_is_caught() {
     let key: &[u8] = b"0123456789abcdef";
     let text = "aaaa 0123456789abcdef bbbb";
-    let mut scrubber = Scrubber::new(vec![MatcherSet::new(LABEL, key).unwrap()]);
+    let mut scrubber = Scrubber::new(vec![MatcherSet::new(LABEL, key).unwrap()]).unwrap();
     let mut out = Vec::new();
     for chunk in text.as_bytes().chunks(6) {
         out.extend_from_slice(&scrubber.push(chunk));
@@ -198,7 +198,7 @@ fn a_match_split_across_three_reads_is_caught() {
 #[test]
 fn the_overlap_window_is_one_less_than_the_longest_consumed_form() {
     let key: &[u8] = b"0123456789abcdef";
-    let scrubber = Scrubber::new(vec![MatcherSet::new(LABEL, key).unwrap()]);
+    let scrubber = Scrubber::new(vec![MatcherSet::new(LABEL, key).unwrap()]).unwrap();
     // The window covers the widest representation a match consumes, which is
     // the fully JSON-escaped form (six bytes per key byte), not the longest
     // literal pattern.
@@ -211,7 +211,7 @@ fn the_overlap_window_is_one_less_than_the_longest_consumed_form() {
 #[test]
 fn a_partial_prefix_at_the_end_of_a_stream_that_never_completes_is_emitted_by_finish() {
     let key: &[u8] = b"0123456789abcdef";
-    let mut scrubber = Scrubber::new(vec![MatcherSet::new(LABEL, key).unwrap()]);
+    let mut scrubber = Scrubber::new(vec![MatcherSet::new(LABEL, key).unwrap()]).unwrap();
     let mut out = scrubber.push(b"body ends with 01234");
     out.extend_from_slice(&scrubber.finish());
     assert_eq!(out, b"body ends with 01234");
@@ -225,7 +225,7 @@ fn two_keys_in_one_stream_are_both_scrubbed() {
     let mut scrubber = Scrubber::new(vec![
         MatcherSet::new("one", first).unwrap(),
         MatcherSet::new("two", second).unwrap(),
-    ]);
+    ]).unwrap();
     let mut out = scrubber.push(text);
     out.extend_from_slice(&scrubber.finish());
     let out_text = String::from_utf8_lossy(&out);
