@@ -1253,10 +1253,11 @@ pub(super) const REMOTE_ADMISSION_PENDING_NOTE: &str = "The remote job is queued
 
 /// The reply for a runon task handed to the background before the runner has
 /// accepted it. Foreground calls reach this at the end of their wait window;
-/// explicit background calls reach it as soon as the task is registered. Both
-/// use the same task-id guidance and admission-pending note. Every other reply
-/// passes through unchanged: a finished or refused task, an accepted job, or a
-/// reply returned early because AFT is restarting.
+/// explicit background calls reach it as soon as the task is registered and
+/// keep background launch wording rather than claiming a foreground wait. Both
+/// retain the admission-pending note. Every other reply passes through unchanged:
+/// a finished or refused task, an accepted job, or a reply returned early because
+/// AFT is restarting.
 fn foreground_runon_reply(
     response: Response,
     window_end: Option<Instant>,
@@ -1278,26 +1279,33 @@ fn foreground_runon_reply(
     let Some(task_id) = response.data["task_id"].as_str() else {
         return response;
     };
-    let promotion = Response::success(
+    let guidance = if background_runon {
+        crate::commands::bash_orchestrate::format_background_launch(
+            task_id,
+            false,
+            worker_session,
+            bash_watch_available,
+        )
+    } else {
+        crate::commands::bash_orchestrate::format_promotion_message(
+            task_id,
+            timeout,
+            window_ms,
+            worker_session,
+            bash_watch_available,
+        )
+    };
+    let reply = Response::success(
         &response.id,
         json!({
-            "output": format!(
-                "{}\n{REMOTE_ADMISSION_PENDING_NOTE}",
-                crate::commands::bash_orchestrate::format_promotion_message(
-                    task_id,
-                    timeout,
-                    window_ms,
-                    worker_session,
-                    bash_watch_available,
-                ),
-            ),
+            "output": format!("{guidance}\n{REMOTE_ADMISSION_PENDING_NOTE}"),
             "task_id": task_id,
             "status": "starting",
             "remote_phase": crate::bash_background::registry::remote::RemotePhase::Submitting.tag(),
             "remote_job_id": Value::Null,
         }),
     );
-    with_capture_warning(&promotion)
+    with_capture_warning(&reply)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6427,6 +6435,10 @@ mod grant_path_tests {
             .expect("a foreground runon call must answer at its window, not at runner admission")
             .unwrap();
         let waited = received.elapsed();
+        assert!(
+            waited >= Duration::from_secs(1),
+            "the foreground call replied early after {waited:?}"
+        );
         assert!(
             waited < Duration::from_secs(5),
             "the reply took {waited:?}, past the one-second window"
