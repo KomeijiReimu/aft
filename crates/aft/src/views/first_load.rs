@@ -2110,6 +2110,144 @@ mod composite_tests {
         resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
     }
 
+    struct PublicationOrderAdapter {
+        owner: super::super::registry::ViewRegistration,
+        producer: String,
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl PlaneAdapter for PublicationOrderAdapter {
+        fn plane(&self) -> FamilyPlane {
+            FamilyPlane::Trigram
+        }
+        fn producer(&self) -> String {
+            self.producer.clone()
+        }
+        fn applies_to(&self, _: &RelPath) -> bool {
+            true
+        }
+        fn open_generation(
+            &self,
+            access: &ViewAccess,
+            generation: &Arc<ComposedGeneration>,
+        ) -> Result<(), PlaneError> {
+            self.open_reader(access, generation).map(|_| ())
+        }
+        fn open_reader(
+            &self,
+            _: &ViewAccess,
+            generation: &Arc<ComposedGeneration>,
+        ) -> Result<Option<PlaneAttachment>, PlaneError> {
+            let view = self
+                .owner
+                .view_store()
+                .map_err(|e| SiblingLoader::error(e.to_string()))?;
+            let manifest = view
+                .load_manifest_v2(generation.name())
+                .map_err(|e| SiblingLoader::error(e.to_string()))?;
+            let store = self
+                .owner
+                .open_store(FamilyPlane::Trigram)
+                .map_err(|e| SiblingLoader::error(e.to_string()))?;
+            let reader = store.reader();
+            let keys: Vec<_> = manifest.ready_keys().collect();
+            assert!(
+                !keys.is_empty(),
+                "the real builder must have materialized a blob"
+            );
+            for key in keys {
+                assert!(reader.get(&key).unwrap().is_some());
+            }
+            self.events.lock().unwrap().push("reader-open");
+            Ok(Some(Arc::new(std::sync::Mutex::new(reader))))
+        }
+        fn release_generation(&self, _: &ViewAccess, _: &str) {}
+        fn readiness(
+            &self,
+            _: &ViewAccess,
+            _: &Snapshot,
+        ) -> super::super::readiness::PlaneReadiness {
+            super::super::readiness::PlaneReadiness::Ready {
+                pending: 0,
+                failed: 0,
+            }
+        }
+    }
+
+    struct PublicationOrderFence {
+        driver: std::sync::Weak<CheckoutDriver>,
+        store: super::super::ViewStore,
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl PublishFence for PublicationOrderFence {
+        fn publish(
+            &self,
+            commit: &mut dyn FnMut() -> Result<(), PlaneError>,
+        ) -> Result<(), PlaneError> {
+            assert_eq!(*self.events.lock().unwrap(), ["reader-open"]);
+            let driver = self.driver.upgrade().unwrap();
+            assert_eq!(driver.installed_bundle().composed.name(), "empty");
+            assert!(self.store.current_generation_read_only().unwrap().is_none());
+            commit()?;
+            assert!(self.store.current_generation_read_only().unwrap().is_some());
+            assert_eq!(
+                driver.installed_bundle().composed.name(),
+                "empty",
+                "pointer publication must not pretend installation happened"
+            );
+            self.events.lock().unwrap().push("pointer-published");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn real_checkout_publication_opens_blob_readers_before_cas_and_installs_after() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        let owner = driver.owner.clone();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = Arc::new(PublicationOrderAdapter {
+            owner: owner.clone(),
+            producer: driver.producers.trigram.clone(),
+            events: events.clone(),
+        });
+        let driver = Arc::new(
+            Arc::try_unwrap(driver)
+                .ok()
+                .unwrap()
+                .with_adapters(vec![adapter.clone()]),
+        );
+        let store = owner.view_store().unwrap();
+        driver.set_publish_fence(Arc::new(PublicationOrderFence {
+            driver: Arc::downgrade(&driver),
+            store: store.clone(),
+            events: events.clone(),
+        }));
+        let outcome = SiblingLoader::new(driver.clone(), vec![])
+            .load(&access)
+            .unwrap();
+        let published = store.current_generation_read_only().unwrap().unwrap();
+        assert_eq!(outcome.snapshot.generation().name(), published);
+        assert_eq!(driver.installed_bundle().composed.name(), published);
+        assert!(outcome
+            .snapshot
+            .readers()
+            .unwrap()
+            .resource(
+                Arc::as_ptr(&adapter) as usize,
+                access.family(),
+                access.scope(),
+                &outcome.snapshot.generation().resident_key()
+            )
+            .is_some());
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["reader-open", "pointer-published"]
+        );
+    }
+
     impl PlaneAdapter for RetirePauseAdapter {
         fn plane(&self) -> FamilyPlane {
             FamilyPlane::Trigram

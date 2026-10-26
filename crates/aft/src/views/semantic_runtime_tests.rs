@@ -150,6 +150,83 @@ fn composition_no_marker_boundary_record() {
 }
 
 #[test]
+fn composition_prune_dry_run_preserves_populated_v3_inventory() {
+    use crate::migration::prune_legacy::{
+        prune_legacy, CensusFinding, ProcessCensus, PruneExit, PruneOptions,
+    };
+    struct NoProcesses;
+    impl ProcessCensus for NoProcesses {
+        fn take(&self) -> Result<Vec<CensusFinding>, String> {
+            Ok(Vec::new())
+        }
+    }
+    fn inventory(root: &Path, path: &Path, out: &mut std::collections::BTreeMap<String, [u8; 32]>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                inventory(root, &path, out);
+            } else {
+                out.insert(
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    *blake3::hash(&std::fs::read(&path).unwrap()).as_bytes(),
+                );
+            }
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path();
+    let v3 = storage.join("blobs/v3/populated");
+    std::fs::create_dir_all(v3.join("views/worker")).unwrap();
+    // A legacy pruner must preserve opaque newer files, not just rows it can decode.
+    // These fixture files are opaque bytes with no live SQLite connection.
+    std::fs::write(v3.join("semantic.sqlite"), b"opaque future plane payload").unwrap();
+    std::fs::write(
+        v3.join("views/worker/manifest-future.json"),
+        br#"{"format_version":3,"entries":["kept.rs"]}"#,
+    )
+    .unwrap();
+    crate::reader_floor::raise(
+        storage,
+        &[
+            (crate::persisted_format::PersistedStore::ViewsV3Registry, 1),
+            (crate::persisted_format::PersistedStore::ViewsV3Store, 1),
+        ],
+    )
+    .unwrap();
+    let mut before = Default::default();
+    inventory(storage, &v3, &mut before);
+    assert_eq!(before.len(), 2);
+    let floor = std::fs::read(storage.join("reader-floor.json")).unwrap();
+    let mut output = Vec::new();
+    assert_eq!(
+        prune_legacy(
+            storage,
+            &PruneOptions {
+                yes: false,
+                now: std::time::SystemTime::now()
+            },
+            &NoProcesses,
+            None,
+            &mut output
+        )
+        .unwrap(),
+        PruneExit::Clean
+    );
+    let mut after = Default::default();
+    if v3.exists() {
+        inventory(storage, &v3, &mut after);
+    }
+    assert_eq!(before, after, "dry-run changed populated v3 files");
+    assert_eq!(
+        floor,
+        std::fs::read(storage.join("reader-floor.json")).unwrap()
+    );
+}
+
+#[test]
 fn lane_paused_view_fill_waits_without_rechunking_and_resumes() {
     use crate::semantic_index::{lane_pause_chunk_calls, with_lane_pause_clock, PauseRetryScope};
     use crate::synapse_embed::pause_test_support::*;
