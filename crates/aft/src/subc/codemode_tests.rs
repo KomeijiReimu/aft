@@ -199,7 +199,12 @@ fn codemode_agent_named_in_arguments_never_replaces_stamp_agent() {
     );
     let effective = owner(admit(&f.routes, channel(9), Some(&body)));
     let owner = effective.run_owner.as_ref().unwrap();
-    assert_eq!(owner.agent_id, "agent-a");
+    assert_eq!(
+        owner.kind,
+        RunKind::Agent {
+            agent_id: "agent-a".into()
+        }
+    );
     assert_eq!(owner.run_id, "run-1");
     assert_eq!(effective.session, "head-a-session");
     assert_eq!(effective.root, f.head_root);
@@ -531,9 +536,11 @@ fn codemode_identity_acting_for_a_run_is_not_the_runs_head() {
     let other_principal = other.spawn_principal.clone();
     edit_head(&mut f, |data| {
         data.run_owner = Some(Arc::new(RunOwner {
-            agent_id: "agent-a".into(),
+            kind: RunKind::Agent {
+                agent_id: "agent-a".into(),
+            },
             run_id: "earlier-run".into(),
-            head: other,
+            owner_route: other,
             run_route: channel(5),
             run_principal: other_principal,
         }));
@@ -671,7 +678,7 @@ fn codemode_head_routes_with_equivalent_first_party_principals_are_served() {
         assert_eq!(effective.trust, head.trust);
         assert_eq!(effective.disabled_tools, head.disabled_tools);
         assert!(Arc::ptr_eq(
-            &effective.run_owner.as_ref().unwrap().head.0,
+            &effective.run_owner.as_ref().unwrap().owner_route.0,
             &head.0
         ));
     }
@@ -876,7 +883,7 @@ fn codemode_head_routes_with_identical_saved_policies_keep_first_owner() {
             },
         ));
         assert!(Arc::ptr_eq(
-            &effective.run_owner.as_ref().unwrap().head.0,
+            &effective.run_owner.as_ref().unwrap().owner_route.0,
             &f.routes[&channel(1)].0
         ));
         assert_eq!(
@@ -1061,7 +1068,7 @@ fn codemode_head_route_regression_multi_checkout_selects_runs_root() {
         // Keep one route's principal, disabled tools and elicitation capability
         // together; never combine access settings across the two checkouts.
         assert!(Arc::ptr_eq(
-            &effective.run_owner.as_ref().unwrap().head.0,
+            &effective.run_owner.as_ref().unwrap().owner_route.0,
             &head.0
         ));
         assert_eq!(effective.root, head.root);
@@ -1137,4 +1144,217 @@ fn codemode_run_with_unauthorized_owner_is_refused() {
     run.owner_authorized = false;
     let f = fixture(run);
     assert_eq!(refusal_reason(&f), "run_owner_unauthorized");
+}
+
+/// A worker's own task scope, under the agent-a head scope.
+fn worker_stamp(scope_ref: &str) -> ScopeStamp {
+    serde_json::from_value(json!({
+        "owner": {"kind": "reserved", "module_id": OWNER},
+        "ref": scope_ref, "scope_epoch": 5, "kind": "worker",
+        "parent": {"owner": {"kind": "reserved", "module_id": OWNER}, "ref": "head-a", "scope_epoch": 3},
+        "parent_state": "linked",
+        "owner_authorized": true,
+    }))
+    .unwrap()
+}
+
+/// A worker run: `run_id` and `on_behalf_of_agent`, no `agent_id`, parented
+/// on the scope `parent` at `parent_epoch`.
+fn worker_run_stamp(parent: &str, parent_epoch: u64, parent_state: Option<&str>) -> ScopeStamp {
+    serde_json::from_value(json!({
+        "owner": {"kind": "reserved", "module_id": OWNER},
+        "ref": "worker-run-scope", "scope_epoch": 1, "kind": "ephemeral",
+        "attributes": {"on_behalf_of_agent": "agent-a", "run_id": "run-w"},
+        "parent": {"owner": {"kind": "reserved", "module_id": OWNER}, "ref": parent, "scope_epoch": parent_epoch},
+        "parent_state": parent_state,
+        "owner_authorized": true,
+    }))
+    .unwrap()
+}
+
+/// The agent-a head (channel 1), the agent-b head (channel 2), agent-a's
+/// worker on channel 4 under its own root, and the worker run on channel 9.
+fn worker_fixture(run: ScopeStamp) -> (Fixture, ProjectRootId) {
+    let mut f = fixture(run);
+    let (worker_dir, worker_root) = test_root("codemode-worker");
+    f.routes.insert(
+        channel(4),
+        route(
+            &worker_root,
+            "worker-session",
+            worker_stamp("worker-a"),
+            CallMode::Classic,
+        ),
+    );
+    f._dirs.push(worker_dir);
+    (f, worker_root)
+}
+
+fn worker_refusal(f: &Fixture) -> Value {
+    let body = call("read", json!({"path": "notes.txt"}));
+    let error = refusal(admit(&f.routes, channel(9), Some(&body)));
+    assert_eq!(error.code, RUN_OWNER_NOT_BOUND);
+    error.detail.unwrap()
+}
+
+#[test]
+fn worker_run_runs_with_its_workers_own_access_never_the_heads() {
+    let (f, worker_root) = worker_fixture(worker_run_stamp("worker-a", 5, Some("linked")));
+    let head = f.routes[&channel(1)].clone();
+    let worker = f.routes[&channel(4)].clone();
+    let run = f.routes[&channel(9)].clone();
+    // `call` names the head preset: the preset sets only the call's role,
+    // and the access is the worker route's either way.
+    let effective = owner(admit(
+        &f.routes,
+        channel(9),
+        Some(&call("edit", json!({"path": "notes.txt"}))),
+    ));
+    assert_eq!(effective.root, worker_root);
+    assert_eq!(effective.project_root, worker.project_root);
+    assert_eq!(effective.session, "worker-session");
+    assert_eq!(effective.spawn_principal, worker.spawn_principal);
+    assert_eq!(*effective.disabled_tools, *worker.disabled_tools);
+    assert_ne!(effective.session, head.session);
+    // Grants, frozen worker params and confinement come from the worker's
+    // own route, never the head's.
+    assert_eq!(
+        access_grants::policy_scope_key(&effective),
+        access_grants::scope_key(&worker)
+    );
+    assert_ne!(
+        access_grants::policy_scope_key(&effective),
+        access_grants::scope_key(&head)
+    );
+    let worker_key = remote_policy::key(&worker, Some("worker"));
+    assert!(worker_key.is_some());
+    assert_eq!(remote_policy::key(&effective, Some("worker")), worker_key);
+    assert_eq!(remote_policy::key(&effective, Some("head")), worker_key);
+    // Judged as the worker (worker jail, worker refusals), and nobody is
+    // asked on anyone's behalf.
+    assert!(access_grants::alfonso_worker(&effective));
+    assert_eq!(
+        access_grants::ask_route(&effective),
+        crate::access_policy::AskRoute::Unavailable
+    );
+    let owner = effective.run_owner.as_ref().unwrap();
+    assert_eq!(
+        owner.kind,
+        RunKind::Worker {
+            on_behalf_of_agent: "agent-a".into()
+        }
+    );
+    assert!(owner.is_worker_run());
+    assert_eq!(owner.run_id, "run-w");
+    assert!(std::ptr::eq(
+        worker_authority_route(&effective),
+        &owner.owner_route
+    ));
+    // Lifetime and ledger stay the run's.
+    assert_eq!(effective.scope, run.scope);
+    assert_eq!(effective.call_mode, CallMode::Codemode);
+    assert_eq!(
+        tool_provider::LedgerEdge::key(&effective, "k"),
+        tool_provider::LedgerEdge::key(&run, "k")
+    );
+}
+
+#[test]
+fn agent_run_keeps_no_worker_authority_route() {
+    let f = linked_fixture();
+    let effective = owner(admit(
+        &f.routes,
+        channel(9),
+        Some(&call("read", json!({"path": "notes.txt"}))),
+    ));
+    assert!(!effective.run_owner.as_ref().unwrap().is_worker_run());
+    assert!(std::ptr::eq(worker_authority_route(&effective), &effective));
+}
+
+#[test]
+fn worker_runs_shell_has_no_bot_identity_to_speak_as() {
+    let (f, _) = worker_fixture(worker_run_stamp("worker-a", 5, Some("linked")));
+    let effective = owner(admit(
+        &f.routes,
+        channel(9),
+        Some(&call("bash", json!({"command": "true"}))),
+    ));
+    // The gh relay finds a shell's scope by the session its ticket names: a
+    // worker run's shell runs in the worker's session, so it gets the
+    // worker's stamp, which names no agent to act as. Bot writes are refused
+    // (`bot_write_requires_scope`) exactly as for the worker's own shell.
+    let scopes = gh_relay_route_scopes(&f.routes);
+    let stamp = scopes
+        .for_session(&effective.session)
+        .expect("the worker session has one stamp");
+    assert_eq!(stamp, f.routes[&channel(4)].scope.as_ref().unwrap());
+    assert!(crate::gh_shim_relay::worker_scope(stamp));
+    assert_eq!(crate::gh_shim_relay::delegating_agent(stamp), None);
+    // The run's own stamp names no agent either.
+    let run_stamp = effective.scope.as_ref().unwrap();
+    assert_eq!(crate::gh_shim_relay::delegating_agent(run_stamp), None);
+}
+
+#[test]
+fn worker_run_under_a_head_scope_is_refused_parent_not_worker() {
+    let (f, _) = worker_fixture(worker_run_stamp("head-a", 3, Some("linked")));
+    let detail = worker_refusal(&f);
+    assert_eq!(detail["reason"], "parent_not_worker");
+    assert_eq!(detail["on_behalf_of_agent"], "agent-a");
+    assert_eq!(detail["run_id"], "run-w");
+    assert!(detail.get("agent_id").is_none(), "{detail}");
+}
+
+#[test]
+fn worker_run_without_live_worker_route_is_refused_never_served_by_the_head() {
+    let (mut f, _) = worker_fixture(worker_run_stamp("worker-a", 5, Some("linked")));
+    f.routes.remove(&channel(4));
+    assert_eq!(worker_refusal(&f)["reason"], "worker_route_not_bound");
+    // A worker route under another epoch of the scope is not this run's.
+    let (f, _) = worker_fixture(worker_run_stamp("worker-a", 6, Some("linked")));
+    assert_eq!(worker_refusal(&f)["reason"], "worker_route_not_bound");
+    // Nor is a route of the worker's scope bound in codemode.
+    let (mut f, _) = worker_fixture(worker_run_stamp("worker-a", 5, Some("linked")));
+    let worker = f.routes.get_mut(&channel(4)).unwrap();
+    Arc::get_mut(&mut worker.0).unwrap().call_mode = CallMode::Codemode;
+    assert_eq!(worker_refusal(&f)["reason"], "worker_route_not_bound");
+}
+
+#[test]
+fn worker_run_needs_a_linked_parent() {
+    for (state, reason) in [
+        (Some("pending"), "parent_pending"),
+        (Some("ended"), "parent_ended"),
+        (None, "parent_state_missing"),
+    ] {
+        let (f, _) = worker_fixture(worker_run_stamp("worker-a", 5, state));
+        assert_eq!(worker_refusal(&f)["reason"], reason, "{state:?}");
+    }
+    let mut run = worker_run_stamp("worker-a", 5, Some("linked"));
+    run.parent = None;
+    let (f, _) = worker_fixture(run);
+    assert_eq!(worker_refusal(&f)["reason"], "parent_missing");
+}
+
+#[test]
+fn worker_run_carrying_delegation_flow_or_an_agent_is_refused() {
+    let mut delegating = worker_run_stamp("worker-a", 5, Some("linked"));
+    delegating.attributes.delegates = true;
+    let (f, _) = worker_fixture(delegating);
+    assert_eq!(worker_refusal(&f)["reason"], "worker_run_delegates");
+
+    let mut flow = worker_run_stamp("worker-a", 5, Some("linked"));
+    flow.attributes.flow_id = Some("flow-1".into());
+    let (f, _) = worker_fixture(flow);
+    assert_eq!(worker_refusal(&f)["reason"], "worker_run_flow");
+
+    let mut both = worker_run_stamp("worker-a", 5, Some("linked"));
+    both.attributes.agent_id = Some("agent-a".into());
+    let (f, _) = worker_fixture(both);
+    assert_eq!(worker_refusal(&f)["reason"], "run_attribution_conflict");
+
+    let mut unauthorized = worker_run_stamp("worker-a", 5, Some("linked"));
+    unauthorized.owner_authorized = false;
+    let (f, _) = worker_fixture(unauthorized);
+    assert_eq!(worker_refusal(&f)["reason"], "run_owner_unauthorized");
 }

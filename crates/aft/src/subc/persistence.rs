@@ -129,6 +129,10 @@ impl DatabaseWaits {
         {
             return Err(decoded);
         }
+        // A worker run's call runs with its worker route's grants, so it
+        // restores that route's launch grants, exactly as the worker's own
+        // call would.
+        let identity = codemode::worker_authority_route(identity);
         let Some(key) = access_grants::launch_key(identity, "worker") else {
             return Err(decoded);
         };

@@ -3859,9 +3859,9 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.33.0"
+version = "0.33.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "587cff68a0d5b98eb85a7231ce00e3a117e3e50314ad6823d42b802afa5461a3"
+checksum = "ec8c260ce7c87a182f013344ff56c716eea3f1b96a4e6c9ae0608bfa0b3eb2de"
 dependencies = [
  "serde",
  "serde_json",

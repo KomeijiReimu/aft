@@ -4,7 +4,9 @@ use crate::db::remote_exec::{self as store, PolicyKey};
 
 pub(super) fn key(identity: &RouteIdentity, preset: Option<&str>) -> Option<PolicyKey> {
     // A requested worker preset cannot turn a head scope into a worker or
-    // make an old head-scoped row an enforceable routing policy.
+    // make an old head-scoped row an enforceable routing policy. A codemode
+    // call is judged by its owner route: an agent run's head never has one, a
+    // worker run's worker does.
     if head_scope(identity) {
         return None;
     }
@@ -15,7 +17,7 @@ fn head_scope(identity: &RouteIdentity) -> bool {
     let identity = identity
         .run_owner
         .as_ref()
-        .map_or(identity, |owner| &owner.head);
+        .map_or(identity, |owner| &owner.owner_route);
     identity
         .scope
         .as_ref()
@@ -23,11 +25,12 @@ fn head_scope(identity: &RouteIdentity) -> bool {
 }
 
 fn policy_key(identity: &RouteIdentity, preset: Option<&str>) -> Result<PolicyKey, &'static str> {
-    // A codemode call is confined exactly as its head agent's route is.
+    // A codemode call is confined exactly as its owner route is: the head
+    // agent's for an agent run, the worker's own for a worker run.
     let identity = identity
         .run_owner
         .as_ref()
-        .map_or(identity, |owner| &owner.head);
+        .map_or(identity, |owner| &owner.owner_route);
     if preset != Some("worker") {
         return Err("missing:preset");
     }
