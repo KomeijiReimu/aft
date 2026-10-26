@@ -164,3 +164,33 @@ fn callgraph_unknown_rust_test_status_is_disclosed_not_guessed() {
     assert_eq!(callers(&store, "lib.rs", "target", false), "Test filtering incomplete: test-ness could not be determined for 1 caller site; they remain visible.\n1 caller · 1 file group\nlib.rs\n  ↳ caller:2");
     assert_eq!(impact(&store, "lib.rs", "target", false), "Test filtering incomplete: test-ness could not be determined for 1 caller site; they remain visible.\n1 affected call site · 1 file\nlib.rs:2\n  ↳ caller\n  fn caller() { target(); }");
 }
+
+#[test]
+fn callgraph_class_initializer_keeps_its_owner_inside_an_enclosing_function() {
+    let source = "function helper() {}\nfunction outer() {\n class Inner {\n  static initial = helper();\n  run() { helper(); }\n }\n}\n";
+    let data = crate::callgraph::build_file_data_from_source(Path::new("main.ts"), source).unwrap();
+    let (class, _) = data
+        .symbol_metadata
+        .iter()
+        .find(|(_, meta)| meta.kind == crate::symbols::SymbolKind::Class)
+        .unwrap();
+    assert_eq!(
+        data.calls_by_symbol[class]
+            .iter()
+            .map(|site| site.line)
+            .collect::<Vec<_>>(),
+        vec![4]
+    );
+    let (method, _) = data
+        .symbol_metadata
+        .iter()
+        .find(|(_, meta)| meta.kind == crate::symbols::SymbolKind::Method)
+        .unwrap();
+    assert_eq!(
+        data.calls_by_symbol[method]
+            .iter()
+            .map(|site| site.line)
+            .collect::<Vec<_>>(),
+        vec![5]
+    );
+}

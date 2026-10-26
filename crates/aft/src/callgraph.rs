@@ -1586,18 +1586,21 @@ fn attribute_sites_to_symbols(
             byte_end,
         };
         let mut attributed = false;
-        let callable_owner = active_ranges.iter().any(|index| {
-            let range = &ranges[*index];
-            byte_end <= range.byte_end
-                && matches!(
-                    symbols[range.symbol_index].kind,
-                    SymbolKind::Function | SymbolKind::Method
-                )
-        });
         for range_index in &active_ranges {
             let range = &ranges[*range_index];
             // Method bodies execute when the method is called, not when its class is constructed.
-            if callable_owner && symbols[range.symbol_index].kind == SymbolKind::Class {
+            if symbols[range.symbol_index].kind == SymbolKind::Class
+                && active_ranges.iter().any(|index| {
+                    let callable = &ranges[*index];
+                    range.byte_start <= callable.byte_start
+                        && callable.byte_end <= range.byte_end
+                        && byte_end <= callable.byte_end
+                        && matches!(
+                            symbols[callable.symbol_index].kind,
+                            SymbolKind::Function | SymbolKind::Method
+                        )
+                })
+            {
                 continue;
             }
             if byte_end <= range.byte_end {
