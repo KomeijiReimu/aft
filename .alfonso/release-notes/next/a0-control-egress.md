@@ -1,1 +1,1 @@
-- Route binds and management replies no longer wait for tool-outcome persistence; candidate calls and replayed events wait for the written bind acknowledgement, and cancelled queued binds receive one control error instead of losing their reply.
+- When the disk is slow, AFT no longer holds up new sessions connecting to it while it saves earlier results, and a request sent while a session is still connecting now waits for the connection instead of failing.
