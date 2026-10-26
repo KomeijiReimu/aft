@@ -915,6 +915,26 @@ impl PinnedDir {
         removed: &mut usize,
         warnings: &mut Vec<String>,
     ) -> io::Result<()> {
+        self.repair_remove_child_with_budget(
+            name,
+            expected,
+            protected,
+            removed,
+            warnings,
+            &mut RepairBudget::new(),
+        )
+    }
+
+    pub(crate) fn repair_remove_child_with_budget(
+        &self,
+        name: &OsStr,
+        expected: (u64, u64),
+        protected: &[(u64, u64)],
+        removed: &mut usize,
+        warnings: &mut Vec<String>,
+        budget: &mut RepairBudget,
+    ) -> io::Result<()> {
+        budget.enter(0)?;
         let child = self.repair_child(name)?;
         if child.directory_identity()? != expected {
             return Err(io::Error::other("repair child identity changed"));
@@ -925,14 +945,7 @@ impl PinnedDir {
             protected,
         };
         policy.check(&child)?;
-        repair_remove_contents(
-            &child,
-            &policy,
-            removed,
-            &mut RepairBudget::new(),
-            0,
-            warnings,
-        )?;
+        repair_remove_contents(&child, &policy, removed, budget, 0, warnings)?;
         if let Some(reason) = self.repair_unlink_directory(name, &child)? {
             warnings.push(format!(
                 "removed_with_warning: {}: {reason}",
@@ -3427,8 +3440,16 @@ pub(crate) fn with_openat_file_hook<T>(hook: OpenatFileHook, action: impl FnOnce
 pub(crate) struct RepairBudget {
     remaining: usize,
     deadline: std::time::Instant,
+    cancelled: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 impl RepairBudget {
+    pub(crate) fn limited(&self, entries: usize) -> Self {
+        Self {
+            remaining: self.remaining.min(entries),
+            deadline: self.deadline,
+            cancelled: self.cancelled.clone(),
+        }
+    }
     pub(crate) fn with_entries(entries: usize) -> Self {
         let mut budget = Self::new();
         budget.remaining = entries;
@@ -3438,9 +3459,25 @@ impl RepairBudget {
         Self {
             remaining: 1_000_000,
             deadline: std::time::Instant::now() + Duration::from_secs(60),
+            cancelled: None,
         }
     }
+    pub(crate) fn until(
+        deadline: std::time::Instant,
+        cancelled: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Self {
+        let mut budget = Self::new();
+        budget.deadline = budget.deadline.min(deadline);
+        budget.cancelled = Some(cancelled);
+        budget
+    }
     pub(crate) fn enter(&self, depth: usize) -> io::Result<()> {
+        if self.cancelled.as_ref().is_some_and(|cancelled| cancelled()) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "repair cancelled",
+            ));
+        }
         if depth > 64 || std::time::Instant::now() >= self.deadline {
             return Err(io::Error::other("repair traversal limit exceeded"));
         }
@@ -3756,6 +3793,7 @@ fn repair_remove_contents(
             .then_with(|| left.cmp(right))
     });
     for name in names {
+        budget.enter(depth)?;
         match dir.repair_child(&name) {
             Ok(child) => {
                 policy.check(&child)?;

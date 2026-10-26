@@ -1590,14 +1590,22 @@ fn known_harness(name: &str) -> bool {
     crate::engram_catalog::harness_label(name).is_some()
 }
 fn candidates_and_durable(storage: &Path) -> io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
-    let mut budget = RepairBudget::new();
+    candidates_and_durable_with_budget(storage, &mut RepairBudget::new())
+}
+
+fn candidates_and_durable_with_budget(
+    storage: &Path,
+    budget: &mut RepairBudget,
+) -> io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let mut candidates = CACHE_DOMAINS
         .iter()
         .map(|name| storage.join(name))
         .collect::<Vec<_>>();
     let mut durable = Vec::new();
-    for entry in fs::read_dir(storage)? {
+    let mut entries = fs::read_dir(storage)?;
+    loop {
         budget.entry()?;
+        let Some(entry) = entries.next() else { break };
         let entry = entry?;
         let name = entry.file_name();
         if name
@@ -1609,8 +1617,10 @@ fn candidates_and_durable(storage: &Path) -> io::Result<(Vec<PathBuf>, Vec<PathB
         if name.to_str().is_some_and(known_harness) && entry.file_type()?.is_dir() {
             let legacy = [entry.path().join("callgraph"), entry.path().join("inspect")];
             candidates.extend(legacy);
-            for child in fs::read_dir(entry.path())? {
+            let mut children = fs::read_dir(entry.path())?;
+            loop {
                 budget.entry()?;
+                let Some(child) = children.next() else { break };
                 let child = child?;
                 if !matches!(child.file_name().to_str(), Some("callgraph" | "inspect")) {
                     durable.push(child.path());
@@ -1624,8 +1634,14 @@ fn candidates_and_durable(storage: &Path) -> io::Result<(Vec<PathBuf>, Vec<PathB
 }
 
 pub(crate) fn deletion_protections(paths: &[PathBuf]) -> io::Result<Vec<(u64, u64)>> {
+    deletion_protections_with_budget(paths, &mut RepairBudget::new())
+}
+
+fn deletion_protections_with_budget(
+    paths: &[PathBuf],
+    budget: &mut RepairBudget,
+) -> io::Result<Vec<(u64, u64)>> {
     let mut protected = Vec::new();
-    let mut budget = RepairBudget::new();
     for path in paths {
         budget.entry()?;
         if !path.try_exists()? {
@@ -1640,7 +1656,7 @@ pub(crate) fn deletion_protections(paths: &[PathBuf]) -> io::Result<Vec<(u64, u6
         };
         if canonical.is_dir() {
             match PinnedDir::open(&canonical) {
-                Ok(pinned) => pinned.repair_directory_identities(&mut protected, &mut budget)?,
+                Ok(pinned) => pinned.repair_directory_identities(&mut protected, budget)?,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
@@ -1656,6 +1672,13 @@ pub(crate) fn deletion_protections(paths: &[PathBuf]) -> io::Result<Vec<(u64, u6
 pub(crate) fn retention_protections(storage: &StoragePaths) -> io::Result<Vec<(u64, u64)>> {
     let (_, durable) = candidates_and_durable(&storage.durable)?;
     deletion_protections(&durable)
+}
+pub(crate) fn retention_protections_with_budget(
+    storage: &StoragePaths,
+    budget: &mut RepairBudget,
+) -> io::Result<Vec<(u64, u64)>> {
+    let (_, durable) = candidates_and_durable_with_budget(&storage.durable, budget)?;
+    deletion_protections_with_budget(&durable, budget)
 }
 /// Register an explicitly supplied owner, never infer durable state from a
 /// cache pathname. Split roots also need their persisted namespace marker.

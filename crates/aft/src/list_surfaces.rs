@@ -650,15 +650,15 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "cache_location.rs",
-        enclosing_item: "candidates_and_durable, deletion_protections, ensure_cache_idle",
+        enclosing_item: "candidates_and_durable, candidates_and_durable_with_budget, deletion_protections, deletion_protections_with_budget, retention_protections_with_budget, ensure_cache_idle",
         location_or_primitive: "RepairBudget",
         reason: "internal cleanup preflight, not result lists; exhausting the traversal budget refuses all deletion rather than accepting incomplete protection or lock inventories",
     },
     ExclusionEntry {
         file: "storage_retention.rs",
-        enclosing_item: "bounded_dirs, traversal_batch_filtered, next_batch, sweep_view_generations, generation_registries, report_generation_registry_error, validate_tree, due_first, orphan_first, run_pass_with_budget, prune_bindings, retirement_members, write_retirement_witness, verify_retirement_witness",
-        location_or_primitive: "DUE_FIRST_ENTRIES, PASS_ENTRIES, TREE_ENTRIES, HISTORY_ENTRIES, 64-view generation batch, 16 diagnostic errors, take",
-        reason: "internal disk-maintenance walks, not tool-result lists; bounded lexical batches persist only processed names, incomplete protection snapshots refuse deletion, and health reports examined, removed, remaining vanished views and stopped-early counts",
+        enclosing_item: "bounded_dirs, traversal_batch_filtered, next_batch, sweep_view_generations, generation_registries, report_generation_registry_error, validate_tree, validate_tree_with_admission, reap_trash, reap_trash_with_snapshot_budget, reap_trash_with_cursor, trash_scans, reap_retired_with_budget, due_first, orphan_first, run_pass_with_budget, prune_bindings, retirement_members, retirement_members_with_budget, write_retirement_witness, verify_retirement_witness",
+        location_or_primitive: "DUE_FIRST_ENTRIES, PASS_ENTRIES, TREE_ENTRIES, HISTORY_ENTRIES, TRASH_SCAN_HANDLES, reaper deadline and 10ms mount-snapshot admission budget, 64-view generation batch, 16 diagnostic errors, take",
+        reason: "internal disk-maintenance walks, not tool-result lists; bounded lexical batches persist only processed names, incomplete protection snapshots refuse deletion, and health reports remaining views, trash estimates, kept reasons and incomplete censuses",
     },
     ExclusionEntry {
         file: "views/registry.rs",

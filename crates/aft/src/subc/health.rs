@@ -1877,7 +1877,24 @@ fn retention_report_totals(
     reports: &std::collections::BTreeMap<String, crate::storage_retention::SweepReport>,
 ) -> Value {
     let mut totals = serde_json::Map::from_iter([("reports".into(), json!(reports.len()))]);
+    let mut trash = crate::storage_retention::TrashReport {
+        at_ms: crate::pins::now_ms(),
+        ..Default::default()
+    };
     for report in reports.values() {
+        let census = &report.trash;
+        trash.entries = trash.entries.saturating_add(census.entries);
+        trash.bytes_estimate = trash.bytes_estimate.saturating_add(census.bytes_estimate);
+        trash.removed_entries = trash.removed_entries.saturating_add(census.removed_entries);
+        trash.incomplete |= census.incomplete || census.at_ms == 0;
+        if let Some(age) = census.oldest_age_ms {
+            let age = age.saturating_add(trash.at_ms.saturating_sub(census.at_ms));
+            trash.oldest_age_ms = Some(trash.oldest_age_ms.unwrap_or(0).max(age));
+        }
+        for (reason, count) in &census.kept_by_reason {
+            let total = trash.kept_by_reason.entry(reason.clone()).or_default();
+            *total = total.saturating_add(*count);
+        }
         for (field, value) in serde_json::to_value(report).unwrap().as_object().unwrap() {
             let (key, count) = match value {
                 Value::Number(number) if field != "at_ms" => {
@@ -1891,6 +1908,10 @@ fn retention_report_totals(
             totals.insert(key, json!(total.saturating_add(count)));
         }
     }
+    // Detail reports can be omitted by the health payload budget; keep the
+    // trash backlog and counts of entries retained by reason in the aggregate
+    // that survives trimming.
+    totals.insert("trash".into(), serde_json::to_value(trash).unwrap());
     Value::Object(totals)
 }
 
@@ -8156,6 +8177,18 @@ mod tests {
                         removed_roots: 3,
                         removed_bytes: 4096,
                         errors: vec!["example maintenance error".repeat(8)],
+                        trash: crate::storage_retention::TrashReport {
+                            at_ms: crate::pins::now_ms(),
+                            entries: 2,
+                            bytes_estimate: 1_500_000_000,
+                            oldest_age_ms: Some(7_200_000),
+                            removed_entries: 1,
+                            incomplete: true,
+                            kept_by_reason: std::collections::BTreeMap::from([(
+                                "witness".into(),
+                                2,
+                            )]),
+                        },
                         ..Default::default()
                     },
                 )
@@ -8183,6 +8216,13 @@ mod tests {
         assert_eq!(metrics["storage_retention_totals"]["removed_roots"], 384);
         assert_eq!(metrics["storage_retention_totals"]["removed_bytes"], 524288);
         assert_eq!(metrics["storage_retention_totals"]["errors"], 128);
+        let trash = &metrics["storage_retention_totals"]["trash"];
+        assert_eq!(trash["entries"], 256);
+        assert_eq!(trash["bytes_estimate"], 192_000_000_000_u64);
+        assert_eq!(trash["removed_entries"], 128);
+        assert_eq!(trash["kept_by_reason"]["witness"], 256);
+        assert_eq!(trash["incomplete"], true);
+        assert!(trash["oldest_age_ms"].as_u64().unwrap() >= 7_200_000);
         let encoded = serde_json::to_vec(&metrics).unwrap();
         assert!(encoded.len() <= 12 * 1024);
         assert_eq!(metrics["metrics_bytes"], encoded.len());
