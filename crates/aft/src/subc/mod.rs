@@ -228,6 +228,8 @@ pub use self::health::SubcTestHealthRollupProbe;
 mod manifest;
 mod page_collect;
 mod persistence;
+#[cfg(test)]
+mod prepared_bind_tests;
 mod push;
 mod readiness;
 mod remote_policy;
@@ -1454,6 +1456,8 @@ struct PendingBind {
 }
 
 struct RouteBindCompletion {
+    expected_snapshot_id: Option<u64>,
+    applied_snapshot_id: Option<u64>,
     route: RouteChannel,
     identity: RouteIdentity,
     bind_root_id: ProjectRootId,
@@ -7126,6 +7130,16 @@ async fn handle_route_bind_completion(
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
     let route_id = completion.route;
+    if completion.configure_response.success
+        && completion.expected_snapshot_id.is_some()
+        && completion.expected_snapshot_id != completion.applied_snapshot_id
+    {
+        completion.configure_response = Response::error(
+            "bind-config-witness",
+            "config_unknown",
+            "configure did not apply this bind's prepared configuration snapshot",
+        );
+    }
     if !ack_written
         && completion.configure_response.success
         && pending_binds
@@ -8106,6 +8120,9 @@ async fn handle_control_request(
 
             sync_bg_live_delivery_sessions(executor, routes, Some(&bind_root_id), Some(metrics));
             let configure_request_id = configure_req.id.clone();
+            let expected_snapshot_id = prepared_config.as_ref().map(|snapshot| snapshot.id());
+            let applied_snapshot = Arc::new(AtomicU64::new(0));
+            let job_snapshot = Arc::clone(&applied_snapshot);
             installed_route_epochs.insert(route_channel, epoch);
             if let Some(meta) = live_roots.get_mut(&bind_root_id) {
                 meta.maintenance_queued_kinds.clear();
@@ -8126,6 +8143,7 @@ async fn handle_control_request(
                     Arc::new(move |ctx| {
                         log_ctx::with_session(Some(configure_session.clone()), || {
                             let bind_started = Instant::now();
+                            job_snapshot.store(0, Ordering::Release);
                             let response = match prepared_config.as_ref() {
                                 Some(snapshot) => crate::subc_config::with_prepared_bind_config(
                                     Arc::clone(snapshot),
@@ -8133,6 +8151,12 @@ async fn handle_control_request(
                                 ),
                                 None => dispatch(configure_req.clone(), ctx),
                             };
+                            if response.success {
+                                job_snapshot.store(
+                                    ctx.config_live().applied_bind_snapshot().unwrap_or(0),
+                                    Ordering::Release,
+                                );
+                            }
                             if response.success {
                                 // Revoke matching standing publication before the
                                 // session is installed, but never on the frame loop.
@@ -8188,6 +8212,11 @@ async fn handle_control_request(
                 // read data, so a later maintenance pass can do it without delaying the
                 // daemon's confirmation that the route is usable.
                 let completion = RouteBindCompletion {
+                    expected_snapshot_id,
+                    applied_snapshot_id: match applied_snapshot.load(Ordering::Acquire) {
+                        0 => None,
+                        id => Some(id),
+                    },
                     route: route_key(completion_route_channel, epoch),
                     identity: completion_identity,
                     bind_root_id: completion_root,
@@ -13938,7 +13967,13 @@ mod tests {
                 &fixture_path.join("absent-connection.json"),
                 app,
                 loop_executor,
-                |request, _| Response::success(request.id, json!({})),
+                |request, ctx| {
+                    if request.command == "configure" {
+                        crate::commands::configure::handle_configure(&request, ctx)
+                    } else {
+                        Response::success(request.id, json!({}))
+                    }
+                },
                 Some(fixture_path.join("absent-user-config.json")),
                 false,
                 usize::MAX,
@@ -14102,7 +14137,13 @@ mod tests {
                 &fixture_path.join("absent-connection.json"),
                 app,
                 loop_executor,
-                |request, _| Response::success(request.id, json!({})),
+                |request, ctx| {
+                    if request.command == "configure" {
+                        crate::commands::configure::handle_configure(&request, ctx)
+                    } else {
+                        Response::success(request.id, json!({}))
+                    }
+                },
                 Some(fixture_path.join("absent-user-config.json")),
                 false,
                 usize::MAX,
@@ -14605,7 +14646,13 @@ mod tests {
                 None,
                 &cache,
                 &senders,
-                |request, _| Response::success(request.id, json!({})),
+                |request, ctx| {
+                    if request.command == "configure" {
+                        crate::commands::configure::handle_configure(&request, ctx)
+                    } else {
+                        Response::success(request.id, json!({}))
+                    }
+                },
                 Some(&dir.path().join("absent-user-config.json")),
                 usize::MAX,
                 None,
@@ -19217,6 +19264,8 @@ mod tests {
             identity,
             bind_root_id: root.clone(),
             inserted_new_actor: false,
+            expected_snapshot_id: None,
+            applied_snapshot_id: None,
             configure_response: Response::success("subc-bind-7", json!({})),
             diagnostics_on_edit: false,
             ver: PROTOCOL_VERSION,
@@ -19342,6 +19391,8 @@ mod tests {
             identity,
             bind_root_id: root.clone(),
             inserted_new_actor: false,
+            expected_snapshot_id: None,
+            applied_snapshot_id: None,
             configure_response: Response::success("subc-bind-8", json!({})),
             diagnostics_on_edit: false,
             ver: PROTOCOL_VERSION,
@@ -23566,7 +23617,13 @@ mod pong_priority_tests {
                 &storage_path.join("connection.json"),
                 App::default_shared(),
                 module_executor,
-                |request, _| Response::success(request.id, json!({})),
+                |request, ctx| {
+                    if request.command == "configure" {
+                        crate::commands::configure::handle_configure(&request, ctx)
+                    } else {
+                        Response::success(request.id, json!({}))
+                    }
+                },
                 Some(storage_path.join("user.json")),
                 false,
                 usize::MAX,

@@ -3,7 +3,10 @@
 use super::*;
 use std::cell::RefCell;
 use std::io::Read;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 
 const CONFIG_FILE_LIMIT: usize = 1024 * 1024;
 
@@ -27,6 +30,7 @@ impl std::fmt::Display for ConfigObservationError {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedBindConfig {
+    snapshot_id: u64,
     root: PathBuf,
     harness: Harness,
     user_path: Option<PathBuf>,
@@ -83,6 +87,7 @@ impl PreparedBindConfig {
             });
         }
         Ok(Arc::new(Self {
+            snapshot_id: NEXT_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed),
             root: root.into(),
             harness: harness.clone(),
             user_path: user_path.map(Path::to_path_buf),
@@ -95,6 +100,9 @@ impl PreparedBindConfig {
 
     pub(crate) fn matches(&self, root: &Path, harness: &Harness) -> bool {
         self.root == root && &self.harness == harness
+    }
+    pub(crate) fn id(&self) -> u64 {
+        self.snapshot_id
     }
 
     pub(crate) fn tiers(&self) -> &[ConfigTier] {
@@ -110,12 +118,14 @@ impl PreparedBindConfig {
         &self,
         config: &crate::config::Config,
     ) -> crate::config_live::ConfigSources {
-        crate::config_live::ConfigSources::from_observed_paths(
+        let mut sources = crate::config_live::ConfigSources::from_observed_paths(
             self.user_path.clone(),
             self.project_path.clone(),
             &self.tiers,
             config,
-        )
+        );
+        sources.prepared_bind_snapshot_id = Some(self.snapshot_id);
+        sources
     }
     pub(crate) fn legacy_notice(&self) -> Option<String> {
         self.tiers
@@ -145,23 +155,30 @@ fn observe(path: &Path, tier: &str) -> Result<ConfigObservation, ConfigObservati
         }
         Err(error) => return Err(unknown(path, &error)),
     };
-    let mut bytes = Vec::new();
-    file.take((CONFIG_FILE_LIMIT + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|error| unknown(path, &error))?;
-    if bytes.len() > CONFIG_FILE_LIMIT {
-        return Err(unknown(
-            path,
-            &std::io::Error::other("configuration exceeds the 1 MiB observation limit"),
-        ));
-    }
-    let doc = String::from_utf8(bytes)
-        .map_err(|_| unknown(path, &std::io::Error::other("configuration is not UTF-8")))?;
+    let doc =
+        read_bounded_config(file, CONFIG_FILE_LIMIT).map_err(|error| unknown(path, &error))?;
     Ok(ConfigObservation::Present(ConfigTier {
         tier: tier.into(),
         source: path.to_string_lossy().into_owned(),
         doc,
     }))
+}
+
+/// Bound I/O itself, including migration's locked reread, rather than reading
+/// the entire file and checking its size after allocation.
+pub(crate) fn read_bounded_config(reader: impl Read, limit: usize) -> std::io::Result<String> {
+    let detection_limit = limit
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("invalid config byte limit"))?;
+    let mut bytes = Vec::new();
+    reader
+        .take(detection_limit as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(std::io::Error::other("configuration exceeds byte limit"));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 thread_local! {
@@ -193,6 +210,43 @@ mod tests {
     fn put(path: &Path, text: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn prepared_read_never_requests_bytes_beyond_limit_plus_one() {
+        struct ReadFence {
+            bytes: usize,
+        }
+        impl Read for &mut ReadFence {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                if out.is_empty() {
+                    return Ok(0);
+                }
+                assert!(self.bytes < 17, "read beyond config limit+1");
+                let count = out.len().min(17 - self.bytes);
+                out[..count].fill(b' ');
+                self.bytes += count;
+                Ok(count)
+            }
+        }
+        let mut reader = ReadFence { bytes: 0 };
+        assert!(read_bounded_config(&mut reader, 16).is_err());
+        assert_eq!(reader.bytes, 17);
+    }
+
+    #[test]
+    fn prepared_migration_rereads_use_the_same_read_time_bound() {
+        let source = include_str!("../config_fix.rs");
+        let body = source
+            .split_once("pub(crate) fn auto_migrate_user_config_bounded(")
+            .unwrap()
+            .1
+            .split_once("fn auto_migrate_user_config_with_reader(")
+            .unwrap()
+            .0;
+        assert!(body.contains("read_bounded_config(file, limit)"));
+        assert!(!body.contains("read_to_string"));
+        assert!(!body.contains("read_to_end"));
     }
 
     #[test]
@@ -259,6 +313,21 @@ mod tests {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             with_prepared_bind_config(snapshot, || panic!("scope unwind"))
         }));
+        assert!(current_prepared_bind_config().is_none());
+    }
+
+    #[test]
+    fn prepared_nested_scope_restores_the_previous_snapshot_after_unwind() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = PreparedBindConfig::read(None, dir.path(), &Harness::Pi).unwrap();
+        let inner = PreparedBindConfig::read(None, dir.path(), &Harness::Opencode).unwrap();
+        let expected = outer.id();
+        with_prepared_bind_config(outer, || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_prepared_bind_config(inner, || panic!("nested scope unwind"))
+            }));
+            assert_eq!(current_prepared_bind_config().unwrap().id(), expected);
+        });
         assert!(current_prepared_bind_config().is_none());
     }
 }

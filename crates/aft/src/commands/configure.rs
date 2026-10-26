@@ -3561,6 +3561,7 @@ fn handle_configure_prepared(
     // refused connect that left it in place.
     let active_before = prepared.is_none().then(|| ctx.config_unpinned());
     if prepared.is_none() {
+        ctx.config_live().clear_applied_bind_snapshot();
         ctx.note_connect_started();
     }
     let _sources_scope = crate::config_live::configure_sources_scope();
@@ -17445,6 +17446,57 @@ mod tests {
                 assert_eq!(
                     cached_after_pass, None,
                     "a read of a provisional root's key does not cache it"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn prepared_bind_identity_replay_retains_the_original_observation() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_temp, root, storage, lock) = busy_bind_fixture();
+        let ctx = test_context();
+        let user = root.join("user.jsonc");
+        let legacy = root.join(".pi/aft.jsonc");
+        write_config(
+            &user,
+            r#"{"indexes":{"trigram":true,"semantic":false,"callgraph":false},"views":{"enabled":false},"url_fetch_allow_private":true}"#,
+        );
+        write_config(&legacy, r#"{"callgraph_chunk_size":7}"#);
+        let snapshot = crate::subc_config::PreparedBindConfig::read(
+            Some(&user),
+            &root,
+            &crate::harness::Harness::Pi,
+        )
+        .unwrap();
+        let request = configure_request_with_params(
+            json!({"project_root":root,"storage_dir":storage,"harness":"pi","cortexkit_user_config_path":user}),
+        );
+        crate::provisional_identity_retry::with_timing_for_test(
+            Duration::ZERO,
+            Duration::from_secs(600),
+            || {
+                let response = crate::subc_config::with_prepared_bind_config(snapshot, || {
+                    super::handle_configure(&request, &ctx)
+                });
+                assert!(response.success, "{}", response.data);
+                super::drain_deferred_configure_maintenance(&ctx);
+                assert!(ctx.provisional_identity_retry().is_armed());
+                write_config(&user, r#"{"url_fetch_allow_private":false}"#);
+                write_config(
+                    &root.join(".cortexkit/aft.jsonc"),
+                    r#"{"callgraph_chunk_size":9}"#,
+                );
+                fs::remove_file(&legacy).unwrap();
+                lock.execute_batch("ROLLBACK").unwrap();
+                drop(lock);
+                super::drain_deferred_configure_maintenance(&ctx);
+                assert!(!ctx.provisional_identity_retry().is_armed());
+                assert_eq!(ctx.config().callgraph_chunk_size, 7);
+                assert!(ctx.config().url_fetch_allow_private);
+                assert_eq!(
+                    ctx.config_live().sources().unwrap().project.path.as_deref(),
+                    Some(legacy.as_path())
                 );
             },
         );

@@ -607,7 +607,6 @@ pub(crate) fn auto_migrate_user_config_bounded(
     path: &Path,
     limit: usize,
 ) -> std::io::Result<Option<UserConfigMigration>> {
-    use std::io::Read;
     let mut failure = None;
     let result = auto_migrate_user_config_with_reader(
         path,
@@ -615,15 +614,7 @@ pub(crate) fn auto_migrate_user_config_bounded(
         |path| {
             let read = (|| {
                 let file = std::fs::File::open(path)?;
-                let mut bytes = Vec::new();
-                file.take((limit + 1) as u64).read_to_end(&mut bytes)?;
-                if bytes.len() > limit {
-                    return Err(std::io::Error::other(
-                        "configuration exceeds migration byte limit",
-                    ));
-                }
-                String::from_utf8(bytes)
-                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+                crate::subc_config::read_bounded_config(file, limit)
             })();
             if let Err(error) = &read {
                 failure = Some(std::io::Error::new(error.kind(), error.to_string()));

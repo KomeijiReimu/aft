@@ -169,6 +169,7 @@ enum RetryKind {
 struct PendingRetry {
     /// The configure request whose bind left a retryable degradation.
     request: RawRequest,
+    prepared_bind: Option<std::sync::Arc<crate::subc_config::PreparedBindConfig>>,
     kind: RetryKind,
     root: std::path::PathBuf,
     connect_generation: u64,
@@ -258,6 +259,7 @@ pub(crate) fn note_configure_outcome(ctx: &AppContext, request: &RawRequest, suc
     }
     *slot = Some(PendingRetry {
         request: request.clone(),
+        prepared_bind: crate::subc_config::current_prepared_bind_config(),
         kind,
         root,
         connect_generation: ctx.connect_generation(),
@@ -496,7 +498,7 @@ impl PreparedReplay {
         if retry.kind == RetryKind::CacheCoordination {
             retry.attempts = retry.attempts.saturating_add(1);
         }
-        let response = match retry.kind {
+        let run = || match retry.kind {
             RetryKind::Identity => {
                 crate::commands::configure::handle_configure(&retry.request, ctx)
             }
@@ -512,6 +514,10 @@ impl PreparedReplay {
                     &prepared,
                 )
             }
+        };
+        let response = match retry.prepared_bind.as_ref() {
+            Some(prepared) => crate::subc_config::with_prepared_bind_config(prepared.clone(), run),
+            None => run(),
         };
         if response.data["code"] == "configure_needs_exclusive" {
             // A shared-hold run handed its worker back before changing the

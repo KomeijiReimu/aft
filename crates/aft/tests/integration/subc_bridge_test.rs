@@ -706,6 +706,10 @@ impl BridgeState {
 }
 
 fn configure_bridge_context(req: &RawRequest, ctx: &AppContext) -> Response {
+    let configured = aft::commands::configure::handle_configure(req, ctx);
+    if !configured.success {
+        return configured;
+    }
     let root = match req.params.get("project_root").and_then(Value::as_str) {
         Some(root) => std::path::PathBuf::from(root),
         None => {

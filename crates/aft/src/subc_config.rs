@@ -20,7 +20,8 @@ use std::path::{Path, PathBuf};
 
 mod prepared;
 pub(crate) use prepared::{
-    current_prepared_bind_config, with_prepared_bind_config, PreparedBindConfig,
+    current_prepared_bind_config, read_bounded_config, with_prepared_bind_config,
+    PreparedBindConfig,
 };
 
 /// CortexKit user config home: `$XDG_CONFIG_HOME/cortexkit/aft.jsonc`, falling

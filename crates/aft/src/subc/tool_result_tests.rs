@@ -249,7 +249,7 @@ async fn tool_result_ast_search_t6_complete_and_budget_cut_on_negotiated_route()
             loop_executor,
             |request, ctx| {
                 if request.command == "configure" {
-                    Response::success(request.id, json!({}))
+                    crate::commands::configure::handle_configure(&request, ctx)
                 } else {
                     crate::commands::ast_search::handle_ast_search(&request, &ctx)
                 }
@@ -517,9 +517,9 @@ async fn tool_result_capability_is_selected_per_bind_not_per_call() {
             &module_root.join("absent-connection.json"),
             App::default_shared(),
             loop_executor,
-            |request, _| {
+            |request, ctx| {
                 if request.command == "configure" {
-                    return Response::success(request.id, json!({}));
+                    return crate::commands::configure::handle_configure(&request, ctx);
                 }
                 Response::error_with_data(
                     "same-id",

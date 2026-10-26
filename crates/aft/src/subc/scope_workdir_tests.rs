@@ -150,7 +150,13 @@ fn bind_observed(
                 None,
                 &HealthRollupCache::new(),
                 &senders,
-                |request, _| Response::success(request.id, request.params),
+                |request, ctx| {
+                    let configured = crate::commands::configure::handle_configure(&request, ctx);
+                    if !configured.success {
+                        return configured;
+                    }
+                    Response::success(request.id, request.params)
+                },
                 Some(&root.join("absent-user-config.json")),
                 usize::MAX,
                 None,

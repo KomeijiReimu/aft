@@ -113,6 +113,7 @@ pub struct TierSource {
 /// the files changed and which changed keys are still waiting for a connect.
 #[derive(Debug, Clone)]
 pub struct ConfigSources {
+    pub(crate) prepared_bind_snapshot_id: Option<u64>,
     pub user: TierSource,
     pub project: TierSource,
     /// The resolver output of the last configure, before configure's own
@@ -163,6 +164,7 @@ impl ConfigSources {
             }
         };
         Self {
+            prepared_bind_snapshot_id: None,
             user: source_for("user", user_path),
             project: source_for("project", Some(project_path)),
             connected: connected.clone(),
@@ -255,7 +257,11 @@ pub fn finish_configure(ctx: &AppContext, success: bool) {
     ctx.begin_configure_ack_step("config_sources_commit");
     {
         let _reload = ctx.config_live().reload_lock.lock();
+        let snapshot_id = sources.prepared_bind_snapshot_id.unwrap_or(0);
         *ctx.config_live().sources.lock() = Some(sources);
+        ctx.config_live()
+            .applied_bind_snapshot
+            .store(snapshot_id, Ordering::Release);
         // A connect resolves the files afresh; nothing it applied is held.
         ctx.config_live()
             .project_hold_active
@@ -268,6 +274,7 @@ pub fn finish_configure(ctx: &AppContext, success: bool) {
 /// Per-root live reload state, owned by the root's `AppContext`.
 #[derive(Default)]
 pub struct ConfigLiveState {
+    applied_bind_snapshot: AtomicU64,
     signal: Arc<ConfigReloadSignal>,
     sources: parking_lot::Mutex<Option<ConfigSources>>,
     watches: parking_lot::Mutex<ContextWatches>,
@@ -295,6 +302,16 @@ struct ContextWatches {
 }
 
 impl ConfigLiveState {
+    pub(crate) fn applied_bind_snapshot(&self) -> Option<u64> {
+        match self.applied_bind_snapshot.load(Ordering::Acquire) {
+            0 => None,
+            id => Some(id),
+        }
+    }
+
+    pub(crate) fn clear_applied_bind_snapshot(&self) {
+        self.applied_bind_snapshot.store(0, Ordering::Release);
+    }
     pub fn signal(&self) -> Arc<ConfigReloadSignal> {
         Arc::clone(&self.signal)
     }
@@ -658,7 +675,9 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
 
     {
         let mut record = state.sources.lock();
+        state.clear_applied_bind_snapshot();
         if let Some(record) = record.as_mut() {
+            record.prepared_bind_snapshot_id = None;
             record.user = user;
             // While a project loosening is held, keep the project text the
             // held values came from as the reference, so later reloads keep
