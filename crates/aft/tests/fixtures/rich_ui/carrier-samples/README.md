@@ -1,0 +1,95 @@
+# Phone carrier read-gate wire samples (CKIOS)
+
+Captured from main commit **9782a74b254bdfbeeb0c7e09909b8d888609ffb1**
+using the production handlers and route admission code at that commit. The
+capture adds tests only; it does not change the gate or the tool implementations.
+
+These are `tool.call` frames on the untrusted `reserved:occipital` carrier route,
+negotiating `tool-result/v1`, with the `worker` preset and bound session
+`session-s`. They are not the separate, projected `rich_ui` operation results in
+the adjacent schema-freeze fixtures. In particular, the task tools here take
+`taskId`, not the rich-UI viewed-call `task` binding.
+
+## Cases
+
+| File | Request | Expected outcome |
+| --- | --- | --- |
+| `read.json` | Read `main.rs` | Success |
+| `aft_outline.json` | Outline `main.rs` | Success |
+| `aft_zoom.json` | Zoom to `greeting` in `main.rs` | Success |
+| `aft_search.json` | Search for literal pattern `greeting` | Success |
+| `grep.json` | Grep Rust files for `greeting` | Success |
+| `glob.json` | Glob `*.rs` | Success |
+| `aft_callgraph.json` | Find callers of `greeting` | Success |
+| `bash_status.json` | Observe a completed, session-owned task | Success |
+| `bash_watch.json` | Watch that completed task | Success |
+| `refused-edit.json` | Call non-admitted `edit` | `carrier_read_only` |
+| `refused-web.json` | Outline an HTTPS target | `carrier_read_only` |
+| `refused-github-issue.json` | Read an `issue://` target | `carrier_read_only` |
+| `refused-github-pr.json` | Read a `pr://` target | `carrier_read_only` |
+| `refused-invalid-arguments.json` | Read with an unknown argument | `invalid_request` |
+
+The read-only gate has no numeric argument limit of its own. The invalid case
+captures the tool-provider schema admission refusal after the read-only gate.
+HTTPS **read** is not used as the web refusal: this gate specifically rejects
+web targets for outline/zoom, and GitHub targets for read/outline/zoom.
+
+## Fixture and capture boundary
+
+Each case gets an isolated project containing only this `main.rs`:
+
+```rust
+fn greeting() -> &'static str {
+    "hello phone"
+}
+
+fn main() {
+    println!("{}", greeting());
+}
+```
+
+Trigram and callgraph indexes are ready before each request; semantic embedding
+is disabled. The task cases observe persisted stdout `hello phone\n`, empty
+stderr and exit code 0. The task has a fixed 12 ms duration; no shell process or
+network request is needed.
+
+The tests reuse the existing carrier-gate route harness: an actual request
+`Frame` enters `handle_tool_call`, reaches real command handlers, and passes
+through final `project_tool_result()` serialization. This is an in-process
+route capture, not a live phone/socket session or a fabricated handler response.
+
+## JSON frame representation and normalization
+
+Each file contains `request_frame` and `reply_frame`. Each frame has:
+
+- `header_hex`: the complete binary frame header, hex encoded.
+- `body_utf8`: the complete serialized JSON body as a string, **not** a parsed
+  and reserialized body object. Parse this string to consume the tagged result.
+
+To recover frame bytes, hex-decode `header_hex` and append the UTF-8 bytes of
+`body_utf8`. JSON escaping in the outer sample file is only the storage wrapper;
+the inner body's key order, whitespace, text and envelope fields are preserved.
+
+The only normalization is replacement of the temporary fixture directory with
+`${FIXTURE_ROOT}` wherever it occurs in body text. The header's body length is
+recomputed for that replacement. Frame channel 41, epoch 1, correlation 7,
+derived request id `subc-41-7` and task id `bash-0123456789abcdef` are fixed by
+the harness, not rewritten. No fields are dropped and no messages, result data,
+durations or timestamps are normalized.
+
+## Reproduce and review updates
+
+Run from the repository root on Linux (the worker guide requires remote Cargo
+jobs; print `git log -1` first and use 1 or 2 vCPUs):
+
+```sh
+git log -1
+cargo test -p agent-file-tools --lib -- carrier_samples::capture_carrier_samples --ignored --nocapture
+cargo test -p agent-file-tools --lib -- carrier_samples::carrier_samples_match_wire
+```
+
+The ignored capture test explicitly overwrites the fourteen JSON samples and
+prints each one as `CARRIER_SAMPLE <case> <json>` for export from remote jobs.
+The normal test never updates fixtures: it reruns all cases, validates tagged
+results and expected success/error codes, and compares normalized frames,
+including the exact serialized body strings, to these reviewed samples.

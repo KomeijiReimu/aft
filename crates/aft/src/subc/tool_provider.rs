@@ -4939,6 +4939,8 @@ mod tests {
 
 #[cfg(test)]
 mod route_tests {
+    mod carrier_samples;
+
     use super::super::*;
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5039,9 +5041,6 @@ mod route_tests {
         metrics: &Arc<DispatchPathMetrics>,
         dispatch: DispatchFn,
     ) -> WriterFrame {
-        let executor = Arc::new(Executor::new());
-        assert!(executor.register_actor(identity.root.clone(), ctx));
-        let routes = HashMap::from([(route_key(41, 1), identity)]);
         let frame = Frame::build(
             FrameType::Request,
             control_flags(),
@@ -5051,6 +5050,19 @@ mod route_tests {
             serde_json::to_vec(&body).unwrap(),
         )
         .unwrap();
+        exchange_frame_with_actor(frame, identity, ctx, metrics, dispatch).await
+    }
+
+    async fn exchange_frame_with_actor(
+        frame: Frame,
+        identity: RouteIdentity,
+        ctx: Arc<AppContext>,
+        metrics: &Arc<DispatchPathMetrics>,
+        dispatch: DispatchFn,
+    ) -> WriterFrame {
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(identity.root.clone(), ctx));
+        let routes = HashMap::from([(route_key(41, 1), identity)]);
         // As on the frame loop, a scoped worker's saved confinement is read
         // off the loop first when memory cannot answer for it.
         let decoded = DecodedFrame {
