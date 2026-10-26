@@ -204,11 +204,13 @@ impl WriterFrame {
             .as_ref()
             .is_some_and(|(publication, _)| !publication.begin_write())
         {
-            if let Some(completion) = self.ack_completion.take() {
-                completion.publish(true);
-            }
-            if let Some((_, receipt)) = self.ack_receipt.take() {
-                let _ = receipt.send(Ok(false));
+            let publication = &self.ack_receipt.as_ref().unwrap().0;
+            if let Ok(Some(error)) = publication.error_frame(&self.frame) {
+                // When the bind is retracted, replace its queued writer frame
+                // with the error frame in place. Keeping its queue position
+                // prevents candidate refusals overtaking the bind's error.
+                self.frame = error;
+                return true;
             }
             return false;
         }
@@ -216,17 +218,28 @@ impl WriterFrame {
     }
 
     pub(super) fn finish_ack_write(&mut self, written: bool) {
+        let retracted = self
+            .ack_receipt
+            .as_ref()
+            .is_some_and(|(publication, _)| publication.is_retracted());
+        if written {
+            if let Some((publication, _)) = self.ack_receipt.as_ref() {
+                if retracted {
+                    publication.finished(false);
+                } else {
+                    publication.written();
+                }
+            }
+        }
         if written {
             if let Some(completion) = self.ack_completion.take() {
-                completion.publish(false);
+                completion.publish(retracted);
             }
         } else {
             self.ack_completion.take();
         }
         if let Some((publication, receipt)) = self.ack_receipt.take() {
-            if written {
-                publication.written();
-            }
+            let _ = publication;
             let _ = receipt.send(if written {
                 Ok(true)
             } else {

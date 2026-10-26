@@ -2473,9 +2473,9 @@ fn subc_bridge_duplicate_routebind_rejects_in_flight_bind() {
 }
 
 #[test]
-fn subc_bridge_tool_call_before_bind_ack_is_route_not_bound() {
+fn subc_bridge_tool_call_before_bind_ack_is_held_until_written() {
     run_subc_bridge_test(
-        "subc_bridge_tool_call_before_bind_ack_is_route_not_bound",
+        "subc_bridge_tool_call_before_bind_ack_is_held_until_written",
         Duration::from_secs(30),
         drive_pending_bind_tool_call_daemon,
         |_, _, _| {},
@@ -7594,8 +7594,8 @@ async fn drive_pending_bind_tool_call_daemon(input: FakeDaemonInput) {
         ..
     } = open_fake_daemon_session(input).await;
 
-    // P5b B2 finding (d): a route-channel tool call sent before its bind ack is
-    // a protocol error and remains route_not_bound while the bind is pending.
+    // Candidate calls wait for bind authority instead of racing configure and
+    // receiving an unbound-route error before its bind ACK finishes writing.
     let pending_tool_base = state.begin_slow_configure_wave();
     send_route_bind_with_doc(
         &mut stream,
@@ -7612,10 +7612,13 @@ async fn drive_pending_bind_tool_call_daemon(input: FakeDaemonInput) {
         inner.slow_configure_started > pending_tool_base
     });
     send_tool_call(&mut stream, 12, 1201, "echo", json!({ "case": "fast" })).await;
-    expect_error_frame(&mut stream, 12, 1201, "route_not_bound").await;
     state.release_slow_configures();
     state.wait_for_slow_configure_finished(pending_tool_base + 1);
     expect_route_bind_ack(&mut stream, 1200).await;
+    let response = read_frame_timeout(&mut stream, "held candidate response").await;
+    assert_eq!(response.header.ty, FrameType::Response);
+    assert_eq!(response.header.channel, 12);
+    assert_eq!(response.header.corr, 1201);
 
     send_connection_goodbye(&mut stream).await;
 }
@@ -7662,9 +7665,7 @@ async fn drive_goodbye_cancels_pending_bind_daemon(input: FakeDaemonInput) {
             .expect("goodbye barrier ping"),
     )
     .await;
-    let pong = read_frame_timeout(&mut stream, "goodbye barrier pong").await;
-    assert_eq!(pong.header.ty, FrameType::Pong, "{:?}", pong.header);
-    assert_eq!(pong.header.corr, 1109);
+    expect_cancelled_bind_with_control_reply(&mut stream, 110, 1109, FrameType::Pong).await;
     // NO manual release: the Goodbye's operational cancellation must itself
     // settle the stuck configure, or this test proves only bookkeeping.
     state.wait_for_slow_configure_finished(goodbye_bind_base + 1);
@@ -7809,7 +7810,7 @@ async fn drive_cancelled_first_bind_does_not_orphan_later_bind_daemon(input: Fak
     // NO manual release: cancelling route 20's configure must free the
     // mutating lane so route 21's queued configure runs and acks.
     state.wait_for_slow_configure_finished(slow_bind_base + 1);
-    expect_route_bind_ack(&mut stream, 210).await;
+    expect_cancelled_bind_with_control_reply(&mut stream, 200, 210, FrameType::Response).await;
     send_tool_call(&mut stream, 21, 211, "echo", json!({ "case": "fast" })).await;
     let joined = read_frame_timeout(&mut stream, "post-cancel sibling bind response").await;
     assert_eq!(joined.header.channel, 21);
@@ -7934,12 +7935,12 @@ async fn drive_goodbye_removes_queued_bind_daemon(input: FakeDaemonInput) {
             .expect("queued-cancel barrier ping"),
     )
     .await;
-    let pong = read_frame_timeout(&mut stream, "queued-cancel barrier pong").await;
-    assert_eq!(pong.header.ty, FrameType::Pong, "{:?}", pong.header);
+    expect_cancelled_bind_with_control_reply(&mut stream, 410, 412, FrameType::Pong).await;
 
     // Cancel the first via Goodbye too; operational cancellation settles it.
     send_route_goodbye(&mut stream, 40, 401).await;
     state.wait_for_slow_configure_finished(slow_bind_base + 1);
+    expect_route_bind_error(&mut stream, 400, "cancelled").await;
     assert_eq!(
         state.slow_configure_started_count(),
         slow_bind_base + 1,
@@ -14847,6 +14848,39 @@ async fn expect_route_bind_ack(stream: &mut tokio::net::TcpStream, corr: u64) {
     assert_eq!(frame.header.corr, corr);
     let ack: ModuleControlResponse = serde_json::from_slice(&frame.body).expect("ack body");
     assert_eq!(ack, ModuleControlResponse::RouteBindAck {});
+}
+
+async fn expect_cancelled_bind_with_control_reply(
+    stream: &mut tokio::net::TcpStream,
+    bind_corr: u64,
+    other_corr: u64,
+    other_type: FrameType,
+) {
+    // Pong uses the priority lane and the sibling ACK is independent. Neither
+    // ordering is promised, but the cancelled bind must answer exactly once.
+    let mut seen = HashSet::new();
+    for _ in 0..2 {
+        let frame = read_frame_timeout(stream, "cancelled bind and control reply").await;
+        assert_eq!(frame.header.channel, 0);
+        assert!(seen.insert(frame.header.corr), "duplicate control reply");
+        if frame.header.corr == bind_corr {
+            assert_error_frame(&frame, 0, bind_corr, "cancelled");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&frame.body).unwrap()["message"],
+                "request cancelled"
+            );
+        } else {
+            assert_eq!(frame.header.corr, other_corr);
+            assert_eq!(frame.header.ty, other_type);
+            if other_type == FrameType::Response {
+                assert_eq!(
+                    serde_json::from_slice::<ModuleControlResponse>(&frame.body).unwrap(),
+                    ModuleControlResponse::RouteBindAck {}
+                );
+            }
+        }
+    }
+    assert_eq!(seen, HashSet::from([bind_corr, other_corr]));
 }
 
 async fn expect_route_bind_error(stream: &mut tokio::net::TcpStream, corr: u64, code: &str) {

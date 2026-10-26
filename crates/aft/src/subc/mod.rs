@@ -199,8 +199,13 @@ type LossyPushEnvelope = (u64, ProjectRootId, PushFrame);
 type RetryBuffer = HashMap<RouteChannel, VecDeque<(push::ReplayKey, PushFrame)>>;
 mod a0_egress;
 mod access_grants;
+#[cfg(test)]
+mod bind_ack_fixup_tests;
+#[cfg(test)]
+mod bind_capacity_tests;
 use a0_egress::{A0Egress, ControlCompletion};
 mod bash;
+mod bind_candidates;
 mod bind_log;
 mod call_policy;
 mod carrier_read_only;
@@ -389,15 +394,19 @@ impl SubcTestLifecycleProbe {
 
     fn route_bind_ack_queued(&self, corr: u64) {
         let guard = self.bind_priority.lock().expect("bind priority probe lock");
-        if let Some(priority) = guard.as_ref().filter(|priority| priority.corr == corr) {
-            let batches_at_arrival = priority
-                .batches_at_arrival
-                .expect("bind completion arrival observed");
-            let _ = self.events_tx.send(SubcLifecycleEvent::RouteBindAckQueued {
-                corr,
-                reliable_push_batches: priority.reliable_push_batches - batches_at_arrival,
-            });
-        }
+        let reliable_push_batches =
+            if let Some(priority) = guard.as_ref().filter(|priority| priority.corr == corr) {
+                let batches_at_arrival = priority
+                    .batches_at_arrival
+                    .expect("bind completion arrival observed");
+                priority.reliable_push_batches - batches_at_arrival
+            } else {
+                0
+            };
+        let _ = self.events_tx.send(SubcLifecycleEvent::RouteBindAckQueued {
+            corr,
+            reliable_push_batches,
+        });
     }
 
     fn attach_decision(&self, attempt: u32, will_retry: bool) {
@@ -4762,6 +4771,12 @@ async fn process_route_bind_completion(
             ControlCompletion::AckWritten(completion) => (completion, false),
             ControlCompletion::ManagementAckWritten { route, .. } => {
                 a0.retire(route);
+                remove_installed_route(installed_route_epochs, route);
+                return Ok(());
+            }
+            ControlCompletion::BindRetracted { route, .. } => {
+                a0.retire(route);
+                remove_installed_route(installed_route_epochs, route);
                 return Ok(());
             }
             _ => return Err(SubcError::WriterClosed),
@@ -4776,6 +4791,11 @@ async fn process_route_bind_completion(
             return Ok(());
         }
         ControlCompletion::WriteFailed => return Err(SubcError::WriterClosed),
+        ControlCompletion::BindRetracted { route, .. } => {
+            a0.retire(route);
+            remove_installed_route(installed_route_epochs, route);
+            return Ok(());
+        }
     };
     handle_route_bind_completion(
         writer_tx,
@@ -4800,6 +4820,7 @@ async fn process_route_bind_completion(
 #[allow(clippy::too_many_arguments)]
 async fn drain_pending_route_bind_completions(
     control_completion_rx: &mut mpsc::Receiver<ControlCompletion>,
+    configure_completion_rx: &mut mpsc::Receiver<ControlCompletion>,
     a0: &A0Egress,
     management_routes: &mut HashMap<RouteChannel, Option<Principal>>,
     writer_tx: &WriterSender,
@@ -4816,7 +4837,10 @@ async fn drain_pending_route_bind_completions(
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<usize, SubcError> {
     let mut drained = 0;
-    while let Ok(completion) = control_completion_rx.try_recv() {
+    while let Ok(completion) = control_completion_rx
+        .try_recv()
+        .or_else(|_| configure_completion_rx.try_recv())
+    {
         process_route_bind_completion(
             writer_tx,
             completion,
@@ -5031,8 +5055,14 @@ where
     let (bash_poll_touch_tx, mut bash_poll_touch_rx) = mpsc::channel::<ProjectRootId>(256);
     let (control_completion_tx, mut control_completion_rx) =
         mpsc::channel::<ControlCompletion>(256);
+    // ACK receipts have admission-reserved slots. Configure-ready messages use
+    // their own bounded channel so those reservations cannot block the very
+    // work that must consume them.
+    let (configure_completion_tx, mut configure_completion_rx) =
+        mpsc::channel::<ControlCompletion>(WRITER_QUEUE_CAPACITY);
     let a0 = A0Egress::new(raw_writer_tx, control_completion_tx.clone())
         .with_probe(lifecycle_probe.clone());
+    let mut candidate_requests = bind_candidates::CandidateRequests::default();
     let (lossy_tx, mut lossy_rx) = mpsc::channel::<LossyPushEnvelope>(1024);
     let lossy_overflow = Arc::new(push::LossyOverflow::default());
     let lossy_seq = Arc::new(AtomicU64::new(0));
@@ -5170,6 +5200,7 @@ where
         );
         match drain_pending_route_bind_completions(
             &mut control_completion_rx,
+            &mut configure_completion_rx,
             &a0,
             &mut management_routes,
             &writer_tx,
@@ -5196,6 +5227,12 @@ where
             Err(error) => break Err(error),
         }
 
+        if let Err(error) = candidate_requests
+            .release(&a0, &routes, &management_routes, &dispatch_path_metrics)
+            .await
+        {
+            break Err(error);
+        }
         if tokio::time::Instant::now() >= next_drain_at {
             dispatch_path_metrics.mark_frame_loop_step("push::emit_bg_event_wakes", "", 0);
             push::emit_bg_event_wakes(
@@ -5217,6 +5254,7 @@ where
             );
             if let Err(error) = expire_overdue_route_binds(
                 &a0.writer,
+                &a0,
                 &executor,
                 &mut pending_binds,
                 &mut installed_route_epochs,
@@ -5378,7 +5416,12 @@ where
                     }
                 }
             }
-            Some(completion) = control_completion_rx.recv() => {
+            Some(completion) = async {
+                tokio::select! { biased;
+                    completion = control_completion_rx.recv() => completion,
+                    completion = configure_completion_rx.recv() => completion,
+                }
+            } => {
                 dispatch_path_metrics.mark_frame_loop_step("process_route_bind_completion", "route_bind", completion.corr());
                 if let Err(error) = process_route_bind_completion(
                     &writer_tx,
@@ -5401,6 +5444,9 @@ where
                 {
                     break Err(error);
                 }
+                if let Err(error) = candidate_requests.release(&a0, &routes, &management_routes, &dispatch_path_metrics).await {
+                    break Err(error);
+                }
                 next_maintenance_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
                 health_rollup_worker.request_refresh();
             }
@@ -5415,6 +5461,9 @@ where
                 break Ok(ModuleLoopExit::SkipSearchFlush);
             }
             (maybe_frame, database_waited, ledger_waited) = async {
+                if let Some(frame) = candidate_requests.next_ready() {
+                    return (Some(Ok(frame)), false, false);
+                }
                 tokio::select! {
                     frame = reader_rx.recv() => (frame, false, false),
                     frame = run_ready_rx.recv() => (frame.map(Ok), false, false),
@@ -5437,6 +5486,12 @@ where
                 if let Some(hooks) = watchdog_test.as_ref() {
                     (hooks.before_frame)();
                 }
+
+                let frame = match candidate_requests.intercept(frame, &a0, &mut pending_binds, &executor, &dispatch_path_metrics).await {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => continue,
+                    Err(error) => break Err(error),
+                };
 
                 if !(ledger_waited && ledger_edge.is_withdrawn(&frame.frame)) && !ingress_route_should_be_processed(
                     &installed_route_epochs,
@@ -5584,7 +5639,7 @@ where
                             &mut retry_buffer,
                             &mut push_buffer,
                             &shutdown,
-                            &control_completion_tx,
+                            &configure_completion_tx,
                             &dispatch_path_metrics,
                             lifecycle_probe.as_ref(),
                             &health_rollup_cache,
@@ -6418,6 +6473,14 @@ where
     };
 
     a0.stop();
+    let loop_result = if matches!(loop_result, Ok(ModuleLoopExit::Graceful)) {
+        candidate_requests
+            .stop(&a0, &dispatch_path_metrics)
+            .await
+            .and(loop_result)
+    } else {
+        loop_result
+    };
     // The exit budget runs from the drain, so the teardown between the loop
     // ending and the index flush is timed and logged as its own exit phase.
     let teardown_started = Instant::now();
@@ -7146,7 +7209,11 @@ async fn handle_route_bind_completion(
             .get(&route_id)
             .is_some_and(|pending| !pending.cancelled && !pending.deadline_reported)
     {
-        if pending_binds[&route_id].ack_publication.is_some() {
+        if pending_binds[&route_id]
+            .ack_publication
+            .as_ref()
+            .is_some_and(|ack| ack.is_queued() || ack.is_committed() || ack.is_retracted())
+        {
             return Ok(());
         }
         let restore_watcher = live_roots
@@ -7218,8 +7285,8 @@ async fn handle_route_bind_completion(
     }
 
     let inserted_new_actor = pending.inserted_new_actor || completion.inserted_new_actor;
-    // The deadline path already answered (and recorded) an overdue bind, and a
-    // torn-down bind is never answered.
+    // Cancelled or overdue binds already own their control error through A0.
+    // A late configure completion only cleans up; it must not reply again.
     if !pending.cancelled && !pending.deadline_reported {
         metrics.record_bind_ack(pending.started_at.elapsed());
     }
@@ -7282,16 +7349,20 @@ async fn handle_route_bind_completion(
         let message = response_message(response, fallback);
         let fatal = response_is_fatal_panic(response);
         let error_code = route_bind_error_code_for_configure_response(response);
-        send_route_bind_error_parts(
-            &a0.writer,
-            completion.ver,
-            completion.corr,
-            completion.flags,
-            error_code,
-            &message,
-            metrics,
-        )
-        .await?;
+        if a0.publication(route_id).is_some() {
+            a0.reject(route_id, ErrorBody::new(error_code, &message));
+        } else {
+            send_route_bind_error_parts(
+                &a0.writer,
+                completion.ver,
+                completion.corr,
+                completion.flags,
+                error_code,
+                &message,
+                metrics,
+            )
+            .await?;
+        }
         remove_installed_route(installed_route_epochs, route_id);
         if fatal {
             signal_fatal_teardown(
@@ -7398,6 +7469,7 @@ async fn handle_route_bind_completion(
 
 async fn expire_overdue_route_binds(
     tx: &WriterSender,
+    a0: &A0Egress,
     executor: &Arc<Executor>,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
@@ -7413,7 +7485,10 @@ async fn expire_overdue_route_binds(
                 && pending
                     .ack_publication
                     .as_ref()
-                    .is_none_or(|ack| ack.cancel_before_write()))
+                    // Write-start wins the bind: completing that frame and
+                    // publishing it after the deadline is intentional. Only an
+                    // ACK still waiting in the queue can become a refusal.
+                    .is_none_or(|ack| !ack.is_committed() && !ack.is_retracted()))
             .then(|| {
                 (
                     *route,
@@ -7423,15 +7498,33 @@ async fn expire_overdue_route_binds(
                     pending.bind_root_id.clone(),
                     pending.configure_request_id.clone(),
                     age,
+                    pending
+                        .ack_publication
+                        .as_ref()
+                        .is_some_and(|ack| ack.is_queued()),
                 )
             })
         })
         .collect();
 
-    for (route, corr, ver, flags, root_id, configure_request_id, age) in expired {
+    for (route, corr, ver, flags, root_id, configure_request_id, age, ack_queued) in expired {
         // Read the blockers before cancelling: once cancelled, the bind is no
         // longer queued and the snapshot can no longer say what held it.
         let blockers = executor.bind_blocker_snapshot(&root_id, &configure_request_id);
+        let (code, message) = if ack_queued {
+            ("actor_not_ready", format!("route bind deadline exceeded after {}ms (deadline {}ms): the bind waited in the ACK writer queue", age.as_millis(), ROUTE_BIND_DEADLINE.as_millis()))
+        } else {
+            route_bind_deadline_refusal(
+                age,
+                ROUTE_BIND_DEADLINE,
+                DAEMON_BIND_RELAY_TIMEOUT,
+                &blockers,
+            )
+        };
+        let reserved = a0.publication(route).is_some();
+        if reserved && !a0.reject(route, ErrorBody::new(code, &message)) {
+            continue;
+        }
         if let Some(pending) = pending_binds.get_mut(&route) {
             pending.cancelled = true;
             pending.deadline_reported = true;
@@ -7443,13 +7536,9 @@ async fn expire_overdue_route_binds(
         remove_installed_route(installed_route_epochs, route);
         metrics.record_bind_ack(age);
         let deadline_ms = ROUTE_BIND_DEADLINE.as_millis();
-        let (code, message) = route_bind_deadline_refusal(
-            age,
-            ROUTE_BIND_DEADLINE,
-            DAEMON_BIND_RELAY_TIMEOUT,
-            &blockers,
-        );
-        send_route_bind_error_parts(tx, ver, corr, flags, code, &message, metrics).await?;
+        if !reserved {
+            send_route_bind_error_parts(tx, ver, corr, flags, code, &message, metrics).await?;
+        }
         log::warn!(
             "subc attach: route {} bind for root {} exceeded {}ms deadline (configure_request_id={}, code={})",
             route,
@@ -7788,6 +7877,31 @@ async fn handle_control_request(
             };
 
             let bind_trust = trust_for_bind(&identity.harness, &principal);
+            if installed_route_epochs
+                .get(&route_channel)
+                .is_some_and(|installed| *installed >= epoch)
+            {
+                return send_route_bind_error(
+                    tx,
+                    frame,
+                    "config_divergence",
+                    "route bind generation is not newer than the installed generation",
+                    metrics,
+                )
+                .await;
+            }
+            let reservation = match a0.reserve(
+                route_id,
+                frame.header.ver,
+                frame.header.corr,
+                frame.header.flags,
+                metrics,
+            ) {
+                Ok(reservation) => reservation,
+                Err(refusal) => {
+                    return send_route_bind_error_body(tx, frame, &refusal, metrics).await
+                }
+            };
             if let RouteTarget::ManagementSurface { module_id } = &target {
                 if let Err(refusal) = flow_read::admit_management(scope.as_ref()) {
                     return send_route_bind_error_body(tx, frame, &refusal, metrics).await;
@@ -7823,7 +7937,7 @@ async fn handle_control_request(
                         )
                         .await;
                     }
-                    a0.cancel(route_key(route_channel, installed_epoch));
+                    a0.supersede(route_key(route_channel, installed_epoch));
                     teardown_installed_route(
                         legacy_tx,
                         metrics,
@@ -7864,6 +7978,7 @@ async fn handle_control_request(
                 }
 
                 installed_route_epochs.insert(route_channel, epoch);
+                let _publication = reservation.commit();
                 let ack =
                     route_bind_ack_frame(frame.header.ver, frame.header.corr, frame.header.flags)?;
                 if a0
@@ -7928,7 +8043,7 @@ async fn handle_control_request(
                         .await;
                     }
                 };
-                a0.cancel(route_key(route_channel, installed_epoch));
+                a0.supersede(route_key(route_channel, installed_epoch));
                 teardown_installed_route(
                     legacy_tx,
                     metrics,
@@ -8135,6 +8250,7 @@ async fn handle_control_request(
                 "executor.scheduler/submit_bind",
                 Some(executor.scheduler_lock_diagnostics()),
             );
+            let publication = reservation.commit();
             let (configure_rx, configure_cancellation) = executor.submit_bind_cancellable_async(
                 bind_root_id.clone(),
                 configure_request_id.clone(),
@@ -8179,7 +8295,7 @@ async fn handle_control_request(
             pending_binds.insert(
                 route_id,
                 PendingBind {
-                    ack_publication: None,
+                    ack_publication: Some(publication),
                     bind_root_id: bind_root_id.clone(),
                     inserted_new_actor,
                     cancelled: false,
@@ -19298,6 +19414,9 @@ mod tests {
         let mut published_routes = HashMap::new();
         let (ack_tx, mut ack_rx) = mpsc::channel(8);
         let a0 = A0Egress::new(writer_tx.clone(), ack_tx);
+        a0.reserve(route, PROTOCOL_VERSION, 91, control_flags(), &metrics)
+            .unwrap()
+            .commit();
 
         handle_route_bind_completion(
             &writer_tx,
@@ -19487,6 +19606,7 @@ mod tests {
 
         expire_overdue_route_binds(
             &writer_tx,
+            &A0Egress::new(writer_tx.clone(), mpsc::channel(8).0),
             &executor,
             &mut pending_binds,
             &mut installed_route_epochs,
@@ -19582,6 +19702,7 @@ mod tests {
 
         expire_overdue_route_binds(
             &writer_tx,
+            &A0Egress::new(writer_tx.clone(), mpsc::channel(8).0),
             &executor,
             &mut pending_binds,
             &mut installed_route_epochs,
@@ -19803,6 +19924,7 @@ mod tests {
             }
             expire_overdue_route_binds(
                 &writer_tx,
+                &A0Egress::new(writer_tx.clone(), mpsc::channel(8).0),
                 &executor,
                 &mut pending_binds,
                 &mut installed,
@@ -20017,6 +20139,7 @@ mod tests {
         let metrics = Arc::new(DispatchPathMetrics::new());
         expire_overdue_route_binds(
             &writer_tx,
+            &A0Egress::new(writer_tx.clone(), mpsc::channel(8).0),
             &executor,
             &mut pending_binds,
             &mut installed,

@@ -1,1 +1,1 @@
-- Prepared route-bind and management replies use a writer path independent of tool-outcome persistence, and routes and replayed events are published only after the bind acknowledgement is written.
+- Route binds and management replies no longer wait for tool-outcome persistence; candidate calls and replayed events wait for the written bind acknowledgement, and cancelled queued binds receive one control error instead of losing their reply.
