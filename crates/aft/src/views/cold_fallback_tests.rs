@@ -650,7 +650,8 @@ fn callgraph_previous_producer_reextracts_callbacks_and_inline_test_status() {
     let old_producer = "ruled-callgraph-v10-go-alias-and-heading-ranges";
     let old_key = CallgraphKey::from_bytes(source.as_bytes(), "rust", old_producer).full_key();
     let current_key =
-        CallgraphKey::from_bytes(source.as_bytes(), "rust", callgraph::PRODUCER).full_key();
+        CallgraphKey::from_bytes(source.as_bytes(), "rust", crate::views::callgraph::PRODUCER)
+            .full_key();
     // An old producer name still runs today's extractor. Remove the evidence
     // the old extractor lacked before seeding its immutable blob.
     let mut old_payload: serde_json::Value = serde_json::from_slice(
@@ -699,7 +700,7 @@ fn callgraph_previous_producer_reextracts_callbacks_and_inline_test_status() {
         old_manifest.to_json_bytes().unwrap(),
     )
     .unwrap();
-    assembly::release_manifest_cache(view.view_dir());
+    crate::views::assembly::release_manifest_cache(view.view_dir());
     Connection::open(owner)
         .unwrap()
         .execute(
