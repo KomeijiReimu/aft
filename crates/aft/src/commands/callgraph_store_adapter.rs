@@ -55,7 +55,7 @@ fn is_zero(value: &usize) -> bool {
 }
 
 pub(crate) const CALLBACK_REFERENCE_LABEL: &str = " (callback reference)";
-pub(crate) const UNRESOLVED_CALLERS_NOTE: &str = "Incomplete: {count} unresolved call sites in the analyzed {language} scope could not be resolved; dynamic or indirect calls may target `{symbol}`. Zero statically linked callers is not proof of no callers.";
+pub(crate) const UNRESOLVED_CALLERS_NOTE: &str = "Incomplete: {count} unresolved call site{plural} in the analyzed {language} scope could not be resolved; dynamic or indirect calls may target `{symbol}`. Zero statically linked callers is not proof of no callers.";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreHubSummary {
@@ -127,6 +127,10 @@ fn empty_receiver_note(
         unresolved_call_sites,
         incomplete_reason: UNRESOLVED_CALLERS_NOTE
             .replace("{count}", &unresolved_call_sites.to_string())
+            .replace(
+                "{plural}",
+                if unresolved_call_sites == 1 { "" } else { "s" },
+            )
             .replace("{language}", &format!("{:?}", target.lang))
             .replace("{symbol}", &target.name),
     }))
@@ -467,7 +471,7 @@ fn unknown_test_note(sites: &[StoreCallSite], include_tests: bool) -> Option<Str
                 && site.caller_is_test.is_none()
         })
         .count();
-    (!include_tests && unknown > 0).then(|| format!("Test filtering incomplete: test-ness could not be determined for {unknown} caller sites; they remain visible."))
+    (!include_tests && unknown > 0).then(|| format!("Test filtering incomplete: test-ness could not be determined for {unknown} caller site{}; they remain visible.", if unknown == 1 { "" } else { "s" }))
 }
 
 fn trace_path_starts_in_test(path: &StoreTracePath) -> bool {
@@ -1157,7 +1161,14 @@ fn trace_to_result_with_budget(
             let wanted = wanted.into_iter().collect::<Vec<_>>();
             let mut fetched = store.direct_callers_for_symbols(&wanted)?;
             for key in wanted {
-                let callers = dedup_call_sites(fetched.remove(&key).unwrap_or_default());
+                let callers = dedup_call_sites(
+                    fetched
+                        .remove(&key)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|site| site.kind == "call")
+                        .collect(),
+                );
                 callers_by_symbol.insert(key, callers);
             }
         }

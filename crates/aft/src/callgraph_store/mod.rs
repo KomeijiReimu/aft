@@ -9037,7 +9037,10 @@ impl CallGraphStore {
                 continue;
             };
             let callers =
-                direct_callers_for_tuple(&conn, &current.node.file, &current.node.symbol)?;
+                direct_callers_for_tuple(&conn, &current.node.file, &current.node.symbol)?
+                    .into_iter()
+                    .filter(|site| site.kind == "call")
+                    .collect::<Vec<_>>();
             if callers.is_empty() {
                 if path.len() > 1 {
                     truncated_paths += 1;
@@ -23733,7 +23736,7 @@ mod refresh_worker_tests {
                 "INSERT INTO nodes SELECT 'positional-target', file_path, name, scoped_name, kind,
                  start_line + 100, start_col, end_line + 100, end_col, range_ordinal,
                  signature, exported, is_default_export, is_type_like, is_callgraph_entry_point,
-                 provenance FROM nodes WHERE name = 'old_leaf';",
+                  provenance, is_test FROM nodes WHERE name = 'old_leaf';",
             )
             .unwrap();
         }
