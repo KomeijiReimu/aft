@@ -7413,7 +7413,6 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
         inner.slow_configure_started > slow_bind_base
     });
 
-    let release_turn = probe.hold_reliable_push_turn_for_test(19);
     let flood_prefix = "routebind-priority-flood";
     let flood_count = 1024_u64;
     send_tool_call(
@@ -7424,11 +7423,9 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
         json!({ "prefix": flood_prefix, "count": flood_count }),
     )
     .await;
-    expect_priority_event(&mut events, SubcLifecycleEvent::ReliablePushTurnHeld).await;
-
-    // The independent ACK lane can overtake proxied flood frames. Confirm actual
-    // flood pressure while configure is still held, not by requiring that race
-    // to resolve the same way after its ACK becomes eligible.
+    // Confirm flood pressure before holding the loop. The independent ACK lane
+    // may overtake proxied frames once configure completes, and the held batch
+    // need not be visible on the socket until the loop resumes.
     let mut flood_seen = 0_u64;
     let mut flood_response_seen = false;
     while flood_seen == 0 {
@@ -7447,6 +7444,14 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
             other => panic!("unexpected frame before bind completion: {other:?}"),
         }
     }
+    let root_id = ProjectRootId::from_path(&root1).expect("root1 id");
+    let ctx = executor.actor_context(&root_id).expect("root1 actor");
+    let release_turn = probe.hold_reliable_push_turn_for_test(19);
+    assert!(emit_push_frame(
+        &ctx,
+        bash_completed_push("routebind-priority-turn-hold", "session-1")
+    ));
+    expect_priority_event(&mut events, SubcLifecycleEvent::ReliablePushTurnHeld).await;
 
     // Hold the loop at a turn boundary, not the configure worker: completion
     // handoff must actually reach the loop's channel before the next turn runs.
@@ -7456,8 +7461,6 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
         SubcLifecycleEvent::RouteBindCompletionQueued { corr: 19 },
     )
     .await;
-    let root_id = ProjectRootId::from_path(&root1).expect("root1 id");
-    let ctx = executor.actor_context(&root_id).expect("root1 actor");
     let ready_task = "routebind-priority-ready";
     assert!(emit_push_frame(
         &ctx,
