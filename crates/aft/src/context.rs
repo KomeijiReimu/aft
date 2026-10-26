@@ -21990,8 +21990,8 @@ mod configure_applicability_tests {
             storage_dir: Some(storage.clone()),
             ..Config::default()
         };
-        crate::cache_location::ensure_config_storage_lease(&mut config).unwrap();
-        assert!(crate::cache_location::prepare_cache_root(&mut config).is_none());
+        crate::root_cache::ensure_config_storage_lease(&mut config).unwrap();
+        assert!(crate::root_cache::prepare_cache_root(&mut config).is_none());
         let cache_lease = Arc::downgrade(config.cache_lease.as_ref().unwrap());
         let storage_lease = Arc::downgrade(config.storage_lease.as_ref().unwrap());
         let ctx = AppContext::new(
