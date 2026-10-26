@@ -5716,12 +5716,15 @@ where
                             )
                             .await
                         } else {
-                             handle_tool_call(
-                                 &writer_tx,
-                                 &frame,
-                                 parsed_body,
-                                 confinement,
-                                 phase_trace,
+                            // The tool-call future is polled on this loop's
+                            // thread, so it is boxed to keep its own frame on
+                            // the heap instead of widening this loop's frame.
+                            Box::pin(handle_tool_call(
+                                &writer_tx,
+                                &frame,
+                                parsed_body,
+                                confinement,
+                                phase_trace,
                                 routes_for_call,
                                 &pending_binds,
                                 &reclaimed_routes,
@@ -5747,7 +5750,7 @@ where
                                 tool_response_body_limit,
                                 &module_drain,
                                 Some(&control),
-                            )
+                            ))
                             .await
                         };
                         if let Err(error) = result {
