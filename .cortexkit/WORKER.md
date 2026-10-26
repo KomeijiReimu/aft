@@ -18,6 +18,13 @@ A check that prints nothing and exits 0 is not a pass unless this guide says tha
 | Real rust-analyzer | prefix with `AFT_TEST_REQUIRE_RUST_ANALYZER=1` | Without it, real-server tests skip silently. |
 | Full suite | `cargo test -p agent-file-tools`, or `scripts/rust-test-gate.sh` | The gate prints `GATE PASSED` / `GATE FAILED` as its last line. |
 
+### Build server jobs (`runon`)
+
+- **Size the job to the work.** Each vCPU you request holds one of the server's shared slots for the whole job. A mutation loop recompiles one mutant at a time, and a single test binary uses about one core, so both use `linux,2c`. A full-suite gate uses `linux,8c` with a timeout of at most 7,200 s: jobs that small may run in a cloud sandbox when the build server is full, while larger or longer jobs wait for a server slot.
+- **Commit first, then submit, in separate steps.** The job snapshots the checkout when it is accepted. A commit sent in the same parallel step can land after the snapshot. Print `git log -1` as the job's first line so the output shows what ran.
+- **Keep gate scripts out of ignored paths.** The job copies tracked and untracked files, but not ignored ones, so a script under `.cortexkit/` or `target/` is missing on the server.
+- **Write long output to a file inside the job and print a summary.** A job that streams tens of megabytes back can lose its connection and come back with an unknown result.
+
 Mandatory when you touch them:
 - A list-cutting site (`.take(`, `truncate(`, a cap): register it, then run `cargo test -p agent-file-tools --test list_envelope`.
 - A new file under the search engine: register its owner, then run `cargo test -p agent-file-tools --test engine`.
@@ -52,7 +59,9 @@ New test files go under `src/__tests__/`. A guard fails the suite on any test fi
 ## Before you report
 - Publication source changes do not need generated docs or alignment commits.
   Run `node scripts/release-gate-v049.mjs --check-inputs` after committing the
-  source (requires the `v0.48.1` tag and the built bridge). It prints six staged
+  source (requires the `v0.48.1` tag and the built bridge). Run it in your
+  worktree, not with `runon`: build-server snapshots carry no git tags, so it
+  always fails there. It prints six staged
   transitions and `release gates passed`; it never runs a native build.
   The reviewed legacy-vocabulary allowlist remains an input: update it explicitly
   only when intentionally changing a reviewed occurrence, never in preflight.
