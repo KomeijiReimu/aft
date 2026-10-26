@@ -12,11 +12,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(windows)]
 use std::process::{Child, Stdio};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
 #[cfg(unix)]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(all(test, unix))]
+#[path = "root_reclaim_tests.rs"]
+pub(crate) mod root_reclaim_tests;
 
 use crate::db::TrackedConnection;
 use serde::Serialize;
@@ -1302,6 +1309,10 @@ pub(crate) struct RegistryInner {
     retired_undelivered_completions: AtomicU64,
     /// Watchdog candidates only; terminal history stays in `tasks` for delivery.
     pub(crate) watchdog_tasks: Mutex<HashMap<String, Arc<BgTask>>>,
+    #[cfg(test)]
+    reclaim_kill_attempts: AtomicUsize,
+    #[cfg(test)]
+    reclaim_kill_noop: AtomicBool,
     /// Finished tasks whose scratch directory is kept on disk until its
     /// delete time, keyed by task id. See `scratch_retention`.
     retained_scratch: Mutex<HashMap<String, scratch_retention::RetainedScratch>>,
@@ -1494,6 +1505,9 @@ pub(crate) struct BgTask {
     pub(crate) session_id: String,
     pub(crate) paths: TaskPaths,
     artifact_root: PathBuf,
+    /// Canonical root identity captured at registration and retained on deletion.
+    /// Reclaim probes compare it without filesystem calls on the frame loop.
+    project_root: PathBuf,
     pub(crate) started: Instant,
     /// Whether this task holds one of the project root's background slots
     /// (`max_background_bash_tasks`): true for a background or PTY launch and
@@ -1914,6 +1928,10 @@ impl BgTaskRegistry {
                 persisted_gc_storage: Mutex::new(BTreeSet::new()),
                 retired_undelivered_completions: AtomicU64::new(0),
                 watchdog_tasks: Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                reclaim_kill_attempts: AtomicUsize::new(0),
+                #[cfg(test)]
+                reclaim_kill_noop: AtomicBool::new(false),
                 retained_scratch: Mutex::new(HashMap::new()),
                 revoked_scopes: Mutex::new(HashSet::new()),
                 held_remote_workers: Mutex::new(None),
@@ -4741,6 +4759,12 @@ impl BgTaskRegistry {
             session_id,
             paths: paths.clone(),
             artifact_root: canonical_artifact_root(&paths),
+            project_root: canonicalized_path(
+                metadata
+                    .project_root
+                    .as_deref()
+                    .unwrap_or(&metadata.workdir),
+            ),
             started: Instant::now(),
             terminal_reader_done: Arc::new(AtomicBool::new(true)),
             holds_background_slot: AtomicBool::new(slot.holds_slot()),
@@ -5132,6 +5156,12 @@ impl BgTaskRegistry {
             session_id,
             paths: paths.clone(),
             artifact_root: canonical_artifact_root(&paths),
+            project_root: canonicalized_path(
+                metadata
+                    .project_root
+                    .as_deref()
+                    .unwrap_or(&metadata.workdir),
+            ),
             started: Instant::now(),
             terminal_reader_done,
             // A PTY always runs in the background.
@@ -5435,6 +5465,12 @@ impl BgTaskRegistry {
             session_id,
             paths: paths.clone(),
             artifact_root: canonical_artifact_root(&paths),
+            project_root: canonicalized_path(
+                metadata
+                    .project_root
+                    .as_deref()
+                    .unwrap_or(&metadata.workdir),
+            ),
             started: Instant::now(),
             terminal_reader_done: Arc::new(AtomicBool::new(true)),
             holds_background_slot: AtomicBool::new(slot.holds_slot()),
@@ -8979,9 +9015,10 @@ impl BgTaskRegistry {
         self.kill_with_status_reason(task_id, session_id, BgTaskStatus::Killed, None)
     }
 
-    /// Terminate live tasks whose project root has been confirmed absent by
-    /// subc's consecutive directory-absence scans, so tasks cannot keep using
-    /// a root that has been verified for reclamation.
+    /// Terminate live tasks and terminal tasks' surviving process groups after
+    /// subc's consecutive directory-absence scans confirm their root is absent.
+    /// Root deletion is a definitive end, like scope termination: descendants
+    /// must not outlive the root just because their command already completed.
     ///
     /// The absence signal intentionally cannot distinguish deletion from
     /// renaming: a task's cwd handle can follow a moved directory even while
@@ -8989,24 +9026,35 @@ impl BgTaskRegistry {
     /// registry identity, so killing those tasks is accepted; operational
     /// guidance is to rename a project only after its live tasks have ended.
     pub fn kill_running_tasks_for_root(&self, project_root: &Path) -> usize {
+        #[cfg(test)]
+        {
+            self.inner
+                .reclaim_kill_attempts
+                .fetch_add(1, Ordering::SeqCst);
+            if self.inner.reclaim_kill_noop.load(Ordering::SeqCst) {
+                return 0;
+            }
+        }
         let canonical_root = canonicalized_path(project_root);
         let tasks = self.task_arcs();
         let targets: Vec<_> = tasks
             .into_iter()
+            .filter(|task| task.project_root == canonical_root)
             .filter_map(|task| {
-                let task_root = {
+                let sample_missing = {
                     let state = task.lock_state().ok()?;
-                    if !BgTask::state_is_running(&state) {
-                        return None;
-                    }
-                    state
-                        .metadata
-                        .project_root
-                        .clone()
-                        .unwrap_or_else(|| state.metadata.workdir.clone())
+                    state.metadata.status.is_terminal()
+                        && state.metadata.pgid.is_some()
+                        && state.metadata.live_descendants.is_none()
                 };
-                (canonicalized_path(&task_root) == canonical_root)
-                    .then(|| (task.task_id.clone(), task.session_id.clone()))
+                if sample_missing {
+                    self.sample_task_process_group(&task);
+                }
+                let needs_reclaim = {
+                    let state = task.lock_state().ok()?;
+                    BgTask::state_needs_root_reclaim(&state)
+                };
+                needs_reclaim.then(|| (task.task_id.clone(), task.session_id.clone()))
             })
             .collect();
 
@@ -11286,6 +11334,30 @@ impl BgTaskRegistry {
         }
     }
 
+    /// Non-waiting counterpart of [`Self::kill_running_tasks_for_root`]. Terminal
+    /// records awaiting delivery or scratch cleanup do not keep artifacts live;
+    /// `metadata.live_descendants` and `live_descendants_omitted` still do. A
+    /// terminal group with no sample also waits for the kill worker to sample
+    /// it; terminal status can be visible before descendant sampling finishes.
+    /// The kill path refreshes those samples after signaling. A cached routing
+    /// identity avoids filesystem calls or process enumeration on the frame loop.
+    pub(crate) fn try_has_reclaimable_tasks_for_root(
+        &self,
+        project_root: &crate::path_identity::ProjectRootId,
+    ) -> Option<bool> {
+        let tasks = self.inner.tasks.try_lock().ok()?;
+        for task in tasks
+            .values()
+            .filter(|task| task.project_root == project_root.as_path())
+        {
+            let state = task.state.try_lock().ok()?;
+            if BgTask::state_needs_root_reclaim(&state) {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+
     /// Hold the watch map lock for the duration of `while_held`, so a test can
     /// prove a caller does not wait for it.
     #[cfg(test)]
@@ -11356,6 +11428,12 @@ impl BgTaskRegistry {
             session_id,
             paths: paths.clone(),
             artifact_root: canonical_artifact_root(&paths),
+            project_root: canonicalized_path(
+                metadata
+                    .project_root
+                    .as_deref()
+                    .unwrap_or(&metadata.workdir),
+            ),
             started,
             terminal_reader_done: Arc::new(AtomicBool::new(true)),
             // A task reloaded after a restart has no caller waiting on it any
@@ -15269,6 +15347,18 @@ impl BgTask {
                 Self::state_is_running(&poison.into_inner())
             }
         }
+    }
+
+    fn state_needs_root_reclaim(state: &BgTaskState) -> bool {
+        !state.metadata.status.is_terminal()
+            || (cfg!(unix)
+                && state.metadata.pgid.is_some()
+                && (state
+                    .metadata
+                    .live_descendants
+                    .as_ref()
+                    .is_none_or(|members| !members.is_empty())
+                    || state.metadata.live_descendants_omitted > 0))
     }
 
     fn state_is_running(state: &BgTaskState) -> bool {

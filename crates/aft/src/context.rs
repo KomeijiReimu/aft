@@ -13932,6 +13932,22 @@ impl AppContext {
         &self,
         include_pending: bool,
     ) -> Option<ArtifactEvictionBlocker> {
+        self.try_artifact_eviction_blocker_for_root(include_pending, None)
+    }
+
+    pub(crate) fn try_artifact_eviction_blocker_for_deleted_root(
+        &self,
+        include_pending: bool,
+        root: &crate::path_identity::ProjectRootId,
+    ) -> Option<ArtifactEvictionBlocker> {
+        self.try_artifact_eviction_blocker_for_root(include_pending, Some(root))
+    }
+
+    fn try_artifact_eviction_blocker_for_root(
+        &self,
+        include_pending: bool,
+        deleted_root: Option<&crate::path_identity::ProjectRootId>,
+    ) -> Option<ArtifactEvictionBlocker> {
         use ArtifactEvictionBlocker as Blocker;
         if self.standing_artifact_exempt.load(Ordering::Acquire) {
             return Some(Blocker::StandingRoot);
@@ -13957,7 +13973,13 @@ impl AppContext {
             Some(true) => return Some(Blocker::InspectTier2),
             Some(false) => {}
         }
-        match self.bash_background.try_has_running_tasks() {
+        let bash_busy = match deleted_root {
+            Some(root) => self
+                .bash_background
+                .try_has_reclaimable_tasks_for_root(root),
+            None => self.bash_background.try_has_running_tasks(),
+        };
+        match bash_busy {
             None => return Some(Blocker::LockContended),
             Some(true) => return Some(Blocker::BashRunning),
             Some(false) => {}
@@ -14056,7 +14078,27 @@ impl AppContext {
     /// when eviction is unsafe or a lock was contended; the reaper retries on
     /// its next sweep.
     pub(crate) fn try_evict_idle_artifacts(&self) -> bool {
-        if self.try_artifact_eviction_blocker(true).is_some() {
+        self.try_evict_idle_artifacts_for_root(None)
+    }
+
+    /// Deleted-root reclamation uses the same root-scoped task gate both before
+    /// and during eviction. Artifact handles belong to this root, so only its
+    /// tasks block reclamation of those handles.
+    pub(crate) fn try_evict_idle_artifacts_for_deleted_root(
+        &self,
+        root: &crate::path_identity::ProjectRootId,
+    ) -> bool {
+        self.try_evict_idle_artifacts_for_root(Some(root))
+    }
+
+    fn try_evict_idle_artifacts_for_root(
+        &self,
+        deleted_root: Option<&crate::path_identity::ProjectRootId>,
+    ) -> bool {
+        if self
+            .try_artifact_eviction_blocker_for_root(true, deleted_root)
+            .is_some()
+        {
             return false;
         }
         let Some(mut callgraph_store) = try_write_unpoisoned(&self.callgraph_store) else {
