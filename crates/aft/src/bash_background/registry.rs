@@ -8432,7 +8432,12 @@ impl BgTaskRegistry {
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     self.forget_task_read_record(&resolved.paths.dir);
-                    match delete_task_bundle(&resolved.paths) {
+                    #[cfg(test)]
+                    let before_teardown = super::persistence::work_counts::get();
+                    let removal = delete_task_bundle(&resolved.paths);
+                    #[cfg(test)]
+                    super::persistence::work_counts::record_gc_teardown_since(before_teardown);
+                    match removal {
                         Ok(()) => {
                             memo.forget(&session_dir, task_id);
                             self.forget_finished_delete_attempts(&metadata.task_id);

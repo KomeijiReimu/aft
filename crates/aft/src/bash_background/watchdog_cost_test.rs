@@ -457,14 +457,13 @@ fn watchdog_cost_persisted_gc_selects_newly_eligible_history() {
     );
 }
 
-#[test]
-fn watchdog_cost_persisted_gc_deadlines_bypass_paced_validation() {
+fn persisted_gc_expiration_work(task_count: usize) -> work_counts::Counts {
     let storage = tempfile::tempdir().unwrap();
     let registry = BgTaskRegistry::default();
     let wall = SystemTime::now();
     let tick = Instant::now();
     let mut paths = Vec::new();
-    for index in 0..4_000 {
+    for index in 0..task_count {
         let (_, path) = fixture(storage.path(), "session", true, 2);
         let modified = if index < 10 {
             wall - Duration::from_secs(23 * 60 * 60)
@@ -500,7 +499,7 @@ fn watchdog_cost_persisted_gc_deadlines_bypass_paced_validation() {
         "retention work opened an independent SQLite connection"
     );
     eprintln!(
-        "4000 deadlines / 10 expired, validation paced: {:?}, {counts:?}",
+        "{task_count} deadlines / 10 expired, validation paced: {:?}, {counts:?}",
         start.elapsed()
     );
     assert!(
@@ -515,9 +514,13 @@ fn watchdog_cost_persisted_gc_deadlines_bypass_paced_validation() {
         counts.metadata_reads <= 40,
         "only ten due tasks may be opened: {counts:?}"
     );
-    assert!(counts.stats < 500, "all history was statted: {counts:?}");
     assert!(paths[..10].iter().all(|path| !path.dir.exists()));
     assert!(paths[10..].iter().all(|path| path.json.exists()));
+    // The control only calibrates expiration work. Its complete small-store
+    // lap is paced differently; exercise minute-slice resumption with history.
+    if task_count == 10 {
+        return counts;
+    }
     work_counts::reset();
     registry
         .scheduled_gc_persisted(storage.path(), tick + Duration::from_secs(59), || wall)
@@ -531,6 +534,35 @@ fn watchdog_cost_persisted_gc_deadlines_bypass_paced_validation() {
     assert!(
         entries > 0 && entries <= 128,
         "validation did not resume at its bounded minute rate: {entries}"
+    );
+    counts
+}
+
+#[test]
+fn watchdog_cost_persisted_gc_deadlines_bypass_paced_validation() {
+    let control = persisted_gc_expiration_work(10);
+    let history = persisted_gc_expiration_work(4_000);
+    // Windows bundle removal performs more identity checks than Unix. Measure
+    // the deadline gate separately, then compare the same ten expirations with
+    // and without retained history instead of assuming a platform's stat cost.
+    let gate_work = |counts: work_counts::Counts| {
+        (
+            counts.opens - counts.gc_teardown_opens,
+            counts.metadata_reads - counts.gc_teardown_metadata_reads,
+            counts.stats - counts.gc_teardown_stats,
+        )
+    };
+    let control_gate = gate_work(control);
+    let history_gate = gate_work(history);
+    eprintln!("deadline gate (opens, metadata reads, stats): control={control_gate:?}, history={history_gate:?}; total and teardown work: control={control:?}, history={history:?}");
+    assert!(
+        history_gate.0 <= control_gate.0 + 2,
+        "deadline gate opens grew with retained history: {control_gate:?} -> {history_gate:?}"
+    );
+    assert!(history_gate.1 <= control_gate.1 + 2, "deadline gate metadata reads grew with retained history: {control_gate:?} -> {history_gate:?}");
+    assert!(
+        history_gate.2 <= control_gate.2 + 2,
+        "deadline gate stats grew with retained history: {control_gate:?} -> {history_gate:?}"
     );
 }
 
@@ -613,6 +645,46 @@ fn gc_grace_rechecks_clock_after_mid_pass_ack() {
     // Keeping future timestamps alone would mask reuse of the pass-start
     // clock. Require a fresh sample after the acknowledgement as well.
     assert_eq!(clock_samples, [pass_started, examined_at]);
+}
+
+#[test]
+fn gc_stamp_cache_revalidates_same_time_metadata_replacement() {
+    let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let (_, paths) = fixture(storage.path(), "session", false, 2);
+    gc_until_lap(&registry, storage.path(), 1);
+    let stamp = super::super::gc_memo::Stamp::of(&paths.json).unwrap();
+    work_counts::reset();
+    assert_eq!(registry.maybe_gc_persisted(storage.path()).unwrap(), 0);
+    let unchanged = work_counts::get();
+    assert_eq!(
+        unchanged.metadata_reads, 0,
+        "an unchanged task lost its cached verdict: {unchanged:?}"
+    );
+    assert_eq!(
+        super::super::gc_memo::Stamp::of(&paths.json).unwrap(),
+        stamp
+    );
+
+    // Keep size, modification time and Windows creation time identical, and
+    // bypass writer notifications so only the replacement's identity can make
+    // the cached verdict demand validation.
+    let original = fs::read_to_string(&paths.json).unwrap();
+    let rewritten = original.replacen("watchdog-fixture", "Watchdog-fixture", 1);
+    assert_ne!(original, rewritten);
+    assert_eq!(original.len(), rewritten.len());
+    crate::file_identity::replace_keeping_times(&paths.json, rewritten.as_bytes());
+    work_counts::reset();
+    assert_eq!(registry.maybe_gc_persisted(storage.path()).unwrap(), 0);
+    let changed = work_counts::get();
+    eprintln!("cached metadata: unchanged={unchanged:?}; same-size/time replacement={changed:?}");
+    assert!(
+        changed.metadata_reads > 0,
+        "a real metadata replacement bypassed validation: {changed:?}"
+    );
+    assert!(paths.json.exists());
+    let task = resolve_task_layout(&paths.session_dir, &paths.task_id).unwrap();
+    assert_eq!(read_task_at(&task).unwrap().command, "Watchdog-fixture");
 }
 
 /// Remembering undeletable tasks must not delay or prevent deletion: a pass
