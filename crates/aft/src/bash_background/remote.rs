@@ -1702,7 +1702,12 @@ const RUNON_CD_OUTSIDE_CHECKOUT_MESSAGE: &str = "runon refused: the command chan
 const RUNON_CD_WINDOWS_ABSOLUTE_MESSAGE: &str = "runon refused: the command changes into <path>, which is not valid on the Windows runner because absolute command paths are not translated (checkout <checkout root>); the command did not run. Set the bash tool's workdir to that folder instead of using cd.";
 
 #[cfg(unix)]
-fn runon_snapshot_directory_known(checkout: &Path, path: &Path, git: &Path) -> bool {
+fn runon_snapshot_directory_known(
+    checkout: &Path,
+    path: &Path,
+    git: &Path,
+    deadline: Instant,
+) -> bool {
     let Ok(relative) = path.strip_prefix(checkout) else {
         return false;
     };
@@ -1713,10 +1718,9 @@ fn runon_snapshot_directory_known(checkout: &Path, path: &Path, git: &Path) -> b
     // tracked overrides; a directory needs a copied file beneath it as proof.
     // Uncertain membership retains the failure cwd and its checkout-escape
     // refusals, rather than assuming a directory change succeeds remotely.
-    if relative.starts_with("target") || !path.is_dir() {
+    if Instant::now() >= deadline || relative.starts_with("target") || !path.is_dir() {
         return false;
     }
-    let deadline = Instant::now() + Duration::from_secs(2);
     let relative = if relative.as_os_str().is_empty() {
         Path::new(".")
     } else {
@@ -1771,6 +1775,9 @@ fn runon_cd_refusal_with_git(
     request: &RunRequest,
     git: &Path,
 ) -> Result<Option<String>, exec::Error> {
+    // All directory probes share one budget so a long cd list cannot delay
+    // remote dispatch by spending a fresh timeout on every destination.
+    let deadline = Instant::now() + Duration::from_secs(2);
     let checkout = Path::new(&request.workspace_key);
     let cwd = exec::DirectoryKind::WorkingDirectory.canonicalize(Path::new(&request.cwd))?;
     // Sibling wire paths are absolute and are not rebased on Linux. A linked
@@ -1809,6 +1816,9 @@ fn runon_cd_refusal_with_git(
     };
     let known_directories = std::cell::RefCell::new(BTreeMap::<PathBuf, bool>::new());
     let known_directory = |path: &Path| {
+        if Instant::now() >= deadline {
+            return false;
+        }
         if let Some(known) = known_directories.borrow().get(path) {
             return *known;
         }
@@ -1816,7 +1826,7 @@ fn runon_cd_refusal_with_git(
             .chain(siblings.iter().map(PathBuf::as_path))
             .filter(|root| path.starts_with(root))
             .max_by_key(|root| root.components().count())
-            .is_some_and(|root| runon_snapshot_directory_known(root, path, git));
+            .is_some_and(|root| runon_snapshot_directory_known(root, path, git, deadline));
         known_directories
             .borrow_mut()
             .insert(path.to_path_buf(), known);

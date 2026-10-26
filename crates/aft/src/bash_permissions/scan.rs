@@ -280,8 +280,8 @@ pub(crate) struct DirectoryTarget {
 /// Follow reachable outer-shell folder and physical-mode alternatives, keeping
 /// successful and failed commands separate so `&&` and `||` stay correlated.
 /// `known_directory` identifies existing directories copied to the runner. Treat
-/// those changes as successful so hypothetical failures cannot make later
-/// commands appear to leave the checkout from a stale working directory.
+/// valid initial `cd` changes as successful, but stop trusting the snapshot after
+/// any non-`cd` command. Keep tracking cwd independently of snapshot trust.
 #[cfg(any(unix, test))]
 pub(crate) fn top_level_directory_targets(
     command: &str,
@@ -294,6 +294,7 @@ pub(crate) fn top_level_directory_targets(
     struct ShellState {
         cwd: PathBuf,
         physical: Option<bool>,
+        snapshot_unchanged: bool,
     }
     #[derive(Clone)]
     enum Paths {
@@ -309,6 +310,7 @@ pub(crate) fn top_level_directory_targets(
             Self::Known(vec![ShellState {
                 cwd,
                 physical: Some(physical),
+                snapshot_unchanged: true,
             }])
         }
         fn is_empty(&self) -> bool {
@@ -377,6 +379,20 @@ pub(crate) fn top_level_directory_targets(
                     result
                 }
             }
+        }
+        fn snapshot_unchanged(&self) -> bool {
+            match self {
+                Self::Known(states) => states.iter().all(|state| state.snapshot_unchanged),
+                Self::Unknown(_) => false,
+            }
+        }
+        fn invalidate_snapshot(mut self) -> Self {
+            if let Self::Known(states) = &mut self {
+                for state in states {
+                    state.snapshot_unchanged = false;
+                }
+            }
+            self
         }
     }
     struct Flow {
@@ -548,15 +564,18 @@ pub(crate) fn top_level_directory_targets(
                             match flag {
                                 'L' => physical = false,
                                 'P' => physical = true,
-                                _ => {}
+                                'e' | '@' => {}
+                                _ => return None,
                             }
                         }
                     }
                     continue;
                 }
             }
-            operand = Some(part.text.as_str());
-            break;
+            if operand.replace(part.text.as_str()).is_some() {
+                return None;
+            }
+            options = false;
         }
         let raw = operand?;
         let expand_home = raw == "~" || raw.starts_with("~/");
@@ -613,7 +632,7 @@ pub(crate) fn top_level_directory_targets(
         let mut success = Paths::empty();
         let mut failure = Paths::empty();
         let mut emitted: Vec<DirectoryTarget> = Vec::new();
-        let mut resolve = |cwd, mode| {
+        let mut resolve = |cwd, mode, snapshot_unchanged| {
             let resolved = match mode {
                 Some(physical) => resolve_target(head, parts, cwd, physical)
                     .map(|(target, next_cwd)| (target, Some(next_cwd))),
@@ -630,7 +649,8 @@ pub(crate) fn top_level_directory_targets(
                     }),
             };
             if let Some((target, next_cwd)) = resolved {
-                let known_success = known_directory(&target.path)
+                let known_success = snapshot_unchanged
+                    && known_directory(&target.path)
                     && target
                         .alternate_path
                         .as_ref()
@@ -639,6 +659,7 @@ pub(crate) fn top_level_directory_targets(
                     success.insert(ShellState {
                         cwd: next_cwd,
                         physical: mode,
+                        snapshot_unchanged,
                     });
                 } else {
                     success = Paths::Unknown(None);
@@ -655,13 +676,17 @@ pub(crate) fn top_level_directory_targets(
         match &incoming {
             Paths::Known(paths) => {
                 for state in paths {
-                    if !resolve(Some(state.cwd.as_path()), state.physical) {
+                    if !resolve(
+                        Some(state.cwd.as_path()),
+                        state.physical,
+                        state.snapshot_unchanged,
+                    ) {
                         failure.insert(state.clone());
                     }
                 }
             }
             Paths::Unknown(mode) => {
-                if !resolve(None, *mode) {
+                if !resolve(None, *mode, false) {
                     failure = incoming.clone();
                 }
             }
@@ -687,6 +712,14 @@ pub(crate) fn top_level_directory_targets(
             );
         }
     }
+    fn has_substitution(node: Node<'_>) -> bool {
+        if matches!(node.kind(), "command_substitution" | "process_substitution") {
+            return true;
+        }
+        let mut cursor = node.walk();
+        let found = node.named_children(&mut cursor).any(has_substitution);
+        found
+    }
     fn evaluate(
         node: Node<'_>,
         source: &str,
@@ -699,8 +732,10 @@ pub(crate) fn top_level_directory_targets(
         }
         match node.kind() {
             "subshell" => return Flow::either(Paths::Unknown(incoming.mode())),
-            "command_substitution" | "process_substitution" => return Flow::either(incoming),
-            "function_definition" => return Flow::success(incoming),
+            "command_substitution" | "process_substitution" => {
+                return Flow::either(incoming.invalidate_snapshot());
+            }
+            "function_definition" => return Flow::success(incoming.invalidate_snapshot()),
             "if_statement"
             | "for_statement"
             | "c_style_for_statement"
@@ -723,6 +758,7 @@ pub(crate) fn top_level_directory_targets(
                 return Flow::either(incoming);
             }
             "redirected_statement" => {
+                let incoming = incoming.invalidate_snapshot();
                 let mut cursor = node.walk();
                 let body = node.child_by_field_name("body").or_else(|| {
                     node.named_children(&mut cursor)
@@ -740,6 +776,11 @@ pub(crate) fn top_level_directory_targets(
             "command" => {
                 let parts = command_parts(source, node);
                 let head = parts.first().and_then(|part| literal_word(&part.text));
+                let incoming = if head.as_deref() == Some("cd") && !has_substitution(node) {
+                    incoming
+                } else {
+                    incoming.invalidate_snapshot()
+                };
                 return match head.as_deref() {
                     Some(head @ ("cd" | "pushd")) => {
                         directory_change(head, &parts, incoming, targets, known_directory)
@@ -806,7 +847,18 @@ pub(crate) fn top_level_directory_targets(
                 "&" => {
                     // The asynchronous list ran in a child shell. Its final cwd
                     // and options must not replace the foreground entry state.
-                    flow = flow.map(|_| Flow::success(asynchronous_entry.clone()));
+                    flow = flow.map(|left| {
+                        // Background jobs share files with the foreground shell,
+                        // even though their directory changes do not carry over.
+                        let entry = if left.success.snapshot_unchanged()
+                            && left.failure.snapshot_unchanged()
+                        {
+                            asynchronous_entry.clone()
+                        } else {
+                            asynchronous_entry.clone().invalidate_snapshot()
+                        };
+                        Flow::success(entry)
+                    });
                     operator = Operator::Sequence;
                     continue;
                 }
@@ -1503,6 +1555,36 @@ mod tests {
     }
 
     #[test]
+    fn directory_targets_only_prove_supported_cd_invocations() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        for name in ["a", "-Z"] {
+            std::fs::create_dir(cwd.join(name)).unwrap();
+        }
+        for (command, destination) in [
+            ("cd a || cd ..", "a"),
+            ("cd -e a || cd ..", "a"),
+            ("cd -@ a || cd ..", "a"),
+            ("cd '-LP' -e@ -- a || cd ..", "a"),
+            ("cd -- -Z || cd ..", "-Z"),
+        ] {
+            let targets = top_level_directory_targets(command, &cwd, &|path| path.is_dir());
+            assert_eq!(targets.len(), 1, "{command}");
+            assert_eq!(targets[0].path, cwd.join(destination), "{command}");
+        }
+        for command in [
+            "cd a extra || cd ..",
+            "cd -Z a || cd ..",
+            "cd -PZ a || cd ..",
+            "cd -- a extra || cd ..",
+        ] {
+            let targets = top_level_directory_targets(command, &cwd, &|path| path.is_dir());
+            assert_eq!(targets.len(), 1, "{command}");
+            assert_eq!(targets[0].path, cwd.parent().unwrap(), "{command}");
+        }
+    }
+
+    #[test]
     fn directory_targets_bound_reachable_cwd_alternatives() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().canonicalize().unwrap();
@@ -1936,16 +2018,14 @@ mod tests {
         assert_eq!(explicit.len(), 1);
         assert_eq!(explicit[0].path, root.parent().unwrap());
         assert_eq!(explicit[0].alternate_path, None);
-        for (both_known, expected_count) in [(false, 2), (true, 1)] {
+        for both_known in [false, true] {
             let targets = top_level_directory_targets(
                 "set \"$OPTS\"; cd link/.. || cd fallback",
                 &deep,
                 &|path| both_known || path.starts_with(&root),
             );
-            assert_eq!(targets.len(), expected_count);
-            if !both_known {
-                assert_eq!(targets[1].path, deep.join("fallback"));
-            }
+            assert_eq!(targets.len(), 2);
+            assert_eq!(targets[1].path, deep.join("fallback"));
         }
         for command in ["set -- \"$X\"; cd ..", "set value \"$X\"; cd .."] {
             assert_eq!(

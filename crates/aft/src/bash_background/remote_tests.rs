@@ -10497,7 +10497,7 @@ async fn runon_cd_sequences_use_existing_copied_directories() {
     let marker = checkout.join("must-not-run-locally");
     for (line, refused) in [
         ("cd packages/a && true; cd ../b", false),
-        ("pushd packages/a && true; cd ../b", false),
+        ("pushd packages/a && true; cd ../b", true),
         ("cd ../commons/a && true; cd ../b", false),
         ("cd packages/missing && true; cd ../b", true),
         ("cd ../../outside", true),
@@ -10687,6 +10687,87 @@ fn runon_cd_snapshot_missing_git_keeps_failure_branch() {
     )
     .unwrap()
     .is_some());
+}
+
+#[test]
+fn runon_cd_snapshot_rule_invalid_cd_keeps_failure_branch() {
+    let (_dir, request) = runon_cd_snapshot_fixture();
+    let checkout = Path::new(&request.workspace_key);
+    fs::create_dir(checkout.join("a")).unwrap();
+    fs::write(checkout.join("a/source.txt"), "source\n").unwrap();
+    for line in [
+        "cd a extra || cd ..",
+        "cd -Z a || cd ..",
+        "cd -PZ a || cd ..",
+        "cd -- a extra || cd ..",
+    ] {
+        assert!(
+            runon_cd_refusal(line, &request).unwrap().is_some(),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn runon_cd_snapshot_rule_prior_command_keeps_failure_branch() {
+    let (_dir, request) = runon_cd_snapshot_fixture();
+    let checkout = Path::new(&request.workspace_key);
+    fs::create_dir(checkout.join("a")).unwrap();
+    fs::write(checkout.join("a/source.txt"), "source\n").unwrap();
+    for line in [
+        "mv a moved; cd a || cd ..",
+        "rm -rf a; cd a || cd ..",
+        "git clean -fd; cd a || cd ..",
+        "./script; cd a || cd ..",
+        "true; cd a || cd ..",
+        "set +P; cd a || cd ..",
+        "pushd .; cd a || cd ..",
+        "rm -rf a & cd a || cd ..",
+        "cd \"$(rm -rf a)\" || cd a || cd ..",
+    ] {
+        assert!(
+            runon_cd_refusal(line, &request).unwrap().is_some(),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn runon_cd_snapshot_rule_shared_deadline_bounds_git_lookups() {
+    let (_dir, request) = runon_cd_snapshot_fixture();
+    let checkout = Path::new(&request.workspace_key);
+    let counter = checkout.join("git-spawns");
+    let git = checkout.join("fake-git");
+    crate::executable_cache::write_executable(
+        &git,
+        format!(
+            "#!/bin/sh\nprintf 'spawn\\n' >> '{}'\nsleep 0.4\nfor target; do :; done\nprintf '%s/source.txt\\000' \"$target\"\n",
+            counter.display()
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let mut line = String::from("cd d0");
+    for index in 0..8 {
+        let folder = checkout.join(format!("d{index}"));
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("source.txt"), "source\n").unwrap();
+        if index > 0 {
+            line.push_str(&format!("; cd ../d{index}"));
+        }
+    }
+    let start = Instant::now();
+    assert_eq!(
+        runon_cd_refusal_with_git(&line, &request, &git).unwrap(),
+        None
+    );
+    let elapsed = start.elapsed();
+    let spawns = fs::read_to_string(counter).unwrap().lines().count();
+    assert!((2..=6).contains(&spawns), "spawned Git {spawns} times");
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "elapsed: {elapsed:?}"
+    );
 }
 
 #[test]
