@@ -38,7 +38,6 @@ pub(super) fn strip_hop_headers(headers: &mut HeaderMap, upgrade: bool) {
         "keep-alive",
         "te",
         "transfer-encoding",
-        "trailer",
     ] {
         headers.remove(name);
     }
@@ -88,7 +87,8 @@ pub(super) async fn forward(
                 super::websocket::relay(client, upstream, state).await;
             }
         });
-        let (parts, _) = response.into_parts();
+        let (mut parts, _) = response.into_parts();
+        parts.extensions.clear();
         return Ok(Response::from_parts(parts, super::full(Bytes::new())));
     }
     let encodings: Vec<_> = response
@@ -109,7 +109,8 @@ pub(super) async fn forward(
     }
     scrub_headers(response.headers_mut(), &state, false)?;
     response.headers_mut().remove("content-encoding");
-    let (parts, incoming) = response.into_parts();
+    let (mut parts, incoming) = response.into_parts();
+    parts.extensions.clear();
     let trailers = Arc::new(Mutex::new(None));
     let captured = trailers.clone();
     let incoming = Arc::new(tokio::sync::Mutex::new(incoming));
@@ -138,7 +139,11 @@ pub(super) async fn forward(
     let mut reader: Pin<Box<dyn AsyncRead + Send>> = Box::pin(StreamReader::new(stream));
     for encoding in encodings.iter().rev() {
         reader = match encoding.as_str() {
-            "gzip" => Box::pin(GzipDecoder::new(BufReader::new(reader))),
+            "gzip" => {
+                let mut decoder = GzipDecoder::new(BufReader::new(reader));
+                decoder.multiple_members(true);
+                Box::pin(decoder)
+            }
             "deflate" => Box::pin(ZlibDecoder::new(BufReader::new(reader))),
             "br" => Box::pin(BrotliDecoder::new(BufReader::new(reader))),
             _ => reader,

@@ -25,6 +25,10 @@ pub(super) async fn forward(
     authority: ConnectAuthority,
     state: Arc<State>,
 ) -> Result<Response<Body>, std::convert::Infallible> {
+    let websocket = request
+        .headers()
+        .get("upgrade")
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
     let fallback = state
         .config
         .grants
@@ -33,10 +37,24 @@ pub(super) async fn forward(
         .unwrap_or("");
     let result = prepare_and_send(request, &authority, &state).await;
     Ok(result.unwrap_or_else(|label| {
-        refusal(
-            if label.is_empty() { fallback } else { &label },
-            &authority.host,
-        )
+        let label = if label.is_empty() { fallback } else { &label };
+        let bytes = Zeroizing::new(format!(
+            "{}: {label} ({})\n",
+            super::PROXY_REFUSAL,
+            authority.host
+        ));
+        let mut response = refusal("", "");
+        *response.body_mut() =
+            full(Bytes::from(state.scrub(bytes.as_bytes()).unwrap_or_else(
+                |_| super::PROXY_REFUSAL.as_bytes().to_vec(),
+            )));
+        if websocket {
+            response.headers_mut().insert(
+                "connection",
+                hyper::header::HeaderValue::from_static("close"),
+            );
+        }
+        response
     }))
 }
 
@@ -151,6 +169,7 @@ async fn prepare_and_send(
             materials.push(None);
             continue;
         }
+        let _gate = state.material_gate.lock();
         if state.stopped.load(Ordering::Acquire)
             || crate::secret::vault::now_ms() >= grant.expires_at_ms
         {
@@ -198,12 +217,13 @@ async fn prepare_and_send(
     drop(view);
     for (name, bytes) in header_edits {
         let name = hyper::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| fail())?;
-        let mut value = hyper::header::HeaderValue::from_bytes(&bytes).map_err(|_| fail())?;
+        let mut value = hyper::header::HeaderValue::from_maybe_shared(super::secret_bytes(bytes))
+            .map_err(|_| fail())?;
         value.set_sensitive(true);
         parts.headers.insert(name, value);
     }
     let mut wire_target = apply_edits(target.as_bytes(), &mut query_edits)?;
-    if let Ok(normalized) = normalize_request_target(&target) {
+    if let Ok(normalized) = normalize_request_target(target.split('?').next().unwrap_or(&target)) {
         let query = wire_target
             .iter()
             .position(|c| *c == b'?')
@@ -213,10 +233,9 @@ async fn prepare_and_send(
             wire_target.extend_from_slice(&query);
         }
     }
-    parts.uri = std::str::from_utf8(&wire_target)
-        .map_err(|_| fail())?
-        .parse()
-        .map_err(|_| fail())?;
+    parts.uri =
+        hyper::Uri::from_maybe_shared(super::secret_bytes(Zeroizing::new(wire_target.to_vec())))
+            .map_err(|_| fail())?;
     parts.headers.remove("proxy-authorization");
     parts.headers.insert(
         "accept-encoding",
@@ -231,7 +250,7 @@ async fn prepare_and_send(
             hyper::header::HeaderValue::from_str(&rewritten.len().to_string())
                 .map_err(|_| fail())?,
         );
-        full(Bytes::copy_from_slice(&rewritten))
+        full(super::secret_bytes(rewritten))
     } else {
         incoming
             .map_err(|_| super::response::io_error())
@@ -260,12 +279,13 @@ async fn prepare_and_send(
     let http2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
     let mut outbound = Request::from_parts(parts, outbound_body);
     if http2 {
-        let uri = Zeroizing::new(format!(
-            "https://{}{}",
-            authority.authority(),
-            std::str::from_utf8(&wire_target).map_err(|_| fail())?
-        ));
-        *outbound.uri_mut() = uri.parse().map_err(|_| fail())?;
+        let host = authority.authority();
+        let mut uri = Zeroizing::new(Vec::with_capacity(8 + host.len() + wire_target.len()));
+        uri.extend_from_slice(b"https://");
+        uri.extend_from_slice(host.as_bytes());
+        uri.extend_from_slice(&wire_target);
+        *outbound.uri_mut() =
+            hyper::Uri::from_maybe_shared(super::secret_bytes(uri)).map_err(|_| fail())?;
         *outbound.version_mut() = Version::HTTP_2;
     } else {
         *outbound.version_mut() = Version::HTTP_11;
@@ -278,8 +298,15 @@ async fn prepare_and_send(
         tokio::spawn(async move {
             let _ = connection.await;
         });
+        let response = {
+            let _gate = state.material_gate.lock();
+            if state.stopped.load(Ordering::Acquire) {
+                return Err(fail());
+            }
+            sender.send_request(outbound)
+        };
         drop(materials);
-        sender.send_request(outbound).await.map_err(|_| fail())?
+        response.await.map_err(|_| fail())?
     } else {
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
             .await
@@ -287,8 +314,15 @@ async fn prepare_and_send(
         tokio::spawn(async move {
             let _ = connection.with_upgrades().await;
         });
+        let response = {
+            let _gate = state.material_gate.lock();
+            if state.stopped.load(Ordering::Acquire) {
+                return Err(fail());
+            }
+            sender.send_request(outbound)
+        };
         drop(materials);
-        sender.send_request(outbound).await.map_err(|_| fail())?
+        response.await.map_err(|_| fail())?
     };
     let _request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     super::response::forward(response, state.clone(), client_upgrade)

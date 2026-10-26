@@ -73,12 +73,18 @@ pub(crate) struct State {
     ca: rcgen::Certificate,
     ca_key: KeyPair,
     upstream: rustls::ClientConfig,
+    material_gate: Mutex<()>,
     // Keep each installed key as an exact-byte matcher for response scrubbers.
     // Rotation adds a matcher instead of replacing earlier key values.
     patterns: Mutex<Vec<(String, Zeroizing<Vec<u8>>)>>,
 }
 
 impl State {
+    fn mark_stopped(&self) {
+        let _gate = self.material_gate.lock();
+        self.stopped.store(true, Ordering::Release);
+    }
+
     fn scrubber(&self) -> Result<Scrubber, ()> {
         let patterns = self.patterns.lock();
         let sets = patterns
@@ -206,6 +212,7 @@ impl SecretProxy {
             ca,
             ca_key,
             upstream,
+            material_gate: Mutex::new(()),
             patterns: Mutex::new(Vec::new()),
         });
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -227,7 +234,7 @@ impl SecretProxy {
             .name("secret-proxy".into())
             .spawn(move || {
                 runtime.block_on(serve(listener, shared.clone(), receiver));
-                shared.stopped.store(true, Ordering::Release);
+                shared.mark_stopped();
                 runtime.shutdown_timeout(Duration::from_secs(1));
                 shared.patterns.lock().clear();
             })
@@ -289,7 +296,7 @@ impl SecretProxy {
     }
 
     pub fn stop(&mut self) {
-        self.state.stopped.store(true, Ordering::Release);
+        self.state.mark_stopped();
         let _ = self.stop.send(true);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -336,7 +343,7 @@ async fn serve(
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
     }
-    state.stopped.store(true, Ordering::Release);
+    state.mark_stopped();
     connections.abort_all();
     while connections.join_next().await.is_some() {}
 }
@@ -422,6 +429,18 @@ pub(crate) fn full(bytes: Bytes) -> Body {
     Full::new(bytes)
         .map_err(|never| match never {})
         .boxed_unsync()
+}
+
+struct SecretBytes(Zeroizing<Vec<u8>>);
+
+impl AsRef<[u8]> for SecretBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+pub(crate) fn secret_bytes(bytes: Zeroizing<Vec<u8>>) -> Bytes {
+    Bytes::from_owner(SecretBytes(bytes))
 }
 
 pub(crate) fn refusal(label: &str, host: &str) -> Response<Body> {

@@ -5,7 +5,6 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::AtomicUsize;
 
 use hyper::header::HeaderValue;
-use hyper::Version;
 use rustls::pki_types::pem::PemObject;
 use secret_rules::location::Location;
 use serde_json::{json, Value};
@@ -16,11 +15,14 @@ use crate::secret::vault::{AuditError, Material, MaterialError, Resolution};
 const K1: &[u8] = b"test-key-12345678";
 const K2: &[u8] = b"rotated-key-987654321";
 const MARKER: &str = "{{ck-secret:test}}";
+const SPECIAL: &[u8] = b"alpha&percent%quote\"slash\\\r\nkey";
 
 struct Vault {
     calls: AtomicUsize,
     denied: AtomicBool,
     rotate: AtomicBool,
+    refused_label: Mutex<Option<String>>,
+    special: AtomicBool,
 }
 
 impl Vault {
@@ -29,6 +31,8 @@ impl Vault {
             calls: AtomicUsize::new(0),
             denied: AtomicBool::new(false),
             rotate: AtomicBool::new(false),
+            refused_label: Mutex::new(None),
+            special: AtomicBool::new(false),
         })
     }
 }
@@ -37,10 +41,20 @@ impl SecretVault for Vault {
     fn resolve(&self, _: &SecretScope, _: &str) -> Resolution {
         panic!("proxy must not resolve or file consent")
     }
-    fn material(&self, _: &SecretScope, _: &str, _: &str) -> Result<Material, MaterialError> {
+    fn material(
+        &self,
+        scope: &SecretScope,
+        label: &str,
+        _: &str,
+    ) -> Result<Material, MaterialError> {
+        assert_eq!(scope.reference(), "head");
         let count = self.calls.fetch_add(1, Ordering::SeqCst);
-        if self.denied.load(Ordering::SeqCst) {
+        if self.denied.load(Ordering::SeqCst) || self.refused_label.lock().as_deref() == Some(label)
+        {
             return Err(MaterialError::GrantLapsed);
+        }
+        if self.special.load(Ordering::SeqCst) {
+            return Ok(Material::new(SPECIAL.to_vec()));
         }
         Ok(Material::new(
             if self.rotate.load(Ordering::SeqCst) && count > 0 {
@@ -60,7 +74,7 @@ fn scope(reference: &str) -> SecretScope {
     SecretScope::from_stamp(
         &serde_json::from_value(json!({
             "owner": {"kind":"reserved", "module_id":"prefrontal-core"},
-            "owner_authorized":true, "kind":"head", "ref":reference, "scope_epoch":1
+        "owner_authorized":true, "kind":if reference == "run" {"ephemeral"} else {"head"}, "ref":reference, "scope_epoch":1
         }))
         .unwrap(),
     )
@@ -136,7 +150,11 @@ impl Server {
                 rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
             )
             .unwrap();
-        tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        tls.alpn_protocols = if mode.ends_with("-h1") {
+            vec![b"http/1.1".to_vec()]
+        } else {
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        };
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -220,7 +238,7 @@ impl Server {
                             if mode == "overlap" {
                                 overlap.wait().await;
                             }
-                            let mut payload = if mode == "echo-request" {
+                            let mut payload = if mode.starts_with("echo-request") {
                                 [
                                     parts.uri.to_string().as_bytes(),
                                     b"|",
@@ -493,7 +511,7 @@ fn client_child() {
                 let authority = value["authority"].as_str().map(str::to_owned).unwrap_or_else(|| std::env::var("AFT_UPSTREAM").unwrap());
                 let path = value["path"].as_str().unwrap_or("/approved");
                 let uri = if matches!(sender, Sender::H2(_)) { format!("https://{authority}{path}") } else { path.to_owned() };
-                let mut request = Request::builder().uri(uri).method("POST").header("host", &authority);
+                let mut request = Request::builder().uri(uri).method("POST").header("host", &authority).header("te", "trailers");
                 if let Some(headers) = value["headers"].as_object() {
                     for (key, val) in headers { request = request.header(key, val.as_str().unwrap()); }
                 }
@@ -699,6 +717,26 @@ async fn proxy_atomic_json_and_material_refusals_send_nothing_upstream() {
     }
     assert_eq!(vault.calls.load(Ordering::SeqCst), 0);
     assert!(server.seen.lock().is_empty());
+    *vault.refused_label.lock() = Some("json".into());
+    assert_eq!(
+        client.request(
+            "/approved",
+            json!({"authorization":format!("Bearer {MARKER}"),"content-type":"application/json"}),
+            r#"{"key":"{{ck-secret:json}}"}"#
+        )["status"],
+        403
+    );
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 2);
+    assert!(server.seen.lock().is_empty());
+    *vault.refused_label.lock() = None;
+    assert_eq!(
+        client.request(
+            "/approved",
+            json!({"authorization":format!("Bearer {MARKER}"),"content-type":"application/json"}),
+            r#"{"key":"{{ck-secret:json}}"}"#
+        )["status"],
+        200
+    );
     vault.denied.store(true, Ordering::SeqCst);
     assert_eq!(
         client.request(
@@ -708,8 +746,7 @@ async fn proxy_atomic_json_and_material_refusals_send_nothing_upstream() {
         )["status"],
         403
     );
-    assert_eq!(vault.calls.load(Ordering::SeqCst), 1);
-    assert!(server.seen.lock().is_empty());
+    assert_eq!(server.seen.lock().len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -759,6 +796,7 @@ async fn proxy_websocket_scrubs_fragments_and_refuses_extensions_and_rsv() {
             .is_none());
         if mode == "ws-extension" {
             assert_eq!(response["status"], 403);
+            assert_eq!(client.request("/approved", json!({}), "")["error"], true);
         } else {
             assert_eq!(response["status"], 101, "{response}");
             let frames = base64::engine::general_purpose::STANDARD
@@ -959,4 +997,139 @@ async fn proxy_process_tree_end_stops_listener_and_discards_matchers() {
     proxy.process_tree_ended();
     assert!(TcpStream::connect(proxy.address()).await.is_err());
     assert!(proxy.state.patterns.lock().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_query_and_json_escape_material_without_partial_header_writes() {
+    let server = Server::new("echo-request").await;
+    let vault = Vault::new();
+    vault.special.store(true, Ordering::SeqCst);
+    let proxy = SecretProxy::start_with_tls(
+        config(
+            vault.clone(),
+            server.address.port(),
+            &[
+                ("query", Location::Query("key".into())),
+                ("json", Location::Json("/key".into())),
+            ],
+        ),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let response = client.request(
+        "/approved?key=%7B%7Bck-secret%3Aquery%7D%7D",
+        json!({"content-type":"application/json"}),
+        r#"{"key":"{{ck-secret:json}}"}"#,
+    );
+    assert_eq!(response["status"], 200, "{response}");
+    let seen = server.seen.lock()[0].clone();
+    assert_eq!(
+        seen["target"],
+        "https://localhost:".to_owned()
+            + &server.address.port().to_string()
+            + "/approved?key=alpha%26percent%25quote%22slash%5C%0D%0Akey"
+    );
+    let body: Value = serde_json::from_str(seen["body"].as_str().unwrap()).unwrap();
+    assert_eq!(body["key"], std::str::from_utf8(SPECIAL).unwrap());
+    assert!(!response
+        .to_string()
+        .contains("alpha%26percent%25quote%22slash%5C%0D%0Akey"));
+    drop(client);
+    drop(proxy);
+    let proxy = SecretProxy::start_with_tls(
+        config(
+            vault.clone(),
+            server.address.port(),
+            &[("test", Location::Bearer)],
+        ),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    assert_eq!(
+        client.request(
+            "/approved",
+            json!({"authorization":format!("Bearer {MARKER}")}),
+            ""
+        )["status"],
+        403
+    );
+    assert_eq!(server.seen.lock().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_expired_grant_refuses_without_material_and_tunnel_closes_on_stop() {
+    let server = Server::new("echo-request").await;
+    let vault = Vault::new();
+    let mut cfg = config(
+        vault.clone(),
+        server.address.port(),
+        &[("test", Location::Bearer)],
+    );
+    cfg.grants[0].expires_at_ms = 0;
+    let mut proxy = SecretProxy::start_with_tls(cfg, server.client_tls.clone()).unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    assert_eq!(
+        client.request(
+            "/approved",
+            json!({"authorization":format!("Bearer {MARKER}")}),
+            ""
+        )["status"],
+        403
+    );
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 0);
+    assert!(server.seen.lock().is_empty());
+    assert_eq!(
+        client.command(json!({"op":"connect","authority":server.address.to_string()}))["ok"],
+        true
+    );
+    assert_eq!(
+        client.request(
+            "/approved",
+            json!({"authorization":format!("Bearer {MARKER}")}),
+            ""
+        )["status"],
+        200
+    );
+    proxy.process_tree_ended();
+    assert!(TcpStream::connect(proxy.address()).await.is_err());
+    assert_eq!(client.request("/approved", json!({}), "")["error"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_http1_upstream_receives_all_locations_and_rewritten_length() {
+    let server = Server::new("echo-request-h1").await;
+    let vault = Vault::new();
+    let proxy = SecretProxy::start_with_tls(
+        config(
+            vault.clone(),
+            server.address.port(),
+            &[
+                ("test", Location::Bearer),
+                ("query", Location::Query("q".into())),
+                ("header", Location::Header("x-key".into())),
+                ("json", Location::Json("/k".into())),
+            ],
+        ),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let response = client.request("/approved?q=%7B%7Bck-secret%3Aquery%7D%7D", json!({"authorization":format!("Bearer {MARKER}"),"x-key":"{{ck-secret:header}}","content-type":"application/json"}), r#"{"k":"{{ck-secret:json}}"}"#);
+    assert_eq!(response["status"], 200, "{response}");
+    let seen = server.seen.lock()[0].clone();
+    assert_eq!(seen["target"], "/approved?q=test-key-12345678");
+    assert_eq!(seen["headers"]["authorization"], "Bearer test-key-12345678");
+    assert_eq!(seen["headers"]["x-key"], "test-key-12345678");
+    assert_eq!(seen["body"], r#"{"k":"test-key-12345678"}"#);
+    assert_eq!(seen["headers"]["content-length"], "25");
 }
