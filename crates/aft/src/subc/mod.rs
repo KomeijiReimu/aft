@@ -4129,6 +4129,9 @@ fn run_subc_mode_inner(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
+    // Before any database opens: this process admits keyed calls, so it is
+    // the one that recovers the call ledger after a restart.
+    crate::db::call_ledger::mark_provider_process();
     let _daemon_storage_lease = crate::root_cache::acquire_daemon_storage_lease(&ctx.storage_dir())
         .map_err(SubcError::StorageLease)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -5675,6 +5678,7 @@ where
                             user_config_path.as_deref(),
                             tool_response_body_limit,
                             Some(&run_scopes),
+                            storage_dir,
                         )
                         .await
                         {
@@ -7039,6 +7043,12 @@ async fn close_daemon_connection(
     }
 }
 
+/// `storage_dir` is the storage root the module selected at startup, the one
+/// its daemon storage lease covers. A new actor starts from it so that the
+/// bind's configure opens aft.db and the actor's other durable state in that
+/// same root. Starting from an empty `storage_dir` would let the actor fall
+/// back to the default data home and split the module's data in two whenever
+/// the module was started with an explicit storage path.
 fn register_actor_for_bind(
     shared_app: &Arc<App>,
     executor: &Arc<Executor>,
@@ -7046,6 +7056,7 @@ fn register_actor_for_bind(
     bind_root_id: &ProjectRootId,
     route_channel: u16,
     root_was_live: bool,
+    storage_dir: &Path,
 ) -> bool {
     if executor.actor_registered(bind_root_id) {
         log::debug!(
@@ -7066,7 +7077,10 @@ fn register_actor_for_bind(
 
     let actor_ctx = Arc::new(AppContext::from_app(
         Arc::clone(shared_app),
-        Config::default(),
+        Config {
+            storage_dir: Some(storage_dir.to_path_buf()),
+            ..Config::default()
+        },
     ));
     install_bash_compressor(&actor_ctx);
     actor_ctx.install_fleet_status_client(Some(push_senders.fleet_status_client.clone()));
@@ -7842,6 +7856,7 @@ async fn handle_control_request(
     user_config_path: Option<&Path>,
     tool_response_body_limit: usize,
     run_scopes: Option<&run_scope::RunScopes>,
+    storage_dir: &Path,
 ) -> Result<(), SubcError> {
     metrics.mark_frame_loop_entry("handle_control_request", frame);
     let request = match serde_json::from_slice::<ModuleControlRequest>(&frame.body) {
@@ -8258,6 +8273,7 @@ async fn handle_control_request(
                 &bind_root_id,
                 route_channel,
                 root_was_live,
+                storage_dir,
             );
 
             sync_bg_live_delivery_sessions(executor, routes, Some(&bind_root_id), Some(metrics));
@@ -14806,6 +14822,7 @@ mod tests {
                 Some(&test_support::bind_config_without_indexes(dir.path())),
                 usize::MAX,
                 None,
+                &ctx.storage_dir(),
             )
             .await
             .expect("admit route bind");
