@@ -1253,10 +1253,11 @@ pub(super) const REMOTE_ADMISSION_PENDING_NOTE: &str = "The remote job is queued
 
 /// The reply for a runon task handed to the background before the runner has
 /// accepted it. Foreground calls reach this at the end of their wait window;
-/// explicit background calls reach it as soon as the task is registered. Both
-/// use the same task-id guidance and admission-pending note. Every other reply
-/// passes through unchanged: a finished or refused task, an accepted job, or a
-/// reply returned early because AFT is restarting.
+/// explicit background calls reach it as soon as the task is registered and
+/// keep background launch wording rather than claiming a foreground wait. Both
+/// retain the admission-pending note. Every other reply passes through unchanged:
+/// a finished or refused task, an accepted job, or a reply returned early because
+/// AFT is restarting.
 fn foreground_runon_reply(
     response: Response,
     window_end: Option<Instant>,
@@ -1278,26 +1279,33 @@ fn foreground_runon_reply(
     let Some(task_id) = response.data["task_id"].as_str() else {
         return response;
     };
-    let promotion = Response::success(
+    let guidance = if background_runon {
+        crate::commands::bash_orchestrate::format_background_launch(
+            task_id,
+            false,
+            worker_session,
+            bash_watch_available,
+        )
+    } else {
+        crate::commands::bash_orchestrate::format_promotion_message(
+            task_id,
+            timeout,
+            window_ms,
+            worker_session,
+            bash_watch_available,
+        )
+    };
+    let reply = Response::success(
         &response.id,
         json!({
-            "output": format!(
-                "{}\n{REMOTE_ADMISSION_PENDING_NOTE}",
-                crate::commands::bash_orchestrate::format_promotion_message(
-                    task_id,
-                    timeout,
-                    window_ms,
-                    worker_session,
-                    bash_watch_available,
-                ),
-            ),
+            "output": format!("{guidance}\n{REMOTE_ADMISSION_PENDING_NOTE}"),
             "task_id": task_id,
             "status": "starting",
             "remote_phase": crate::bash_background::registry::remote::RemotePhase::Submitting.tag(),
             "remote_job_id": Value::Null,
         }),
     );
-    with_capture_warning(&promotion)
+    with_capture_warning(&reply)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6073,30 +6081,28 @@ mod grant_path_tests {
         }
     }
 
-    /// A background runon reply names the registered task before the runner
-    /// accepts it, and that task later delivers its completion on the same id.
+    /// A background runon reply keeps local background launch wording and names
+    /// the registered task before acceptance, then delivers completion on that id.
     #[cfg(unix)]
     #[tokio::test]
     async fn background_runon_replies_at_registration_before_acceptance() {
         use crate::exec_remote::wire_tests::Script;
         let (daemon, _dir, root, executor, ctx) =
             capture_fixture(Script::GatedAcceptanceThenExit).await;
-        let timing = BashTimingForTest::new(Instant::now());
+        let received_at = Instant::now();
+        let timing = BashTimingForTest::new(received_at);
         let mut rx = with_bash_timing_for_test(Some(timing.clone()), || {
             deadline_test_call_received(
                 &executor,
                 &root,
                 remote_runon_stub,
                 json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":600_000}),
-                Instant::now(),
+                received_at,
             )
         });
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            timing.capture_registered.notified(),
-        )
-        .await
-        .expect("task registration must publish its detach target");
+        tokio::time::timeout(Duration::from_secs(5), timing.capture_registered.notified())
+            .await
+            .expect("task registration must publish its detach target");
         let registered_at = Instant::now();
         let early = tokio::time::timeout(Duration::from_millis(900), rx.recv()).await;
         if early.is_err() {
@@ -6106,13 +6112,23 @@ mod grant_path_tests {
         }
         let done = early.unwrap().unwrap();
         assert!(registered_at.elapsed() < Duration::from_secs(1));
+        assert!(
+            received_at.elapsed() < Duration::from_secs(5),
+            "background runon must not wait for the 15-second foreground window"
+        );
         let response = done.response_for_test();
         let text = done.text_for_test().unwrap();
         let task_id = response.data["task_id"].as_str().unwrap().to_owned();
         assert!(response.success, "{response:?}");
         assert_eq!(response.data["status"], "starting", "{response:?}");
         assert_eq!(response.data["remote_phase"], "submitting", "{response:?}");
-        assert!(text.contains("promoted to background"), "{text}");
+        assert_eq!(
+            response.data["output"].as_str().unwrap(),
+            format!(
+                "Background task started: {task_id}. A completion reminder will be delivered automatically; don't poll bash_status.\n{REMOTE_ADMISSION_PENDING_NOTE}\n{REMOTE_INPUT_CAPTURE_WARNING}"
+            ),
+        );
+        assert!(!text.contains("Foreground bash didn't finish"), "{text}");
         assert!(text.contains(&task_id), "{text}");
         assert!(text.contains(REMOTE_ADMISSION_PENDING_NOTE), "{text}");
         assert!(text.contains(REMOTE_INPUT_CAPTURE_WARNING), "{text}");
@@ -6422,6 +6438,10 @@ mod grant_path_tests {
             .unwrap();
         let waited = received.elapsed();
         assert!(
+            waited >= Duration::from_secs(1),
+            "the foreground call replied early after {waited:?}"
+        );
+        assert!(
             waited < Duration::from_secs(5),
             "the reply took {waited:?}, past the one-second window"
         );
@@ -6431,7 +6451,12 @@ mod grant_path_tests {
         let task_id = response.data["task_id"].as_str().unwrap().to_owned();
         assert_eq!(response.data["status"], "starting", "{response:?}");
         assert_eq!(response.data["remote_phase"], "submitting", "{response:?}");
-        assert!(text.contains("promoted to background"), "{text}");
+        assert_eq!(
+            response.data["output"].as_str().unwrap(),
+            format!(
+                "Foreground bash didn't finish within 1s and was promoted to background: {task_id}. A completion reminder will be delivered automatically; use bash_status({{ taskId: \"{task_id}\" }}) to inspect output or bash_kill({{ taskId: \"{task_id}\" }}) to terminate.\n{REMOTE_ADMISSION_PENDING_NOTE}\n{REMOTE_INPUT_CAPTURE_WARNING}"
+            ),
+        );
         assert!(text.contains(&task_id), "{text}");
         assert!(text.contains(REMOTE_ADMISSION_PENDING_NOTE), "{text}");
         assert!(text.contains(REMOTE_INPUT_CAPTURE_WARNING), "{text}");
