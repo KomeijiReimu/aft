@@ -451,7 +451,7 @@ impl Client {
                 "client exited: {:?}",
                 self.process.try_wait()
             );
-            if let Ok(value) = serde_json::from_str(line.trim()) {
+            if let Some(value) = child_reply(&line) {
                 return value;
             }
         }
@@ -495,7 +495,7 @@ fn client_child() {
                     let mut process = command.spawn().map_err(|_| ())?;
                     writeln!(process.stdin.take().unwrap(), "{{\"op\":\"connect\"}}").map_err(|_| ())?;
                     let output = process.wait_with_output().map_err(|_| ())?;
-                    return Ok(String::from_utf8_lossy(&output.stdout).lines().find_map(|line| serde_json::from_str::<Value>(line).ok()).ok_or(())?);
+                    return Ok(String::from_utf8_lossy(&output.stdout).lines().find_map(child_reply).ok_or(())?);
                 }
                 if value["op"] == "connect" {
                     let proxy = url::Url::parse(&std::env::var("AFT_PROXY").unwrap()).unwrap();
@@ -567,6 +567,25 @@ fn client_child() {
             std::io::stdout().flush().unwrap();
         }
     });
+}
+
+fn child_reply(line: &str) -> Option<Value> {
+    // With a single test thread, libtest prefixes uncaptured output with the
+    // test name on the same line. Only the following JSON is our IPC reply.
+    serde_json::from_str(line.get(line.find('{')?..)?.trim()).ok()
+}
+
+#[test]
+fn child_reply_accepts_libtest_single_thread_prefix() {
+    assert_eq!(
+        child_reply("test client_child ... {\"ok\":true}\n"),
+        Some(json!({"ok":true}))
+    );
+    assert_eq!(
+        child_reply("{\"status\":403}\n"),
+        Some(json!({"status":403}))
+    );
+    assert_eq!(child_reply("running 1 test\n"), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
