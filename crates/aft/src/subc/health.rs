@@ -1173,14 +1173,18 @@ impl DispatchPathMetrics {
                     continue;
                 }
                 logged.insert(key, now);
-                crate::slog_warn!(
-                    "subc bg wake: pending watch remains unacked root={} session={} task={} watch={} age_ms={}",
-                    root.as_path().display(),
-                    session,
-                    task_id,
-                    watch_id,
-                    age_ms
-                );
+                // One scan covers every session's watches, so log each inside
+                // its own session's scope to tag it with that session.
+                crate::log_ctx::with_session(Some(session.clone()), || {
+                    crate::slog_warn!(
+                        "subc bg wake: pending watch remains unacked root={} session={} task={} watch={} age_ms={}",
+                        root.as_path().display(),
+                        session,
+                        task_id,
+                        watch_id,
+                        age_ms
+                    );
+                });
             }
         }
         logged.retain(|_, last| {

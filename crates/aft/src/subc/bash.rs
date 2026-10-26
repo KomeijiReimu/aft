@@ -785,12 +785,15 @@ fn detach_held_bash_sync(target: drain::BashDetachTarget, cancelled: bool) {
         // process alive until the daemon's scope.describe response confirms the run ended; the
         // command's normal hard timeout still applies while confirmation waits.
     } else if let Err(error) = target.registry.promote(&target.task_id, &target.session_id) {
-        crate::slog_warn!(
-            "subc attach: bash background handoff failed task_id={:?} session={:?} error={:?}",
-            target.task_id,
-            target.session_id,
-            error
-        );
+        // Runs on a shared blocking-pool thread; tag with the task's session.
+        crate::log_ctx::with_session(Some(target.session_id.clone()), || {
+            crate::slog_warn!(
+                "subc attach: bash background handoff failed task_id={:?} session={:?} error={:?}",
+                target.task_id,
+                target.session_id,
+                error
+            );
+        });
     } else if cancelled {
         // The caller saw only the cancellation; name the still-running task
         // on the session's next bash call.
@@ -2383,7 +2386,10 @@ pub(super) fn submit_deferred_bash(
                             let reply = await_runon_launch_reply(spawn_ctx.bash_background().clone(), &session_id, &response, capture_deadline, &cancel, &claim, server_completion, Some(capture_reply_deadline), background_runon).await.unwrap_or(response);
                             foreground_runon_reply(reply, foreground_runon_deadline, background_runon, &cancel, foreground_runon_timeout, startup_window, worker_session, format_context.bash_watch_available.unwrap_or(worker_session))
                         };
-                        crate::slog_warn!("bash startup reply deadline channel={} corr={corr} elapsed_ms={} admitted={} code={} steps={}", route.channel, received_at.elapsed().as_millis(), admitted.load(Ordering::Relaxed), response.data.get("code").and_then(Value::as_str).unwrap_or("promoted"), startup_steps.format_steps());
+                        // This task runs on the shared subc runtime outside any session scope.
+                        crate::log_ctx::with_session(Some(session_id.to_string()), || {
+                            crate::slog_warn!("bash startup reply deadline channel={} corr={corr} elapsed_ms={} admitted={} code={} steps={}", route.channel, received_at.elapsed().as_millis(), admitted.load(Ordering::Relaxed), response.data.get("code").and_then(Value::as_str).unwrap_or("promoted"), startup_steps.format_steps());
+                        });
                         let result = (!cancel.connection.is_cancelled() && !cancel.route.is_cancelled() && claim.try_claim_for_wait_task()).then(|| bash_result_from_response(response, &format_context));
                         send_bash_deferred_completion(&completion_tx, &task_metrics, route, corr, flags, ver, root_for_task.clone(), request_id.clone(), result, false).await;
                         answered_startup = true;
@@ -3592,9 +3598,12 @@ async fn send_ready_bash_result(
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or(&result.text);
-        crate::slog_warn!(
-            "subc attach: late bash result discarded after handoff task_id={task_id:?} session={session_id:?} error={error:?}"
-        );
+        // Runs on the shared subc runtime; tag with the task's session.
+        crate::log_ctx::with_session(Some(session_id.to_string()), || {
+            crate::slog_warn!(
+                "subc attach: late bash result discarded after handoff task_id={task_id:?} session={session_id:?} error={error:?}"
+            );
+        });
     } else if claim.claimed_by_module_loop() {
         send_bash_deferred_completion(
             completion_tx,
