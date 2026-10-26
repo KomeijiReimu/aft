@@ -1,0 +1,1 @@
+- Storage retention reports cache walks interrupted by the retention deadline as incomplete, not protected, and keeps the reason visible while later passes retry reclamation.
