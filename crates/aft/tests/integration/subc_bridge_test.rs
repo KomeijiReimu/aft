@@ -5039,7 +5039,11 @@ async fn drive_bash_wait_true_daemon(input: FakeDaemonInput) {
             "command": "printf 'wait-early\\n'; sleep 1; printf 'wait-late\\n'",
             "foreground_orchestrate": true,
             "wait": true,
-            "timeout": 5_000,
+            // The test checks that wait:true returns terminal output, not how
+            // fast the command runs: a loaded Windows runner can take over 5 s
+            // to start the shell and its two printfs around the 1 s sleep.
+            // Stays under read_frame_timeout's 30 s so a kill still answers.
+            "timeout": 20_000,
             "compressed": false,
         }),
     )
