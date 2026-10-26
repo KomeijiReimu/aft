@@ -8,8 +8,8 @@
 //! The live delta holds the difference between the checkout's disk and its
 //! generation. Its invariant: **an entry exists for a path exactly when the
 //! last observed disk state differs from the generation's entry**. Every
-//! mutation is journaled, including one that removes an entry, because the
-//! generation switch needs it.
+//! disk mutation is journaled, including one that removes an entry. Readiness
+//! and write intents are versioned separately: neither observes new disk bytes.
 //!
 //! When a new generation `G+1` is published (by this daemon or by another
 //! one), the successor delta is derived over
@@ -567,6 +567,8 @@ pub struct LiveDelta {
     entries: Arc<Entries>,
     readiness: Arc<BTreeMap<RelPath, PlanePatch>>,
     journal: Vec<JournalRecord>,
+    observation_journal: BTreeMap<RelPath, u64>,
+    readiness_journal: BTreeMap<RelPath, u64>,
     intent: Arc<BTreeMap<RelPath, u64>>,
     intent_version: u64,
     watcher: WatcherState,
@@ -629,6 +631,8 @@ impl LiveDelta {
             entries: Arc::new(Entries::new()),
             readiness: Arc::new(BTreeMap::new()),
             journal: Vec::new(),
+            observation_journal: BTreeMap::new(),
+            readiness_journal: BTreeMap::new(),
             intent: Arc::new(BTreeMap::new()),
             intent_version: 0,
             watcher: WatcherState::Healthy,
@@ -675,16 +679,7 @@ impl LiveDelta {
 
     pub fn set_readiness(&mut self, path: RelPath, patch: PlanePatch) {
         self.version += 1;
-        let disk = self
-            .entries
-            .get(&path)
-            .map_or_else(|| self.base.disk_state(&path), |entry| entry.disk);
-        self.journal.retain(|record| record.rel_path != path);
-        self.journal.push(JournalRecord {
-            version: self.version,
-            rel_path: path.clone(),
-            disk,
-        });
+        self.readiness_journal.insert(path.clone(), self.version);
         Arc::make_mut(&mut self.readiness).insert(path, patch);
     }
 
@@ -705,6 +700,8 @@ impl LiveDelta {
             .get(&rel_path)
             .map_or_else(|| self.base.disk_state(&rel_path), |entry| entry.disk);
         self.version += 1;
+        self.observation_journal
+            .insert(rel_path.clone(), self.version);
         let attachments_changed = self.entries.get(&rel_path).is_some_and(|previous| {
             previous.attachments.len() != entry.attachments.len()
                 || previous.attachments.iter().any(|(plane, attachment)| {
@@ -736,16 +733,8 @@ impl LiveDelta {
     pub fn record_intent(&mut self, rel_path: RelPath) -> u64 {
         self.intent_version += 1;
         self.version += 1;
-        let disk = self
-            .entries
-            .get(&rel_path)
-            .map_or_else(|| self.base.disk_state(&rel_path), |entry| entry.disk);
-        self.journal.retain(|record| record.rel_path != rel_path);
-        self.journal.push(JournalRecord {
-            version: self.version,
-            rel_path: rel_path.clone(),
-            disk,
-        });
+        // An intent is not a disk observation. Replaying its old disk value
+        // would overwrite bytes a later strict walk actually observed.
         Arc::make_mut(&mut self.intent).insert(rel_path, self.intent_version);
         self.intent_version
     }
@@ -819,12 +808,18 @@ impl LiveDelta {
         if !Arc::ptr_eq(&draft.expected_base, &self.base) {
             return Err(SwitchError::BaseChanged);
         }
-        let replay = self
-            .journal
+        let mut replay = self
+            .observation_journal
             .iter()
-            .filter(|record| record.version > draft.cut_version)
-            .map(|record| record.rel_path.clone())
+            .filter(|(_, version)| **version > draft.cut_version)
+            .map(|(path, _)| path.clone())
             .collect::<BTreeSet<_>>();
+        replay.extend(
+            self.readiness_journal
+                .iter()
+                .filter(|(_, version)| **version > draft.cut_version)
+                .map(|(path, _)| path.clone()),
+        );
         for path in replay {
             let observed = self.entries.get(&path).cloned();
             rederive_path(
@@ -848,6 +843,8 @@ impl LiveDelta {
         // One successor is in flight at a time per root, so nothing older than
         // the swap is needed again.
         self.journal.clear();
+        self.observation_journal.clear();
+        self.readiness_journal.clear();
         Ok(())
     }
 
@@ -860,6 +857,8 @@ impl LiveDelta {
             entries: inner.entries.clone(),
             readiness: inner.readiness.clone(),
             journal: Vec::new(),
+            observation_journal: BTreeMap::new(),
+            readiness_journal: BTreeMap::new(),
             intent: inner.intent.clone(),
             intent_version: inner.intent_version,
             watcher: inner.watcher,
@@ -880,19 +879,23 @@ impl LiveDelta {
             return Err(SwitchError::BaseChanged);
         }
         let mut next = Self::from_snapshot(snapshot);
-        for record in self
-            .journal
+        for (path, _) in self
+            .observation_journal
             .iter()
-            .filter(|record| record.version > cut.version)
+            .filter(|(_, version)| **version > cut.version)
         {
             let entry = self
                 .entries
-                .get(&record.rel_path)
+                .get(path)
                 .cloned()
-                .unwrap_or_else(|| carry_disk_state_only(&record.rel_path, &self.base));
-            next.apply(record.rel_path.clone(), entry);
-            if let Some(patch) = self.readiness.get(&record.rel_path) {
-                next.set_readiness(record.rel_path.clone(), patch.clone());
+                .unwrap_or_else(|| carry_disk_state_only(path, &self.base));
+            next.apply(path.clone(), entry);
+        }
+        for (path, version) in &self.readiness_journal {
+            if *version > cut.version {
+                if let Some(patch) = self.readiness.get(path) {
+                    next.set_readiness(path.clone(), patch.clone());
+                }
             }
         }
         let intent = Arc::make_mut(&mut next.intent);
@@ -908,6 +911,8 @@ impl LiveDelta {
         next.version = self.version;
         next.watcher = self.watcher;
         next.journal.clear();
+        next.observation_journal.clear();
+        next.readiness_journal.clear();
         Ok(next)
     }
 }
@@ -1324,6 +1329,62 @@ mod mutation_tests {
         );
         assert_eq!(next.readiness()[&changed], live.readiness()[&changed]);
         assert_eq!(next.version(), live.version());
+    }
+
+    #[test]
+    fn intent_and_readiness_replay_do_not_undo_strictly_observed_bytes() {
+        let mut live = delta();
+        let file = RelPath::new(b"file.rs".to_vec()).unwrap();
+        live.apply(file.clone(), LiveEntry::new(DiskState::of_bytes(b"A"), 1));
+        let cut = InstallCut {
+            seq: 0,
+            resident: live.base().clone(),
+            epoch: live.epoch(),
+            version: live.version(),
+            intent_version: 0,
+        };
+        let mut walked = LiveDelta::new(live.base().clone());
+        walked.apply(file.clone(), LiveEntry::new(DiskState::of_bytes(b"B"), 2));
+        live.record_intent(file.clone());
+        live.set_readiness(
+            file.clone(),
+            PlanePatch {
+                content: ContentHash::of(b"A"),
+                planes: EntryPlanes {
+                    trigram: Some(super::super::readiness::PlaneState::pending("old A fill")),
+                    ..Default::default()
+                },
+            },
+        );
+        let replayed = live
+            .replay_onto(&walked.snapshot(), &cut)
+            .unwrap()
+            .snapshot();
+        assert_eq!(replayed.disk_state(&file), DiskState::of_bytes(b"B"));
+        assert!(replayed.pending_intent().any(|path| path == &file));
+        assert_eq!(replayed.plane_readiness(&file, FamilyPlane::Trigram), None);
+    }
+
+    #[test]
+    fn repeated_observation_after_a_cut_still_replays_over_a_walk() {
+        let mut live = delta();
+        let file = RelPath::new(b"file.rs".to_vec()).unwrap();
+        live.apply(file.clone(), LiveEntry::new(DiskState::of_bytes(b"A"), 1));
+        let cut = InstallCut {
+            seq: 0,
+            resident: live.base().clone(),
+            epoch: live.epoch(),
+            version: live.version(),
+            intent_version: 0,
+        };
+        let mut walked = LiveDelta::new(live.base().clone());
+        walked.apply(file.clone(), LiveEntry::new(DiskState::of_bytes(b"B"), 2));
+        live.apply(file.clone(), LiveEntry::new(DiskState::of_bytes(b"A"), 3));
+        let replayed = live
+            .replay_onto(&walked.snapshot(), &cut)
+            .unwrap()
+            .snapshot();
+        assert_eq!(replayed.disk_state(&file), DiskState::of_bytes(b"A"));
     }
 
     #[test]

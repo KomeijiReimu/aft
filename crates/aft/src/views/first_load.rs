@@ -3227,6 +3227,11 @@ impl CompositePlane for CallgraphBridge {
             if entry.disk == super::snapshot::DiskState::Absent || !self.applies_to(path) {
                 continue;
             }
+            // A concurrent reconcile may have replaced the observation cache.
+            // Never label manifest content with a key computed for other bytes.
+            if super::snapshot::DiskState::in_generation(manifest, path) != entry.disk {
+                continue;
+            }
             let attachment = entry
                 .attachments
                 .get(&FamilyPlane::Callgraph)
@@ -3331,6 +3336,209 @@ mod callgraph_bridge_tests {
         }
     }
 
+    fn graph_driver(
+        root: &std::path::Path,
+        storage: &std::path::Path,
+        bridge: &Arc<CallgraphBridge>,
+        plane: Arc<dyn CompositePlane>,
+    ) -> (Arc<CheckoutDriver>, ViewAccess) {
+        let registry =
+            super::super::registry::FamilyRegistry::open(storage, "coherent-graph").unwrap();
+        let owner = registry
+            .register_view_with_storage(storage, "local", root)
+            .unwrap();
+        let driver = Arc::new(
+            CheckoutDriver::new(
+                owner.clone(),
+                Producers {
+                    trigram: "test".into(),
+                    semantic: None,
+                    callgraph: super::super::callgraph::PRODUCER.into(),
+                },
+                None,
+                Arc::new(Walker),
+                vec![plane],
+            )
+            .with_adapters(vec![bridge.adapter.clone()]),
+        );
+        (driver, ViewAccess::Owner(owner))
+    }
+
+    fn graph_key(bytes: &[u8]) -> crate::blob_store::v2::FamilyKey {
+        let mut entry = LiveEntry::new(super::super::snapshot::DiskState::of_bytes(bytes), 0);
+        super::super::callgraph::attach(&mut entry, bytes, "rust").unwrap();
+        entry.attachments[&FamilyPlane::Callgraph]
+            .downcast_ref::<super::super::callgraph::CallgraphAttachment>()
+            .unwrap()
+            .key
+    }
+
+    struct RevertAfterAttachment {
+        bridge: Arc<CallgraphBridge>,
+        driver: std::sync::Mutex<std::sync::Weak<CheckoutDriver>>,
+        root: std::path::PathBuf,
+        armed: std::sync::atomic::AtomicBool,
+    }
+    impl CompositePlane for RevertAfterAttachment {
+        fn plane(&self) -> FamilyPlane {
+            FamilyPlane::Callgraph
+        }
+        fn applies_to(&self, path: &RelPath) -> bool {
+            self.bridge.applies_to(path)
+        }
+        fn attachment(
+            &self,
+            path: &RelPath,
+            bytes: &[u8],
+        ) -> Result<super::super::snapshot::PlaneAttachment, PlaneError> {
+            let attachment = self.bridge.attachment(path, bytes)?;
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                std::fs::write(
+                    self.root.join("file.rs"),
+                    b"fn original() {} fn caller() { original(); }",
+                )
+                .unwrap();
+                let driver = self.driver.lock().unwrap().upgrade().unwrap();
+                driver.record_change(path.clone());
+            }
+            Ok(attachment)
+        }
+        fn materialize(
+            &self,
+            owner: &super::super::registry::ViewRegistration,
+            generation: &str,
+            snapshot: &Snapshot,
+            observed: &BTreeMap<RelPath, LiveEntry>,
+            manifest: &mut super::super::manifest_v2::ManifestV2,
+            live: &mut crate::pins::LivePin,
+            seed_derived: bool,
+        ) -> Result<(), PlaneError> {
+            self.bridge.materialize(
+                owner,
+                generation,
+                snapshot,
+                observed,
+                manifest,
+                live,
+                seed_derived,
+            )
+        }
+        fn finish_generation(
+            &self,
+            owner: &super::super::registry::ViewRegistration,
+            staging: &str,
+            published: &str,
+        ) -> Result<(), PlaneError> {
+            self.bridge.finish_generation(owner, staging, published)
+        }
+    }
+
+    #[test]
+    fn a_mid_walk_revert_cannot_publish_a_key_for_other_manifest_bytes() {
+        let a = b"fn original() {} fn caller() { original(); }";
+        let b = b"fn replacement() {} fn caller() { replacement(); }";
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file.rs"), a).unwrap();
+        let bridge = Arc::new(CallgraphBridge::default());
+        let plane = Arc::new(RevertAfterAttachment {
+            bridge: bridge.clone(),
+            driver: Default::default(),
+            root: root.path().to_path_buf(),
+            armed: false.into(),
+        });
+        let (driver, access) = graph_driver(root.path(), storage.path(), &bridge, plane.clone());
+        *plane.driver.lock().unwrap() = Arc::downgrade(&driver);
+        let loader = SiblingLoader::new(driver.clone(), vec![bridge.adapter.clone()]);
+        drop(loader.load(&access).unwrap());
+        let key_a = graph_key(a);
+        let key_b = graph_key(b);
+        assert_ne!(key_a, key_b);
+        std::fs::write(root.path().join("file.rs"), b).unwrap();
+        driver.record_change(RelPath::new(b"file.rs".to_vec()).unwrap());
+        plane.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let snapshot = loader
+            .refresh(&access, driver.installed_snapshot().generation().clone())
+            .unwrap();
+        let store = driver.owner.view_store().unwrap();
+        let current = store.current_generation_read_only().unwrap().unwrap();
+        let manifest = store.load_manifest_v2(&current).unwrap();
+        let file = RelPath::new(b"file.rs".to_vec()).unwrap();
+        let entry = manifest.get(&file).unwrap();
+        let expected = if entry.content() == Some(crate::blob_store::v2::ContentHash::of(a)) {
+            key_a
+        } else {
+            assert_eq!(
+                entry.content(),
+                Some(crate::blob_store::v2::ContentHash::of(b))
+            );
+            key_b
+        };
+        assert_eq!(
+            entry.plane_state(FamilyPlane::Callgraph),
+            Some(&super::super::readiness::PlaneState::ready(&expected))
+        );
+        assert!(snapshot.pending_intent().any(|path| path == &file));
+        assert_eq!(
+            bridge.adapter.readiness(&access, &snapshot),
+            super::super::readiness::PlaneReadiness::Building
+        );
+    }
+
+    #[test]
+    fn callgraph_materialization_ignores_an_observation_for_other_content() {
+        let a = b"fn original() {} fn caller() { original(); }";
+        let b = b"fn replacement() {} fn caller() { replacement(); }";
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file.rs"), a).unwrap();
+        let bridge = Arc::new(CallgraphBridge::default());
+        let (driver, access) = graph_driver(root.path(), storage.path(), &bridge, bridge.clone());
+        let snapshot = SiblingLoader::new(driver.clone(), vec![bridge.adapter.clone()])
+            .load(&access)
+            .unwrap()
+            .snapshot;
+        let mut manifest = snapshot.generation().flatten().unwrap();
+        let file = RelPath::new(b"file.rs".to_vec()).unwrap();
+        let mut other = LiveEntry::new(super::super::snapshot::DiskState::of_bytes(b), 1);
+        other
+            .attachments
+            .insert(FamilyPlane::Callgraph, bridge.attachment(&file, b).unwrap());
+        let observed = BTreeMap::from([(file.clone(), other)]);
+        let _assembly = crate::pins::AssemblyPin::create_v2(
+            &driver.owner,
+            "guard-build",
+            &manifest.ready_keys().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let mut live = crate::pins::LivePin::create(&driver.owner).unwrap();
+        bridge
+            .materialize(
+                &driver.owner,
+                "guard-build",
+                &snapshot,
+                &observed,
+                &mut manifest,
+                &mut live,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            manifest
+                .get(&file)
+                .unwrap()
+                .plane_state(FamilyPlane::Callgraph),
+            Some(&super::super::readiness::PlaneState::ready(&graph_key(a)))
+        );
+        assert!(driver
+            .owner
+            .open_store(FamilyPlane::Callgraph)
+            .unwrap()
+            .get(&graph_key(b))
+            .unwrap()
+            .is_none());
+    }
+
     struct RejectAfterBuild {
         directory: std::path::PathBuf,
         panic: bool,
@@ -3412,6 +3620,7 @@ mod callgraph_bridge_tests {
             .reconciled(&access, loader.seed(&access).unwrap())
             .unwrap();
         driver.install(&access, &snapshot, revision).unwrap();
+        let snapshot = driver.installed_snapshot();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             driver.build_own_generation(&access, &snapshot, false)
         }));
@@ -3481,6 +3690,7 @@ mod callgraph_bridge_tests {
         let seed = loader.seed(&access).unwrap();
         let (seed_snapshot, revision) = loader.reconciled(&access, seed).unwrap();
         driver.install(&access, &seed_snapshot, revision).unwrap();
+        let seed_snapshot = driver.installed_snapshot();
         assert_eq!(
             driver.installed_state(&access, FamilyPlane::Callgraph).1,
             vec![root.path().join("file.rs")]
