@@ -143,6 +143,7 @@ jobs:
         run: |
           python3 --version
           python3 scripts/test-ci-rust-quality.py
+          bash scripts/test-ci-sccache-start.sh
           python3 -m unittest discover -s scripts/lib -p test_workflow_gates.py -v
           python3 -m unittest discover -s scripts/lib -p test_ci_rustc_cache.py -v
           python3 -m unittest discover -s scripts/lib -p test_rust_gate_collection.py -v
@@ -214,6 +215,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         id: rust
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
       # Executables include the commit's build provenance. Never restore a
       # fallback binary from another SHA or compiler, even with identical source.
       - uses: actions/cache/restore@v4
@@ -244,7 +249,8 @@ jobs:
         if: steps.release-binary.outputs.cache-hit != 'true'
         run: cargo build --profile ci-storm --locked -p agent-file-tools --bin aft
         env:
-          RUSTC_WRAPPER: ${{ github.workspace }}/scripts/ci-rustc-cache.py
+          # The measurement wrapper invokes sccache too; do not re-enable it after fallback.
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER != '' && format('{0}/scripts/ci-rustc-cache.py', github.workspace) || '' }}
       - name: Verify search-quality executable can self-report
         run: target/ci-storm/aft --version
       - uses: ./.github/actions/upload-artifact-retry

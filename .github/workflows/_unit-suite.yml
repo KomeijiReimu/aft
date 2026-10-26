@@ -65,6 +65,10 @@ jobs:
           python3 scripts/check-path-deps.py --self-test
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -186,6 +190,10 @@ jobs:
           components: rustfmt
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -220,6 +228,7 @@ jobs:
 
       - name: CI workflow and compiler-cache invariant guards
         run: |
+          bash scripts/test-ci-sccache-start.sh
           python3 -m unittest discover -s scripts/lib -p test_workflow_gates.py -v
           python3 -m unittest discover -s scripts/lib -p test_ci_rustc_cache.py -v
           python3 -m unittest discover -s scripts/lib -p test_rust_gate_collection.py -v
@@ -566,6 +575,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -591,6 +604,10 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: ci-storm-thin
@@ -625,6 +642,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.92
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -666,6 +687,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: ./.github/actions/setup-nextest
 
@@ -728,6 +753,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: ./.github/actions/setup-nextest
 
@@ -793,6 +822,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: ./.github/actions/setup-nextest
 
@@ -987,6 +1020,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -1047,6 +1084,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -1111,6 +1152,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
