@@ -29,6 +29,7 @@ use tempfile::tempdir;
 #[cfg(unix)]
 use super::helpers::warm_executable;
 use super::helpers::{link_cached_executable, link_cached_path, AftProcess};
+use crate::test_helpers::real_rust_analyzer_available;
 
 fn fake_server_path() -> PathBuf {
     crate::test_helpers::fake_lsp::fake_server_binary()
@@ -2934,13 +2935,6 @@ fn server_without_server_status_keeps_authoritative_behavior() {
     );
 }
 
-fn real_rust_analyzer_available() -> bool {
-    Command::new("rust-analyzer")
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
-}
-
 fn configured_rust_context(root: &std::path::Path) -> AppContext {
     configured_rust_context_with_lsp(root, serde_json::json!({}))
 }
@@ -3044,8 +3038,9 @@ fn poll_lsp_diagnostics(
 /// report the type error that only the full load can see.
 #[test]
 fn lsp_diagnostics_recovers_after_external_cargo_update_with_real_rust_analyzer() {
-    if !real_rust_analyzer_available() {
-        eprintln!("SKIP lsp_diagnostics_recovers_after_external_cargo_update_with_real_rust_analyzer: rust-analyzer is not installed");
+    if !real_rust_analyzer_available(
+        "lsp_diagnostics_recovers_after_external_cargo_update_with_real_rust_analyzer",
+    ) {
         return;
     }
     let temp_dir = tempdir().expect("tempdir");

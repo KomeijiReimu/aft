@@ -1729,6 +1729,9 @@ mod tests {
             assert!(biome_includes(&config_path).is_some());
         }
         assert_eq!(parses() - before, 1, "one parse serves every lookup");
+        let includes = biome_includes(&config_path).unwrap();
+        assert!(includes.includes(Path::new("a/file.ts")));
+        assert!(!includes.includes(Path::new("b/file.ts")));
 
         // Replace the file with same-length content and restore its old
         // modification time: only its identity (Unix) or bytes (Windows) differ.
@@ -1742,7 +1745,9 @@ mod tests {
             .set_modified(modified)
             .unwrap();
         std::fs::rename(&staged, &config_path).unwrap();
-        assert!(biome_includes(&config_path).is_some());
+        let includes = biome_includes(&config_path).unwrap();
+        assert!(!includes.includes(Path::new("a/file.ts")));
+        assert!(includes.includes(Path::new("b/file.ts")));
         assert_eq!(
             parses() - before,
             2,

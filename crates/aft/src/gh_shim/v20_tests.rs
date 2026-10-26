@@ -227,9 +227,39 @@ fn run_json(raw: &[&str], responses: Vec<Value>) -> (Value, Vec<ReadRequest>, i3
 
 #[test]
 fn v20_worker_reads_admit_the_reviewed_verbs() {
-    for command in TUPLES {
+    let reviewed = [
+        "api",
+        "run list",
+        "run view",
+        "pr list",
+        "pr view",
+        "pr diff",
+        "pr files",
+        "pr checks",
+        "issue list",
+        "issue view",
+        "issue comments",
+        "workflow list",
+        "workflow view",
+        "release list",
+        "release view",
+        "repo view",
+        "search code",
+        "search issues",
+    ];
+    assert_eq!(TUPLES.len(), reviewed.len());
+    assert_eq!(
+        TUPLES
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        reviewed
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+    );
+    for command in reviewed {
         let mut raw: Vec<_> = command.split_whitespace().collect();
-        match *command {
+        match command {
             "api" => raw.push("repos/cortexkit/aft/issues"),
             "run view" | "pr view" | "pr diff" | "pr files" | "pr checks" | "issue view"
             | "issue comments" => raw.push("42"),

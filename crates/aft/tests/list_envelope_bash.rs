@@ -286,9 +286,10 @@ fn test_subc_and_ndjson_transport_parity_on_fixture() {
 #[test]
 fn test_uncompressed_bash_output_stays_byte_identical_to_prespec_golden() {
     let fixture_dir = fixtures_dir().join("uncompressed");
+    let input_path = fixture_dir.join("input.txt");
     let reply_path = fixture_dir.join("reply.json");
 
-    let input_text = capped_input();
+    let input_text = fs::read_to_string(&input_path).expect("read fixture input.txt");
     let reply_json = fs::read_to_string(&reply_path).expect("read fixture reply.json");
 
     let input_line_count = input_text.lines().count();

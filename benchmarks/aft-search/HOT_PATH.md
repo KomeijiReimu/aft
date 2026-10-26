@@ -108,8 +108,8 @@ row differences. A changing row is not permission to update the baseline.
 
 `HOT_PATH_MEASURED.md` is the final counts/latency table; the preliminary source
 checks and first measurements are retained separately in `HOT_PATH_RESULTS.md`.
-The machine-readable counts, recall rows, standalone parity and mutation
-controls live in `hot-path-*.json`.
+The machine-readable counts, recall rows and standalone parity live in
+`hot-path-*.json`.
 
 ```bash
 python3 benchmarks/aft-search/compare_hot_path.py before.json after.json
