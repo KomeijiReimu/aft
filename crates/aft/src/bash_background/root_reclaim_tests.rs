@@ -236,6 +236,7 @@ fn root_reclaim_identity_is_resolved_before_spawn_admission() {
                         session: "reclaim".into(),
                         requested_vcpus: None,
                         requested_network: false,
+                        configured_env_names: Vec::new(),
                     },
                     SpawnPlan::Unsandboxed,
                     "true",
