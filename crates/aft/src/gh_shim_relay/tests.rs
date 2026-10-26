@@ -655,11 +655,12 @@ async fn production_foreground_forwards_while_reconnected_background_is_guarded(
         &|_| {},
     )
     .await;
-    assert!(
-        bound.ok,
-        "an original launch route that is still bound retains today's forwarding"
+    assert!(!bound.ok);
+    assert_eq!(
+        bound.data["reason"], "start_policy_missing",
+        "a bound route cannot authorize an uncaptured background ticket"
     );
-    assert_eq!(transport.calls().len(), 2);
+    assert_eq!(transport.calls().len(), 1);
     routes.origins.clear();
     let mut reconnected = stamp;
     reconnected.scope_epoch += 1;
@@ -680,7 +681,7 @@ async fn production_foreground_forwards_while_reconnected_background_is_guarded(
     assert_eq!(answer.data["reason"], "guard_unsupported");
     assert_eq!(answer.data["refusal_code"], "task_gh_authority_unavailable");
     assert_eq!(answer.data["message"], "this command's bot-write permission cannot be verified (guard_unsupported); start the command again from a live session, and tell the operator if it repeats.");
-    assert_eq!(transport.calls().len(), 2);
+    assert_eq!(transport.calls().len(), 1);
 }
 
 #[tokio::test]

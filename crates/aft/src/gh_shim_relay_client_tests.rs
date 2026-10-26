@@ -44,7 +44,7 @@ fn assert_approved_background_refusal(
         )
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(REFUSAL_EXIT_STATUS));
+    assert_eq!(output.status.code(), Some(86));
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         format!("gh-shim: gh_shim_seam_refusal: {code}: {message}\n")

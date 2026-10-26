@@ -135,3 +135,19 @@ fn contradictory_or_unknown_partner_errors_are_not_blessed_as_pre_write_refusals
     .is_none());
     assert!(map_refusal(&json!({"status":"refused","code":"run_scope_not_child","scope_role":"route","transmission":"not_sent"}),ScopeRole::Head).is_none());
 }
+
+#[test]
+fn typed_scope_end_with_completed_legs_is_evidence_but_not_a_prewrite_refusal() {
+    let reply = json!({"status":"refused","code":"scope_ended","scope_role":"run","transmission":"sent","legs_sent":["add_issue_comment"]});
+    assert_eq!(
+        scope_end_role(&reply, ScopeRole::Head, true),
+        Some(ScopeRole::Run)
+    );
+    assert!(map_refusal(&reply, ScopeRole::Head).is_none());
+    assert_eq!(scope_end_role(&reply, ScopeRole::Authority, false), None);
+    let contradictory = json!({"status":"refused","code":"scope_ended","refusal_code":"scope_unverifiable","scope_role":"route"});
+    assert_eq!(
+        scope_end_role(&contradictory, ScopeRole::Authority, false),
+        None
+    );
+}

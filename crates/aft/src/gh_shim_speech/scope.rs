@@ -6,11 +6,69 @@ use crate::db::access_grants::ScopeKey;
 
 use super::{Code, Refusal, ScopeRole};
 
-/// Only validated daemon evidence can create a permanent end record for a scope.
+/// Only authenticated, selector-bound scope evidence can create a permanent end record.
 #[derive(Clone, Debug)]
 pub(crate) struct ValidatedEnd {
     key: ScopeKey,
     evidence: Value,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ScopedRpcEndSource {
+    Provider,
+    RouteOpen,
+}
+
+impl ValidatedEnd {
+    pub(crate) fn scoped_rpc(
+        expected: &ScopeStamp,
+        role: ScopeRole,
+        selector: &subc_client_rs::ScopeSelector,
+        request_generation: &str,
+        current_generation: &str,
+        source: ScopedRpcEndSource,
+    ) -> Result<Self, Refusal> {
+        let expected_selector = subc_client_rs::ScopeSelector::new(
+            expected.owner.clone(),
+            expected.scope_ref.clone(),
+            Some(expected.scope_epoch),
+        );
+        let valid_kind = match role {
+            ScopeRole::Run => {
+                expected.kind == subc_protocol::scope::ScopeKind::Ephemeral
+                    && expected.parent.is_some()
+                    && expected.parent_state == Some(subc_protocol::scope::ParentState::Linked)
+                    && expected.attributes.run_id.is_some()
+            }
+            ScopeRole::Authority => {
+                (expected.kind == subc_protocol::scope::ScopeKind::Head
+                    || (expected.kind == subc_protocol::scope::ScopeKind::Ephemeral
+                        && expected.parent.is_none()))
+                    && crate::gh_shim_relay::delegating_agent(expected).is_some()
+            }
+            ScopeRole::Head => {
+                expected.kind == subc_protocol::scope::ScopeKind::Head
+                    && crate::gh_shim_relay::delegating_agent(expected).is_some()
+            }
+        };
+        if request_generation.is_empty()
+            || request_generation != current_generation
+            || selector != &expected_selector
+            || !expected.owner_authorized
+            || expected.scope_ref.is_empty()
+            || !valid_kind
+        {
+            return Err(unknown("unverifiable", role));
+        }
+        let source = match source {
+            ScopedRpcEndSource::Provider => "plexus.bot_request.scope_ended",
+            ScopedRpcEndSource::RouteOpen => "subc.route.open.scope_ended",
+        };
+        Ok(Self {
+            key: ScopeKey::from_stamp(expected),
+            evidence: json!({"source":source,"generation":request_generation,"scope":expected,"scope_role":role}),
+        })
+    }
 }
 
 impl ValidatedEnd {

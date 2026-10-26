@@ -215,3 +215,50 @@ fn codemode_run_parent_run_id_and_expiry_are_independent_of_head_liveness() {
             .is_err()
     );
 }
+
+#[test]
+fn scoped_rpc_end_requires_the_exact_selector_role_and_current_generation() {
+    let scope = head();
+    let selector = subc_client_rs::ScopeSelector::new(
+        scope.owner.clone(),
+        scope.scope_ref.clone(),
+        Some(scope.scope_epoch),
+    );
+    let proof = ValidatedEnd::scoped_rpc(
+        &scope,
+        ScopeRole::Authority,
+        &selector,
+        "current",
+        "current",
+        ScopedRpcEndSource::Provider,
+    )
+    .unwrap();
+    assert_eq!(proof.key(), &ScopeKey::from_stamp(&scope));
+    for (role, actual, request_generation) in [
+        (
+            ScopeRole::Authority,
+            subc_client_rs::ScopeSelector::new(
+                scope.owner.clone(),
+                scope.scope_ref.clone(),
+                Some(scope.scope_epoch + 1),
+            ),
+            "current",
+        ),
+        (ScopeRole::Run, selector.clone(), "current"),
+        (ScopeRole::Head, selector.clone(), "old-control"),
+    ] {
+        let error = ValidatedEnd::scoped_rpc(
+            &scope,
+            role,
+            &actual,
+            request_generation,
+            "current",
+            ScopedRpcEndSource::RouteOpen,
+        )
+        .unwrap_err();
+        assert_eq!(
+            (error.code, error.reason.as_str()),
+            (Code::ScopeUnknown, "unverifiable")
+        );
+    }
+}

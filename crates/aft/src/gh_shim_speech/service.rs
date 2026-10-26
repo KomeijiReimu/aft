@@ -28,6 +28,28 @@ type Describe = Arc<
 >;
 type EndNotice = Arc<dyn Fn(ScopeStamp) + Send + Sync>;
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestPartners {
+    pub(crate) expect_placed: Option<&'static str>,
+    pub(crate) run_placed: Option<&'static str>,
+    pub(crate) reserved_send_placed: bool,
+    pub(crate) bindings: Arc<dyn Fn(&str, &str) -> Result<Value, Refusal> + Send + Sync>,
+    pub(crate) reserve: Arc<
+        dyn Fn(
+                &str,
+                &str,
+                &ScopeStamp,
+                Value,
+            ) -> Result<super::partner::ReservedBotRequest, Refusal>
+            + Send
+            + Sync,
+    >,
+    pub(crate) before_final_gate: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub(crate) on_bound_enqueue: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub(crate) after_bound_commit: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+}
+
 static RUN: OnceLock<Option<String>> = OnceLock::new();
 pub(crate) fn run_nonce() -> Option<&'static str> {
     RUN.get_or_init(|| {
@@ -107,6 +129,8 @@ pub(crate) struct Service {
     pending_tasks: Mutex<HashSet<String>>,
     pending_ids: Mutex<HashSet<(String, String)>>,
     legacy_slots: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    test_partners: Mutex<Option<Arc<TestPartners>>>,
     pending_scopes: Mutex<HashSet<ScopeKey>>,
     pub(crate) admission: Mutex<()>,
     cache: Mutex<HashMap<ScopeKey, Cached>>,
@@ -161,6 +185,8 @@ pub(crate) fn start(
                 pending_tasks: Mutex::new(HashSet::new()),
                 pending_ids: Mutex::new(HashSet::new()),
                 legacy_slots: Arc::new(tokio::sync::Semaphore::new(16)),
+                #[cfg(test)]
+                test_partners: Mutex::new(None),
                 pending_scopes: Mutex::new(HashSet::new()),
                 admission: Mutex::new(()),
                 cache: Mutex::new(HashMap::new()),
@@ -327,6 +353,15 @@ impl Service {
             .admission
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        if proof.evidence().get("generation").and_then(Value::as_str)
+            != Some(self.generation().as_str())
+        {
+            return Err(Refusal::scoped(
+                Code::ScopeUnknown,
+                "unverifiable",
+                super::ScopeRole::Authority,
+            ));
+        }
         self.pending_scopes
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -390,6 +425,49 @@ impl Service {
     }
 }
 
+impl Service {
+    pub(crate) fn record_rpc_end(
+        self: &Arc<Self>,
+        scope: &ScopeStamp,
+        role: ScopeRole,
+        selector: &subc_client_rs::ScopeSelector,
+        request_generation: &str,
+        source: super::scope::ScopedRpcEndSource,
+    ) -> Result<(), Refusal> {
+        let proof = ValidatedEnd::scoped_rpc(
+            scope,
+            role,
+            selector,
+            request_generation,
+            &self.generation(),
+            source,
+        )?;
+        self.record_end(scope, proof)
+    }
+
+    pub(crate) fn observe_unqualified_end(self: &Arc<Self>, scopes: Vec<(ScopeRole, ScopeStamp)>) {
+        let handle = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|runtime| runtime.handle.clone());
+        let Some(handle) = handle else { return };
+        for (_, scope) in &scopes {
+            self.invalidate(scope);
+        }
+        let service = self.clone();
+        // An unqualified provider error is not proof that a particular scope ended.
+        // Refresh descriptions asynchronously without delaying the original GitHub reply.
+        let _ = handle.spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(9_750);
+            for (role, scope) in scopes {
+                let _ = service.check_scope(&scope, role, deadline).await;
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -433,7 +511,7 @@ impl LaunchContext {
                 return prepared;
             }
         };
-        let (handle, relay) = {
+        let handle = {
             let guard = self
                 .service
                 .runtime
@@ -446,7 +524,7 @@ impl LaunchContext {
                 ));
                 return prepared;
             };
-            (runtime.handle.clone(), runtime.relay.clone())
+            runtime.handle.clone()
         };
         if tokio::runtime::Handle::try_current().is_ok() {
             prepared.denial = Some(Refusal::new(
@@ -466,15 +544,10 @@ impl LaunchContext {
             tokio::time::timeout(
                 Duration::from_secs(1).saturating_sub(started.elapsed()),
                 async {
-                    let relay = relay.upgrade().ok_or_else(|| {
-                        Refusal::new(Code::AuthorityUnavailable, "binding_unverifiable")
-                    })?;
-                    let reply = relay
+                    let reply = self
+                        .service
                         .read_bindings(&self.seed.project_root, &self.seed.session)
-                        .await
-                        .map_err(|_| {
-                            Refusal::new(Code::AuthorityUnavailable, "binding_unverifiable")
-                        })?;
+                        .await?;
                     parse_bindings(&desired, &facade_reply(&reply), agent)
                 },
             )
@@ -744,6 +817,10 @@ impl Service {
         project: &str,
         session: &str,
     ) -> Result<Value, Refusal> {
+        #[cfg(test)]
+        if let Some(partners) = self.test_partners() {
+            return (partners.bindings)(project, session);
+        }
         let relay = {
             let runtime = self
                 .runtime
@@ -767,6 +844,10 @@ impl Service {
         scope: &ScopeStamp,
         body: Value,
     ) -> Result<super::partner::ReservedBotRequest, Refusal> {
+        #[cfg(test)]
+        if let Some(partners) = self.test_partners() {
+            return (partners.reserve)(project, session, scope, body);
+        }
         let relay = {
             let runtime = self
                 .runtime
@@ -795,6 +876,8 @@ pub(crate) fn record_service(root: &Path) -> Arc<Service> {
                 pending_tasks: Mutex::new(HashSet::new()),
                 pending_ids: Mutex::new(HashSet::new()),
                 legacy_slots: Arc::new(tokio::sync::Semaphore::new(16)),
+                #[cfg(test)]
+                test_partners: Mutex::new(None),
                 pending_scopes: Mutex::new(HashSet::new()),
                 admission: Mutex::new(()),
                 cache: Mutex::new(HashMap::new()),
@@ -911,5 +994,78 @@ impl Service {
                 reply,
             },
         );
+    }
+}
+
+impl Service {
+    pub(crate) fn require_plex_guards(&self, codemode: bool) -> Result<(), Refusal> {
+        #[cfg(test)]
+        if let Some(partners) = self.test_partners() {
+            return if partners.expect_placed.is_some()
+                && (!codemode || partners.run_placed.is_some())
+                && partners.reserved_send_placed
+            {
+                Ok(())
+            } else {
+                Err(Refusal::new(
+                    Code::AuthorityUnavailable,
+                    "guard_unsupported",
+                ))
+            };
+        }
+        super::partner::require_plex_guards(codemode)
+    }
+
+    #[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn install_test_partners(&self, partners: Arc<TestPartners>) {
+        *self
+            .test_partners
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(partners);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_partners(&self) -> Option<Arc<TestPartners>> {
+        self.test_partners
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    #[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn expire_test_scope_cache(&self) {
+        for cached in self
+            .cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values_mut()
+        {
+            cached.sent -= Duration::from_secs(6);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_before_final_gate(&self) {
+        if let Some(partners) = self.test_partners() {
+            if let Some(hook) = &partners.before_final_gate {
+                hook();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_after_bound_commit(&self) -> bool {
+        self.test_partners()
+            .and_then(|partners| partners.after_bound_commit.clone())
+            .is_none_or(|hook| hook())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_bound_enqueued(&self) {
+        if let Some(partners) = self.test_partners() {
+            if let Some(hook) = &partners.on_bound_enqueue {
+                hook();
+            }
+        }
     }
 }

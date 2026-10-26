@@ -102,6 +102,15 @@ pub(crate) struct ReservedBotRequest {
 }
 
 impl ReservedBotRequest {
+    #[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn for_test(
+        commit: impl FnOnce() -> Result<QueuedBotResponse, Refusal> + Send + 'static,
+    ) -> Self {
+        Self {
+            commit: Box::new(commit),
+        }
+    }
+
     pub(crate) fn send(self) -> Result<QueuedBotResponse, Refusal> {
         (self.commit)()
     }
@@ -112,6 +121,13 @@ pub(crate) struct QueuedBotResponse {
 }
 
 impl QueuedBotResponse {
+    #[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn for_test(reply: Value) -> Self {
+        Self {
+            response: Box::pin(async move { Ok(reply) }),
+        }
+    }
+
     pub(crate) async fn response(self) -> Result<Value, String> {
         self.response.await
     }
@@ -170,6 +186,34 @@ pub(crate) fn map_refusal(result: &Value, route_role: ScopeRole) -> Option<Refus
         }
         _ => return None,
     })
+}
+
+/// End evidence is independent of transmission outcome: a completed mutation leg
+/// stays posted even when the same authenticated reply ends the selected scope.
+pub(crate) fn scope_end_role(
+    result: &Value,
+    route_role: ScopeRole,
+    codemode: bool,
+) -> Option<ScopeRole> {
+    if result.get("status").and_then(Value::as_str) != Some("refused") {
+        return None;
+    }
+    let direct = result.get("code").and_then(Value::as_str);
+    let decorated = result
+        .get("refusal_code")
+        .and_then(Value::as_str)
+        .map(|code| code.split('{').next().unwrap_or(code));
+    if direct.zip(decorated).is_some_and(|(a, b)| a != b)
+        || direct.or(decorated) != Some("scope_ended")
+    {
+        return None;
+    }
+    match result.get("scope_role").and_then(Value::as_str) {
+        Some("run") if codemode => Some(ScopeRole::Run),
+        Some("route") => Some(route_role),
+        None if !codemode => Some(route_role),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

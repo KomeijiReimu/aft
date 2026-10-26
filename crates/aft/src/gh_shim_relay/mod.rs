@@ -102,6 +102,11 @@ pub fn facade_refusal_code(reply: &Value) -> Option<&str> {
 /// How a call to prefrontal or plexus failed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TransportError {
+    /// The daemon refused an epoch-pinned route open with SCOPE_ENDED.
+    ScopeEnded {
+        selector: ScopeSelector,
+        message: String,
+    },
     /// The target answered with a subc Error frame carrying this code.
     Refused { code: String, message: String },
     /// The target refused with this code for a reason expected to clear, so
@@ -377,7 +382,36 @@ async fn relay_inner<T: RelayTransport>(
                 "no agent session is attached to this command",
             );
         };
-        let redeemed = match crate::gh_shim_ticket::redeem(ticket) {
+        let memory_ticket = crate::gh_shim_ticket::redeem(ticket);
+        let durable_background =
+            crate::gh_shim_ticket::speech_for_ticket(ticket).is_some_and(|speech| {
+                speech.background.load(std::sync::atomic::Ordering::SeqCst)
+                    && speech.stored.load(std::sync::atomic::Ordering::SeqCst)
+            });
+        if call.operation == BOT_REQUEST_OPERATION
+            && (memory_ticket.is_none() || durable_background)
+        {
+            if let (Some(service), Some(digest), Some(nonce), Some(request)) = (
+                call.route_scopes.speech.as_ref(),
+                crate::gh_shim_ticket::speech_digest(ticket),
+                params
+                    .get("request_nonce")
+                    .and_then(Value::as_str)
+                    .filter(|nonce| !nonce.is_empty()),
+                params.get("request").filter(|request| request.is_object()),
+            ) {
+                let payload = blake3::derive_key(
+                    "aft-gh-bound-request-v1",
+                    &serde_json::to_vec(request).expect("a JSON value serializes"),
+                );
+                match service.store.legacy_replay_for_digest(&digest, nonce, &payload) {
+                    Ok(true) => break 'reply bound::unknown(),
+                    Ok(false) => {},
+                    Err(_) => break 'reply RelayReply::refused("outcome_unknown", "plexus", "AFT could not check this GitHub write's prior dispatch state; do not repeat it with a new request key"),
+                }
+            }
+        }
+        let redeemed = match memory_ticket {
             Some(redeemed) => redeemed,
             None if call.operation == BOT_REQUEST_OPERATION
                 || (call.operation == BINDINGS_READ_OPERATION
@@ -659,6 +693,33 @@ async fn bindings_read<T: RelayTransport>(
     }
 }
 
+fn worker_write_refused(
+    redeemed: &crate::gh_shim_ticket::Redeemed,
+    stamp: Option<&ScopeStamp>,
+) -> bool {
+    let admitted_run = redeemed
+        .launch
+        .as_ref()
+        .filter(|launch| launch.validate().is_ok())
+        .and_then(|launch| launch.run.as_ref());
+    // A parented ephemeral is a worker unless it is the exact program admitted
+    // with a validated Head launch. A Worker-kind stamp is never exempt.
+    [
+        stamp,
+        redeemed.lifecycle_scope.as_ref(),
+        redeemed.launch.as_ref().map(|launch| &launch.authority),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|scope| match scope.kind {
+        subc_protocol::scope::ScopeKind::Worker => true,
+        subc_protocol::scope::ScopeKind::Ephemeral if scope.parent.is_some() => {
+            Some(scope) != admitted_run
+        }
+        _ => false,
+    })
+}
+
 /// Relay one bot write, returning plexus's reply and the path it took.
 async fn bot_request<T: RelayTransport>(
     transport: &T,
@@ -668,16 +729,7 @@ async fn bot_request<T: RelayTransport>(
     routes: &RouteScopes,
     captured_background: bool,
 ) -> (RelayReply, &'static str) {
-    if stamp.is_some_and(|stamp| stamp.kind == subc_protocol::scope::ScopeKind::Worker)
-        || redeemed
-            .launch
-            .as_ref()
-            .is_some_and(|launch| launch.authority.kind == subc_protocol::scope::ScopeKind::Worker)
-        || redeemed
-            .lifecycle_scope
-            .as_ref()
-            .is_some_and(|scope| scope.kind == subc_protocol::scope::ScopeKind::Worker)
-    {
+    if worker_write_refused(redeemed, stamp) {
         return (
             RelayReply::refused(
                 crate::gh_shim_speech::WORKER_WRITE_CODE,
@@ -788,12 +840,61 @@ async fn bot_request<T: RelayTransport>(
         }
         let selector = scope_selector(_stamp);
         let body = github_call(json!({"op":"bot_request","request_nonce":nonce,"request":request}));
+        let response_generation = routes.speech.as_ref().map(|service| service.generation());
+        let route_role = if redeemed
+            .launch
+            .as_ref()
+            .is_some_and(|launch| launch.run.as_ref() == Some(_stamp))
+        {
+            crate::gh_shim_speech::ScopeRole::Run
+        } else if redeemed
+            .launch
+            .as_ref()
+            .is_some_and(|launch| launch.run.is_some())
+        {
+            crate::gh_shim_speech::ScopeRole::Head
+        } else {
+            crate::gh_shim_speech::ScopeRole::Authority
+        };
         let reply = match transport
             .plexus(&redeemed.project_root, session, Some(&selector), body)
             .await
         {
-            Ok(reply) => RelayReply::relayed(reply),
-            Err(error) => transport_refusal("plexus", error),
+            Ok(reply) => {
+                if let (Some(service), Some(generation)) = (&routes.speech, &response_generation) {
+                    let facade = facade_reply(&reply);
+                    let result = facade.get("result").unwrap_or(&facade);
+                    if crate::gh_shim_speech::partner::scope_end_role(result, route_role, false)
+                        .is_some()
+                    {
+                        let _ = service.record_rpc_end(
+                            _stamp,
+                            route_role,
+                            &selector,
+                            generation,
+                            crate::gh_shim_speech::scope::ScopedRpcEndSource::Provider,
+                        );
+                    }
+                }
+                RelayReply::relayed(reply)
+            }
+            Err(error) => {
+                if let (
+                    TransportError::ScopeEnded { selector, .. },
+                    Some(service),
+                    Some(generation),
+                ) = (&error, &routes.speech, &response_generation)
+                {
+                    let _ = service.record_rpc_end(
+                        _stamp,
+                        route_role,
+                        selector,
+                        generation,
+                        crate::gh_shim_speech::scope::ScopedRpcEndSource::RouteOpen,
+                    );
+                }
+                transport_refusal("plexus", error)
+            }
         };
         return (reply, PATH_STAMP);
     }
@@ -828,7 +929,7 @@ async fn post_captured(
             "serving_lock_unavailable",
         ));
     }
-    partner::require_plex_guards(launch.run.is_some())?;
+    service.require_plex_guards(launch.run.is_some())?;
     let ticket = params
         .get("ticket")
         .and_then(Value::as_str)
@@ -935,14 +1036,47 @@ async fn post_captured(
     }
     let body =
         partner::BotRequest::new(request.clone(), nonce, expect.clone(), launch.run.as_ref())?;
-    let slot = service
+    let route_role = if launch.run.is_some() {
+        ScopeRole::Head
+    } else {
+        ScopeRole::Authority
+    };
+    let reserve_generation = service.generation();
+    let slot = match service
         .reserve(
             &redeemed.project_root,
             &redeemed.session_id,
             &launch.authority,
             github_call(body.value()),
         )
-        .await?;
+        .await
+    {
+        Ok(slot) => slot,
+        Err(mut error) => {
+            if error.code == Code::ScopeEnded && error.reason == "ended" {
+                if error.role.is_some_and(|role| role != route_role) {
+                    return Err(Refusal::scoped(
+                        Code::ScopeUnknown,
+                        "unverifiable",
+                        route_role,
+                    ));
+                }
+                if let Err(proof_error) = service.record_rpc_end(
+                    &launch.authority,
+                    route_role,
+                    &scope_selector(&launch.authority),
+                    &reserve_generation,
+                    crate::gh_shim_speech::scope::ScopedRpcEndSource::RouteOpen,
+                ) {
+                    if proof_error.code == Code::ScopeUnknown {
+                        return Err(proof_error);
+                    }
+                }
+                error.role = Some(route_role);
+            }
+            return Err(error);
+        }
+    };
     service.check_pending(
         Some(&stored.record.incarnation),
         launch,
@@ -956,6 +1090,7 @@ async fn post_captured(
         &body.payload_digest(),
         &body.expect_json(),
     )?;
+    let dispatch_generation = service.generation();
     let queued = {
         let _local = service
             .admission
@@ -983,6 +1118,8 @@ async fn post_captured(
             }
             slot.send()
         };
+        #[cfg(test)]
+        service.test_before_final_gate();
         let queued = if foreground {
             service.store.final_foreground_gate(
                 &stored.record.incarnation,
@@ -1027,25 +1164,41 @@ async fn post_captured(
     };
     let facade = facade_reply(&reply);
     let result = facade.get("result").unwrap_or(&facade);
-    if facade_refusal_code(&facade)
-        .is_some_and(|code| code.split('{').next() == Some("scope_ended"))
-    {
-        let (role, scope) = if result.get("scope_role").and_then(Value::as_str) == Some("run") {
-            (ScopeRole::Run, launch.run.as_ref())
+    if let Some(role) = partner::scope_end_role(result, route_role, launch.run.is_some()) {
+        let scope = if role == ScopeRole::Run {
+            launch.run.as_ref()
         } else {
-            (
-                if launch.run.is_some() {
-                    ScopeRole::Head
-                } else {
-                    ScopeRole::Authority
-                },
-                Some(&launch.authority),
-            )
+            Some(&launch.authority)
         };
         if let Some(scope) = scope {
-            service.invalidate(scope);
-            let _ = service.check_scope(scope, role, probe_deadline).await;
+            let proof = service.record_rpc_end(
+                scope,
+                role,
+                &scope_selector(scope),
+                &dispatch_generation,
+                crate::gh_shim_speech::scope::ScopedRpcEndSource::Provider,
+            );
+            if let Err(error) = proof {
+                if error.code == Code::ScopeUnknown
+                    && !result
+                        .get("legs_sent")
+                        .and_then(Value::as_array)
+                        .is_some_and(|legs| !legs.is_empty())
+                {
+                    return Err(error);
+                }
+            }
         }
+    } else if facade_refusal_code(&facade)
+        .is_some_and(|code| code.split('{').next() == Some("scope_ended"))
+    {
+        service.observe_unqualified_end(
+            launch
+                .required_scopes()
+                .into_iter()
+                .map(|(role, scope)| (role, scope.clone()))
+                .collect(),
+        );
     }
     // Posted legs and terminal replays are returned intact, even after revocation.
     if let Some(refusal) = partner::map_refusal(
@@ -1091,6 +1244,9 @@ fn github_call(arguments: Value) -> Value {
 
 fn transport_refusal(stage: &str, error: TransportError) -> RelayReply {
     match error {
+        TransportError::ScopeEnded { message, .. } => {
+            RelayReply::refused(subc_protocol::error_codes::SCOPE_ENDED, stage, message)
+        }
         TransportError::Refused { code, message } => RelayReply::refused(&code, stage, message),
         TransportError::RefusedRetryable { code, message } => {
             let mut reply = RelayReply::refused(&code, stage, message);
@@ -1166,10 +1322,18 @@ const RETRYABLE_SCOPE_OPEN_REFUSALS: [&str; 2] = [
 
 /// The typed refusal for a failed route open, when the daemon refused it for
 /// one of the scope reasons above.
-fn scope_open_refusal(error: &subc_client_rs::CallError) -> Option<TransportError> {
+fn scope_open_refusal(
+    error: &subc_client_rs::CallError,
+    selector: &ScopeSelector,
+) -> Option<TransportError> {
     let body = error.route_open_refusal()?;
     let code = body.code.as_str();
-    if TERMINAL_SCOPE_OPEN_REFUSALS.contains(&code) {
+    if code == subc_protocol::error_codes::SCOPE_ENDED {
+        Some(TransportError::ScopeEnded {
+            selector: selector.clone(),
+            message: body.message.clone(),
+        })
+    } else if TERMINAL_SCOPE_OPEN_REFUSALS.contains(&code) {
         Some(TransportError::Refused {
             code: body.code.clone(),
             message: body.message.clone(),
@@ -1417,7 +1581,7 @@ async fn open_and_send(
     let route = match opened {
         Ok(route) => route,
         Err(error) => {
-            if let Some(refusal) = scope.and_then(|_| scope_open_refusal(&error)) {
+            if let Some(refusal) = scope.and_then(|selector| scope_open_refusal(&error, selector)) {
                 return Err(CallFailure {
                     error: refusal,
                     reconnect: false,

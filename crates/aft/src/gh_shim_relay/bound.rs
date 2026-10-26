@@ -1,5 +1,5 @@
 use super::*;
-use crate::gh_shim_speech::{Code, Refusal};
+use crate::gh_shim_speech::{Code, Refusal, ScopeRole};
 
 struct DispatchItem {
     body: Value,
@@ -7,7 +7,7 @@ struct DispatchItem {
     _slot: tokio::sync::OwnedSemaphorePermit,
 }
 
-fn unknown() -> RelayReply {
+pub(super) fn unknown() -> RelayReply {
     RelayReply::refused("outcome_unknown", "plexus", "this GitHub write was already queued and its outcome cannot be confirmed; do not repeat it with a new request key")
 }
 
@@ -38,6 +38,12 @@ pub(super) async fn post_bound_background<T: RelayTransport>(
         .and_then(Value::as_str)
         .ok_or_else(invalid)?;
     let warm = crate::gh_shim_ticket::speech_for_ticket(ticket).ok_or_else(invalid)?;
+    if !warm.stored.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(Refusal::new(
+            Code::AuthorityUnavailable,
+            "start_policy_missing",
+        ));
+    }
     if let Some(error) = warm
         .failure
         .lock()
@@ -45,12 +51,6 @@ pub(super) async fn post_bound_background<T: RelayTransport>(
         .clone()
     {
         return Err(error);
-    }
-    if !warm.stored.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err(Refusal::new(
-            Code::AuthorityUnavailable,
-            "start_policy_missing",
-        ));
     }
     if warm.prepared.context.service.store.path() != service.store.path() {
         return Err(invalid());
@@ -109,6 +109,8 @@ pub(super) async fn post_bound_background<T: RelayTransport>(
             &redeemed.session_id,
             &redeemed.task_id,
         )?;
+        #[cfg(test)]
+        service.test_before_final_gate();
         service.store.final_legacy_gate(
             &warm.incarnation,
             nonce,
@@ -134,7 +136,10 @@ pub(super) async fn post_bound_background<T: RelayTransport>(
                         selector,
                         _slot: slot,
                     })
-                    .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "admission_raced"))
+                    .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "admission_raced"))?;
+                #[cfg(test)]
+                service.test_bound_enqueued();
+                Ok(())
             },
         )
     };
@@ -143,6 +148,10 @@ pub(super) async fn post_bound_background<T: RelayTransport>(
         Err(crate::db::gh_speech::GateError::BeforeSend(error)) => return Err(error),
         Err(crate::db::gh_speech::GateError::AfterSend) => return Ok(unknown()),
     }
+    #[cfg(test)]
+    if !service.test_after_bound_commit() {
+        return Ok(unknown());
+    }
     let item = match receiver.await {
         Ok(item) => item,
         Err(_) => return Ok(unknown()),
@@ -150,6 +159,14 @@ pub(super) async fn post_bound_background<T: RelayTransport>(
     if !service.try_serve() {
         return Ok(unknown());
     }
+    let dispatch_generation = service.generation();
+    let route_role = if launch.run.as_ref() == Some(stamp) {
+        ScopeRole::Run
+    } else if launch.run.is_some() {
+        ScopeRole::Head
+    } else {
+        ScopeRole::Authority
+    };
     let reply = match transport
         .plexus(
             &redeemed.project_root,
@@ -159,8 +176,51 @@ pub(super) async fn post_bound_background<T: RelayTransport>(
         )
         .await
     {
-        Ok(reply) => RelayReply::relayed(reply),
-        Err(error) => transport_refusal("plexus", error),
+        Ok(reply) => {
+            let facade = facade_reply(&reply);
+            let result = facade.get("result").unwrap_or(&facade);
+            if crate::gh_shim_speech::partner::scope_end_role(result, route_role, false).is_some() {
+                let _ = service.record_rpc_end(
+                    stamp,
+                    route_role,
+                    &item.selector,
+                    &dispatch_generation,
+                    crate::gh_shim_speech::scope::ScopedRpcEndSource::Provider,
+                );
+            }
+            RelayReply::relayed(reply)
+        }
+        Err(TransportError::ScopeEnded {
+            selector,
+            message: _,
+        }) => {
+            let proof = service.record_rpc_end(
+                stamp,
+                route_role,
+                &selector,
+                &dispatch_generation,
+                crate::gh_shim_speech::scope::ScopedRpcEndSource::RouteOpen,
+            );
+            match proof {
+                Err(error) if error.code == Code::ScopeUnknown => RelayReply::task_refused(error),
+                _ => {
+                    RelayReply::task_refused(Refusal::scoped(Code::ScopeEnded, "ended", route_role))
+                }
+            }
+        }
+        Err(error) => {
+            if matches!(&error, TransportError::Refused { code, .. } if code == subc_protocol::error_codes::SCOPE_ENDED)
+            {
+                service.observe_unqualified_end(
+                    launch
+                        .required_scopes()
+                        .into_iter()
+                        .map(|(role, scope)| (role, scope.clone()))
+                        .collect(),
+                );
+            }
+            transport_refusal("plexus", error)
+        }
     };
     if reply.data.get("refusal_code").and_then(Value::as_str) != Some("outcome_unknown") {
         if let Err(error) = service

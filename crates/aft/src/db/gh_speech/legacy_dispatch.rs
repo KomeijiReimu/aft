@@ -154,3 +154,24 @@ impl Store {
         Ok(count)
     }
 }
+
+impl Store {
+    /// A dead/revoked ticket may report an already queued attempt, but this lookup
+    /// grants no new dispatch and is never used for context or worker reads.
+    pub(crate) fn legacy_replay_for_digest(
+        &self,
+        digest: &[u8; 32],
+        nonce: &str,
+        payload: &[u8; 32],
+    ) -> Result<bool, Refusal> {
+        let conn = self.connect()?;
+        let incarnation: Option<String> = conn.query_row("SELECT a.incarnation FROM gh_speech_authorities a JOIN gh_speech_legacy_dispatch d ON d.incarnation=a.incarnation WHERE a.ticket_digest=?1 AND d.request_nonce=?2", params![digest.as_slice(),nonce], |row| row.get(0)).optional().map_err(db_error)?;
+        let Some(incarnation) = incarnation else {
+            return Ok(false);
+        };
+        let _record = load(&conn, &incarnation)?;
+        Ok(self
+            .legacy_dispatch_status(nonce, &incarnation, payload)?
+            .is_some())
+    }
+}
