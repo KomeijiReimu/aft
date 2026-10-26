@@ -10,6 +10,10 @@ negotiating `tool-result/v1`, with the `worker` preset and bound session
 the adjacent schema-freeze fixtures. In particular, the task tools here take
 `taskId`, not the rich-UI viewed-call `task` binding.
 
+Successful replies have tagged `tool-result/v1` bodies. Admission refusals are
+protocol `Error` frames with `code` and `message`, even when `tool-result/v1`
+is negotiated; they are not fabricated tool-result error envelopes.
+
 ## Cases
 
 | File | Request | Expected outcome |
@@ -90,6 +94,6 @@ cargo test -p agent-file-tools --lib -- carrier_samples::carrier_samples_match_w
 
 The ignored capture test explicitly overwrites the fourteen JSON samples and
 prints each one as `CARRIER_SAMPLE <case> <json>` for export from remote jobs.
-The normal test never updates fixtures: it reruns all cases, validates tagged
-results and expected success/error codes, and compares normalized frames,
+The normal test never updates fixtures: it reruns all cases, validates successful
+tagged results and admission error codes, and compares normalized frames,
 including the exact serialized body strings, to these reviewed samples.

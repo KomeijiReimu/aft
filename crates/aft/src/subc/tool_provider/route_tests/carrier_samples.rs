@@ -215,23 +215,17 @@ async fn run_case(case: &Case) -> Value {
         dispatch,
     )
     .await;
-    assert_eq!(
-        reply.header.ty,
-        FrameType::Response,
-        "{}: {:?}",
-        case.name,
-        reply.body
-    );
-    let result: cortexkit_role_tool_provider::result::ToolResult =
-        serde_json::from_slice(&reply.body).unwrap();
-    cortexkit_role_tool_provider::result::validate(&result).unwrap();
-    assert_eq!(
-        result.error_code.as_deref(),
-        case.error,
-        "{}: {}",
-        case.name,
-        String::from_utf8_lossy(&reply.body)
-    );
+    if let Some(code) = case.error {
+        assert_eq!(reply.header.ty, FrameType::Error, "{}", case.name);
+        let error: subc_protocol::ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(error.code, code, "{}: {error:?}", case.name);
+    } else {
+        assert_eq!(reply.header.ty, FrameType::Response, "{}", case.name);
+        let result: cortexkit_role_tool_provider::result::ToolResult =
+            serde_json::from_slice(&reply.body).unwrap();
+        cortexkit_role_tool_provider::result::validate(&result).unwrap();
+        assert!(result.error_code.is_none(), "{}: {result:?}", case.name);
+    }
     json!({"request_frame":normalized_frame(&request, dir.path()),"reply_frame":normalized_frame(reply.frame(), dir.path())})
 }
 
