@@ -107,6 +107,10 @@ pub(crate) fn signer_refusal(detail: &str, retry_after_ms: Option<u64>) -> Termi
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy)]
 pub(crate) enum Script {
+    SubmissionFreshReplyLost,
+    SubmissionGapExpired {
+        unknown: bool,
+    },
     Submission {
         never_accepted: bool,
         mismatch: bool,
@@ -358,7 +362,26 @@ pub(crate) async fn daemon_with_capabilities(
                         "exec.run" | "exec.attach" => {
                             let attaching = body["method"] == "exec.attach";
                             if !attaching { runs += 1; }
-                            if let Script::Submission { never_accepted, mismatch, always_unknown, disconnect } = script {
+                            if matches!(script, Script::SubmissionFreshReplyLost) {
+                                if runs == 1 {
+                                    replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Terminal(TerminalRecord::new(
+                                        Uuid::from_bytes([0x77;16]), Outcome::RefusedBeforeStart { reason: RefusalReason::SubmissionNeverAccepted }, 0, 0, 0,
+                                    ))).unwrap()));
+                                    replies.push(reply(FrameType::StreamEnd, Value::Null));
+                                }
+                                // Later requests may be running, but provide no admission or result.
+                            } else if let Script::SubmissionGapExpired { unknown } = script {
+                                let initial = !attaching && runs == 1;
+                                if initial {
+                                    replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), 1))).unwrap()));
+                                    for (seq, bytes) in [(0, b"A".to_vec()), (2, b"C".to_vec())] {
+                                        replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Output(Output::new(seq, OutputStream::Stdout, BytePayload(bytes)))).unwrap()));
+                                    }
+                                }
+                                let outcome = if initial { Outcome::Exit { code: 0 } } else if unknown { Outcome::OutcomeUnknown } else { Outcome::HistoryExpired };
+                                replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Terminal(TerminalRecord::new(id(), outcome, 0, 0, 0))).unwrap()));
+                                replies.push(reply(FrameType::StreamEnd, Value::Null));
+                            } else if let Script::Submission { never_accepted, mismatch, always_unknown, disconnect } = script {
                                 let mut request = body["params"].clone();
                                 let cursor = request.as_object_mut().unwrap().remove("resume_from_seq").and_then(|v| v.as_u64());
                                 let keyed = request["submission_key"].is_string();
@@ -368,7 +391,9 @@ pub(crate) async fn daemon_with_capabilities(
                                 if !same_key { submission = Some(request); }
                                 if refusal {
                                     // Refusals have their own ID, never the existing job's ID.
-                                    let record = TerminalRecord::new(Uuid::from_bytes([0x77;16]), Outcome::RefusedBeforeStart {
+                                    let mut refusal_id = [0x77; 16];
+                                    refusal_id[8..].copy_from_slice(&(runs as u64).to_be_bytes());
+                                    let record = TerminalRecord::new(Uuid::from_bytes(refusal_id), Outcome::RefusedBeforeStart {
                                         reason: if never_accepted { RefusalReason::SubmissionNeverAccepted } else { RefusalReason::RequestRejected }
                                     }, 0, 0, 0).with_refusal_detail(if never_accepted { "submission_never_accepted" } else { "submission_key_mismatch" });
                                     replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Terminal(record)).unwrap()));
