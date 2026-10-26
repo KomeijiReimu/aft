@@ -77,6 +77,8 @@ pub(crate) struct State {
     // Keep each installed key as an exact-byte matcher for response scrubbers.
     // Rotation adds a matcher instead of replacing earlier key values.
     patterns: Mutex<Vec<(String, Zeroizing<Vec<u8>>)>>,
+    #[cfg(test)]
+    headers_sensitive: AtomicBool,
 }
 
 impl State {
@@ -214,6 +216,8 @@ impl SecretProxy {
             upstream,
             material_gate: Mutex::new(()),
             patterns: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            headers_sensitive: AtomicBool::new(false),
         });
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .map_err(|_| ProxyError::Initialization)?;

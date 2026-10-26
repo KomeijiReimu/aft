@@ -290,6 +290,16 @@ async fn prepare_and_send(
     } else {
         *outbound.version_mut() = Version::HTTP_11;
     }
+    #[cfg(test)]
+    state.headers_sensitive.store(
+        plan.header_edits.iter().all(|edit| {
+            outbound
+                .headers()
+                .get(edit.name.as_str())
+                .is_some_and(|value| value.is_sensitive())
+        }),
+        Ordering::Release,
+    );
     let response = if http2 {
         let (mut sender, connection) =
             hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))

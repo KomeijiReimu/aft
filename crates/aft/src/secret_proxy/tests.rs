@@ -194,8 +194,10 @@ impl Server {
                                     )
                                 })
                                 .collect();
-                            recorded.lock().push(json!({"target":parts.uri.to_string(),"headers":fields,
-                                "body":String::from_utf8_lossy(&data),"sensitive":parts.headers.get("authorization").is_some_and(HeaderValue::is_sensitive)}));
+                            recorded
+                                .lock()
+                                .push(json!({"target":parts.uri.to_string(),"headers":fields,
+                                "body":String::from_utf8_lossy(&data)}));
                             if let Some(upgrade) = upgrade {
                                 let mut response = Response::new(full(Bytes::new()));
                                 *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
@@ -508,6 +510,7 @@ fn client_child() {
                     if !header.starts_with(b"HTTP/1.1 200") { return Err(()); }
                     let mut roots = rustls::RootCertStore::empty();
                     for name in ["AFT_PROXY_CA", "AFT_UPSTREAM_CA"] {
+                        if value["trust_upstream_only"] == true && name == "AFT_PROXY_CA" { continue; }
                         for cert in rustls::pki_types::CertificateDer::pem_slice_iter(std::env::var(name).unwrap().as_bytes()) { roots.add(cert.unwrap()).unwrap(); }
                     }
                     let mut config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
@@ -601,9 +604,9 @@ async fn proxy_h1_h2_locations_keepalive_authority_and_scanned_set() {
             seen["body"],
             r#"{"a/b":{"~":"test-key-12345678"},"literal":"{{ck-secret:unscanned}}"}"#
         );
-        if h2 {
-            assert_eq!(seen["sensitive"], true);
-        }
+        // The receiving HPACK decoder does not preserve the never-indexed bit
+        // as HeaderValue sensitivity. Check the actual outbound annotations.
+        assert!(proxy.state.headers_sensitive.load(Ordering::Acquire));
         assert!(!response
             .to_string()
             .contains(std::str::from_utf8(K1).unwrap()));
@@ -746,13 +749,15 @@ async fn proxy_atomic_json_and_material_refusals_send_nothing_upstream() {
     assert_eq!(vault.calls.load(Ordering::SeqCst), 0);
     assert!(server.seen.lock().is_empty());
     *vault.refused_label.lock() = Some("json".into());
+    let refused = client.request(
+        "/approved",
+        json!({"authorization":format!("Bearer {MARKER}"),"content-type":"application/json"}),
+        r#"{"key":"{{ck-secret:json}}"}"#,
+    );
+    assert_eq!(refused["status"], 403);
     assert_eq!(
-        client.request(
-            "/approved",
-            json!({"authorization":format!("Bearer {MARKER}"),"content-type":"application/json"}),
-            r#"{"key":"{{ck-secret:json}}"}"#
-        )["status"],
-        403
+        refused["body"],
+        "Secret proxy refused the request: json (localhost)\n"
     );
     assert_eq!(vault.calls.load(Ordering::SeqCst), 2);
     assert!(server.seen.lock().is_empty());
@@ -872,18 +877,18 @@ async fn proxy_non_rule_connect_is_tunnelled_without_interception() {
     let mut client = Client::spawn(&proxy, &server);
     proxy.arm_command(client.process.id()).unwrap();
     assert_eq!(
-        client.command(json!({"op":"connect","authority":server.address.to_string()}))["ok"],
+        client.command(json!({"op":"connect","authority":server.address.to_string(),"trust_upstream_only":true}))["ok"],
         true
     );
     let response = client.request(
         "/approved",
-        json!({"authorization":format!("Bearer {MARKER}")}),
+        json!({"authorization":"Bearer {{ck-secret:from-file}}"}),
         "",
     );
     assert_eq!(response["status"], 200);
     assert_eq!(
         server.seen.lock()[0]["headers"]["authorization"],
-        format!("Bearer {MARKER}")
+        "Bearer {{ck-secret:from-file}}"
     );
     assert_eq!(vault.calls.load(Ordering::SeqCst), 0);
     assert!(proxy.state.patterns.lock().is_empty());
