@@ -332,8 +332,9 @@ fn run_restore_before_lock_hook_for_tests(_session: &str, _attempt: usize) {}
 /// unknown kind as content and then requires its content file, fails closed
 /// on them; the new fields are optional, and readers treat them as unset when
 /// absent, so version-4 stacks load unchanged.
-// Version 6 makes older readers refuse stacks whose imported guards they
-// cannot enforce; ignoring an optional guard would allow a destructive undo.
+// Version 6 marks disk metadata that can contain imported guards. Older disk
+// readers enforcing this version gate reject it; the SQLite mirror needs
+// separate downgrade protection before imported history can be exposed.
 pub const SCHEMA_VERSION: u32 = 6;
 
 /// A single backup entry for a file.

@@ -157,13 +157,21 @@ fn imported_undo_preserves_destination_commit() {
             expected: ExpectedState::capture(&path).unwrap(),
         }],
     };
-    let mut store = BackupStore::new();
-    store.set_portable_registry(Arc::new(Registry {
+    let registry = Arc::new(Registry {
         roots: vec![checkout.clone()],
-    }));
+    });
+    let storage = checkout.join("aft-storage");
+    let mut store = BackupStore::new();
+    store.set_storage_dir_for_harness(storage.clone(), crate::harness::Harness::Pi, 0);
+    store.set_portable_registry(registry.clone());
     store
         .install_portable_undo("session-one", &[(group, vec![path.clone()])])
         .unwrap();
+    // A missing persisted guard must not be hidden by the in-memory entry.
+    drop(store);
+    let mut store = BackupStore::new();
+    store.set_storage_dir_for_harness(storage, crate::harness::Harness::Pi, 0);
+    store.set_portable_registry(registry);
     std::fs::write(&path, "destination-only commit").unwrap();
     let before = std::fs::read(&path).unwrap();
     let mut checkpoint_called = false;
@@ -206,15 +214,11 @@ fn carried_history_and_move_limits_include_every_stream() {
     assert_eq!(entries.add_stream(1, 1), Err("entry_limit"));
 }
 
-fn registered(root: Option<String>) -> super::binding::RegisteredSession {
-    super::binding::RegisteredSession {
-        agent_id: "agent-one".into(),
-        ref_kind: "pi-session".into(),
-        reference: "0123456789abcdef0123456789abcdef".into(),
-        harness: "pi".into(),
-        session_id: "native-session".into(),
-        project_root: root,
-    }
+fn registered(root: Option<String>) -> cortexkit_agent_identity::AgentSessionForRefReply {
+    serde_json::from_value(json!({"agent_id":"agent-one", "ref_kind":"pi-session",
+        "ref":"0123456789abcdef0123456789abcdef", "harness":"pi", "session_id":"native-session",
+        "project_root":root, "incarnation":"0123456789abcdef"}))
+    .unwrap()
 }
 
 #[test]
@@ -272,6 +276,8 @@ fn registered_v1_and_new_session_refs_are_never_rederived() {
 
 #[test]
 fn session_for_ref_published_vectors_decode_without_rewriting() {
+    use cortexkit_agent_identity::{AgentSessionForRefParams, AgentSessionForRefReply};
+    use cortexkit_project_identity::{RefusalCode, Request};
     use sha2::{Digest, Sha256};
     let root =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent_data/agent-sessions-v1");
@@ -289,15 +295,25 @@ fn session_for_ref_published_vectors_decode_without_rewriting() {
     let vectors: Vec<serde_json::Value> =
         serde_json::from_slice(&std::fs::read(root.join("session-for-ref.json")).unwrap()).unwrap();
     for vector in vectors {
-        if let Some(result) = vector["reply"].get("result") {
-            let registered: super::binding::RegisteredSession =
-                serde_json::from_value(result.clone()).unwrap();
-            assert_eq!(
-                registered.reference,
-                vector["request"]["params"]["ref"].as_str().unwrap()
-            );
-        } else {
-            assert_eq!(vector["reply"]["code"], "not_found");
+        let request: Request<AgentSessionForRefParams> =
+            serde_json::from_value(vector["request"].clone()).unwrap();
+        assert_eq!(request.method, "agent.session_for_ref");
+        let outcome: Outcome<AgentSessionForRefReply> =
+            serde_json::from_value(vector["reply"].clone()).unwrap();
+        assert_eq!(serde_json::to_value(&outcome).unwrap(), vector["reply"]);
+        match outcome {
+            Outcome::Success(success) => {
+                assert_eq!(success.result.session_ref, request.params.session_ref);
+                assert_eq!(success.result.ref_kind, request.params.ref_kind);
+            }
+            Outcome::Refusal(refusal) => {
+                assert_eq!(refusal.code, RefusalCode::NotFound);
+                assert!(matches!(
+                    super::transport::decode_session_for_ref(vector["reply"].clone()),
+                    Err(super::participant::BindingFailure::NotBindable)
+                ));
+            }
+            _ => panic!("unsupported published outcome"),
         }
     }
 }
@@ -439,9 +455,9 @@ impl super::participant::RefResolver for CountingResolver {
     fn resolve(
         &self,
         _: &cortexkit_role_agent_data::refs::Ref,
-    ) -> Result<super::participant::ResolvedSession, super::participant::NotBindable> {
+    ) -> Result<super::participant::ResolvedSession, super::participant::BindingFailure> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Err(super::participant::NotBindable)
+        Err(super::participant::BindingFailure::NotBindable)
     }
 }
 
@@ -550,9 +566,9 @@ impl super::participant::RefResolver for FixtureResolver {
     fn resolve(
         &self,
         reference: &cortexkit_role_agent_data::refs::Ref,
-    ) -> Result<super::participant::ResolvedSession, super::participant::NotBindable> {
+    ) -> Result<super::participant::ResolvedSession, super::participant::BindingFailure> {
         if reference.r#ref != self.0.registered_ref {
-            return Err(super::participant::NotBindable);
+            return Err(super::participant::BindingFailure::NotBindable);
         }
         Ok(self.0.clone())
     }
@@ -743,12 +759,13 @@ fn flipped_byte_import_applies_nothing() {
     protocol_roundtrip("0123456789abcdef0123456789abcdef", true);
 }
 
-struct FixtureLookup(super::binding::RegisteredSession);
+struct FixtureLookup(cortexkit_agent_identity::AgentSessionForRefReply);
 impl super::binding::SessionLookup for FixtureLookup {
     fn session_for_ref(
         &self,
         _: &cortexkit_role_agent_data::refs::Ref,
-    ) -> Result<super::binding::RegisteredSession, super::participant::NotBindable> {
+    ) -> Result<cortexkit_agent_identity::AgentSessionForRefReply, super::participant::BindingFailure>
+    {
         Ok(self.0.clone())
     }
 }
@@ -759,7 +776,7 @@ impl super::binding::NativeIdentityLookup for FixtureNativeLookup {
         _: &Path,
         _: &str,
         _: &str,
-    ) -> Result<super::binding::NativeIdentity, super::participant::NotBindable> {
+    ) -> Result<super::binding::NativeIdentity, super::participant::BindingFailure> {
         Ok(self.0.clone())
     }
 }
@@ -777,7 +794,7 @@ fn entorhinal_with_wrong_native_session_or_null_root_is_refused() {
     for root in [Some(temp.path().to_str().unwrap().to_owned()), None] {
         let registration = registered(root);
         let params =
-            json!({"refs":[{"ref_kind":registration.ref_kind,"ref":registration.reference}]});
+            json!({"refs":[{"ref_kind":registration.ref_kind,"ref":registration.session_ref}]});
         let resolver = super::binding::EntorhinalRefs {
             registry: Arc::new(FixtureLookup(registration)),
             native: Arc::new(FixtureNativeLookup(native.clone())),
@@ -883,4 +900,95 @@ fn portable_order_preserves_u128_without_json_number_coercion() {
     };
     let decoded = super::SessionSnapshot::decode(&original.encode().unwrap()).unwrap();
     assert_eq!(decoded.groups[0].files()[0].order, u128::MAX);
+}
+
+#[test]
+fn typed_session_lookup_refuses_missing_session_id_and_nullable_harness() {
+    use super::binding::{EntorhinalRefs, NativeIdentity};
+    use super::participant::{BindingFailure, RefResolver};
+    use std::sync::Arc;
+    let temp = tempfile::tempdir().unwrap();
+    let native = NativeIdentity {
+        root: temp.path().into(),
+        harness: "pi".into(),
+        session: "native-session".into(),
+        storage_harness: crate::harness::Harness::Pi,
+    };
+    let mut wrong_row =
+        serde_json::to_value(registered(Some(temp.path().to_str().unwrap().to_owned()))).unwrap();
+    wrong_row.as_object_mut().unwrap().remove("session_id");
+    wrong_row["session"] = json!("native-session");
+    let missing: cortexkit_agent_identity::AgentSessionForRefReply =
+        serde_json::from_value(wrong_row).unwrap();
+    assert!(missing.session_id.is_none());
+    let mut placeholder = registered(Some(temp.path().to_str().unwrap().to_owned()));
+    placeholder.harness = None;
+    for reply in [missing, placeholder] {
+        let reference =
+            serde_json::from_value(json!({"ref_kind":reply.ref_kind,"ref":reply.session_ref}))
+                .unwrap();
+        let resolver = EntorhinalRefs {
+            registry: Arc::new(FixtureLookup(reply)),
+            native: Arc::new(FixtureNativeLookup(native.clone())),
+        };
+        assert!(matches!(
+            resolver.resolve(&reference),
+            Err(BindingFailure::NotBindable)
+        ));
+    }
+}
+
+#[test]
+fn typed_session_lookup_not_found_is_final_and_outages_are_unavailable() {
+    use super::participant::{BindingFailure, Participant};
+    use std::sync::Arc;
+    struct LookupReply(serde_json::Value);
+    impl super::binding::SessionLookup for LookupReply {
+        fn session_for_ref(
+            &self,
+            _: &cortexkit_role_agent_data::refs::Ref,
+        ) -> Result<cortexkit_agent_identity::AgentSessionForRefReply, BindingFailure> {
+            super::transport::decode_session_for_ref(self.0.clone())
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    for code in ["not_found", "storage_unavailable"] {
+        for method in ["agent_data.busy", "agent_data.import"] {
+            let resolver = super::binding::EntorhinalRefs {
+                registry: Arc::new(LookupReply(
+                    json!({"code":code,"message":"lookup refusal","detail":null}),
+                )),
+                native: Arc::new(FixtureNativeLookup(super::binding::NativeIdentity {
+                    root: temp.path().into(),
+                    harness: "pi".into(),
+                    session: "native-session".into(),
+                    storage_harness: crate::harness::Harness::Pi,
+                })),
+            };
+            let participant = Participant::new(
+                temp.path().join("participant"),
+                Arc::new(resolver),
+                Arc::new(super::participant::UnavailableActivity),
+                Arc::new(NeverStores),
+                Arc::new(Registry { roots: Vec::new() }),
+                Arc::new(super::door_tests::MemoryDoor::aft().engram()),
+            );
+            let mut params = json!({"refs":[{"ref_kind":"pi-session","ref":"0123456789abcdef0123456789abcdef"}]});
+            if method == "agent_data.import" {
+                params["cutId"] = json!("0123456789abcdef0123456789abcdef");
+            }
+            let refusal = participant
+                .handle("reserved:entorhinal", method, &params)
+                .unwrap_err();
+            use cortexkit_role_agent_data::errors::RefusalCode;
+            let expected = if code != "not_found" {
+                RefusalCode::Unavailable
+            } else if method == "agent_data.busy" {
+                RefusalCode::UnknownRef
+            } else {
+                RefusalCode::InvalidRequest
+            };
+            assert_eq!(refusal.code, expected);
+        }
+    }
 }

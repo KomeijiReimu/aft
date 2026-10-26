@@ -1,6 +1,6 @@
-//! Typed agent-data state machine. Catalog admission remains disabled while
-//! attested ref resolution and the daemon's session-wide activity fence are
-//! being connected; neither dependency has an unsafe permissive default.
+//! Incomplete typed agent-data protocol core. Catalog admission remains disabled
+//! until native identity lookup, the daemon session fence and crash-atomic
+//! lifecycle publication are implemented; missing dependencies refuse access.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -41,18 +41,21 @@ impl ResolvedSession {
 }
 
 #[derive(Debug)]
-pub struct NotBindable;
+pub enum BindingFailure {
+    NotBindable,
+    Unavailable(String),
+}
 
 /// Only registered, attested identity may supply this mapping. A bare session
 /// string or a folder name never establishes ownership of another store.
 pub trait RefResolver: Send + Sync {
-    fn resolve(&self, reference: &Ref) -> Result<ResolvedSession, NotBindable>;
+    fn resolve(&self, reference: &Ref) -> Result<ResolvedSession, BindingFailure>;
 }
 
 pub struct UnbindableRefs;
 impl RefResolver for UnbindableRefs {
-    fn resolve(&self, _reference: &Ref) -> Result<ResolvedSession, NotBindable> {
-        Err(NotBindable)
+    fn resolve(&self, _reference: &Ref) -> Result<ResolvedSession, BindingFailure> {
+        Err(BindingFailure::NotBindable)
     }
 }
 
@@ -249,7 +252,10 @@ impl Participant {
         }
         let mut sessions = Vec::new();
         for reference in refs.as_slice() {
-            let session = self.resolver.resolve(reference).map_err(|_| {
+            let session = self.resolver.resolve(reference).map_err(|failure| {
+                if let BindingFailure::Unavailable(reason) = failure {
+                    return unavailable(reason);
+                }
                 if matches!(op, Op::Busy | Op::Prepare | Op::Export | Op::Release) {
                     let mut body = error(
                         RefusalCode::UnknownRef,
@@ -259,7 +265,10 @@ impl Participant {
                         Some(json!({"ref_kind":reference.ref_kind,"ref":reference.r#ref}));
                     body
                 } else {
-                    unavailable("registered session identity is not bindable")
+                    error(
+                        RefusalCode::InvalidRequest,
+                        "registered session identity is not bindable",
+                    )
                 }
             })?;
             if session.registered_ref != reference.r#ref
@@ -318,7 +327,7 @@ impl Participant {
                     let offsets = self
                         .door
                         .offsets(&session_ref)
-                        .map_err(|failure| unavailable(failure.code))?;
+                        .map_err(|failure| door_failure(Op::Prepare, "session.offsets", failure))?;
                     let end = offsets
                         .durable_offset
                         .checked_add(next.len() as u64)
@@ -327,7 +336,7 @@ impl Participant {
                         .add_stream(end, entries)
                         .map_err(|reason| error(RefusalCode::NotExportable, reason))?;
                     let mut prefix =
-                        self.read_local_prefix(&session_ref, offsets.durable_offset)?;
+                        self.read_local_prefix(&session_ref, offsets.durable_offset, Op::Prepare)?;
                     if prefix.len() as u64 + next.len() as u64 > SESSION_LIMIT {
                         return Err(error(RefusalCode::NotExportable, "session_limit"));
                     }
@@ -337,10 +346,9 @@ impl Participant {
                     let file = format!("source-{index}.bin");
                     self.write_cut_file(cut, &file, &prefix)?;
                     if offsets.durable_offset > 0 {
-                        let covered = self
-                            .door
-                            .cover(&session_ref)
-                            .map_err(|failure| unavailable(failure.code))?;
+                        let covered = self.door.cover(&session_ref).map_err(|failure| {
+                            door_failure(Op::Prepare, "session.cover", failure)
+                        })?;
                         if covered.cloud_offset < offsets.durable_offset {
                             return Err(unavailable("previously admitted prefix is not covered"));
                         }
@@ -367,8 +375,9 @@ impl Participant {
                 }
                 journal.streams = streams;
                 journal.refs = Some(refs.clone());
-                // Save the cut material before freezing. A crash retry can always
-                // reconstruct the same prefix without reading a moving store.
+                // Native integration must atomically couple the durable freeze,
+                // normalized request and first reply. This saved cut material
+                // alone does not close the prepare/freeze crash window.
                 self.save(cut, &journal)?;
                 barrier.freeze(cut, &sessions).map_err(unavailable)?;
                 let reply =
@@ -383,12 +392,15 @@ impl Participant {
                     let offsets = self
                         .door
                         .offsets(&stream.session_ref)
-                        .map_err(|failure| unavailable(failure.code))?;
+                        .map_err(|failure| door_failure(Op::Export, "session.offsets", failure))?;
                     if offsets.durable_offset > stream.end {
                         return Err(unavailable("door advanced past prepared cut"));
                     }
-                    let admitted_prefix =
-                        self.read_local_prefix(&stream.session_ref, offsets.durable_offset)?;
+                    let admitted_prefix = self.read_local_prefix(
+                        &stream.session_ref,
+                        offsets.durable_offset,
+                        Op::Export,
+                    )?;
                     if bytes.get(..admitted_prefix.len()) != Some(admitted_prefix.as_slice()) {
                         return Err(unavailable("door prefix differs from prepared bytes"));
                     }
@@ -398,7 +410,9 @@ impl Participant {
                         let admitted = self
                             .door
                             .admit(&stream.session_ref, offset as u64, &bytes[offset..end])
-                            .map_err(|failure| unavailable(failure.code))?;
+                            .map_err(|failure| {
+                                door_failure(Op::Export, "session.admit", failure)
+                            })?;
                         if admitted.durable_offset != end as u64 {
                             return Err(unavailable("invalid admitted offset"));
                         }
@@ -563,7 +577,7 @@ impl Participant {
         }
     }
 
-    fn read_local_prefix(&self, session: &str, end: u64) -> Result<Vec<u8>, ErrorBody> {
+    fn read_local_prefix(&self, session: &str, end: u64, op: Op) -> Result<Vec<u8>, ErrorBody> {
         if end > SESSION_LIMIT {
             return Err(error(RefusalCode::NotExportable, "session_limit"));
         }
@@ -573,7 +587,7 @@ impl Participant {
             let page = self
                 .door
                 .read(session, offset, PAGE_LIMIT, None)
-                .map_err(|failure| unavailable(failure.code))?;
+                .map_err(|failure| door_failure(op, "session.read", failure))?;
             let decoded = super::door::unhex(&page.bytes).map_err(unavailable)?;
             if decoded.is_empty()
                 || decoded.len() > PAGE_LIMIT
@@ -712,7 +726,26 @@ fn import_error(reason: String) -> ErrorBody {
         | "noncontiguous cut"
         | "noncontiguous or changed cut"
         | "nonprogressing cut" => error(RefusalCode::DigestMismatch, reason),
-        "session_limit" => incompatible(reason),
+        "session_limit" | "below_floor" => incompatible(reason),
+        "verify_failed" => error(RefusalCode::DigestMismatch, reason),
+        _ if super::door::classify("session.read", &reason) == super::door::FailureClass::Stop => {
+            error(RefusalCode::InvalidRequest, reason)
+        }
         _ => unavailable(reason),
     }
+}
+
+fn door_failure(op: Op, method: &str, failure: super::door::DoorError) -> ErrorBody {
+    if super::door::classify(method, &failure.code) == super::door::FailureClass::Retry {
+        return unavailable(failure.code);
+    }
+    let code = if op == Op::Prepare {
+        RefusalCode::NotExportable
+    } else {
+        RefusalCode::InvalidRequest
+    };
+    error(
+        code,
+        format!("session door stopped {method}: {}", failure.code),
+    )
 }

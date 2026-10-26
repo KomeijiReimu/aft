@@ -17,6 +17,8 @@ struct State {
     cuts: BTreeMap<(String, String), Cut>,
     flip: bool,
     gap: bool,
+    read_offsets: Vec<u64>,
+    floor_change: Option<u64>,
 }
 #[derive(Clone, Default)]
 pub(super) struct MemoryDoor {
@@ -105,6 +107,22 @@ impl JsonDoorTransport for MemoryDoor {
             }
             "session.read" => {
                 let start = params["fromOffset"].as_u64().unwrap();
+                state.read_offsets.push(start);
+                if start > 0 {
+                    if let Some(floor) = state.floor_change.take() {
+                        let cut = state
+                            .cuts
+                            .get_mut(&(
+                                params["cutId"].as_str().unwrap().to_owned(),
+                                session.to_owned(),
+                            ))
+                            .unwrap();
+                        let mut prefix = StreamHash::fresh();
+                        prefix.update(&cut.bytes[..floor as usize]).unwrap();
+                        cut.floor = floor;
+                        cut.midstate = prefix.midstate();
+                    }
+                }
                 let limit = params["limit"].as_u64().unwrap() as usize;
                 if limit > PAGE_LIMIT {
                     return Err(error("record_too_large", json!({"cap":PAGE_LIMIT})));
@@ -173,7 +191,8 @@ fn cut_digest_accepts_correct_and_trimmed_streams() {
         .unwrap();
     for floor in [0, 77, 128] {
         memory.entorhinal_seal("cut", "one", floor);
-        let verified = read_verified_cut(&door, "one", "cut", 64 * 1024 * 1024).unwrap();
+        let verified =
+            read_verified_cut_from(&door, "one", "cut", 64 * 1024 * 1024, floor).unwrap();
         assert_eq!(verified.bytes, bytes[floor as usize..]);
         assert_eq!(verified.digest, format!("{:x}", Sha256::digest(&bytes)));
     }
@@ -239,5 +258,101 @@ fn door_double_enforces_real_admission_and_lease_free_reads() {
         forbidden.engram().read("one", 0, 1, None).unwrap_err().code,
         "caller_forbidden"
     );
-    assert_eq!(classify("a_future_refusal"), FailureClass::Retry);
+    assert_eq!(
+        classify("session.read", "a_future_refusal"),
+        FailureClass::Retry
+    );
+}
+
+#[test]
+fn cut_floor_change_discards_buffer_and_restarts_from_new_midstate() {
+    let memory = MemoryDoor::aft();
+    let door = memory.engram();
+    let bytes: Vec<u8> = (0..=255).cycle().take(PAGE_LIMIT + 131).collect();
+    door.admit("one", 0, &bytes[..PAGE_LIMIT]).unwrap();
+    door.admit("one", PAGE_LIMIT as u64, &bytes[PAGE_LIMIT..])
+        .unwrap();
+    memory.entorhinal_seal("cut", "one", 0);
+    memory.state.lock().unwrap().floor_change = Some(77);
+    let verified = read_verified_cut(&door, "one", "cut", 64 * 1024 * 1024).unwrap();
+    assert_eq!(verified.floor, 77);
+    assert_eq!(verified.bytes, bytes[77..]);
+    assert_eq!(verified.digest, format!("{:x}", Sha256::digest(&bytes)));
+    assert_eq!(
+        &memory.state.lock().unwrap().read_offsets[..3],
+        &[0, PAGE_LIMIT as u64, 77]
+    );
+}
+
+#[test]
+fn cut_below_floor_stops_without_retrying_error_floor() {
+    let memory = MemoryDoor::aft();
+    let door = memory.engram();
+    door.admit("one", 0, b"retained bytes").unwrap();
+    memory.entorhinal_seal("cut", "one", 3);
+    assert_eq!(
+        read_verified_cut(&door, "one", "cut", 64 * 1024 * 1024)
+            .err()
+            .as_deref(),
+        Some("below_floor")
+    );
+    assert_eq!(memory.state.lock().unwrap().read_offsets, [0]);
+}
+
+#[test]
+fn door_stream_refusal_table_matches_published_contract() {
+    let doc =
+        include_str!("../../tests/fixtures/agent_data/session-door-stream-refusals-6ca43ec0.md");
+    let mut expected = Vec::new();
+    for line in doc.lines().filter(|line| line.starts_with("| `")) {
+        let cells: Vec<_> = line.split('|').map(str::trim).collect();
+        let code = cells[1].trim_matches('`').to_owned();
+        let methods = cells[2]
+            .split(',')
+            .map(|method| method.trim().trim_matches('`').to_owned())
+            .collect::<Vec<_>>();
+        let next = match cells[4] {
+            "Stop" => FailureClass::Stop,
+            "Retry" => FailureClass::Retry,
+            unknown => panic!("unknown contract class {unknown}"),
+        };
+        expected.push((code, methods, next));
+    }
+    assert_eq!(expected.len(), 19);
+    let actual = STREAM_REFUSALS
+        .iter()
+        .map(|row| {
+            (
+                row.code.to_owned(),
+                row.methods
+                    .iter()
+                    .map(|method| (*method).to_owned())
+                    .collect::<Vec<_>>(),
+                row.next,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+    for row in STREAM_REFUSALS {
+        for method in row.methods {
+            assert_eq!(classify(method, row.code), row.next);
+        }
+    }
+    assert_eq!(
+        classify("session.offsets", "offset_mismatch"),
+        FailureClass::Retry
+    );
+    struct InternalRefusal;
+    impl JsonDoorTransport for InternalRefusal {
+        fn call(&self, _: &str, _: Value, _: std::time::Duration) -> Result<Value, DoorError> {
+            Err(DoorError {
+                code: "an_internal_engram_code".into(),
+                detail: Value::Null,
+            })
+        }
+    }
+    assert_eq!(
+        EngramDoor(InternalRefusal).offsets("one").unwrap_err().code,
+        "unavailable"
+    );
 }

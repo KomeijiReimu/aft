@@ -85,21 +85,13 @@ impl ModuleTransport {
                     .close_handle(&route, CloseRouteOptions::default())
                     .await;
                 let _ = consumer.close().await;
-                let bytes = result.map_err(|error| match error {
-                    CallError::Module(body) => {
-                        let detail = serde_json::to_value(&body)
-                            .ok()
-                            .and_then(|value| value.get("detail").cloned())
-                            .unwrap_or(Value::Null);
-                        DoorError {
-                            code: body.code,
-                            detail,
-                        }
-                    }
-                    error => DoorError::unavailable(error.to_string()),
-                })?;
-                serde_json::from_slice(&bytes)
-                    .map_err(|error| DoorError::unavailable(error.to_string()))
+                match result {
+                    Ok(bytes) => serde_json::from_slice(&bytes)
+                        .map_err(|error| DoorError::unavailable(error.to_string())),
+                    Err(CallError::Module(body)) => serde_json::to_value(body)
+                        .map_err(|error| DoorError::unavailable(error.to_string())),
+                    Err(error) => Err(DoorError::unavailable(error.to_string())),
+                }
             })
         })
         .join()
@@ -111,19 +103,21 @@ impl super::binding::SessionLookup for ModuleTransport {
     fn session_for_ref(
         &self,
         reference: &cortexkit_role_agent_data::refs::Ref,
-    ) -> Result<super::binding::RegisteredSession, super::participant::NotBindable> {
-        let request = json!({"method":"agent.session_for_ref", "params":{"ref_kind":reference.ref_kind,"ref":reference.r#ref}});
-        let bytes = serde_json::to_vec(&request).map_err(|_| super::participant::NotBindable)?;
+    ) -> Result<cortexkit_agent_identity::AgentSessionForRefReply, super::participant::BindingFailure>
+    {
+        let request = Request::new(
+            "agent.session_for_ref",
+            cortexkit_agent_identity::AgentSessionForRefParams::new(
+                reference.ref_kind.clone(),
+                reference.r#ref.clone(),
+            ),
+        );
+        let bytes = serde_json::to_vec(&request)
+            .map_err(|error| super::participant::BindingFailure::Unavailable(error.to_string()))?;
         let reply = self
             .request(bytes, Duration::from_secs(30))
-            .map_err(|_| super::participant::NotBindable)?;
-        serde_json::from_value(
-            reply
-                .get("result")
-                .cloned()
-                .ok_or(super::participant::NotBindable)?,
-        )
-        .map_err(|_| super::participant::NotBindable)
+            .map_err(|error| super::participant::BindingFailure::Unavailable(error.code))?;
+        decode_session_for_ref(reply)
     }
 }
 
@@ -132,10 +126,16 @@ impl JsonDoorTransport for ModuleTransport {
         let body = serde_json::to_vec(&json!({"method":method,"params":params}))
             .map_err(|error| DoorError::unavailable(error.to_string()))?;
         let reply = self.request(body, timeout)?;
-        reply
-            .get("result")
-            .cloned()
-            .ok_or_else(|| DoorError::unavailable("missing module result envelope"))
+        match serde_json::from_value::<Outcome<Value>>(reply)
+            .map_err(|error| DoorError::unavailable(error.to_string()))?
+        {
+            Outcome::Success(success) => Ok(success.result),
+            Outcome::Refusal(error) => Err(DoorError {
+                code: error.code.into(),
+                detail: error.detail.unwrap_or(Value::Null),
+            }),
+            _ => Err(DoorError::unavailable("unsupported module outcome")),
+        }
     }
 }
 
@@ -169,5 +169,30 @@ impl ProjectRegistry for EntorhinalRegistry {
     }
     fn enumerate(&self) -> Result<EnumerateReply, String> {
         self.read(Request::new("enumerate", EnumerateParams::new(None)))
+    }
+}
+
+/// Use the published envelope and refusal vocabulary for both DATA and ERROR
+/// replies. A missing registration is final; service or decoding failures are
+/// unavailable rather than evidence that the session belongs to someone else.
+pub(super) fn decode_session_for_ref(
+    reply: Value,
+) -> Result<cortexkit_agent_identity::AgentSessionForRefReply, super::participant::BindingFailure> {
+    use super::participant::BindingFailure;
+    match serde_json::from_value::<Outcome<cortexkit_agent_identity::AgentSessionForRefReply>>(
+        reply,
+    )
+    .map_err(|error| BindingFailure::Unavailable(error.to_string()))?
+    {
+        Outcome::Success(success) => Ok(success.result),
+        Outcome::Refusal(error)
+            if error.code == cortexkit_project_identity::RefusalCode::NotFound =>
+        {
+            Err(BindingFailure::NotBindable)
+        }
+        Outcome::Refusal(error) => Err(BindingFailure::Unavailable(error.message)),
+        _ => Err(BindingFailure::Unavailable(
+            "unsupported session lookup outcome".into(),
+        )),
     }
 }

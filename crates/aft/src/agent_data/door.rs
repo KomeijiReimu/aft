@@ -17,27 +17,143 @@ pub struct DoorError {
 pub enum FailureClass {
     Retry,
     Stop,
-    CutNotReady,
 }
 
-/// Keep the door's refusal policy in one place. Unknown codes are unavailable,
-/// never guessed terminal outcomes, until engram publishes its closed table.
-pub fn classify(code: &str) -> FailureClass {
-    const CLASSES: &[(&str, FailureClass)] = &[
-        ("caller_forbidden", FailureClass::Stop),
-        ("record_too_large", FailureClass::Stop),
-        ("stream_label_too_long", FailureClass::Stop),
-        ("invalid_request", FailureClass::Stop),
-        ("digest_unindexed", FailureClass::Stop),
-        ("below_floor", FailureClass::Stop),
-        ("cut_not_published", FailureClass::CutNotReady),
-        ("not_found", FailureClass::CutNotReady),
-    ];
-    CLASSES
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamRefusal {
+    pub code: &'static str,
+    pub methods: &'static [&'static str],
+    pub next: FailureClass,
+}
+
+const ALL: &[&str] = &[
+    "session.admit",
+    "session.cover",
+    "session.read",
+    "session.offsets",
+];
+const ADMIT: &[&str] = &["session.admit"];
+const READ: &[&str] = &["session.read"];
+const ADMIT_READ: &[&str] = &["session.admit", "session.read"];
+const CLOUD: &[&str] = &["session.admit", "session.cover", "session.read"];
+
+/// The stream-method rows of engram's SESSION_WRITER_CONTRACT at 6ca43ec0.
+pub const STREAM_REFUSALS: &[StreamRefusal] = &[
+    StreamRefusal {
+        code: "invalid_request",
+        methods: ALL,
+        next: FailureClass::Stop,
+    },
+    StreamRefusal {
+        code: "caller_forbidden",
+        methods: ALL,
+        next: FailureClass::Stop,
+    },
+    StreamRefusal {
+        code: "stream_label_too_long",
+        methods: ALL,
+        next: FailureClass::Stop,
+    },
+    StreamRefusal {
+        code: "unavailable",
+        methods: ALL,
+        next: FailureClass::Retry,
+    },
+    StreamRefusal {
+        code: "record_too_large",
+        methods: ADMIT_READ,
+        next: FailureClass::Stop,
+    },
+    StreamRefusal {
+        code: "response_too_large",
+        methods: ALL,
+        next: FailureClass::Stop,
+    },
+    StreamRefusal {
+        code: "offset_mismatch",
+        methods: ADMIT,
+        next: FailureClass::Stop,
+    },
+    StreamRefusal {
+        code: "lease_acquiring",
+        methods: ADMIT,
+        next: FailureClass::Retry,
+    },
+    StreamRefusal {
+        code: "lease_unavailable",
+        methods: CLOUD,
+        next: FailureClass::Retry,
+    },
+    StreamRefusal {
+        code: "lease_held_elsewhere",
+        methods: ADMIT,
+        next: FailureClass::Stop,
+    },
+    StreamRefusal {
+        code: "lease_not_writable",
+        methods: ADMIT,
+        next: FailureClass::Stop,
+    },
+    StreamRefusal {
+        code: "container_handed_off",
+        methods: ADMIT,
+        next: FailureClass::Stop,
+    },
+    StreamRefusal {
+        code: "cut_pending_handoff",
+        methods: ADMIT,
+        next: FailureClass::Stop,
+    },
+    StreamRefusal {
+        code: "offset_out_of_range",
+        methods: READ,
+        next: FailureClass::Stop,
+    },
+    StreamRefusal {
+        code: "below_floor",
+        methods: READ,
+        next: FailureClass::Stop,
+    },
+    StreamRefusal {
+        code: "cut_not_published",
+        methods: READ,
+        next: FailureClass::Stop,
+    },
+    StreamRefusal {
+        code: "not_found",
+        methods: READ,
+        next: FailureClass::Stop,
+    },
+    StreamRefusal {
+        code: "verify_failed",
+        methods: READ,
+        next: FailureClass::Stop,
+    },
+    StreamRefusal {
+        code: "cut_item_missing",
+        methods: READ,
+        next: FailureClass::Stop,
+    },
+];
+
+/// Unknown codes, including known codes on another method, are unavailable and
+/// retryable rather than an invented terminal refusal.
+pub fn classify(method: &str, code: &str) -> FailureClass {
+    STREAM_REFUSALS
         .iter()
-        .find(|(known, _)| *known == code)
-        .map(|(_, class)| *class)
+        .find(|row| row.code == code && row.methods.contains(&method))
+        .map(|row| row.next)
         .unwrap_or(FailureClass::Retry)
+}
+
+fn normalize(method: &str, mut error: DoorError) -> DoorError {
+    if !STREAM_REFUSALS
+        .iter()
+        .any(|row| row.code == error.code && row.methods.contains(&method))
+    {
+        error.code = "unavailable".into();
+    }
+    error
 }
 
 impl DoorError {
@@ -103,8 +219,12 @@ pub struct EngramDoor<T>(pub T);
 impl<T: JsonDoorTransport> EngramDoor<T> {
     fn offsets_call(&self, method: &str, params: Value, long: bool) -> Result<Offsets, DoorError> {
         let timeout = std::time::Duration::from_secs(if long { 600 } else { 30 });
-        serde_json::from_value(self.0.call(method, params, timeout)?)
-            .map_err(|error| DoorError::unavailable(error.to_string()))
+        serde_json::from_value(
+            self.0
+                .call(method, params, timeout)
+                .map_err(|error| normalize(method, error))?,
+        )
+        .map_err(|error| DoorError::unavailable(error.to_string()))
     }
 }
 
@@ -145,11 +265,11 @@ impl<T: JsonDoorTransport> SessionDoor for EngramDoor<T> {
         if let Some(cut) = cut {
             params["cutId"] = json!(cut);
         }
-        serde_json::from_value(self.0.call(
-            "session.read",
-            params,
-            std::time::Duration::from_secs(600),
-        )?)
+        serde_json::from_value(
+            self.0
+                .call("session.read", params, std::time::Duration::from_secs(600))
+                .map_err(|error| normalize("session.read", error))?,
+        )
         .map_err(|error| DoorError::unavailable(error.to_string()))
     }
 }
@@ -292,20 +412,23 @@ pub fn read_verified_cut(
     cut: &str,
     cap: u64,
 ) -> Result<VerifiedStream, String> {
-    let first = door.read(session, 0, PAGE_LIMIT, Some(cut));
-    let first = match first {
-        Err(error) if error.code == "below_floor" => {
-            let floor = error
-                .detail
-                .get("floor")
-                .and_then(Value::as_u64)
-                .ok_or("invalid floor")?;
-            door.read(session, floor, PAGE_LIMIT, Some(cut))
-                .map_err(|error| error.code)?
-        }
-        other => other.map_err(|error| error.code)?,
-    };
-    let floor = first.floor.ok_or("missing authenticated floor")?;
+    read_verified_cut_from(door, session, cut, cap, 0)
+}
+
+/// A caller that already knows a trim floor may start there. A below_floor
+/// refusal is terminal for this cut-bound import, never a hint to retry at the
+/// error's floor. Only a successful page can replace the authenticated state.
+pub fn read_verified_cut_from(
+    door: &dyn SessionDoor,
+    session: &str,
+    cut: &str,
+    cap: u64,
+    initial_floor: u64,
+) -> Result<VerifiedStream, String> {
+    let first = door
+        .read(session, initial_floor, PAGE_LIMIT, Some(cut))
+        .map_err(|error| error.code)?;
+    let mut floor = first.floor.ok_or("missing authenticated floor")?;
     let end = first.stream_end;
     if end > cap || floor > end {
         return Err("session_limit".into());
@@ -314,7 +437,7 @@ pub fn read_verified_cut(
     if unhex(&digest)?.len() != 32 {
         return Err("invalid digest".into());
     }
-    let midstate = first
+    let mut midstate = first
         .midstate
         .clone()
         .ok_or("missing authenticated midstate")?;
@@ -322,13 +445,37 @@ pub fn read_verified_cut(
     let mut offset = floor;
     let mut bytes = Vec::new();
     let mut page = first;
+    let mut restarts = 0usize;
     loop {
-        if page.from_offset != offset
-            || page.stream_end != end
-            || page.floor != Some(floor)
-            || page.digest.as_deref() != Some(&digest)
-            || page.midstate.as_ref() != Some(&midstate)
-        {
+        if page.stream_end != end || page.digest.as_deref() != Some(&digest) {
+            return Err("noncontiguous or changed cut".into());
+        }
+        let observed_floor = page.floor.ok_or("missing authenticated floor")?;
+        if observed_floor != floor {
+            if observed_floor > end {
+                return Err("invalid floor".into());
+            }
+            // An authenticated cloud snapshot can supersede a stale local floor.
+            // Drop every buffered byte and restart its hash, preserving the
+            // immutable cut digest and end rather than stitching two snapshots.
+            floor = observed_floor;
+            midstate = page
+                .midstate
+                .clone()
+                .ok_or("missing authenticated midstate")?;
+            hash = StreamHash::resume(floor, &midstate)?;
+            bytes.clear();
+            offset = floor;
+            restarts += 1;
+            if restarts > 8 {
+                return Err("unavailable".into());
+            }
+            page = door
+                .read(session, floor, PAGE_LIMIT, Some(cut))
+                .map_err(|error| error.code)?;
+            continue;
+        }
+        if page.from_offset != offset || page.midstate.as_ref() != Some(&midstate) {
             return Err("noncontiguous or changed cut".into());
         }
         if page.bytes.len() > PAGE_LIMIT * 2 {
