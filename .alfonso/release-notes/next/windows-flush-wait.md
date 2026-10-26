@@ -1,0 +1,1 @@
+- On Windows, a finished command waits up to 1.5 seconds for its changed-files report to catch up, so busy machines no longer mark it incomplete while listing every file.
