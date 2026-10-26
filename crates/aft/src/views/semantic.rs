@@ -1972,12 +1972,26 @@ impl SemanticPlane {
         })
     }
 
-    /// The index `overlay` last built for the view, whatever snapshot it was
-    /// built for. Never builds one.
+    /// The index `overlay` last built for the owner's view, whatever snapshot
+    /// it was built for. Borrowers use `cached_index_for` to name their reader
+    /// binding. Never builds one.
     pub fn cached_index(&self, access: &ViewAccess) -> Option<Arc<SemanticIndex>> {
         let view = lock(&self.views)
             .get(&(access.family().to_owned(), access.scope().to_owned()))
             .cloned()?;
+        let state = lock(&view);
+        state.cache.as_ref().map(|(_, index)| Arc::clone(index))
+    }
+
+    /// The last overlay cached in this snapshot's reader binding. Borrowers
+    /// have private caches, so a scope-only lookup could observe an owner's
+    /// unpublished fills or a different reader's generation. Never builds one.
+    pub fn cached_index_for(
+        &self,
+        access: &ViewAccess,
+        snapshot: &Snapshot,
+    ) -> Option<Arc<SemanticIndex>> {
+        let view = self.query_view(access, snapshot);
         let state = lock(&view);
         state.cache.as_ref().map(|(_, index)| Arc::clone(index))
     }
@@ -2800,7 +2814,7 @@ mod tests {
             assert!(query.complete());
             assert!(!query.results.is_empty());
             let old_summary = plane
-                .cached_index(&access)
+                .cached_index_for(&access, &before)
                 .unwrap()
                 .entry_vectors_for_test()
                 .into_iter()
@@ -2859,7 +2873,7 @@ mod tests {
             assert!(query.complete());
             assert!(!query.results.is_empty());
             let new_summary = plane
-                .cached_index(&access)
+                .cached_index_for(&access, &after)
                 .unwrap()
                 .entry_vectors_for_test()
                 .into_iter()
@@ -2868,6 +2882,18 @@ mod tests {
                 .2;
             assert_ne!(old_summary, new_summary);
             assert_eq!(new_summary, vector("model-a", &embedded[0]));
+            assert_eq!(
+                plane
+                    .cached_index_for(&access, &before)
+                    .unwrap()
+                    .entry_vectors_for_test()
+                    .into_iter()
+                    .find(|(_, name, _)| name == "summary")
+                    .unwrap()
+                    .2,
+                old_summary,
+                "a newer reader binding must not replace the old query's cache"
+            );
             assert_ne!(before.generation().name(), after.generation().name());
             assert!(plane.pending_work(&checkout.access, &published).is_empty());
             let current = published.clone();
@@ -3060,6 +3086,56 @@ mod tests {
             .results
             .iter()
             .any(|row| row.name == "exported"));
+    }
+
+    #[test]
+    fn composed_worker_never_repairs_inherited_summaries_or_fills_inherited_pending_files() {
+        use super::super::manifest_v2::{BaseHeader, EntryPlanes, EntryV2, ManifestV2};
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let caps = EmbedTextCaps {
+            total_chars: 70,
+            ..EmbedTextCaps::default()
+        };
+        let (legacy, _, _) = legacy_summary_checkout(storage.path(), root.path(), caps);
+        let mut manifest = legacy.installed().generation().flatten().unwrap();
+        manifest
+            .insert(
+                RelPath::new(b"src/pending.rs".to_vec()).unwrap(),
+                EntryV2::regular(
+                    ContentHash::of(b"pending"),
+                    7,
+                    EntryPlanes {
+                        semantic: Some(PlaneState::pending("base fill pending")),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap();
+        let header = manifest.header().clone();
+        let base = Arc::new(ComposedGeneration::new("base", manifest, None));
+        let worker = ManifestV2::new_v3(
+            header,
+            Some(BaseHeader {
+                scope: "base".into(),
+                membership_digest: "11".repeat(32),
+                identity_digest: "22".repeat(32),
+                bound_generation: "base".into(),
+            }),
+            Default::default(),
+        );
+        let composed = Arc::new(ComposedGeneration::compose("worker", worker, base, None).unwrap());
+        let plane = SemanticPlane::new(
+            storage.path().to_path_buf(),
+            SemanticProducer::current("model-a", caps),
+        );
+        let resident = plane.admit(&legacy.access, &composed).unwrap();
+        assert_eq!(resident.legacy_summaries.len(), 1);
+        let snapshot = LiveDelta::new(composed).snapshot();
+        let state = ViewState::default();
+        assert!(plane
+            .work_items(&state, &resident, &snapshot, true)
+            .is_empty());
     }
 
     #[test]
