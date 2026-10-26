@@ -1403,6 +1403,7 @@ fn remote_kill_result_names_the_full_job_id() {
 #[test]
 fn remote_execution_header_without_a_job_id_keeps_its_existing_text() {
     let mut remote = RemoteTask {
+        submission: None,
         accepted_platform: None,
         explicit_runon: false,
         connection_file: None,
@@ -2952,6 +2953,7 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
     metadata.harness = Some("runner".into());
     metadata.execution_note = Some("ran remotely on ck-motor".into());
     metadata.remote = Some(RemoteTask {
+        submission: None,
         accepted_platform: None,
         explicit_runon: false,
         connection_file: Some(daemon.connection.clone()),
@@ -4257,6 +4259,7 @@ fn persist_accepted_with_snapshot_cap(
     metadata.status = BgTaskStatus::Running;
     metadata.execution_note = Some("ran remotely on ck-motor".into());
     metadata.remote = Some(RemoteTask {
+        submission: None,
         accepted_platform: None,
         explicit_runon: false,
         connection_file: Some(connection),
@@ -6578,6 +6581,7 @@ async fn non_blocking_runon_is_still_promoted_at_the_foreground_wait_window() {
 #[test]
 fn remote_phase_comes_from_acceptance_started_or_output() {
     let mut remote = RemoteTask {
+        submission: None,
         accepted_platform: None,
         connection_file: None,
         explicit_runon: true,
@@ -6695,6 +6699,7 @@ fn remote_phase_note_says_submitting_then_queued_until_started() {
     metadata.status = BgTaskStatus::Running;
     metadata.started_at = 1_000_000;
     metadata.remote = Some(RemoteTask {
+        submission: None,
         accepted_platform: None,
         connection_file: None,
         explicit_runon: true,
@@ -7140,6 +7145,7 @@ async fn reattach_limit_counts_from_a_late_draining_resubmission() {
     // Submitted first nine minutes ago; the runner drained until now.
     metadata.started_at = now - 9 * MINUTE_MS;
     metadata.remote = Some(RemoteTask {
+        submission: None,
         accepted_platform: None,
         connection_file: None,
         explicit_runon: true,
@@ -11881,4 +11887,580 @@ async fn bash_kill_scope_withdraws_submission_before_acceptance() {
         "no job ID was known for exec.cancel"
     );
     daemon.acceptance_gate.notify_one();
+}
+
+async fn submission_daemon(
+    never_accepted: bool,
+    mismatch: bool,
+    always_unknown: bool,
+    clients: usize,
+) -> crate::exec_remote::wire_tests::Daemon {
+    crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::Submission {
+            never_accepted,
+            mismatch,
+            always_unknown,
+            disconnect: false,
+        },
+        &["exec-remote/v1", "exec-remote-submission-key/v1"],
+        clients,
+    )
+    .await
+}
+
+fn submission_runs(daemon: &crate::exec_remote::wire_tests::Daemon) -> Vec<serde_json::Value> {
+    daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, body)| body["method"] == "exec.run")
+        .map(|(_, body)| body["params"].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn submission_key_attach_resumes_output_exactly_once() {
+    let daemon = submission_daemon(false, false, false, 1).await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    let task = registry.task(&task_id).unwrap();
+    assert_eq!(
+        fs::read_to_string(&task.paths.stdout).unwrap(),
+        "line-0\nline-1\nline-2\nline-3\n"
+    );
+    let runs = submission_runs(&daemon);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0]["submission_key"], format!("aft:{task_id}"));
+    assert_eq!(runs[1]["resume_from_seq"], 1);
+    let mut resumed = runs[1].clone();
+    resumed.as_object_mut().unwrap().remove("resume_from_seq");
+    assert_eq!(resumed, runs[0]);
+    let durable = read_task(&task.paths.json).unwrap();
+    assert_eq!(durable.remote.as_ref().unwrap().job_id, Some(id()));
+    assert!(
+        durable
+            .remote
+            .as_ref()
+            .unwrap()
+            .submission
+            .as_ref()
+            .unwrap()
+            .reattached
+    );
+}
+
+#[tokio::test]
+async fn submission_key_never_accepted_uses_one_new_key() {
+    let daemon = submission_daemon(true, false, false, 1).await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    let runs = submission_runs(&daemon);
+    assert_eq!(runs.len(), 3);
+    assert_eq!(runs[0]["submission_key"], runs[1]["submission_key"]);
+    assert_ne!(runs[1]["submission_key"], runs[2]["submission_key"]);
+    assert!(runs[2].get("resume_from_seq").is_none());
+    let task = registry.task(&task_id).unwrap();
+    let durable = serde_json::to_value(read_task(&task.paths.json).unwrap()).unwrap();
+    assert_eq!(
+        durable["remote"]["submission"]["key"],
+        runs[2]["submission_key"]
+    );
+}
+
+#[tokio::test]
+async fn submission_key_without_capability_is_never_sent_or_retried() {
+    let daemon = daemon(Script::Lost, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    assert_eq!(
+        terminal(&registry, &task_id).await.info.status,
+        BgTaskStatus::FateUnknown
+    );
+    let runs = submission_runs(&daemon);
+    assert_eq!(runs.len(), 1);
+    assert!(runs[0].get("submission_key").is_none(), "{runs:?}");
+    assert!(runs[0].get("resume_from_seq").is_none());
+}
+
+#[tokio::test]
+async fn submission_key_mismatch_preserves_existing_job_for_cancel() {
+    let daemon = submission_daemon(false, true, false, 2).await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown);
+    assert_eq!(submission_runs(&daemon).len(), 2);
+    assert!(
+        done.remote_refusal.is_none(),
+        "the retry's refusal is not proof about the existing job"
+    );
+    assert!(
+        done.output_preview.contains("submission_key_mismatch"),
+        "{done:?}"
+    );
+    let task = registry.task(&task_id).unwrap();
+    assert_eq!(
+        read_task(&task.paths.json).unwrap().remote.unwrap().job_id,
+        Some(id())
+    );
+    let recorded_id = read_task(&task.paths.json)
+        .unwrap()
+        .remote
+        .unwrap()
+        .job_id
+        .unwrap();
+    let client = ExecRemoteClient::connect(
+        &daemon.connection,
+        subc_protocol::BindIdentity::new(dir.path().display().to_string(), "broca", "session"),
+    )
+    .await
+    .unwrap();
+    client.cancel_job(recorded_id).await.unwrap();
+    daemon.wait_for_requests("exec.cancel", 1).await;
+    let log = daemon.log.lock().unwrap();
+    assert_eq!(
+        log.iter()
+            .find(|(_, b)| b["method"] == "exec.cancel")
+            .unwrap()
+            .1["params"]["job_id"],
+        id().to_string()
+    );
+}
+
+async fn stopped_submission(
+    dir: &Path,
+    daemon: &crate::exec_remote::wire_tests::Daemon,
+) -> (BgTaskRegistry, String) {
+    stopped_draining_roots().lock().unwrap().insert(dir.into());
+    let registry = registry();
+    let task_id = start(&registry, dir, daemon.connection.clone());
+    remote_worker_exited(&task_id).await;
+    (registry, task_id)
+}
+
+#[tokio::test]
+async fn submission_key_restart_restores_request_key_and_output_cursor() {
+    let daemon = submission_daemon(false, false, false, 2).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (old, task_id) = stopped_submission(dir.path(), &daemon).await;
+    let task = old.task(&task_id).unwrap();
+    let saved = read_task(&task.paths.json).unwrap();
+    assert_eq!(saved.remote.as_ref().unwrap().last_seq, Some(1));
+    let value = serde_json::to_value(&saved).unwrap();
+    assert_eq!(
+        value["remote"]["submission"]["key"],
+        format!("aft:{task_id}")
+    );
+    drop(task);
+    drop(old);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    assert_eq!(
+        terminal(&restarted, &task_id).await.info.status,
+        BgTaskStatus::Completed
+    );
+    let task = restarted.task(&task_id).unwrap();
+    assert_eq!(
+        fs::read_to_string(&task.paths.stdout).unwrap(),
+        "line-0\nline-1\nline-2\nline-3\n"
+    );
+    let runs = submission_runs(&daemon);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[1]["resume_from_seq"], 1);
+    assert_eq!(runs[1]["submission_key"], runs[0]["submission_key"]);
+}
+
+#[tokio::test]
+async fn submission_key_older_than_retention_is_not_resubmitted() {
+    let daemon = submission_daemon(false, false, false, 2).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (old, task_id) = stopped_submission(dir.path(), &daemon).await;
+    let task = old.task(&task_id).unwrap();
+    let mut value = serde_json::to_value(read_task(&task.paths.json).unwrap()).unwrap();
+    assert!(value["remote"]["submission"].is_object());
+    value["remote"]["submission"]["created_at_ms"] =
+        serde_json::json!(unix_millis() - 24 * 60 * 60 * 1000);
+    write_task(&task.paths.json, &serde_json::from_value(value).unwrap()).unwrap();
+    drop(task);
+    drop(old);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    assert_eq!(
+        terminal(&restarted, &task_id).await.info.status,
+        BgTaskStatus::FateUnknown
+    );
+    assert_eq!(submission_runs(&daemon).len(), 1);
+}
+
+#[test]
+fn submission_key_reattachment_copy_is_not_enabled_without_approval() {
+    assert_eq!(REATTACHED_RESULT_SENTENCE, None);
+}
+
+#[tokio::test]
+async fn submission_key_recovery_attempts_are_bounded() {
+    let daemon = submission_daemon(false, false, true, 1).await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    assert_eq!(
+        terminal(&registry, &task_id).await.info.status,
+        BgTaskStatus::FateUnknown
+    );
+    let runs = submission_runs(&daemon);
+    assert_eq!(runs.len(), 4);
+    let task = registry.task(&task_id).unwrap();
+    assert_eq!(
+        read_task(&task.paths.json).unwrap().remote.unwrap().job_id,
+        Some(id())
+    );
+    for run in &runs[1..] {
+        assert_eq!(run["submission_key"], runs[0]["submission_key"]);
+        assert_eq!(run["resume_from_seq"], 1);
+    }
+}
+
+#[tokio::test]
+async fn submission_key_closed_runner_time_budget_is_not_resubmitted() {
+    let daemon = submission_daemon(false, false, false, 2).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (old, task_id) = stopped_submission(dir.path(), &daemon).await;
+    let task = old.task(&task_id).unwrap();
+    let mut saved = read_task(&task.paths.json).unwrap();
+    saved.started_at =
+        unix_millis() - saved.timeout_ms.unwrap() - duration_ms(RUNNER_QUEUE_WAIT_LIMIT) - 1;
+    write_task(&task.paths.json, &saved).unwrap();
+    drop(task);
+    drop(old);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    assert_eq!(
+        terminal(&restarted, &task_id).await.info.status,
+        BgTaskStatus::FateUnknown
+    );
+    assert_eq!(submission_runs(&daemon).len(), 1);
+}
+
+#[tokio::test]
+async fn submission_key_daemon_restart_reconnects_before_resubmission() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::Submission {
+            never_accepted: false,
+            mismatch: false,
+            always_unknown: false,
+            disconnect: true,
+        },
+        &["exec-remote/v1", "exec-remote-submission-key/v1"],
+        2,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    let done = terminal(&registry, &task_id).await;
+    let operations: Vec<_> = daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, body)| {
+            body.get("method")
+                .or_else(|| body.get("op"))
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(
+        done.info.status,
+        BgTaskStatus::Completed,
+        "{done:?}; operations: {operations:?}"
+    );
+    let task = registry.task(&task_id).unwrap();
+    assert_eq!(
+        fs::read_to_string(&task.paths.stdout).unwrap(),
+        "line-0\nline-1\nline-2\nline-3\n"
+    );
+    let runs = submission_runs(&daemon);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0]["submission_key"], runs[1]["submission_key"]);
+    assert_eq!(runs[1]["resume_from_seq"], 1);
+}
+
+#[tokio::test]
+async fn submission_key_restart_before_acceptance_replays_from_beginning() {
+    let daemon = submission_daemon(false, false, false, 2).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (old, task_id) = stopped_submission(dir.path(), &daemon).await;
+    let task = old.task(&task_id).unwrap();
+    let mut saved = read_task(&task.paths.json).unwrap();
+    let remote = saved.remote.as_mut().unwrap();
+    remote.accepted = false;
+    remote.job_id = None;
+    remote.last_seq = None;
+    remote.stdout_len = 0;
+    remote.output_received = false;
+    remote.terminal = None;
+    write_task(&task.paths.json, &saved).unwrap();
+    drop(task);
+    drop(old);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    assert_eq!(
+        terminal(&restarted, &task_id).await.info.status,
+        BgTaskStatus::Completed
+    );
+    let task = restarted.task(&task_id).unwrap();
+    assert_eq!(
+        fs::read_to_string(&task.paths.stdout).unwrap(),
+        "line-0\nline-1\nline-2\nline-3\n"
+    );
+    let runs = submission_runs(&daemon);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[1]["submission_key"], runs[0]["submission_key"]);
+    assert!(runs[1].get("resume_from_seq").is_none());
+}
+
+#[tokio::test]
+async fn submission_key_queue_wait_does_not_consume_execution_timeout() {
+    let daemon = submission_daemon(false, false, false, 2).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (old, task_id) = stopped_submission(dir.path(), &daemon).await;
+    let task = old.task(&task_id).unwrap();
+    let mut saved = read_task(&task.paths.json).unwrap();
+    saved.started_at = unix_millis() - saved.timeout_ms.unwrap() - 1;
+    let remote = saved.remote.as_mut().unwrap();
+    remote.submission.as_mut().unwrap().created_at_ms = saved.started_at;
+    // Recover the checkpoint from admission, before any execution was observed.
+    remote.last_seq = None;
+    remote.stdout_len = 0;
+    remote.output_received = false;
+    remote.terminal = None;
+    write_task(&task.paths.json, &saved).unwrap();
+    drop(task);
+    drop(old);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    assert_eq!(
+        terminal(&restarted, &task_id).await.info.status,
+        BgTaskStatus::Completed
+    );
+    assert_eq!(submission_runs(&daemon).len(), 2);
+}
+
+fn lost_submission_roots() -> &'static Mutex<HashSet<PathBuf>> {
+    static ROOTS: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub(super) fn lose_submission_replies(root: &Path) -> bool {
+    lost_submission_roots()
+        .lock()
+        .unwrap()
+        .contains(&test_clock_key(root))
+}
+
+struct LostSubmissionReplies(PathBuf);
+
+impl LostSubmissionReplies {
+    fn new(root: &Path) -> Self {
+        let root = test_clock_key(root);
+        assert!(lost_submission_roots().lock().unwrap().insert(root.clone()));
+        Self(root)
+    }
+}
+
+impl Drop for LostSubmissionReplies {
+    fn drop(&mut self) {
+        lost_submission_roots().lock().unwrap().remove(&self.0);
+    }
+}
+
+async fn review_daemon(script: Script, clients: usize) -> crate::exec_remote::wire_tests::Daemon {
+    crate::exec_remote::wire_tests::daemon_with_capabilities(
+        script,
+        &["exec-remote/v1", "exec-remote-submission-key/v1"],
+        clients,
+    )
+    .await
+}
+
+async fn fresh_reply_loss_never_runs_locally(restored: bool) {
+    let daemon = review_daemon(
+        Script::SubmissionFreshReplyLost,
+        if restored { 2 } else { 1 },
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    ensure_git_fixture(dir.path());
+    let _loss = LostSubmissionReplies::new(dir.path());
+    if restored {
+        stopped_draining_roots()
+            .lock()
+            .unwrap()
+            .insert(dir.path().into());
+    }
+    let old = registry();
+    let counter = dir.path().join("local-spawn-counter");
+    let task_id = old
+        .spawn_remote(
+            launch(daemon.connection.clone()),
+            SpawnPlan::Unsandboxed,
+            "printf x >> \"$LOCAL_SPAWN_COUNTER\"",
+            resolve_posix_shell(),
+            "session".into(),
+            dir.path().into(),
+            HashMap::from([("LOCAL_SPAWN_COUNTER".into(), counter.display().to_string())]),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
+            dir.path().into(),
+            crate::bash_background::TaskSlot::Background { max: 10 },
+            true,
+            false,
+            Some(dir.path().into()),
+        )
+        .unwrap();
+    let registry = if restored {
+        remote_worker_exited(&task_id).await;
+        drop(old);
+        let restarted = registry();
+        restarted.replay_session(dir.path(), "session").unwrap();
+        restarted
+    } else {
+        old
+    };
+    let done = terminal(&registry, &task_id).await;
+    let local_spawns = match fs::read(&counter) {
+        Ok(bytes) => bytes.len(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+        Err(error) => panic!("read local spawn counter: {error}"),
+    };
+    assert_eq!(
+        local_spawns, 0,
+        "an uncertain fresh submission must not also run locally"
+    );
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown, "{done:?}");
+    let runs = submission_runs(&daemon);
+    assert!(
+        runs.len() >= 2,
+        "fresh dispatch must reach the fake executor"
+    );
+    assert_ne!(runs[0]["submission_key"], runs[1]["submission_key"]);
+    for request in &runs[1..] {
+        assert_eq!(request["submission_key"], runs[1]["submission_key"]);
+    }
+    let task = registry.task(&task_id).unwrap();
+    let durable = read_task(&task.paths.json).unwrap();
+    assert!(!durable.local_fallback_started);
+    assert!(durable.child_pid.is_none());
+    let remote = durable.remote.as_ref().unwrap();
+    assert_eq!(
+        serde_json::to_value(remote).unwrap()["submission"]["key"],
+        runs[1]["submission_key"]
+    );
+    assert!(remote.terminal.is_none());
+    assert!(remote.submission.as_ref().unwrap().refusal.is_none());
+    assert!(remote.submission.as_ref().unwrap().fresh_key_used);
+}
+
+#[tokio::test]
+async fn submission_review_fresh_reply_loss_never_runs_locally() {
+    fresh_reply_loss_never_runs_locally(false).await;
+}
+
+#[tokio::test]
+async fn submission_review_restored_fresh_reply_loss_never_runs_locally() {
+    fresh_reply_loss_never_runs_locally(true).await;
+}
+
+async fn expired_gap_keeps_confirmed_exit(restored: bool) {
+    for unknown in [false, true] {
+        let daemon = review_daemon(
+            Script::SubmissionGapExpired { unknown },
+            if restored { 2 } else { 1 },
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, task_id) = if restored {
+            let (old, task_id) = stopped_submission(dir.path(), &daemon).await;
+            let task = old.task(&task_id).unwrap();
+            let saved = read_task(&task.paths.json).unwrap();
+            assert!(saved.remote.as_ref().unwrap().gap_recovery.is_some());
+            drop(task);
+            drop(old);
+            let restarted = registry();
+            restarted.replay_session(dir.path(), "session").unwrap();
+            (restarted, task_id)
+        } else {
+            let registry = registry();
+            let task_id = start(&registry, dir.path(), daemon.connection.clone());
+            (registry, task_id)
+        };
+        let done = terminal(&registry, &task_id).await;
+        assert_eq!(
+            done.info.status,
+            BgTaskStatus::Completed,
+            "unknown={unknown}, {done:?}"
+        );
+        assert_eq!(done.exit_code, Some(0));
+        let task = registry.task(&task_id).unwrap();
+        assert_eq!(fs::read(&task.paths.stdout).unwrap(), b"AC");
+        let durable = read_task(&task.paths.json).unwrap();
+        assert_eq!(durable.incomplete_output, vec![(1, 1)]);
+        assert!(
+            done.output_preview
+                .contains("output lost between seq 1 and 1"),
+            "{done:?}"
+        );
+        assert!(!durable.local_fallback_started);
+        let remote = durable.remote.unwrap();
+        assert!(remote.gap_recovery.is_none());
+        assert_eq!(remote.terminal.unwrap().outcome, Outcome::Exit { code: 0 });
+    }
+}
+
+#[tokio::test]
+async fn submission_review_expired_gap_keeps_confirmed_exit() {
+    expired_gap_keeps_confirmed_exit(false).await;
+}
+
+#[tokio::test]
+async fn submission_review_restored_expired_gap_keeps_confirmed_exit() {
+    expired_gap_keeps_confirmed_exit(true).await;
+}
+
+#[tokio::test]
+async fn submission_review_current_never_accepted_allows_local_fallback() {
+    let daemon = review_daemon(Script::SubmissionFreshReplyLost, 2).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (old, task_id) = stopped_submission(dir.path(), &daemon).await;
+    let task = old.task(&task_id).unwrap();
+    let mut saved = read_task(&task.paths.json).unwrap();
+    saved
+        .remote
+        .as_mut()
+        .unwrap()
+        .submission
+        .as_mut()
+        .unwrap()
+        .attempts = SUBMISSION_RECOVERY_ATTEMPTS;
+    write_task(&task.paths.json, &saved).unwrap();
+    drop(task);
+    drop(old);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    let done = terminal(&restarted, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    assert!(done.output_preview.contains("local-proof"));
+    let task = restarted.task(&task_id).unwrap();
+    assert!(read_task(&task.paths.json).unwrap().local_fallback_started);
+    assert_eq!(submission_runs(&daemon).len(), 1);
 }

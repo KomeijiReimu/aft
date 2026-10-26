@@ -740,6 +740,8 @@ impl RemotePreStartRefusal {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct RemoteTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission: Option<KeyedSubmission>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_platform: Option<Platform>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted_platform: Option<Platform>,
@@ -805,6 +807,59 @@ pub(crate) struct RemoteTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_holder: Option<WorkspaceHolder>,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct KeyedSubmission {
+    key: String,
+    created_at_ms: u64,
+    request_digest: String,
+    attempts: u8,
+    fresh_key_used: bool,
+    resuming: bool,
+    reattached: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refusal: Option<TerminalRecord>,
+}
+
+#[cfg(unix)]
+impl KeyedSubmission {
+    fn expires_at(&self, metadata: &PersistedTask) -> u64 {
+        let submitted_at = metadata
+            .remote
+            .as_ref()
+            .and_then(|r| r.retry.as_ref())
+            .and_then(|r| r.resubmitted_at_ms)
+            .unwrap_or(metadata.started_at);
+        self.created_at_ms
+            .saturating_add(SUBMISSION_RETENTION_MS)
+            .min(
+                submitted_at.saturating_add(
+                    metadata
+                        .timeout_ms
+                        .unwrap_or(duration_ms(DEFAULT_BG_TIMEOUT))
+                        // Admission can wait before execution starts; that wait
+                        // does not consume the runner's execution timeout.
+                        .saturating_add(duration_ms(RUNNER_QUEUE_WAIT_LIMIT)),
+                ),
+            )
+    }
+}
+
+#[cfg(unix)]
+const SUBMISSION_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+#[cfg(unix)]
+const SUBMISSION_RECOVERY_ATTEMPTS: u8 = 3;
+
+#[cfg(unix)]
+fn new_submission_key(task_id: &str) -> Result<String, String> {
+    let mut nonce = [0; 16];
+    getrandom::fill(&mut nonce).map_err(|e| e.to_string())?;
+    Ok(format!("aft:{task_id}:{}", Uuid::from_bytes(nonce)))
+}
+
+// Reattachment is recorded in metadata without adding agent-visible wording.
+#[cfg(all(test, unix))]
+const REATTACHED_RESULT_SENTENCE: Option<&str> = None;
 
 /// This session's earlier remote job that still held the workspace when the
 /// runner refused a later job in it.
@@ -931,6 +986,12 @@ pub(crate) fn remote_phase_note(metadata: &super::PersistedTask, now_ms: u64) ->
 
 #[cfg(unix)]
 impl RemoteTask {
+    fn resubmit_for_recovery(&self) -> bool {
+        // A confirmed terminal needs only output recovery. Attach preserves the
+        // saved terminal and buffered records if executor history has expired.
+        self.submission.is_some() && self.gap_recovery.is_none()
+    }
+
     fn point(&self) -> Option<ResumePoint> {
         Some(ResumePoint {
             job_id: self.job_id?,
@@ -1432,6 +1493,9 @@ pub(super) fn persist_terminal_artifacts(paths: &TaskPaths, metadata: &mut Persi
 impl OutputSink for TaskSink {
     fn accepted(&mut self, accepted: &Accepted) -> io::Result<()> {
         self.commit(|r| {
+            if let Some(submission) = r.submission.as_mut() {
+                submission.reattached |= accepted.attached;
+            }
             r.job_id = Some(accepted.job_id);
             r.queue_position = Some(accepted.queue_position);
             r.accepted = true;
@@ -1543,10 +1607,21 @@ impl OutputSink for TaskSink {
         #[cfg(test)]
         let clock = tests::task_draining_clock(&self.task);
         self.commit(|r| {
+            let resubmit_refusal = r.submission.as_ref().is_some_and(|s| s.resuming)
+                && matches!(verdict, Verdict::RunLocally { .. });
+            // A keyed refusal belongs to this call, not to the existing job.
+            // Keep the existing ID available for cancellation and recovery.
+            if resubmit_refusal {
+                r.submission.as_mut().unwrap().refusal = Some(record.clone());
+                return;
+            }
             r.job_id = Some(record.job_id);
             r.terminal = Some(record.clone());
-            // The runner has finished with the job: no cancellation is owed.
-            r.cancel_pending = false;
+            if r.submission.is_none()
+                || !matches!(verdict, Verdict::OutcomeUnknown | Verdict::HistoryExpired)
+            {
+                r.cancel_pending = false;
+            }
             r.gap_recovery = None;
             if retries_draining(r, verdict) {
                 if let Some(retry) = r.retry.as_mut() {
@@ -1562,14 +1637,61 @@ impl OutputSink for TaskSink {
                 }
             }
         })?;
-        // The saved record no longer owes a cancel; drop its index entry.
-        remove_owed_cancel_marker(&self.task.paths);
+        if self.task.state.lock().is_ok_and(|state| {
+            state
+                .metadata
+                .remote
+                .as_ref()
+                .is_some_and(|r| !r.cancel_pending)
+        }) {
+            remove_owed_cancel_marker(&self.task.paths);
+        }
         Ok(())
     }
 }
 
 #[cfg(unix)]
 impl TaskSink {
+    fn settle_never_accepted(&mut self) -> io::Result<()> {
+        let mut proven_never_accepted = false;
+        self.commit(|r| {
+            // Dispatch clears terminal and submission.refusal for the next key.
+            // Only a refusal still belonging to the current key permits fallback.
+            let current_refusal = r
+                .submission
+                .as_ref()
+                .and_then(|s| s.refusal.as_ref())
+                .or(r.terminal.as_ref());
+            let current_proof = current_refusal.is_some_and(|record| {
+                matches!(
+                    exec::grade(record),
+                    Verdict::RunLocally {
+                        reason: RefusalReason::SubmissionNeverAccepted,
+                        ..
+                    }
+                )
+            });
+            if !current_proof {
+                return;
+            }
+            proven_never_accepted = true;
+            if let Some(submission) = r.submission.as_mut() {
+                submission.resuming = false;
+                if let Some(refusal) = submission.refusal.take() {
+                    r.job_id = Some(refusal.job_id);
+                    r.terminal = Some(refusal);
+                }
+            }
+            r.cancel_pending = false;
+        })?;
+        if !proven_never_accepted {
+            return Err(io::Error::other(
+                "current keyed submission outcome unknown; local fallback withheld",
+            ));
+        }
+        Ok(())
+    }
+
     fn truncate_output(&mut self, before_seq: u64, undelivered: bool) -> io::Result<()> {
         self.dirty
             .sync(&self.stdout, &self.stderr, self.unknown.as_ref())?;
@@ -1872,6 +1994,7 @@ impl BgTaskRegistry {
         metadata.status = BgTaskStatus::Running;
         metadata.execution_note = Some(format!("remote execution requested on {RUNNER_ID}"));
         metadata.remote = Some(RemoteTask {
+            submission: None,
             requested_platform: launch.requested_platform.clone(),
             accepted_platform: None,
             connection_file: launch.connection_file,
@@ -2067,6 +2190,186 @@ impl BgTaskRegistry {
         self.start_remote_worker(self.task(task_id).ok_or("remote task missing")?, None)
     }
 
+    async fn key_fresh_request(
+        &self,
+        client: &ExecRemoteClient,
+        task: &Arc<BgTask>,
+        request: RunRequest,
+    ) -> Result<RunRequest, String> {
+        let supported = client
+            .supports_submission_key()
+            .await
+            .map_err(|e| e.to_string())?;
+        let previous = task
+            .state
+            .lock()
+            .map_err(|_| "task lock poisoned")?
+            .metadata
+            .remote
+            .clone()
+            .unwrap();
+        let submission = if supported {
+            let digest = match previous
+                .retry
+                .as_ref()
+                .map(|r| &r.request_digest)
+                .or_else(|| previous.submission.as_ref().map(|s| &s.request_digest))
+            {
+                Some(digest) => digest.clone(),
+                None => save_retry_request(task, &request)?,
+            };
+            Some(KeyedSubmission {
+                key: if previous.submission.is_some() {
+                    new_submission_key(&task.task_id)?
+                } else {
+                    format!("aft:{}", task.task_id)
+                },
+                created_at_ms: unix_millis(),
+                request_digest: digest,
+                attempts: 0,
+                fresh_key_used: false,
+                resuming: false,
+                reattached: false,
+                refusal: None,
+            })
+        } else {
+            None
+        };
+        let request = match &submission {
+            Some(submission) => request.with_submission_key(&submission.key),
+            None => request,
+        };
+        let mut db = DeferredDbWrites::new(self, task);
+        let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
+        state.metadata.remote.as_mut().unwrap().submission = submission;
+        self.persist_task_locked(task, &state.metadata, &mut db)
+            .map_err(|e| e.to_string())?;
+        Ok(request)
+    }
+
+    /// Retry only a durable key, while both the caller's timeout and the
+    /// executor's key retention are open. Attempts survive AFT restarts too.
+    async fn recover_submission(
+        &self,
+        client: &mut ExecRemoteClient,
+        sink: &mut TaskSink,
+        root: &Path,
+        mut fresh: bool,
+    ) -> Result<Option<exec::RemoteStream>, String> {
+        sink.checkpoint_progress().map_err(|e| e.to_string())?;
+        loop {
+            let metadata = sink
+                .task
+                .state
+                .lock()
+                .map_err(|_| "task lock poisoned")?
+                .metadata
+                .clone();
+            let remote = metadata.remote.as_ref().unwrap();
+            let Some(mut submission) = remote.submission.clone() else {
+                return Ok(None);
+            };
+            let now = unix_millis();
+            let expires = submission.expires_at(&metadata);
+            if remote.cancel_requested
+                || now >= expires
+                || now < submission.created_at_ms
+                || submission.attempts >= SUBMISSION_RECOVERY_ATTEMPTS
+            {
+                return Ok(None);
+            }
+            let delay = Duration::from_millis(100 << submission.attempts);
+            if delay.as_millis() as u64 >= expires - now {
+                return Ok(None);
+            }
+            tokio::time::sleep(delay).await;
+            if fresh {
+                if submission.fresh_key_used {
+                    return Ok(None);
+                }
+                submission.key = new_submission_key(&sink.task.task_id)?;
+                submission.created_at_ms = unix_millis();
+                submission.fresh_key_used = true;
+            }
+            let mut request = restore_retry_request(&sink.task, &submission.request_digest)?
+                .with_submission_key(&submission.key);
+            if !fresh {
+                if let Some(seq) = remote.last_seq {
+                    request = request.with_resume_from_seq(seq);
+                }
+            }
+            submission.attempts += 1;
+            submission.resuming = !fresh;
+            submission.refusal = None;
+            // Save the attempt and key before dispatch. A crash can then repeat
+            // only the same request, never invent an untracked second job.
+            let mut cancelled = false;
+            sink.commit(|r| {
+                cancelled = r.cancel_requested;
+                if cancelled {
+                    return;
+                }
+                r.submission = Some(submission);
+                r.terminal = None;
+                if fresh {
+                    r.job_id = None;
+                    r.last_seq = None;
+                    r.accepted = false;
+                    r.started = None;
+                }
+            })
+            .map_err(|e| e.to_string())?;
+            if cancelled {
+                return Ok(None);
+            }
+            fresh = false;
+            let remaining = expires.saturating_sub(unix_millis());
+            if remaining == 0 {
+                return Ok(None);
+            }
+            let submit = async {
+                if !client.supports_submission_key().await? {
+                    return Ok(None);
+                }
+                let result = client.run(&request).await;
+                #[cfg(test)]
+                let result = if result.is_ok() && tests::lose_submission_replies(root) {
+                    // A round trip confirms dispatch reached the fake executor
+                    // before losing the caller's dispatch result.
+                    let _ = client.status().await;
+                    Err(exec::Error::RecoveryRequired {
+                        resume: None,
+                        reason: "submission dispatch reply lost".into(),
+                    })
+                } else {
+                    result
+                };
+                result.map(Some)
+            };
+            match tokio::time::timeout(Duration::from_millis(remaining), submit).await {
+                Ok(Ok(Some(stream))) => return Ok(Some(stream)),
+                Ok(Ok(None)) => return Ok(None),
+                _ => {
+                    // The SDK reconnects the transport after a daemon restart,
+                    // but its old route is stale. Reopen that route with the
+                    // same caller identity instead of dialing a second client.
+                    if let Ok(Ok(reconnected)) = tokio::time::timeout(
+                        Duration::from_millis(expires.saturating_sub(unix_millis())),
+                        client.reopen_route(subc_protocol::BindIdentity::new(
+                            root.display().to_string(),
+                            remote.harness.clone(),
+                            remote.session.clone(),
+                        )),
+                    )
+                    .await
+                    {
+                        *client = reconnected;
+                    }
+                }
+            }
+        }
+    }
+
     fn start_remote_worker(
         &self,
         task: Arc<BgTask>,
@@ -2218,7 +2521,18 @@ impl BgTaskRegistry {
                 .metadata,
         );
         let mut retry_request = None;
-        if let Some(record) = remote.terminal.as_ref() {
+        let resume_submission = initial.is_none()
+            && remote.resubmit_for_recovery()
+            && (remote.terminal.as_ref().is_some_and(|record| {
+                exec::grade(record) == Verdict::OutcomeUnknown
+                    || matches!(
+                        record.outcome,
+                        Outcome::RefusedBeforeStart {
+                            reason: RefusalReason::SubmissionNeverAccepted
+                        }
+                    )
+            }) || remote.terminal.is_none());
+        if let Some(record) = remote.terminal.as_ref().filter(|_| !resume_submission) {
             let verdict = exec::grade(record);
             if retries_draining(&remote, &verdict) && remote.retry.is_some() {
                 retry_request = self.wait_draining_retry(&task, &root).await?;
@@ -2293,6 +2607,7 @@ impl BgTaskRegistry {
             .connection_file
             .as_ref()
             .ok_or_else(|| "daemon connection file unavailable".to_string());
+        let mut keyed_connect_attempts = 0;
         let mut client = loop {
             let connect = async {
                 match &connection {
@@ -2309,7 +2624,24 @@ impl BgTaskRegistry {
                     Err(error) => Err(error.clone()),
                 }
             };
-            let result = if initial.is_none() && retry_request.is_none() {
+            let result = if resume_submission {
+                let metadata = task
+                    .state
+                    .lock()
+                    .map_err(|_| "task lock poisoned")?
+                    .metadata
+                    .clone();
+                let submission = remote.submission.as_ref().unwrap();
+                let now = unix_millis();
+                let expires = submission.expires_at(&metadata);
+                if now < submission.created_at_ms || now >= expires {
+                    return Err("remote outcome unknown; keyed recovery time limit passed".into());
+                }
+                keyed_connect_attempts += 1;
+                tokio::time::timeout(Duration::from_millis(expires - now), connect)
+                    .await
+                    .unwrap_or_else(|_| Err("remote connection timed out".into()))
+            } else if initial.is_none() && retry_request.is_none() {
                 if let Some(point) = remote.point() {
                     recovery.wait(point.job_id, connect).await?
                 } else {
@@ -2321,6 +2653,16 @@ impl BgTaskRegistry {
             match result {
                 Ok(c) => break c,
                 Err(error) => {
+                    if resume_submission {
+                        if keyed_connect_attempts < SUBMISSION_RECOVERY_ATTEMPTS {
+                            tokio::time::sleep(Duration::from_millis(
+                                100 << (keyed_connect_attempts - 1),
+                            ))
+                            .await;
+                            continue;
+                        }
+                        return Err(format!("remote outcome unknown; keyed recovery connection attempts exhausted: {error}"));
+                    }
                     if retry_request.is_some() {
                         self.refuse_remote_before_dispatch(&task, &error)?;
                         // A pause that landed while reconnecting already ended
@@ -2352,7 +2694,65 @@ impl BgTaskRegistry {
             }
             return Err("remote outcome unknown: Windows platform was not acknowledged; cancel requested; result not trusted".into());
         }
-        let mut stream = if retry_request.is_some() {
+        let mut stream = if resume_submission {
+            let refusal = remote
+                .submission
+                .as_ref()
+                .and_then(|s| s.refusal.as_ref())
+                .or_else(|| {
+                    remote.terminal.as_ref().filter(|r| {
+                        matches!(
+                            r.outcome,
+                            Outcome::RefusedBeforeStart {
+                                reason: RefusalReason::SubmissionNeverAccepted
+                            }
+                        )
+                    })
+                });
+            if let Some(record) = refusal {
+                if let Verdict::RunLocally {
+                    reason,
+                    refusal_detail,
+                } = exec::grade(record)
+                {
+                    if reason != RefusalReason::SubmissionNeverAccepted {
+                        return Err(format!(
+                            "remote keyed resubmit refused: {}; {}; original job outcome unknown",
+                            String::from(reason),
+                            refusal_detail.unwrap_or_default()
+                        ));
+                    }
+                }
+            }
+            let fresh = refusal.is_some_and(|r| {
+                matches!(
+                    &r.outcome,
+                    Outcome::RefusedBeforeStart {
+                        reason: RefusalReason::SubmissionNeverAccepted
+                    }
+                )
+            });
+            match self
+                .recover_submission(&mut client, &mut sink, &root, fresh)
+                .await?
+            {
+                Some(stream) => stream,
+                None if fresh => {
+                    sink.settle_never_accepted().map_err(|e| e.to_string())?;
+                    return self.restored_remote_fallback(
+                        &task,
+                        &remote,
+                        "submission_never_accepted",
+                        None,
+                    );
+                }
+                None => {
+                    return Err(
+                        "remote outcome unknown; keyed recovery unavailable or exhausted".into(),
+                    )
+                }
+            }
+        } else if retry_request.is_some() {
             let Some((stream, retry)) = self.submit_draining_retry(&client, &task, &root).await?
             else {
                 return Ok(());
@@ -2393,6 +2793,7 @@ impl BgTaskRegistry {
                 .map_err(|e| e.to_string())?;
                 hinted = Some(HintedRetry::start(&root, request.clone()));
             }
+            let request = self.key_fresh_request(&client, &task, request).await?;
             if task
                 .state
                 .lock()
@@ -2421,9 +2822,10 @@ impl BgTaskRegistry {
                         )
                     }
                 }
-                Err(error) => {
-                    return Err(format!("remote outcome unknown; not resubmitted: {error}"))
-                }
+                Err(error) => self
+                    .recover_submission(&mut client, &mut sink, &root, false)
+                    .await?
+                    .ok_or_else(|| format!("remote outcome unknown; not resubmitted: {error}"))?,
             }
         } else {
             let point = remote.point().ok_or("remote outcome unknown: acceptance job ID was not persisted; command was not resubmitted")?;
@@ -2520,6 +2922,34 @@ impl BgTaskRegistry {
                     reason,
                     refusal_detail,
                 })) => {
+                    #[cfg(test)]
+                    if reason == RefusalReason::SubmissionNeverAccepted
+                        && tests::stop_draining_worker(&root)
+                    {
+                        return Ok(());
+                    }
+                    let submission = task
+                        .state
+                        .lock()
+                        .map_err(|_| "task lock poisoned")?
+                        .metadata
+                        .remote
+                        .as_ref()
+                        .and_then(|r| r.submission.clone());
+                    if let Some(submission) = submission {
+                        if reason == RefusalReason::SubmissionNeverAccepted {
+                            if let Some(next) = self
+                                .recover_submission(&mut client, &mut sink, &root, true)
+                                .await?
+                            {
+                                stream = next;
+                                continue;
+                            }
+                            sink.settle_never_accepted().map_err(|e| e.to_string())?;
+                        } else if submission.resuming {
+                            return Err(format!("remote keyed resubmit refused: {}; {}; original job outcome unknown", String::from(reason), refusal_detail.unwrap_or_default()));
+                        }
+                    }
                     let verdict = Verdict::RunLocally {
                         reason: reason.clone(),
                         refusal_detail: refusal_detail.clone(),
@@ -2596,13 +3026,52 @@ impl BgTaskRegistry {
                     return result;
                 }
                 Ok(StreamProgress::Complete(verdict)) => {
+                    #[cfg(test)]
+                    if verdict == Verdict::OutcomeUnknown && tests::stop_draining_worker(&root) {
+                        return Ok(());
+                    }
                     if !platform_ok {
                         return Err("remote outcome unknown: Windows platform was not acknowledged; result not trusted".into());
+                    }
+                    if verdict == Verdict::OutcomeUnknown {
+                        if let Some(next) = self
+                            .recover_submission(&mut client, &mut sink, &root, false)
+                            .await?
+                        {
+                            stream = next;
+                            continue;
+                        }
                     }
                     self.remote_terminal(&task, verdict, None);
                     return Ok(());
                 }
                 Err(error) => {
+                    #[cfg(test)]
+                    if stream
+                        .resume_point()
+                        .is_some_and(|point| point.gap_recovery.is_some())
+                        && tests::stop_draining_worker(&root)
+                    {
+                        return Ok(());
+                    }
+                    let keyed = task
+                        .state
+                        .lock()
+                        .map_err(|_| "task lock poisoned")?
+                        .metadata
+                        .remote
+                        .as_ref()
+                        .is_some_and(RemoteTask::resubmit_for_recovery);
+                    if keyed {
+                        if let Some(next) = self
+                            .recover_submission(&mut client, &mut sink, &root, false)
+                            .await?
+                        {
+                            stream = next;
+                            continue;
+                        }
+                        return Err(format!("remote outcome unknown; keyed recovery unavailable or exhausted: {error}"));
+                    }
                     let Some(point) = stream.resume_point() else {
                         return Err(format!("remote outcome unknown; not resubmitted: {error}"));
                     };
@@ -2611,8 +3080,8 @@ impl BgTaskRegistry {
                     if stream.received_frame() {
                         recovery.reset();
                     }
-                    // A known accepted job is recovered only by attach. Never
-                    // convert a lost stream into another run or local fallback.
+                    // Without a submission key, only attach can recover an
+                    // accepted job without risking a second execution.
                     recovery.pause(point.job_id).await?;
                     stream = match self
                         .attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
@@ -2715,6 +3184,9 @@ impl BgTaskRegistry {
         };
         #[cfg(test)]
         tests::draining_gate(root, tests::DrainingGate::BeforeResubmit).await;
+        let keyed_request = self
+            .key_fresh_request(client, task, request.clone())
+            .await?;
         {
             let mut db = DeferredDbWrites::new(self, task);
             let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
@@ -2750,7 +3222,7 @@ impl BgTaskRegistry {
         }
         // A fresh submission gets its own signer-retry allowance, counted from now.
         let hinted = HintedRetry::start(root, request);
-        match resubmit(client, &hinted.request, root).await {
+        match resubmit(client, &keyed_request, root).await {
             Ok(stream) => Ok(Some((stream, hinted))),
             Err(error) if proves_no_start(&error) => {
                 #[cfg(test)]
@@ -2852,6 +3324,9 @@ impl BgTaskRegistry {
         }
         #[cfg(test)]
         tests::draining_gate(root, tests::DrainingGate::BeforeHintedResubmit).await;
+        let request = self
+            .key_fresh_request(client, task, retry.request.clone())
+            .await?;
         {
             let mut db = DeferredDbWrites::new(self, task);
             let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
@@ -2886,7 +3361,7 @@ impl BgTaskRegistry {
                 .map_err(|e| e.to_string())?;
         }
         retry.resubmits += 1;
-        match resubmit(client, &retry.request, root).await {
+        match resubmit(client, &request, root).await {
             Ok(stream) => Ok(HintedRetryStep::Resubmitted(stream)),
             Err(error) if proves_no_start(&error) => {
                 #[cfg(test)]
@@ -3306,8 +3781,8 @@ impl BgTaskRegistry {
     }
 
     fn remote_terminal(&self, task: &Arc<BgTask>, verdict: Verdict, error: Option<String>) {
-        // Known terminal outcomes keep their status. An unknown outcome is reported
-        // as uncertain, never automatically resubmitted.
+        // Known terminal outcomes keep their status. Unknown outcomes reach
+        // this point only after recovery was unavailable or exhausted.
         let refused = matches!(&verdict, Verdict::RunLocally { .. });
         let unknown = matches!(&verdict, Verdict::OutcomeUnknown);
         let (status, code, mut reason) = terminal_outcome(verdict, error);
