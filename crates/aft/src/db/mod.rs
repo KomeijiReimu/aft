@@ -24,6 +24,7 @@ pub(crate) mod contention_probe;
 pub mod github_read_cache;
 pub mod remote_exec;
 pub mod removal;
+pub mod rich_ui;
 pub mod standing_roots;
 pub mod state;
 
@@ -33,10 +34,29 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod wal_credit_probe;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 19;
+pub const CURRENT_SCHEMA_VERSION: u32 = rich_ui::SCHEMA_VERSION;
 
 const MIGRATION_VERSIONS: &[u32] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    rich_ui::SCHEMA_VERSION,
 ];
 
 // Performance-only indexes do not change the table format or reader floor.
@@ -772,12 +792,16 @@ fn apply_pragmas_with_timeout(
 /// Returns the post-migration schema version. Refuses to open databases created
 /// by newer AFT versions.
 pub fn run_migrations(conn: &mut Connection) -> Result<u32, OpenError> {
+    run_migrations_supported(conn, CURRENT_SCHEMA_VERSION)
+}
+
+fn run_migrations_supported(conn: &mut Connection, supported: u32) -> Result<u32, OpenError> {
     // Also fence callers that supply their own connection. Read the version
     // on that connection, never a second descriptor while it is live.
     if let Some(path) = conn.path().filter(|path| !path.is_empty()) {
         if crate::production_storage::protected(Path::new(path)) {
-            if current_schema_version(conn).ok() == Some(CURRENT_SCHEMA_VERSION) {
-                return Ok(CURRENT_SCHEMA_VERSION);
+            if current_schema_version(conn).ok() == Some(supported) {
+                return Ok(supported);
             }
             crate::production_storage::refuse_write(Path::new(path))?;
         }
@@ -787,24 +811,27 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, OpenError> {
     )?;
 
     let db_version = current_schema_version(conn)?;
-    if db_version == CURRENT_SCHEMA_VERSION {
+    if db_version == supported {
         return Ok(db_version);
     }
-    if db_version > CURRENT_SCHEMA_VERSION {
+    if db_version > supported {
         return Err(OpenError::DowngradeRefused {
             db_version,
-            supported: CURRENT_SCHEMA_VERSION,
+            supported,
         });
     }
 
     // The bare read above keeps current-schema opens read-only. A lagging opener
     // may still have observed a stale version, so every planned step re-reads it
     // after acquiring SQLite's write lock and skips work another opener committed.
-    for &version in MIGRATION_VERSIONS.iter().filter(|&&v| v > db_version) {
+    for &version in MIGRATION_VERSIONS
+        .iter()
+        .filter(|&&v| v > db_version && v <= supported)
+    {
         apply_migration(conn, version)?;
     }
 
-    Ok(CURRENT_SCHEMA_VERSION)
+    Ok(supported)
 }
 
 fn ensure_additive_indexes(conn: &Connection) -> rusqlite::Result<()> {
@@ -989,6 +1016,7 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
         17 => conn.execute_batch(access_asks::MIGRATION),
         18 => conn.execute_batch(access_grants::MODES_MIGRATION),
         19 => call_ledger::migrate_result_source(conn),
+        rich_ui::SCHEMA_VERSION => conn.execute_batch(rich_ui::MIGRATION),
         _ => Ok(()),
     }
 }
@@ -1026,6 +1054,10 @@ mod tests {
         "write_ledger_process_minutes",
         "write_ledger_meta",
         "write_ledger_unmeasurable_minutes",
+        "bash_view_records",
+        "rich_ui_templates",
+        "rich_ui_cursor_key",
+        "rich_ui_session_presets",
     ];
 
     const EXPECTED_INDEXES: &[&str] = &[
@@ -1051,6 +1083,7 @@ mod tests {
         "idx_standing_root_freshness_needs_verify",
         "idx_write_ledger_minutes_window",
         "idx_write_ledger_unmeasurable_window",
+        "idx_rich_ui_session_presets_recorded",
     ];
 
     /// Opens `aft.db` twice: the first connection plays this process's shared
