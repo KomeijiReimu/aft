@@ -96,6 +96,7 @@ pub(crate) struct State {
     session_birth: std::sync::atomic::AtomicU64,
     stopped: AtomicBool,
     token: Zeroizing<String>,
+    expected_auth: Zeroizing<Vec<u8>>,
     ca: rcgen::Certificate,
     ca_key: KeyPair,
     upstream: rustls::ClientConfig,
@@ -269,15 +270,18 @@ impl SecretProxy {
             .self_signed(&ca_key)
             .map_err(|_| ProxyError::Initialization)?;
         let ca_pem = ca.pem();
-        let mut random = [0u8; 32];
-        getrandom::fill(&mut random).map_err(|_| ProxyError::Initialization)?;
-        let token = Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random));
+        let mut random = Zeroizing::new([0u8; 32]);
+        getrandom::fill(&mut random[..]).map_err(|_| ProxyError::Initialization)?;
+        let token =
+            Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&random[..]));
+        let expected_auth = basic_credentials(&token)?;
         let state = Arc::new(State {
             config,
             session: AtomicI32::new(0),
             session_birth: std::sync::atomic::AtomicU64::new(0),
             stopped: AtomicBool::new(false),
             token,
+            expected_auth,
             ca,
             ca_key,
             upstream,
@@ -331,11 +335,15 @@ impl SecretProxy {
 
     /// Exec-time only: never persist the returned credential with a task request.
     pub fn proxy_url(&self) -> Zeroizing<String> {
-        Zeroizing::new(format!(
-            "http://{}:@{}",
-            self.state.token.as_str(),
-            self.address
-        ))
+        let address = self.address.to_string();
+        let mut url = Zeroizing::new(String::with_capacity(
+            9 + self.state.token.len() + address.len(),
+        ));
+        url.push_str("http://");
+        url.push_str(&self.state.token);
+        url.push_str(":@");
+        url.push_str(&address);
+        url
     }
 
     /// Public CA certificate only; the signer stays in daemon memory.
@@ -438,11 +446,7 @@ async fn connect(
         return Ok(refused());
     }
     let mut credentials = request.headers().get_all("proxy-authorization").iter();
-    let expected = Zeroizing::new(format!(
-        "Basic {}",
-        base64::engine::general_purpose::STANDARD.encode(format!("{}:", state.token.as_str()))
-    ));
-    if credentials.next().map(|v| v.as_bytes()) != Some(expected.as_bytes())
+    if credentials.next().map(|v| v.as_bytes()) != Some(state.expected_auth.as_slice())
         || credentials.next().is_some()
     {
         return Ok(refused());
@@ -510,6 +514,19 @@ async fn connect(
         }
     });
     Ok(Response::new(full(Bytes::new())))
+}
+
+fn basic_credentials(token: &str) -> Result<Zeroizing<Vec<u8>>, ProxyError> {
+    let mut userinfo = Zeroizing::new(Vec::with_capacity(token.len() + 1));
+    userinfo.extend_from_slice(token.as_bytes());
+    userinfo.push(b':');
+    let encoded = base64::encoded_len(userinfo.len(), true).ok_or(ProxyError::Initialization)?;
+    let mut header = Zeroizing::new(vec![0u8; 6 + encoded]);
+    header[..6].copy_from_slice(b"Basic ");
+    base64::engine::general_purpose::STANDARD
+        .encode_slice(&userinfo[..], &mut header[6..])
+        .map_err(|_| ProxyError::Initialization)?;
+    Ok(header)
 }
 
 pub(crate) fn full(bytes: Bytes) -> Body {

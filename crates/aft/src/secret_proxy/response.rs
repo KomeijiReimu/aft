@@ -14,6 +14,14 @@ use zeroize::Zeroizing;
 
 use super::{Body, State};
 
+#[derive(Clone, Copy)]
+pub(super) enum Coding {
+    Identity,
+    Gzip,
+    Deflate,
+    Brotli,
+}
+
 pub(super) fn io_error() -> std::io::Error {
     std::io::Error::other(super::PROXY_REFUSAL)
 }
@@ -135,15 +143,15 @@ pub(super) async fn forward(
         .boxed();
     let mut reader: Pin<Box<dyn AsyncRead + Send>> = Box::pin(StreamReader::new(stream));
     for encoding in encodings.iter().rev() {
-        reader = match encoding.as_str() {
-            "gzip" => {
+        reader = match encoding {
+            Coding::Gzip => {
                 let mut decoder = GzipDecoder::new(BufReader::new(reader));
                 decoder.multiple_members(true);
                 Box::pin(decoder)
             }
-            "deflate" => Box::pin(ZlibDecoder::new(BufReader::new(reader))),
-            "br" => Box::pin(BrotliDecoder::new(BufReader::new(reader))),
-            _ => reader,
+            Coding::Deflate => Box::pin(ZlibDecoder::new(BufReader::new(reader))),
+            Coding::Brotli => Box::pin(BrotliDecoder::new(BufReader::new(reader))),
+            Coding::Identity => reader,
         };
     }
     let mut scrubber = state.scrubber()?;
@@ -210,22 +218,27 @@ pub(super) async fn forward(
     ))
 }
 
-pub(super) fn content_codings(headers: &HeaderMap) -> Result<Vec<String>, ()> {
-    let encodings: Vec<_> = headers
-        .get_all("content-encoding")
-        .iter()
-        .map(|v| v.to_str().map_err(|_| ()))
-        .collect::<Result<Vec<_>, _>>()?
-        .iter()
-        .flat_map(|v| v.split(','))
-        .map(|s| s.trim().to_ascii_lowercase())
-        .collect();
-    if encodings.len() > super::limits::CODINGS
-        || encodings
-            .iter()
-            .any(|s| !matches!(s.as_str(), "identity" | "gzip" | "deflate" | "br"))
-    {
-        return Err(());
+pub(super) fn content_codings(headers: &HeaderMap) -> Result<Vec<Coding>, ()> {
+    let mut encodings = Vec::new();
+    for value in headers.get_all("content-encoding") {
+        for token in value.to_str().map_err(|_| ())?.split(',') {
+            let token = token.trim();
+            let coding = if token.eq_ignore_ascii_case("identity") {
+                Coding::Identity
+            } else if token.eq_ignore_ascii_case("gzip") {
+                Coding::Gzip
+            } else if token.eq_ignore_ascii_case("deflate") {
+                Coding::Deflate
+            } else if token.eq_ignore_ascii_case("br") {
+                Coding::Brotli
+            } else {
+                return Err(());
+            };
+            if encodings.len() >= super::limits::CODINGS {
+                return Err(());
+            }
+            encodings.push(coding);
+        }
     }
     Ok(encodings)
 }
