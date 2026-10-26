@@ -916,6 +916,8 @@ impl PendingWorkspacePull {
 
 pub struct DrainedLspEvents {
     pub events: Vec<LspEvent>,
+    /// Events examined, including startup events withheld from outward delivery.
+    pub processed_events: usize,
     pub diagnostics_changed: bool,
     /// Complete snapshots accepted from document-version-verified publishes
     /// emitted by already-live, quiescent producers. Runtime consumers must
@@ -1055,6 +1057,8 @@ pub struct LspManager {
     /// Already accepted observations consumed while ordering a pull response.
     /// The normal event drain delivers them once to status/alert consumers.
     pending_diagnostic_observations: Vec<AcceptedDiagnosticSnapshot>,
+    /// Events applied at startup release, awaiting outward delivery exactly once.
+    ready_startup_events: std::collections::VecDeque<StartupEventDelivery>,
     /// Unified event channel — all server reader threads send here.
     event_tx: Sender<LspEvent>,
     event_rx: Receiver<LspEvent>,
@@ -1361,6 +1365,7 @@ impl LspManager {
             documents: HashMap::new(),
             diagnostics: DiagnosticsStore::new(),
             pending_diagnostic_observations: Vec::new(),
+            ready_startup_events: Default::default(),
             event_tx,
             event_rx,
             post_edit_waiters: HashMap::new(),
@@ -1408,6 +1413,10 @@ impl LspManager {
     }
 
     fn queue_background_document_pull(&mut self, key: &ServerKey, file: &Path) {
+        // Reserved document versions are not queryable until replay finishes.
+        if self.starting.contains_key(key) {
+            return;
+        }
         let eligible = self.clients.get(key).is_some_and(|client| {
             client.uses_analysis_progress()
                 && client.state() == ServerState::Ready
@@ -1934,8 +1943,32 @@ impl LspManager {
         let Some(reservation) = self.starting.remove(key) else {
             return;
         };
-        for event in &reservation.deferred_events {
-            self.handle_event(event);
+        if reservation
+            .signal
+            .cancelled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            reservation.signal.finish();
+            return;
+        }
+        for event in reservation.deferred_events {
+            let published = self.handle_event(&event).map(|file| {
+                let version = self
+                    .documents
+                    .get(key)
+                    .and_then(|store| store.version(&file));
+                let epoch = self.diagnostic_epoch(key, &file);
+                let pid = self.clients.get(key).map(LspClient::child_pid);
+                StartupPublished {
+                    key: key.clone(),
+                    file,
+                    version,
+                    epoch,
+                    pid,
+                }
+            });
+            self.ready_startup_events
+                .push_back(StartupEventDelivery { event, published });
         }
         reservation.signal.finish();
     }
@@ -2208,12 +2241,6 @@ impl LspManager {
             })
             .collect();
         jobs.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
-        for (path, version, _) in &jobs {
-            self.documents
-                .entry(key.clone())
-                .or_default()
-                .sync_at_version(path.clone(), *version, &DiskSnapshot::default());
-        }
         reservation.replay_pid = Some(pid);
         let signal = Arc::clone(&reservation.signal);
         *signal
@@ -2276,7 +2303,6 @@ impl LspManager {
                     client.record_startup_sync(&uri, document.opened, document.saved);
                 }
             }
-            self.queue_background_document_pull(key, &document.path);
         }
         if let Some(error) = result.error {
             self.complete_startup_outcome(
@@ -2299,6 +2325,7 @@ impl LspManager {
 
     /// Publish the final startup outcome for all waiters before releasing the reservation.
     fn complete_startup_outcome(&mut self, key: &ServerKey, outcome: Option<ServerAttemptResult>) {
+        let ready = outcome.is_none();
         if let Some(reservation) = self.starting.get(key) {
             *reservation.signal.outcome.lock() =
                 Some(outcome.unwrap_or_else(|| ServerAttemptResult::Ok {
@@ -2306,6 +2333,9 @@ impl LspManager {
                 }));
         }
         self.release_start_reservation(key);
+        if ready {
+            self.queue_open_document_pulls(key);
+        }
     }
 
     pub(crate) fn pending_startup_files(&self) -> Vec<(ServerKey, PathBuf)> {
@@ -2467,6 +2497,9 @@ impl LspManager {
                 Some((definition, key))
             })
             .any(|(definition, key)| {
+                if self.starting.contains_key(&key) {
+                    return true;
+                }
                 if let Some(client) = self.clients.get(&key) {
                     return client.state() != ServerState::Ready;
                 }
@@ -3640,7 +3673,7 @@ impl LspManager {
             .find_map(|(key, entry)| (key == server_key).then_some(entry.epoch))
     }
 
-    /// Whether this server is a running client.
+    /// Whether this server has a running client, including pending startup replay.
     pub(crate) fn has_client(&self, server_key: &ServerKey) -> bool {
         self.clients.contains_key(server_key)
     }
@@ -3807,6 +3840,9 @@ impl LspManager {
     /// Get an active client for a file path, if one exists.
     pub fn client_for_file(&self, file_path: &Path, config: &Config) -> Option<&LspClient> {
         let key = self.server_key_for_file(file_path, config)?;
+        if self.starting.contains_key(&key) {
+            return None;
+        }
         self.clients.get(&key)
     }
 
@@ -3821,6 +3857,9 @@ impl LspManager {
         config: &Config,
     ) -> Option<&mut LspClient> {
         let key = self.server_key_for_file(file_path, config)?;
+        if self.starting.contains_key(&key) {
+            return None;
+        }
         self.clients.get_mut(&key)
     }
 
@@ -3841,7 +3880,9 @@ impl LspManager {
     /// Whether LSP events are waiting to be drained. Cheap channel peek for
     /// the maintenance scheduler's skip probe.
     pub fn has_pending_events(&self) -> bool {
-        !self.event_rx.is_empty() || !self.pending_diagnostic_observations.is_empty()
+        !self.event_rx.is_empty()
+            || !self.pending_diagnostic_observations.is_empty()
+            || !self.ready_startup_events.is_empty()
     }
 
     pub fn drain_events_bounded(&mut self, max_events: usize) -> DrainedLspEvents {
@@ -3862,19 +3903,41 @@ impl LspManager {
             std::mem::take(&mut self.pending_diagnostic_observations)
         };
         let mut diagnostics_changed = !accepted_snapshots.is_empty();
-        while events.len() < max_events {
+        let mut processed_events = 0;
+        while processed_events < max_events {
+            if !preserve_pull_observations {
+                if let Some(delivery) = self.ready_startup_events.pop_front() {
+                    processed_events += 1;
+                    diagnostics_changed |= delivery.published.is_some();
+                    if let Some(ref published) = delivery.published {
+                        if self.startup_publish_is_current(published) {
+                            if let Some(snapshot) =
+                                self.accepted_snapshot_for_file(&published.key, &published.file)
+                            {
+                                accepted_snapshots.push(snapshot);
+                            }
+                        }
+                    }
+                    events.push(delivery.event);
+                    continue;
+                }
+            }
             let Ok(event) = self.event_rx.try_recv() else {
                 break;
             };
+            processed_events += 1;
             if preserve_pull_observations
                 && matches!(event, LspEvent::DocumentDiagnosticsPulled { .. })
             {
                 deferred_pull_events.push(event);
                 continue;
             }
-            // `handle_event` returns the file of a stored publish; the
+            if self.defer_startup_event(&event) {
+                continue;
+            }
+            // `handle_ready_event` returns the file of a stored publish; the
             // snapshot reuses it instead of parsing the payload again.
-            if let Some(file) = self.handle_event(&event) {
+            if let Some(file) = self.handle_ready_event(&event) {
                 diagnostics_changed = true;
                 if let Some(snapshot) = self.accepted_live_publish_snapshot(&event, &file) {
                     accepted_snapshots.push(snapshot);
@@ -3885,7 +3948,9 @@ impl LspManager {
         for event in deferred_pull_events {
             let _ = self.event_tx.send(event);
         }
-        let has_more = events.len() >= max_events && !self.event_rx.is_empty();
+        let has_more = processed_events >= max_events
+            && (!self.event_rx.is_empty()
+                || (!preserve_pull_observations && !self.ready_startup_events.is_empty()));
         self.send_due_rust_saves();
         let mut promoted_reports = Vec::new();
         for (key, client) in &mut self.clients {
@@ -3930,6 +3995,7 @@ impl LspManager {
         }
         DrainedLspEvents {
             events,
+            processed_events,
             diagnostics_changed,
             accepted_snapshots,
             has_more,
@@ -4077,7 +4143,7 @@ impl LspManager {
 
     #[doc(hidden)]
     pub fn pending_event_count_for_test(&self) -> usize {
-        self.event_rx.len()
+        self.event_rx.len() + self.ready_startup_events.len()
     }
 
     #[doc(hidden)]
@@ -4689,6 +4755,12 @@ impl LspManager {
             opened_for_pull: false,
             state: DocumentPullState::Done(PullFileOutcome::PullNotSupported),
         };
+        if self.starting.contains_key(&pull.key) {
+            pull.state = DocumentPullState::Replied(Err(LspError::ServerNotReady(
+                START_IN_PROGRESS_REASON.into(),
+            )));
+            return pull;
+        }
         let supports_pull = self
             .clients
             .get(&pull.key)
@@ -4758,6 +4830,9 @@ impl LspManager {
         file: &Path,
         deadline: Instant,
     ) -> Result<super::typescript_diagnostics::TypescriptDiagnosticsRequest, LspError> {
+        if self.starting.contains_key(key) {
+            return Err(LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()));
+        }
         let file = canonicalize_for_lsp(file)?;
         let uri = uri_for_path(&file)?;
         let version = self
@@ -4935,6 +5010,9 @@ impl LspManager {
         &mut self,
         server_key: &ServerKey,
     ) -> Result<Option<PendingWorkspacePull>, LspError> {
+        if self.starting.contains_key(server_key) {
+            return Err(LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()));
+        }
         let supports_workspace = self
             .clients
             .get(server_key)
@@ -5242,6 +5320,8 @@ impl LspManager {
     pub fn take_all_clients(&mut self) -> Vec<(ServerKey, LspClient)> {
         self.cancel_startups();
         self.starting.clear();
+        self.ready_startup_events.clear();
+        self.pending_diagnostic_observations.clear();
         let clients: Vec<_> = self.clients.drain().collect();
         self.clients_generation = self.clients_generation.wrapping_add(1);
         self.forget_server_state(None);
@@ -5516,10 +5596,14 @@ impl LspManager {
         notes
     }
 
-    /// Active server keys (running clients). Used by `lsp_diagnostics`
+    /// Server keys whose startup synchronization has finished. Used by `lsp_diagnostics`
     /// directory mode to know which servers to ask for workspace pull.
     pub fn active_server_keys(&self) -> Vec<ServerKey> {
-        self.clients.keys().cloned().collect()
+        self.clients
+            .keys()
+            .filter(|key| !self.starting.contains_key(*key))
+            .cloned()
+            .collect()
     }
 
     /// Return the last watched-file routing decision for Windows CI timeout
@@ -5786,6 +5870,9 @@ impl LspManager {
     /// diagnostics freshness gate both use this predicate so a complete
     /// producer set cannot be judged incomplete by a second, stricter check.
     pub fn producer_has_settled(&self, server: &ServerKey) -> bool {
+        if self.starting.contains_key(server) {
+            return false;
+        }
         if self
             .clients
             .get(server)
@@ -5823,7 +5910,11 @@ impl LspManager {
     }
 
     fn drain_events_for_file(&mut self, file_path: &Path) -> bool {
-        let mut saw_file_diagnostics = false;
+        let mut saw_file_diagnostics = self.ready_startup_events.iter().any(|delivery| {
+            delivery.published.as_ref().is_some_and(|published| {
+                published.file.as_path() == file_path && self.startup_publish_is_current(published)
+            })
+        });
         while let Ok(event) = self.event_rx.try_recv() {
             if matches!(
                 self.handle_event(&event),
@@ -5833,6 +5924,21 @@ impl LspManager {
             }
         }
         saw_file_diagnostics
+    }
+
+    // Outward delivery may follow another edit or restart. Only the same
+    // client's still-current document and report can contribute an observation.
+    fn startup_publish_is_current(&self, published: &StartupPublished) -> bool {
+        !self.is_quiesced()
+            && published.pid.is_some()
+            && self.clients.get(&published.key).map(LspClient::child_pid) == published.pid
+            && self
+                .documents
+                .get(&published.key)
+                .and_then(|store| store.version(&published.file))
+                == published.version
+            && published.epoch.is_some()
+            && self.diagnostic_epoch(&published.key, &published.file) == published.epoch
     }
 
     /// The snapshot of a publish `handle_event` just stored for `file`, when
@@ -5942,7 +6048,7 @@ impl LspManager {
         }
     }
 
-    fn handle_event(&mut self, event: &LspEvent) -> Option<PathBuf> {
+    fn defer_startup_event(&mut self, event: &LspEvent) -> bool {
         let (LspEvent::Notification {
             server_kind, root, ..
         }
@@ -5964,8 +6070,20 @@ impl LspManager {
         // and rust-analyzer check-begin counts.
         if let Some(reservation) = self.starting.get_mut(&event_key) {
             reservation.deferred_events.push(event.clone());
+            true
+        } else {
+            false
+        }
+    }
+
+    fn handle_event(&mut self, event: &LspEvent) -> Option<PathBuf> {
+        if self.defer_startup_event(event) {
             return None;
         }
+        self.handle_ready_event(event)
+    }
+
+    fn handle_ready_event(&mut self, event: &LspEvent) -> Option<PathBuf> {
         let published_file = match event {
             LspEvent::DocumentDiagnosticsPulled {
                 server_kind,
@@ -7754,6 +7872,19 @@ struct StartupReplayDocument {
     saved: Option<(Instant, u64)>,
 }
 
+struct StartupEventDelivery {
+    event: LspEvent,
+    published: Option<StartupPublished>,
+}
+
+struct StartupPublished {
+    key: ServerKey,
+    file: PathBuf,
+    version: Option<i32>,
+    epoch: Option<u64>,
+    pid: Option<u32>,
+}
+
 struct StartupReplayResult {
     pid: u32,
     documents: Vec<StartupReplayDocument>,
@@ -7777,6 +7908,8 @@ fn replay_startup_notifications(
         error: None,
     };
     for (path, version, opened) in jobs {
+        let mut write_attempted = false;
+        let mut document_written = false;
         let sent = (|| -> Result<(DiskSnapshot, Option<(Instant, u64)>), LspError> {
             let disk = DiskSnapshot::read(&path);
             let content = std::fs::read_to_string(&path)?;
@@ -7801,7 +7934,9 @@ fn replay_startup_notifications(
             } else {
                 super::client::full_did_change_message(&uri, version, &content)?
             };
+            write_attempted = true;
             writer.send(payload)?;
+            document_written = true;
             let saved = if let Some(save) = save {
                 writer.send(super::client::did_save_message(
                     &uri,
@@ -7825,6 +7960,17 @@ fn replay_startup_notifications(
                 saved,
             }),
             Err(error) => {
+                if document_written
+                    || (write_attempted && (!opened || matches!(error, LspError::Timeout(_))))
+                {
+                    result.documents.push(StartupReplayDocument {
+                        path,
+                        version,
+                        opened,
+                        disk: DiskSnapshot::default(),
+                        saved: None,
+                    });
+                }
                 result.error = Some(error);
                 break;
             }
@@ -8112,7 +8258,14 @@ where
     G: std::ops::DerefMut<Target = LspManager>,
 {
     let canonical_path = canonicalize_for_lsp(file_path)?;
-    ensure_server_for_file_detailed_unlocked(&lock, &canonical_path, config);
+    let outcomes = ensure_server_for_file_detailed_unlocked(&lock, &canonical_path, config);
+    if outcomes
+        .attempts
+        .iter()
+        .any(|attempt| matches!(attempt.result, ServerAttemptResult::InProgress { .. }))
+    {
+        return Err(LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()));
+    }
     // Every server is now running or has a remembered failure, so this
     // starts nothing under the lock unless a client vanished in between.
     lock().ensure_file_open(&canonical_path, config)

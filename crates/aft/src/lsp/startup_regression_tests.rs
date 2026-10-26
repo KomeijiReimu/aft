@@ -552,8 +552,22 @@ fn unlocked_request_waits_until_startup_notification_replay_finishes() {
         entered_rx.recv_timeout(WAIT).unwrap();
         let mut lock_available = false;
         let mut event_deferred = false;
+        let mut readiness_blocked = false;
         if let Some(mut manager) = f.manager.try_lock_for(Duration::from_secs(5)) {
             lock_available = true;
+            let client_hidden = manager.client_for_file_mut(&f.file, &f.config).is_none();
+            let uri = uri_for_path(&canonicalize_for_lsp(&f.file).unwrap()).unwrap();
+            let pull = manager.begin_open_document_pull(f.key.clone(), &f.file, &uri, None);
+            readiness_blocked = client_hidden
+                && manager.has_client(&f.key)
+                && manager.active_server_keys().is_empty()
+                && !manager.producer_has_settled(&f.key)
+                && manager.navigation_requires_deferred_execution(&f.file, &f.config)
+                && matches!(
+                    pull.state,
+                    DocumentPullState::Replied(Err(LspError::ServerNotReady(_)))
+                )
+                && manager.begin_workspace_pull(&f.key).is_err();
             let before = manager.starting[&f.key].deferred_events.len();
             let event = LspEvent::Notification {
                 server_kind: f.key.kind.clone(),
@@ -561,20 +575,33 @@ fn unlocked_request_waits_until_startup_notification_replay_finishes() {
                 method: "custom/producerProgress".into(),
                 params: None,
             };
-            manager.handle_event(&event);
+            manager.event_tx.send(event).unwrap();
+            let drained = manager.drain_events_bounded(1);
             event_deferred = manager.clients.contains_key(&f.key)
-                && manager.starting[&f.key].deferred_events.len() == before + 1;
+                && manager.starting[&f.key].deferred_events.len() == before + 1
+                && drained.events.is_empty()
+                && drained.processed_events == 1;
         }
         let returned_early = done_rx.try_recv().is_ok();
         resume_tx.send(()).unwrap();
         assert_eq!(waiting.join().unwrap().successful, vec![f.key.clone()]);
         assert!(lock_available, "replay held the manager mutex");
         assert!(
+            readiness_blocked,
+            "uncommitted replay versions were exposed to requests"
+        );
+        assert!(
             event_deferred,
             "producer event passed uncommitted replay state"
         );
         assert!(!returned_early, "request returned before replay completed");
     });
+    let delivered = f.manager.lock().drain_events_bounded(1);
+    assert_eq!(delivered.processed_events, 1);
+    assert!(
+        matches!(&delivered.events[..], [LspEvent::Notification { method, .. }] if method == "custom/producerProgress")
+    );
+    assert!(f.manager.lock().drain_events().events.is_empty());
     let messages = recorded_notifications(&f);
     assert_eq!(
         messages[0]["params"]["textDocument"]["text"],

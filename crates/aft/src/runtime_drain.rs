@@ -4249,7 +4249,7 @@ pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBat
         lsp.drain_events_bounded(max_events)
     };
     let outcome = DrainBatchOutcome {
-        processed: drained.events.len(),
+        processed: drained.processed_events,
         has_more: drained.has_more,
     };
     let mut status_changed = drained.diagnostics_changed;
