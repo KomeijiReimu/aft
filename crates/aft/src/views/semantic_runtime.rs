@@ -352,6 +352,7 @@ impl CheckoutSemantic {
                 )
             })?;
         let cut = self.driver.installed_snapshot().install_cut()?.clone();
+        let cut_epoch = cut.epoch;
         let snapshot = LiveDelta::new(Arc::clone(&base.generation))
             .snapshot()
             .with_install_cut(cut);
@@ -404,6 +405,9 @@ impl CheckoutSemantic {
             crate::slog_info!("semantic base reference strict fallback root={} reason=membership members={} base={}", self.root.display(), members.len(), manifest.entries().count());
             return None;
         }
+        // The stable content-and-membership walk above completes this cut's
+        // reconciliation; selecting a cached base alone would not establish it.
+        let snapshot = snapshot.with_reconciled_epoch(cut_epoch);
         if let Err(error) = self.driver.install(&self.access, &snapshot, revision) {
             crate::slog_info!(
                 "semantic base reference strict fallback root={} reason=install error={error}",
