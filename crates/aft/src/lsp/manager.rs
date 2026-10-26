@@ -1102,9 +1102,9 @@ pub struct LspManager {
     recent_exit_log_lines: std::collections::VecDeque<String>,
     /// Exit reports for servers that died before a client owned them (during
     /// spawn or `initialize`) or whose failure was already reported, keyed by
-    /// PID. Each waits for its reader's `ServerExited` event so the exit is
-    /// logged exactly once, with full detail.
-    pending_exit_reports: HashMap<u32, ServerExitReport>,
+    /// reader instance and PID. Each waits for its reader's `ServerExited`
+    /// event so the exit is logged exactly once, with full detail.
+    pending_exit_reports: HashMap<(ServerInstanceId, u32), ServerExitReport>,
     /// Servers being started by [`start_applicable_server_unlocked`] without
     /// the manager lock, keyed by server.
     starting: HashMap<ServerKey, StartReservation>,
@@ -4953,16 +4953,19 @@ impl LspManager {
             .get(key)
             .cloned()
             .unwrap_or_else(|| key.kind.id_str().to_string());
-        let report = {
+        let (instance, report) = {
             let client = self.clients.get_mut(key)?;
             let status = client.wait_for_exit(Duration::from_millis(100))?;
-            client.exit_report(client.phase(), Some(status), false)
+            (
+                client.instance,
+                client.exit_report(client.phase(), Some(status), false),
+            )
         };
         let reason = format_post_initialize_exit_reason(&binary, &report, err);
         let durability = exit_durability(&reason, &report.stderr_tail);
         let result = ServerAttemptResult::SpawnFailed { binary, reason };
         self.clients.remove(key);
-        self.remember_exit_report(report);
+        self.remember_exit_report(instance, report);
         self.forget_server_state(Some(key));
         Some(self.record_failed_spawn(key, result, durability))
     }
@@ -5838,6 +5841,7 @@ impl LspManager {
 
     fn handle_event(&mut self, receipt: &ReceivedLspEvent) -> Result<Option<PathBuf>, ()> {
         if !self.accept_event_instance(&receipt.event, receipt.instance) {
+            self.consume_pending_exit_report(receipt);
             return Err(());
         }
         let event = &receipt.event;
@@ -5984,11 +5988,10 @@ impl LspManager {
                         let report = client.reap_with_report(reason);
                         self.record_exit_log_line(report.log_line(&reason_text));
                     }
-                } else if let Some(report) = self.pending_exit_reports.remove(pid) {
+                } else if self.consume_pending_exit_report(receipt) {
                     // This process died while starting (or its failure was
                     // already reported to a caller); its full report was
                     // kept for this moment so the exit is logged once.
-                    self.record_exit_log_line(report.log_line(&reason_text));
                 } else {
                     self.record_exit_log_line(format!(
                         "exited {:?} {} ({reason_text}): pid={pid} status unavailable (aft had already released this server)",
@@ -6682,13 +6685,14 @@ impl LspManager {
                 StartFailure { error, durability }
             }
             SpawnFailure::Initialize {
+                instance,
                 reason,
                 report,
                 durability,
             } => {
                 // Dropping the client in `PreparedSpawn::run` killed a
                 // still-running server, so the report is complete either way.
-                self.remember_exit_report(*report);
+                self.remember_exit_report(instance, *report);
                 StartFailure {
                     error: LspError::ServerNotReady(reason),
                     durability,
@@ -6698,14 +6702,32 @@ impl LspManager {
     }
 
     /// Keep a dead server's report until its reader's exit event is drained.
-    fn remember_exit_report(&mut self, report: ServerExitReport) {
+    fn remember_exit_report(&mut self, instance: ServerInstanceId, report: ServerExitReport) {
         if self.pending_exit_reports.len() >= PENDING_EXIT_REPORTS_CAP {
             // Never expected: each report is consumed by its reader's exit
             // event. Log directly rather than grow without bound.
             self.record_exit_log_line(report.log_line("exit event not yet seen"));
             return;
         }
-        self.pending_exit_reports.insert(report.pid, report);
+        self.pending_exit_reports
+            .insert((instance, report.pid), report);
+    }
+
+    /// Retiring a reader must not lose its saved failure details. Removing only
+    /// its instance/PID pair also protects a replacement's report if the OS has
+    /// reused the PID; this cleanup never changes live clients or diagnostics.
+    fn consume_pending_exit_report(&mut self, receipt: &ReceivedLspEvent) -> bool {
+        let LspEvent::ServerExited { pid, reason, .. } = &receipt.event else {
+            return false;
+        };
+        let Some(instance) = receipt.instance else {
+            return false;
+        };
+        let Some(report) = self.pending_exit_reports.remove(&(instance, *pid)) else {
+            return false;
+        };
+        self.record_exit_log_line(report.log_line(&reason.to_string()));
+        true
     }
 
     fn resolve_binary(
@@ -7415,6 +7437,7 @@ enum SpawnFailure {
     },
     /// The process started but the `initialize` handshake failed.
     Initialize {
+        instance: ServerInstanceId,
         reason: String,
         report: Box<ServerExitReport>,
         durability: FailureDurability,
@@ -7590,6 +7613,7 @@ impl PreparedSpawn {
             };
             // Dropping the client here kills a still-running server.
             return Err(SpawnFailure::Initialize {
+                instance: self.instance,
                 reason,
                 report: Box::new(report),
                 durability,
@@ -7617,6 +7641,7 @@ impl PreparedSpawn {
                 // AFT's own check refused this binary; starting it again
                 // would be refused the same way.
                 return Err(SpawnFailure::Initialize {
+                    instance: self.instance,
                     reason,
                     report: Box::new(report),
                     durability: FailureDurability::Permanent,

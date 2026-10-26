@@ -417,16 +417,28 @@ pub enum ServerState {
     Exited,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ServerInstanceId(u64);
 
 impl ServerInstanceId {
     pub(crate) fn next() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        Self(
-            NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-                .expect("LSP server instance ids exhausted"),
-        )
+        Self::allocate(&NEXT)
+    }
+
+    fn allocate(counter: &AtomicU64) -> Self {
+        // Rust 1.92 predates try_update; an explicit CAS loop also avoids the
+        // deprecated fetch_update API on newer toolchains.
+        let mut id = counter.load(Ordering::Relaxed);
+        loop {
+            let next = id
+                .checked_add(1)
+                .expect("LSP server instance ids exhausted");
+            match counter.compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Self(id),
+                Err(observed) => id = observed,
+            }
+        }
     }
 }
 
@@ -3012,6 +3024,22 @@ fn parse_diagnostic_capabilities(value: &Value) -> ServerDiagnosticCapabilities 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_instance_allocator_preserves_the_exhaustion_boundary() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(
+            ServerInstanceId::allocate(&counter),
+            ServerInstanceId(u64::MAX - 1)
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert!(std::panic::catch_unwind(|| ServerInstanceId::allocate(&counter)).is_err());
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            u64::MAX,
+            "exhausted ids must never wrap or be reused"
+        );
+    }
 
     #[test]
     fn analysis_progress_end_before_publication_cannot_certify_the_report() {

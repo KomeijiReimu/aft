@@ -464,3 +464,152 @@ fn pull_preservation_drops_retired_receipts_before_requeue() {
     assert_eq!(manager.pending_event_count_for_test(), 1);
     assert_eq!(next(&manager).instance, Some(current));
 }
+
+#[test]
+fn retired_exit_consumes_only_its_saved_report_across_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("main.ts");
+    let mut manager = LspManager::new();
+    let mut held_clients = Vec::new();
+    for cycle in 0..4 {
+        let retired = ServerInstanceId::next();
+        let pause = Pause::install(retired, Stage::Reader);
+        let marker = format!("retired root cause {cycle}");
+        let command = format!("printf '%s\\n' {} >&2; exit 7", quote(&marker));
+        let client = spawn(&manager, dir.path(), retired, &command);
+        manager.clients.insert(key(dir.path()), client);
+        pause.wait();
+        let report = manager
+            .clients
+            .get_mut(&key(dir.path()))
+            .unwrap()
+            .reap_with_report(&ServerExitReason::Eof);
+        assert!(report.stderr_tail.contains(&marker));
+        let retired_pid = report.pid;
+        let _ = manager.absorb_spawn_failure(SpawnFailure::Initialize {
+            instance: retired,
+            reason: "server failed during initialize".into(),
+            report: Box::new(report.clone()),
+            durability: FailureDurability::Transient,
+        });
+        let (current, old) = replace(&mut manager, dir.path(), "exec cat");
+        held_clients.extend(old);
+        let current_pid = manager.clients[&key(dir.path())].child_pid();
+        let mut replacement_report = report;
+        replacement_report.pid = current_pid;
+        replacement_report.stderr_tail = format!("replacement saved report {cycle}");
+        manager.remember_exit_report(current, replacement_report.clone());
+        manager
+            .documents
+            .entry(key(dir.path()))
+            .or_default()
+            .open(file.clone());
+        manager
+            .diagnostics
+            .publish(key(dir.path()), file.clone(), Vec::new());
+        let epoch = manager.diagnostics.current_epoch();
+        drop(pause);
+        let receipt = next(&manager);
+        assert_eq!(receipt.instance, Some(retired));
+        let (result, logs) = crate::logging::capture_log_lines(|| manager.handle_event(&receipt));
+        assert!(
+            result.is_err(),
+            "retired exit must still be rejected for state"
+        );
+        assert!(
+            !manager
+                .pending_exit_reports
+                .contains_key(&(retired, retired_pid)),
+            "retired saved report was not consumed"
+        );
+        assert_eq!(
+            logs.iter().filter(|line| line.contains(&marker)).count(),
+            1,
+            "saved exit details were lost: {logs:?}"
+        );
+        assert!(logs
+            .iter()
+            .all(|line| !line.contains(&replacement_report.stderr_tail)));
+        assert_eq!(manager.clients[&key(dir.path())].instance, current);
+        assert_eq!(manager.clients[&key(dir.path())].child_pid(), current_pid);
+        assert_eq!(
+            manager.pending_exit_reports[&(current, current_pid)].log_line("eof"),
+            replacement_report.log_line("eof")
+        );
+        assert_eq!(manager.diagnostics.current_epoch(), epoch);
+        assert!(manager
+            .diagnostics
+            .has_report_for_server_file(&key(dir.path()), &file));
+        assert!(manager.documents[&key(dir.path())].is_open(&file));
+        assert_eq!(
+            manager.pending_exit_reports.len(),
+            1,
+            "saved reports grew after restart {cycle}"
+        );
+        manager.pending_exit_reports.remove(&(current, current_pid));
+        held_clients.extend(manager.clients.remove(&key(dir.path())));
+        assert!(manager.pending_exit_reports.is_empty());
+    }
+    assert_eq!(manager.retired_event_count(), 4);
+}
+
+#[test]
+fn retired_exit_cleanup_preserves_a_replacement_report_with_the_same_pid() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = LspManager::new();
+    let retired = ServerInstanceId::next();
+    let (current, _old) = replace(&mut manager, dir.path(), "exec cat");
+    let pid = manager.clients[&key(dir.path())].child_pid();
+    let report = ServerExitReport {
+        kind: ServerKind::TypeScript,
+        root: dir.path().to_path_buf(),
+        pid,
+        phase: ServerPhase::Initialize,
+        status: None,
+        killed_by_aft: true,
+        elapsed: Duration::ZERO,
+        command: "old server".into(),
+        stderr_tail: "retired saved failure".into(),
+    };
+    // Model OS PID reuse without depending on how the host allocates processes.
+    manager.remember_exit_report(retired, report.clone());
+    let mut replacement_report = report;
+    replacement_report.stderr_tail = "replacement saved failure".into();
+    manager.remember_exit_report(current, replacement_report.clone());
+    assert_eq!(manager.pending_exit_reports.len(), 2);
+    let receipt = ReceivedLspEvent {
+        instance: Some(retired),
+        event: LspEvent::ServerExited {
+            server_kind: ServerKind::TypeScript,
+            root: dir.path().to_path_buf(),
+            pid,
+            reason: ServerExitReason::Eof,
+        },
+    };
+    let (result, logs) = crate::logging::capture_log_lines(|| manager.handle_event(&receipt));
+    assert!(result.is_err());
+    assert_eq!(manager.pending_exit_reports.len(), 1);
+    assert_eq!(
+        manager.pending_exit_reports[&(current, pid)].log_line("eof"),
+        replacement_report.log_line("eof")
+    );
+    assert_eq!(manager.clients[&key(dir.path())].instance, current);
+    assert_eq!(manager.clients[&key(dir.path())].child_pid(), pid);
+    assert_eq!(
+        logs.iter()
+            .filter(|line| line.contains("retired saved failure"))
+            .count(),
+        1
+    );
+    assert!(logs
+        .iter()
+        .all(|line| !line.contains("replacement saved failure")));
+    assert_eq!(manager.retired_event_count(), 1);
+    assert!(manager.handle_event(&receipt).is_err());
+    assert_eq!(manager.pending_exit_reports.len(), 1);
+    assert_eq!(
+        manager.recent_server_exit_log_lines().len(),
+        1,
+        "duplicate receipt logged the same report twice"
+    );
+}
