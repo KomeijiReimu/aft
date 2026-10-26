@@ -3725,7 +3725,9 @@ impl LspManager {
             if preserve_pull_observations
                 && matches!(event.event, LspEvent::DocumentDiagnosticsPulled { .. })
             {
-                deferred_pull_events.push(event);
+                if self.accept_event_instance(&event.event, event.instance) {
+                    deferred_pull_events.push(event);
+                }
                 continue;
             }
             // `handle_event` returns the file of a stored publish; the

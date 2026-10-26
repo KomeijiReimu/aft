@@ -216,7 +216,18 @@ fn retired_reader_request_is_not_replied_to_by_replacement() {
     manager.clients.insert(key(dir.path()), old);
     pause.wait();
     let trace = dir.path().join("replacement-input");
-    let command = format!("exec tee {}", quote(trace.to_str().unwrap()));
+    let echo = format!(
+        r#"export LC_ALL=C
+while IFS= read -r header && IFS= read -r blank; do
+    length=${{header#Content-Length: }}
+    length=${{length%$'\r'}}
+    IFS= read -r -n "$length" body || exit 1
+    printf 'Content-Length: %s\r\n\r\n%s' "$length" "$body" >> {}
+    printf 'Content-Length: %s\r\n\r\n%s' "$length" "$body"
+done"#,
+        quote(trace.to_str().unwrap())
+    );
+    let command = format!("exec bash -c {}", quote(&echo));
     let (current, _old) = replace(&mut manager, dir.path(), &command);
     drop(pause);
     let receipt = next(&manager);
@@ -424,4 +435,32 @@ fn drain_dispatch_does_not_wait_for_a_contended_manager() {
     assert!(outcome.has_more);
     drop(manager);
     worker.join().unwrap();
+}
+
+#[test]
+fn pull_preservation_drops_retired_receipts_before_requeue() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = LspManager::new();
+    let retired = ServerInstanceId::next();
+    let (current, _old) = replace(&mut manager, dir.path(), "exec cat");
+    for instance in [retired, current] {
+        manager
+            .event_tx
+            .send(ReceivedLspEvent {
+                instance: Some(instance),
+                event: LspEvent::DocumentDiagnosticsPulled {
+                    server_kind: ServerKind::TypeScript,
+                    root: dir.path().to_path_buf(),
+                    file: dir.path().join("main.ts"),
+                    epoch: 1,
+                },
+            })
+            .unwrap();
+    }
+    let drained = manager.drain_events_inner(usize::MAX, true);
+    assert_eq!(drained.processed, 2);
+    assert!(drained.events.is_empty());
+    assert_eq!(manager.retired_events_dropped, 1);
+    assert_eq!(manager.pending_event_count_for_test(), 1);
+    assert_eq!(next(&manager).instance, Some(current));
 }
