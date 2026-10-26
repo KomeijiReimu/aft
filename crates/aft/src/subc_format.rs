@@ -3374,7 +3374,7 @@ fn format_callgraph_error(command: &str, data: &Value) -> String {
             let action = if code == Some("ambiguous_target") {
                 "Pass toPath to disambiguate"
             } else {
-                "Try one of these files for toFile"
+                "Try one of these files for toPath"
             };
             let mut lines = vec![format!(
                 "{command}: {} — {target}. {action}:",

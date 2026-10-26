@@ -18550,7 +18550,7 @@ mod callgraph_store_for_ops_tests {
         for expected in [
             "reason=fingerprint or schema stale;",
             "stored_schema=1;",
-            "current_schema=2;",
+            "current_schema=3;",
         ] {
             assert!(log.contains(expected), "missing {expected}: {log}");
         }

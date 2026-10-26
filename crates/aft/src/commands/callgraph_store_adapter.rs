@@ -77,7 +77,10 @@ struct EdgeMarker {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreCallersResult {
+    #[serde(skip_serializing_if = "is_zero")]
     pub callback_dependencies: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_reference_label: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_filter_note: Option<String>,
     pub symbol: String,
@@ -197,7 +200,10 @@ pub struct StoreCallTreeNode {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreImpactResult {
+    #[serde(skip_serializing_if = "is_zero")]
     pub callback_dependencies: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_reference_label: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_filter_note: Option<String>,
     pub symbol: String,
@@ -706,6 +712,7 @@ pub fn callers_result(
 
     Ok(StoreCallersResult {
         callback_dependencies,
+        callback_reference_label: (callback_dependencies > 0).then_some(CALLBACK_REFERENCE_LABEL),
         test_filter_note,
         incomplete: empty_receiver_note(
             store,
@@ -1075,6 +1082,7 @@ pub fn impact_result(
 
     Ok(StoreImpactResult {
         callback_dependencies,
+        callback_reference_label: (callback_dependencies > 0).then_some(CALLBACK_REFERENCE_LABEL),
         test_filter_note,
         incomplete: empty_receiver_note(
             store,

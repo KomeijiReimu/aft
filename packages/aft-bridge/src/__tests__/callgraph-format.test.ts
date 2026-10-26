@@ -6,6 +6,68 @@ import {
 } from "../callgraph-format.js";
 
 describe("formatCallgraphSections", () => {
+  test("callgraph callback dependencies preserve direct and reference rows", () => {
+    const data = {
+      callback_dependencies: 1,
+      callback_reference_label: " (callback reference)",
+      total_callers: 2,
+      callers: [
+        {
+          file: "main.ts",
+          callers: [
+            { symbol: "process", line: 2 },
+            { symbol: "process", line: 2, relation: "callback_reference" },
+          ],
+        },
+      ],
+    };
+    expect(formatCallgraphSections("callers", data).join("\n")).toBe(
+      "2 caller dependencies · 1 file group\nmain.ts\n  ↳ process:2\n  ↳ process:2 (callback reference)",
+    );
+    expect(
+      formatCallgraphSections("impact", {
+        callback_dependencies: 1,
+        callback_reference_label: data.callback_reference_label,
+        total_affected: 1,
+        affected_files: 1,
+        callers: [
+          {
+            caller_file: "main.ts",
+            caller_symbol: "process",
+            line: 2,
+            relation: "callback_reference",
+            call_expression: "items.map(transform);",
+          },
+        ],
+      }).join("\n"),
+    ).toBe(
+      "1 affected dependency site · 1 file\nmain.ts:2\n  ↳ process (callback reference)\n  items.map(transform);",
+    );
+  });
+
+  test("callgraph inline test counts and unknown classifications stay visible", () => {
+    for (const op of ["callers", "impact"]) {
+      const data = {
+        hidden_test_callers: 1,
+        total_callers: 2,
+        total_affected: 2,
+        affected_files: 1,
+        test_filter_note: "Test filtering incomplete: an unknown caller remains visible.",
+        callers:
+          op === "callers"
+            ? [{ file: "lib.rs", callers: [{ symbol: "live", line: 2 }] }]
+            : [{ caller_file: "lib.rs", caller_symbol: "live", line: 2 }],
+      };
+      const row =
+        op === "callers"
+          ? "1 caller · 1 file group\nlib.rs\n  ↳ live:2"
+          : "1 affected call site · 1 file\nlib.rs:2\n  ↳ live";
+      expect(formatCallgraphSections(op, data).join("\n")).toBe(
+        `${data.test_filter_note}\n${row}\n1 callers in tests hidden — includeTests: true shows them`,
+      );
+    }
+  });
+
   test("empty callers and impact warn when receiver resolution is incomplete", () => {
     const reason =
       "Incomplete: 2 unresolved method call sites; use grep before concluding there are no callers";

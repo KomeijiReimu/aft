@@ -172,39 +172,6 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/commands/trace_to_symbol.rs",
-      "line": 80,
-      "column": 43,
-      "token": "toFile",
-      "text": "format!(\"trace_to_symbol: toFile not found: {}\", to_file),",
-      "location": "line 80, column 43",
-      "ordinal": 1,
-      "class": "rust-compatibility",
-      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
-    },
-    {
-      "path": "crates/aft/src/commands/trace_to_symbol.rs",
-      "line": 144,
-      "column": 76,
-      "token": "toFile",
-      "text": "\"trace_to_symbol: target symbol '{}' is not defined in toFile: {}\",",
-      "location": "line 144, column 76",
-      "ordinal": 1,
-      "class": "rust-compatibility",
-      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
-    },
-    {
-      "path": "crates/aft/src/commands/trace_to_symbol.rs",
-      "line": 174,
-      "column": 94,
-      "token": "toFile",
-      "text": "\"trace_to_symbol: target symbol '{}' exists in multiple files; pass 'toFile' to disambiguate\",",
-      "location": "line 174, column 94",
-      "ordinal": 1,
-      "class": "rust-compatibility",
-      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
-    },
-    {
       "path": "crates/aft/src/commands/undo.rs",
       "line": 20,
       "column": 72,
@@ -1157,28 +1124,6 @@
       "token": "filePath",
       "text": "for key in [\"target\", \"path\", \"filePath\", \"url\"] {",
       "location": "line 2778, column 40",
-      "ordinal": 1,
-      "class": "rust-compatibility",
-      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
-    },
-    {
-      "path": "crates/aft/src/subc_format.rs",
-      "line": 3266,
-      "column": 23,
-      "token": "toFile",
-      "text": "\"Pass toFile to disambiguate\"",
-      "location": "line 3266, column 23",
-      "ordinal": 1,
-      "class": "rust-compatibility",
-      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
-    },
-    {
-      "path": "crates/aft/src/subc_format.rs",
-      "line": 3268,
-      "column": 45,
-      "token": "toFile",
-      "text": "\"Try one of these files for toFile\"",
-      "location": "line 3268, column 45",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
@@ -4240,28 +4185,6 @@
       "text": "delete record.filePath;",
       "location": "line 427, column 19",
       "ordinal": 2,
-      "class": "internal-compatibility",
-      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
-    },
-    {
-      "path": "packages/aft-bridge/src/tool-format.ts",
-      "line": 71,
-      "column": 19,
-      "token": "toFile",
-      "text": "? \"Pass toFile to disambiguate\"",
-      "location": "line 71, column 19",
-      "ordinal": 1,
-      "class": "internal-compatibility",
-      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
-    },
-    {
-      "path": "packages/aft-bridge/src/tool-format.ts",
-      "line": 72,
-      "column": 41,
-      "token": "toFile",
-      "text": ": \"Try one of these files for toFile\";",
-      "location": "line 72, column 41",
-      "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },

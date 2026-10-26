@@ -30262,7 +30262,7 @@ edition = "2021"
             .lock()
             .unwrap()
             .query_row(
-                "SELECT status FROM refs WHERE kind='value_ref' AND full_ref='GoGetHandler'",
+                "SELECT status FROM refs WHERE kind='callback_ref' AND full_ref='GoGetHandler'",
                 [],
                 |row| row.get(0),
             )

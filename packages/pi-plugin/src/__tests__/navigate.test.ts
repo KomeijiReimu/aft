@@ -204,7 +204,7 @@ describe("aft_callgraph adapter", () => {
     );
 
     expect(message).toBe(
-      'trace_to_symbol: ambiguous_target — multiple symbols named "target". Pass toFile to disambiguate:\n  - file1.rs:42\n  - file2.rs:78',
+      'trace_to_symbol: ambiguous_target — multiple symbols named "target". Pass toPath to disambiguate:\n  - file1.rs:42\n  - file2.rs:78',
     );
   });
 
@@ -230,7 +230,7 @@ describe("aft_callgraph adapter", () => {
     );
 
     expect(message).toBe(
-      'trace_to_symbol: ambiguous_target — multiple symbols named "target". Pass toFile to disambiguate:\n  - file1.rs:42',
+      'trace_to_symbol: ambiguous_target — multiple symbols named "target". Pass toPath to disambiguate:\n  - file1.rs:42',
     );
   });
 
@@ -258,7 +258,7 @@ describe("aft_callgraph adapter", () => {
     );
 
     expect(message).toContain("target_symbol_not_in_file");
-    expect(message).toContain("Try one of these files for toFile");
+    expect(message).toContain("Try one of these files for toPath");
     expect(message).toContain("right1.rs:12");
     expect(message).toContain("right2.rs:99");
   });
