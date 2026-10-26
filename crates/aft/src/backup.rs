@@ -13,6 +13,8 @@ use crate::error::AftError;
 use crate::fs_lock::AdvisoryLockGuard;
 use sha2::{Digest, Sha256};
 
+#[path = "agent_data/backup.rs"]
+mod portable;
 pub mod purge;
 
 pub const DEFAULT_MAX_UNDO_DEPTH: usize = 20;
@@ -51,9 +53,10 @@ const V2_FORMAT_VERSION: &str = "v2";
 /// Version of the `restore_meta` JSON mirrored into the backups table.
 /// Version 2 adds `post_state`, `external_change_before`,
 /// `external_change_checkpoint` (undo's external-change record), `link_to`
-/// and `hardlink_detached`. Readers accept 1 and 2; in version 1 rows these
-/// fields are absent or optional and read as unset.
-const DB_RESTORE_META_VERSION: u32 = 2;
+/// and `hardlink_detached`. Readers accept 1 through 3; in version 1 rows these
+/// fields are absent or optional and read as unset. Version 3 carries the
+/// strict registry and baseline guard on imported history.
+const DB_RESTORE_META_VERSION: u32 = 3;
 const MAX_RESTORE_OPERATION_LOCK_RETRIES: usize = 32;
 const MAX_SESSION_DISCOVERY_ENTRIES: usize = 100_000;
 /// Recovery must finish undo bookkeeping even after its caller is cancelled,
@@ -329,7 +332,9 @@ fn run_restore_before_lock_hook_for_tests(_session: &str, _attempt: usize) {}
 /// unknown kind as content and then requires its content file, fails closed
 /// on them; the new fields are optional, and readers treat them as unset when
 /// absent, so version-4 stacks load unchanged.
-pub const SCHEMA_VERSION: u32 = 5;
+// Version 6 makes older readers refuse stacks whose imported guards they
+// cannot enforce; ignoring an optional guard would allow a destructive undo.
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// A single backup entry for a file.
 #[derive(Debug, Clone)]
@@ -366,6 +371,8 @@ pub struct BackupEntry {
     /// the deleted tree: undo can restore the content, but only as an
     /// independent copy that no longer shares data with those outside links.
     pub hardlink_detached: bool,
+    /// Imported entries require an exact destination baseline and registry binding.
+    pub imported_guard: Option<crate::agent_data::ImportedGuard>,
 }
 
 /// Captures stay shared until committed. Durable stacks keep only a blob
@@ -848,6 +855,9 @@ impl TryFrom<BackupRow> for BackupEntry {
             hardlink_detached: restore_metadata
                 .as_ref()
                 .is_some_and(|metadata| metadata.hardlink_detached),
+            imported_guard: restore_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.imported_guard.clone()),
             link_to,
             created_dirs: restore_metadata
                 .map(|metadata| metadata.created_dirs)
@@ -1014,6 +1024,7 @@ impl Default for BackupPolicy {
 /// this migration.
 #[derive(Debug)]
 pub struct BackupStore {
+    portable_registry: Option<Arc<dyn crate::agent_data::ProjectRegistry>>,
     /// session -> path -> entry stack
     entries: HashMap<String, HashMap<PathBuf, Vec<BackupEntry>>>,
     /// session -> path -> disk metadata
@@ -1108,6 +1119,7 @@ struct SessionMeta {
 impl BackupStore {
     pub fn new() -> Self {
         BackupStore {
+            portable_registry: None,
             entries: HashMap::new(),
             disk_index: HashMap::new(),
             session_meta: HashMap::new(),
@@ -1622,6 +1634,7 @@ impl BackupStore {
             external_change_checkpoint: None,
             link_to: None,
             hardlink_detached: false,
+            imported_guard: None,
         };
 
         self.persist_new_entry_locked(session, &key, entry)?;
@@ -1923,6 +1936,9 @@ impl BackupStore {
                 .ok_or_else(|| AftError::NoUndoHistory {
                     path: key.display().to_string(),
                 })?;
+            if let Some(guard) = &entry.imported_guard {
+                guard.check(key, self.portable_registry.as_deref())?;
+            }
             if needs_capture_before_undo(&entry, key) {
                 capture_targets.push(key.clone());
             }
@@ -2270,6 +2286,9 @@ impl BackupStore {
                 path: path.display().to_string(),
             })?;
 
+        if let Some(guard) = &top.imported_guard {
+            guard.check(path, self.portable_registry.as_deref())?;
+        }
         let checkpoint = if needs_capture_before_undo(&top, path) {
             self.ensure_preservable(path)?;
             Some(save_external(&[key.to_path_buf()])?)
@@ -3503,6 +3522,7 @@ impl BackupStore {
         key: &Path,
         path: &Path,
     ) -> Result<(BackupEntry, Option<String>), AftError> {
+        let registry = self.portable_registry.clone();
         let session_entries =
             self.entries
                 .get_mut(session)
@@ -3522,6 +3542,9 @@ impl BackupStore {
                 path: path.display().to_string(),
             })?;
 
+        if let Some(guard) = &entry.imported_guard {
+            guard.check(path, registry.as_deref())?;
+        }
         // The returned entry must outlive pruning of its on-disk blob.
         entry.materialize().map_err(|error| AftError::IoError {
             path: path.display().to_string(),
@@ -5461,6 +5484,7 @@ struct BackupEntryDiskMetadata {
     external_change_checkpoint: Option<String>,
     link_to: Option<PathBuf>,
     hardlink_detached: bool,
+    imported_guard: Option<crate::agent_data::ImportedGuard>,
 }
 
 /// Refuse, by name, backup metadata (`meta.json` or the session marker) whose
@@ -5502,6 +5526,7 @@ fn restore_metadata_json(entry: &BackupEntry) -> String {
         "external_change_checkpoint": entry.external_change_checkpoint,
         "link_to": entry.link_to.as_ref().map(|key| key.display().to_string()),
         "hardlink_detached": entry.hardlink_detached,
+        "imported_guard": entry.imported_guard,
     })
     .to_string()
 }
@@ -5509,7 +5534,7 @@ fn restore_metadata_json(entry: &BackupEntry) -> String {
 fn restore_metadata_from_json(value: &str) -> Option<BackupEntryDiskMetadata> {
     let value: serde_json::Value = serde_json::from_str(value).ok()?;
     let version = value.get("version")?.as_u64()?;
-    if version != 1 && version != u64::from(DB_RESTORE_META_VERSION) {
+    if !(1..=u64::from(DB_RESTORE_META_VERSION)).contains(&version) {
         return None;
     }
 
@@ -5576,6 +5601,7 @@ fn restore_metadata_fields(value: &serde_json::Value) -> BackupEntryDiskMetadata
             .get("hardlink_detached")
             .and_then(|value| value.as_bool())
             .unwrap_or(false),
+        imported_guard: crate::agent_data::ImportedGuard::from_meta(value.get("imported_guard")),
     }
 }
 
@@ -5703,6 +5729,7 @@ fn backup_entry_from_path(
         external_change_checkpoint: None,
         link_to: None,
         hardlink_detached: false,
+        imported_guard: None,
     })
 }
 
@@ -5725,6 +5752,7 @@ fn metadata_only_entry(id: String, order: u128, description: &str, op_id: &str) 
         created_dirs: Vec::new(),
         link_to: None,
         hardlink_detached: false,
+        imported_guard: None,
     }
 }
 
@@ -5751,6 +5779,7 @@ fn backup_entry_from_capture(
         external_change_checkpoint: None,
         link_to: None,
         hardlink_detached: false,
+        imported_guard: None,
     }
 }
 
@@ -6326,6 +6355,9 @@ fn entry_from_meta(
             .and_then(|meta| meta.get("hardlink_detached"))
             .and_then(|value| value.as_bool())
             .unwrap_or(false),
+        imported_guard: crate::agent_data::ImportedGuard::from_meta(
+            entry_meta.and_then(|meta| meta.get("imported_guard")),
+        ),
     }
 }
 
@@ -6432,6 +6464,7 @@ fn entry_meta_json(entry: &BackupEntry) -> serde_json::Value {
         "external_change_checkpoint": entry.external_change_checkpoint,
         "link_to": entry.link_to.as_ref().map(|key| key.display().to_string()),
         "hardlink_detached": entry.hardlink_detached,
+        "imported_guard": entry.imported_guard,
     })
 }
 
@@ -7847,6 +7880,7 @@ mod tests {
             external_change_checkpoint: None,
             link_to: None,
             hardlink_detached: false,
+            imported_guard: None,
         }
     }
 
@@ -7894,6 +7928,7 @@ mod tests {
                 external_change_checkpoint: Some("external-change-a.txt-1".to_string()),
                 link_to: entry.link_to,
                 hardlink_detached: entry.hardlink_detached,
+                imported_guard: entry.imported_guard.clone(),
             }
         );
     }

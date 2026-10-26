@@ -469,7 +469,7 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
     //
     // A subc daemon older than 0.17.20 refuses this manifest, so that version
     // is the minimum supported daemon version.
-    ModuleManifest::builder("aft", env!("CARGO_PKG_VERSION"))
+    let mut manifest = ModuleManifest::builder("aft", env!("CARGO_PKG_VERSION"))
         .protocol_ver(PROTOCOL_VERSION)
         .trust_tier(Some(TrustTier::FirstParty))
         .ready(false)
@@ -639,7 +639,19 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                 of: vec!["synapse".to_string()],
             },
         ])
-        .build()
+        .build();
+    if crate::agent_data::CATALOG_ENABLED {
+        if let Some(capabilities) = &mut manifest.capabilities {
+            capabilities
+                .provides
+                .push(cortexkit_role_agent_data::PROVIDES.to_string());
+        }
+        manifest.provides.push(serde_json::from_value(json!({
+            "role":"internal_service", "service_id":cortexkit_role_agent_data::SERVICE_ID,
+            "transport":"bulk", "agent_facing":false, "operations":cortexkit_role_agent_data::REQUIRED_OPS,
+        })).expect("the published agent-data internal-service declaration is valid"));
+    }
+    manifest
 }
 
 pub(super) fn control_ops() -> Option<Vec<String>> {

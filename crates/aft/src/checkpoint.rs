@@ -23,6 +23,9 @@ const MAX_NAMED_CHECKPOINTS_PER_SESSION: usize = 20;
 const NAMED_CHECKPOINT_RETENTION_DAYS: u64 = 14;
 const NAMED_CHECKPOINT_RETENTION_SECS: u64 = NAMED_CHECKPOINT_RETENTION_DAYS * 24 * 60 * 60;
 const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+const IMPORTED_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+#[path = "agent_data/checkpoint.rs"]
+mod portable;
 const UNBOUND_HARNESS_SEGMENT: &str = "unbound";
 
 static CHECKPOINT_MAINTENANCE_KEYS: LazyLock<Mutex<HashSet<(PathBuf, String)>>> =
@@ -84,6 +87,7 @@ pub struct CheckpointPurge {
 /// A stored checkpoint: a snapshot of multiple file contents and metadata.
 #[derive(Debug, Clone)]
 struct Checkpoint {
+    imported_guards: HashMap<PathBuf, crate::agent_data::ImportedGuard>,
     name: String,
     file_contents: HashMap<PathBuf, CheckpointFile>,
     pending_purge: Vec<DiskCheckpointFileMeta>,
@@ -111,6 +115,8 @@ struct CheckpointFile {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct DiskCheckpointMeta {
+    #[serde(default)]
+    imported_guards: HashMap<PathBuf, crate::agent_data::ImportedGuard>,
     schema_version: u32,
     session_id: String,
     name: String,
@@ -291,6 +297,7 @@ fn checkpoint_mode(_metadata: &fs::Metadata) -> Option<u32> {
 /// change that depends on them.
 #[derive(Debug)]
 pub struct CheckpointStore {
+    portable_registry: Option<Arc<dyn crate::agent_data::ProjectRegistry>>,
     /// session -> name -> checkpoint, derived from the durable disk tree.
     checkpoints: HashMap<String, HashMap<String, Checkpoint>>,
     hydrated_checkpoints: Mutex<HashMap<PathBuf, CachedCheckpoint>>,
@@ -482,6 +489,7 @@ impl CheckpointStore {
 
     fn with_lock_path(lock_path: PathBuf, lock_timeout: Duration) -> Self {
         CheckpointStore {
+            portable_registry: None,
             checkpoints: HashMap::new(),
             hydrated_checkpoints: Mutex::new(HashMap::new()),
             lock_path,
@@ -656,6 +664,7 @@ impl CheckpointStore {
         captured_paths.sort();
         let checkpoint = Checkpoint {
             pending_purge: Vec::new(),
+            imported_guards: HashMap::new(),
             name: name.to_string(),
             file_contents,
             created_at,
@@ -704,6 +713,9 @@ impl CheckpointStore {
         let mut paths = checkpoint.file_contents.keys().cloned().collect::<Vec<_>>();
         paths.sort();
 
+        for (path, guard) in &checkpoint.imported_guards {
+            guard.check(path, self.portable_registry.as_deref())?;
+        }
         let unchanged = restore_paths_atomically(checkpoint, &paths)?;
         crate::slog_info!("checkpoint restored: {}", name);
 
@@ -739,6 +751,17 @@ impl CheckpointStore {
                 .ok_or_else(|| AftError::FileNotFound {
                     path: path.display().to_string(),
                 })?;
+        }
+        if !checkpoint.imported_guards.is_empty()
+            && validated_paths.len() != checkpoint.file_contents.len()
+        {
+            return Err(AftError::IoError {
+                path: name.to_string(),
+                message: "imported checkpoint must restore as a complete group".into(),
+            });
+        }
+        for (path, guard) in &checkpoint.imported_guards {
+            guard.check(path, self.portable_registry.as_deref())?;
         }
         let unchanged = restore_paths_atomically(checkpoint, validated_paths)?;
         crate::slog_info!("checkpoint restored: {}", name);
@@ -1352,7 +1375,12 @@ impl CheckpointStore {
         }
 
         let meta = DiskCheckpointMeta {
-            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            schema_version: if checkpoint.imported_guards.is_empty() {
+                CHECKPOINT_SCHEMA_VERSION
+            } else {
+                IMPORTED_CHECKPOINT_SCHEMA_VERSION
+            },
+            imported_guards: checkpoint.imported_guards.clone(),
             session_id: session.to_string(),
             name: checkpoint.name.clone(),
             created_at: checkpoint.created_at,
@@ -1735,7 +1763,10 @@ fn read_checkpoint_from_disk(
             message: format!("failed to parse durable checkpoint metadata: {error}"),
         }
     })?;
-    if meta.schema_version != CHECKPOINT_SCHEMA_VERSION {
+    if !matches!(
+        meta.schema_version,
+        CHECKPOINT_SCHEMA_VERSION | IMPORTED_CHECKPOINT_SCHEMA_VERSION
+    ) {
         return Err(AftError::IoError {
             path: meta_path.display().to_string(),
             message: format!(
@@ -1840,6 +1871,7 @@ fn read_checkpoint_from_disk(
 
     let checkpoint = Checkpoint {
         name: meta.name,
+        imported_guards: meta.imported_guards,
         file_contents,
         pending_purge: meta.pending_purge,
         created_at: meta.created_at,
@@ -2909,6 +2941,7 @@ mod tests {
         // process exiting after persistence but before retention eviction.
         let checkpoint = Checkpoint {
             pending_purge: Vec::new(),
+            imported_guards: HashMap::new(),
             name: "checkpoint-20".to_string(),
             file_contents: HashMap::from([(path, checkpoint_file("newest"))]),
             created_at: current_timestamp(),
@@ -3384,6 +3417,7 @@ mod tests {
                 "old".to_string(),
                 Checkpoint {
                     pending_purge: Vec::new(),
+                    imported_guards: HashMap::new(),
                     name: "old".to_string(),
                     file_contents: HashMap::new(),
                     created_at: 1000, // far in the past
@@ -3907,6 +3941,7 @@ mod tests {
 
         let checkpoint = Checkpoint {
             pending_purge: Vec::new(),
+            imported_guards: HashMap::new(),
             name: "dir-cleanup".to_string(),
             file_contents: HashMap::from([
                 (path_a.clone(), checkpoint_file("checkpoint-a")),

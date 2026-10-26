@@ -43,6 +43,8 @@ dependencies = [
  "content_inspector",
  "cortexkit-exec-remote-types",
  "cortexkit-paths",
+ "cortexkit-project-identity",
+ "cortexkit-role-agent-data",
  "cortexkit-role-harness",
  "cortexkit-role-tool-provider",
  "cortexkit-role-tool-provider-conformance",
@@ -619,6 +621,26 @@ name = "cortexkit-paths"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "30c3c61a48e327675a8baf6698cb96c6225c785a2e3988bc581b7c5305e90752"
+
+[[package]]
+name = "cortexkit-project-identity"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "874eca19539b3784525cbdccff1bf7ff8849f2dfe87076c972b52df05238d36f"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cortexkit-role-agent-data"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c974c2d1a3840050a7fb8e0e1eef98454bdee06b43dff176659a6e18735d3f6"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "cortexkit-role-harness"
