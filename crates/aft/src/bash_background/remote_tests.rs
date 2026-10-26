@@ -9506,6 +9506,91 @@ async fn concurrent_stop_and_registration_of_a_shared_task_never_deadlock() {
     }
 }
 
+/// Repeated owner stops can replace metadata during every optimistic replay
+/// open. A busy writer is not a corrupt task: replay must still register it
+/// and deliver its stop, even when the bounded open retries are exhausted.
+#[tokio::test]
+async fn a_stop_racing_every_replay_metadata_open_still_delivers_one_completion() {
+    use std::os::unix::fs::MetadataExt;
+
+    // Disk discovery resolves then reads metadata (skip 0/1); the batch's
+    // revalidation repeats those opens (skip 2/3). Project-scoped discovery
+    // reads metadata directly after resolving directories (skip 0, true).
+    for (skip_metadata_opens, project_scoped) in
+        [(1, false), (0, false), (2, false), (3, false), (0, true)]
+    {
+        let open_attempts = crate::bash_background::persistence::metadata_open_attempts_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let scope = owner_scope(&format!(
+            "stop-during-replay-metadata-open-{skip_metadata_opens}-{project_scoped}"
+        ));
+        let (_daemon, _clock, task_id, json) =
+            saved_due_draining_retry(dir.path(), &scope, u32::MAX).await;
+        let (recovered, errors) =
+            BgTaskRegistry::recover_saved_scope_tasks(dir.path(), &scope, &[]);
+        assert!(errors.is_empty(), "{errors:?}");
+        let recovery = recovered.into_iter().next().unwrap();
+        let project = registry();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let registration = {
+            let (project, storage) = (project.clone(), dir.path().to_path_buf());
+            std::thread::spawn(move || {
+                let mut metadata_opens = 0;
+                crate::bash_background::persistence::with_artifact_validation_hook_for_test(
+                    move |file| {
+                        let opened = file.metadata().unwrap();
+                        let current = fs::metadata(&json).unwrap();
+                        if (opened.dev(), opened.ino()) != (current.dev(), current.ino()) {
+                            return;
+                        }
+                        metadata_opens += 1;
+                        // Pause with the old metadata open, before its link count
+                        // is checked. Each owner write unlinks that exact handle.
+                        if (skip_metadata_opens + 1..=skip_metadata_opens + open_attempts)
+                            .contains(&metadata_opens)
+                        {
+                            reached_tx
+                                .send(metadata_opens - skip_metadata_opens)
+                                .unwrap();
+                            release_rx
+                                .recv_timeout(Duration::from_secs(30))
+                                .expect("the owner must release the metadata reader");
+                        }
+                    },
+                    || {
+                        if project_scoped {
+                            project.replay_session_for_project(&storage, "session", &storage)
+                        } else {
+                            project.replay_session(&storage, "session")
+                        }
+                    },
+                )
+            })
+        };
+        for attempt in 1..=open_attempts {
+            assert_eq!(
+                reached_rx.recv_timeout(Duration::from_secs(30)).unwrap(),
+                attempt
+            );
+            if attempt < open_attempts {
+                recovery
+                    .record_owner_pause_intent(&recovery.task(&task_id).unwrap())
+                    .unwrap();
+            } else {
+                let members = recovery.begin_scope_pause(&scope).unwrap();
+                recovery.pause_scope(&scope, true, &members).unwrap();
+            }
+            release_tx.send(()).unwrap();
+        }
+        registration.join().unwrap().unwrap();
+        assert_project_told_of_the_stop_once(&project, &task_id);
+        assert_paused(&project, &task_id);
+        recovery.detach();
+        project.detach();
+    }
+}
+
 /// `bash.kill_scope` recovered a saved task and holds it without a worker.
 /// The task's project then binds and registers that same task. The pause
 /// records no cancellation (as when it fails part way), so the held task must
