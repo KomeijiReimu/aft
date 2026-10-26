@@ -264,7 +264,13 @@ fn failed_spawn_releases_reservation_for_retry_and_all_waiters() {
         let two = scope.spawn(|| {
             ensure_server_for_file_detailed_unlocked(|| f.manager.lock(), &f.file, &f.config)
         });
+        let mut manager = f.manager.lock();
+        let signal = Arc::clone(&manager.starting[&f.key].signal);
         pause.resume.send(()).unwrap();
+        assert!(signal.wait_until(Instant::now() + WAIT));
+        manager.publish_completed_starts();
+        assert!(manager.starting.is_empty());
+        drop(manager);
         let one = one.join().unwrap();
         let two = two.join().unwrap();
         assert!(matches!(
@@ -306,6 +312,7 @@ fn closing_project_during_startup_reaps_child_and_never_installs_it() {
             f.manager.lock().quiesce();
         }
         resume_tx.send(()).unwrap();
+        assert!(signal.cancelled.load(Ordering::SeqCst));
         assert!(signal.wait_until(Instant::now() + WAIT));
         // waitpid blocks in the kernel, not a timing loop; the client's reaper
         // may already have consumed the exit status, which also proves exit.
