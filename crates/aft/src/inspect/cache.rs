@@ -2140,7 +2140,7 @@ fn inspect_scope_candidate(
 
     // Keep the lease through deletion so a concurrent writer either wins first
     // and protects the scope, or starts after this directory has been removed.
-    let _writer_lease = match crate::fs_lock::try_acquire(
+    let mut writer_lease = match crate::fs_lock::try_acquire(
         &crate::root_cache::writer_lease_path(scope_dir),
         Duration::ZERO,
     ) {
@@ -2151,6 +2151,7 @@ fn inspect_scope_candidate(
         return InspectScopeCandidateResult::SkippedMarker;
     }
 
+    writer_lease.stop_heartbeat_for_removal();
     match fs::remove_dir_all(scope_dir) {
         Ok(()) => InspectScopeCandidateResult::Removed { bytes: stats.bytes },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && !scope_dir.exists() => {

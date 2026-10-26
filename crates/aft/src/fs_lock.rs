@@ -392,10 +392,13 @@ impl LockGuard {
             Err(ReadLockError::Malformed(_)) => Ok(false),
         }
     }
-}
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
+    /// Stop and join the heartbeat, closing its kept descriptor without
+    /// unlinking the lease. Retention uses this immediately before moving or
+    /// removing a cache tree: Windows cannot rename a directory containing an
+    /// open lease file. The lease remains on disk and excludes other writers
+    /// during the move; the guard must be dropped after the operation, even on
+    /// error. Do not stop it early: remote hosts still rely on heartbeat age.
+    pub(crate) fn stop_heartbeat_for_removal(&mut self) {
         // Signal shutdown then unconditionally join the heartbeat thread
         // BEFORE removing the lockfile. The earlier `recv_timeout(100ms)`
         // implementation could let `remove_lock_if_owned` race with a
@@ -441,7 +444,13 @@ impl Drop for LockGuard {
         // Stop publishing the slot so a later replacement for this path never
         // waits on this guard's closed handle.
         unregister_lease_slot(self.pump.slot, &self.path);
+        self.pump.visible.store(false, Ordering::Release);
+    }
+}
 
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        self.stop_heartbeat_for_removal();
         match remove_lock_if_owned(&self.path, &self.metadata) {
             Ok(true) => slog_debug!("released filesystem lock at {}", self.path.display()),
             Ok(false) => {}
@@ -4242,6 +4251,55 @@ mod tests {
         }
         let ledger = io_ledger::take();
         assert_beat_opens_no_descriptor(&ledger);
+    }
+
+    #[test]
+    fn stopped_heartbeat_releases_handle_without_unlocking_or_touching_replacement() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cache = dir.path().join("cache");
+        fs::create_dir(&cache).expect("cache dir");
+        let path = cache.join("writer.lease");
+        let mut guard = acquire_with_config(&path, None, test_config()).expect("acquire lease");
+        let _ = io_ledger::take();
+
+        guard.stop_heartbeat_for_removal();
+        assert_eq!(io_ledger::take().closes, 1, "close the kept handle now");
+        assert!(guard.heartbeat.is_none(), "join before closing the handle");
+        assert!(guard.heartbeat_file.lock().unwrap().is_none());
+        assert!(!guard
+            .verify_writer_epoch()
+            .expect("stopped guard is not writable"));
+        assert!(matches!(
+            guard.pump.heartbeat_once(),
+            Err(HeartbeatError::NotPumped)
+        ));
+        assert!(matches!(
+            try_acquire_once(&path),
+            Err(AcquireError::Timeout)
+        ));
+        assert!(lock_identity_matches(
+            &read_lock_metadata(&path).expect("lease remains until removal"),
+            &guard.metadata
+        ));
+
+        // Windows refuses this directory rename while the heartbeat handle is
+        // open. Keep the lease on disk until the directory has moved so another
+        // writer cannot enter the old cache during retirement.
+        let retired = dir.path().join("retired");
+        fs::rename(&cache, &retired).expect("retire with the lease guard still alive");
+        fs::create_dir(&cache).expect("replacement cache");
+        let replacement = acquire_with_config(&path, None, test_config()).expect("new owner");
+        let canary = cache.join("canary");
+        fs::write(&canary, b"replacement").expect("canary");
+        drop(guard);
+        assert!(replacement
+            .verify_writer_epoch()
+            .expect("replacement owns lease"));
+        assert_eq!(
+            fs::read(canary).expect("replacement preserved"),
+            b"replacement"
+        );
+        fs::remove_dir_all(retired).expect("reap without a lingering lease handle");
     }
 
     #[test]
