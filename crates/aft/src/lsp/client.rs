@@ -2219,6 +2219,26 @@ impl LspClient {
         })
     }
 
+    /// Clone the installed client's writer for startup replay outside the manager lock.
+    pub(crate) fn startup_notification_writer(&self) -> Result<LspWriter, LspError> {
+        self.ensure_can_send()?;
+        Ok(self.writer.clone())
+    }
+
+    pub(crate) fn record_startup_sync(&mut self, uri: &lsp_types::Uri, opened: bool, saved: bool) {
+        self.note_analysis_document(
+            if opened {
+                "textDocument/didOpen"
+            } else {
+                "textDocument/didChange"
+            },
+            &json!({"textDocument": {"uri": uri.as_str()}}),
+        );
+        if saved {
+            self.record_save_sent(uri);
+        }
+    }
+
     /// Send a notification (fire-and-forget).
     pub fn send_notification<N>(&mut self, params: N::Params) -> Result<(), LspError>
     where

@@ -513,3 +513,96 @@ fn file_change_during_cancelled_startup_is_not_replayed() {
         "closed reservation leaked a notification into its replacement"
     );
 }
+
+#[test]
+fn unlocked_request_waits_until_startup_notification_replay_finishes() {
+    let f = notification_fixture();
+    let pause = pause_first_spawn(&f);
+    locked(&f, |manager| {
+        manager.ensure_server_for_file_detailed(&f.file, &f.config)
+    });
+    pause.entered.recv_timeout(WAIT).unwrap();
+    std::fs::write(&f.file, "latest disk content").unwrap();
+    locked(&f, |manager| {
+        manager.notify_file_changed_versioned(&f.file, "not retained", &f.config)
+    })
+    .unwrap();
+    let (entered_tx, entered_rx) = unbounded();
+    let (resume_tx, resume_rx) = unbounded();
+    let signal = Arc::clone(&f.manager.lock().starting[&f.key].signal);
+    *signal.replay_hook.lock() = Some(Arc::new(move || {
+        assert!(!MANAGER_LOCK_HELD.get());
+        entered_tx.send(()).unwrap();
+        resume_rx.recv_timeout(WAIT).unwrap();
+    }));
+    let (done_tx, done_rx) = unbounded();
+    std::thread::scope(|scope| {
+        let waiting = scope.spawn(|| {
+            let result =
+                ensure_server_for_file_detailed_unlocked(|| f.manager.lock(), &f.file, &f.config);
+            done_tx.send(()).unwrap();
+            result
+        });
+        pause.resume.send(()).unwrap();
+        entered_rx.recv_timeout(WAIT).unwrap();
+        assert!(
+            f.manager.try_lock().is_some(),
+            "replay held the manager mutex"
+        );
+        assert!(
+            done_rx.try_recv().is_err(),
+            "request returned before replay completed"
+        );
+        resume_tx.send(()).unwrap();
+        assert_eq!(waiting.join().unwrap().successful, vec![f.key.clone()]);
+    });
+    let messages = recorded_notifications(&f);
+    assert_eq!(
+        messages[0]["params"]["textDocument"]["text"],
+        "latest disk content"
+    );
+}
+
+#[test]
+fn startup_notification_path_bound_rejects_instead_of_dropping() {
+    let f = notification_fixture();
+    let pause = pause_first_spawn(&f);
+    locked(&f, |manager| {
+        manager.ensure_server_for_file_detailed(&f.file, &f.config)
+    });
+    pause.entered.recv_timeout(WAIT).unwrap();
+    {
+        let mut manager = f.manager.lock();
+        let reservation = manager.starting.get_mut(&f.key).unwrap();
+        reservation.notification_versions.insert(f.file.clone(), 0);
+        for index in 1..STARTUP_NOTIFICATION_PATH_CAP {
+            reservation
+                .notification_versions
+                .insert(f.file.with_file_name(format!("{index}.reserved")), 0);
+        }
+        assert_eq!(
+            manager.queue_startup_notification(&f.key, &f.file).unwrap(),
+            1
+        );
+        let extra = f.file.with_file_name("over-cap.reserved");
+        let error = manager
+            .queue_startup_notification(&f.key, &extra)
+            .unwrap_err();
+        assert_eq!(
+            STARTUP_NOTIFICATION_QUEUE_FULL,
+            "language-server startup notification queue is full; retry the file change"
+        );
+        assert!(
+            matches!(error, LspError::ServerNotReady(ref reason) if reason == STARTUP_NOTIFICATION_QUEUE_FULL)
+        );
+        assert_eq!(
+            manager.starting[&f.key].notification_versions.len(),
+            STARTUP_NOTIFICATION_PATH_CAP
+        );
+        assert!(!manager.starting[&f.key]
+            .pending_notifications
+            .contains(&extra));
+    }
+    f.manager.lock().quiesce();
+    pause.resume.send(()).unwrap();
+}

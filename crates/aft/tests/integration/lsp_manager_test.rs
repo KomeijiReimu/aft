@@ -179,9 +179,14 @@ fn rust_worker_cap_refuses_n_plus_one_without_spawn() {
     let pid_dir = fixtures[2].0.path().join("pids");
     fs::create_dir(&pid_dir).unwrap();
     managers[2].set_extra_env("AFT_FAKE_LSP_PID_DIR", &pid_dir.display().to_string());
-    let result = crate::test_helpers::settled_lsp(&mut managers[2], |startup_manager| {
-        startup_manager.ensure_server_for_file_detailed(&fixtures[2].1, &config)
-    });
+    let result = {
+        let manager = std::cell::RefCell::new(&mut managers[2]);
+        aft::lsp::manager::ensure_server_for_file_detailed_unlocked(
+            || std::cell::RefMut::map(manager.borrow_mut(), |manager| &mut **manager),
+            &fixtures[2].1,
+            &config,
+        )
+    };
     assert!(
         result.successful.is_empty(),
         "the third analyzer must not be admitted"
@@ -221,9 +226,14 @@ fn rust_worker_cap_admits_next_request_after_slot_release_without_restart() {
             1
         );
     }
-    let refused = crate::test_helpers::settled_lsp(&mut managers[2], |startup_manager| {
-        startup_manager.ensure_server_for_file_detailed(&fixtures[2].1, &config)
-    });
+    let refused = {
+        let manager = std::cell::RefCell::new(&mut managers[2]);
+        aft::lsp::manager::ensure_server_for_file_detailed_unlocked(
+            || std::cell::RefMut::map(manager.borrow_mut(), |manager| &mut **manager),
+            &fixtures[2].1,
+            &config,
+        )
+    };
     assert!(refused.successful.is_empty());
     assert!(refused.attempts[0]
         .result

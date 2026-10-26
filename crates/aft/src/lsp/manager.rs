@@ -444,6 +444,9 @@ pub struct ApplicableServerStartOutcomes {
 
 pub const START_IN_PROGRESS_STATUS: &str = "start_in_progress";
 pub const START_IN_PROGRESS_REASON: &str = "server startup is in progress; retry shortly";
+pub const STARTUP_NOTIFICATION_PATH_CAP: usize = 8_192;
+pub const STARTUP_NOTIFICATION_QUEUE_FULL: &str =
+    "language-server startup notification queue is full; retry the file change";
 
 impl ServerAttemptResult {
     pub fn failure_reason(&self) -> String {
@@ -1952,11 +1955,11 @@ impl LspManager {
         if self.is_quiesced() {
             return FileServerStart::Failed(ServerAttemptResult::ProjectClosed);
         }
-        if self.clients.contains_key(key) {
-            return FileServerStart::Running;
-        }
         if self.starting.contains_key(key) {
             return FileServerStart::Wait;
+        }
+        if self.clients.contains_key(key) {
+            return FileServerStart::Running;
         }
         if let Some(cached) = self.failure_to_replay(key) {
             return FileServerStart::Failed(cached);
@@ -1973,6 +1976,9 @@ impl LspManager {
                         deferred_events: Vec::new(),
                         clients_generation: self.clients_generation,
                         signal: Arc::new(StartSignal::default()),
+                        notification_versions: HashMap::new(),
+                        pending_notifications: HashSet::new(),
+                        replay_pid: None,
                     },
                 );
                 FileServerStart::Spawn(Box::new(prepared))
@@ -2018,12 +2024,12 @@ impl LspManager {
                         let result = prepared.run(Some(timeout));
                         worker_signal.complete(result);
                         drop(guard);
+                        if let Some(manager) = owner.upgrade() {
+                            manager.lock().publish_completed_starts();
+                        }
                         #[cfg(test)]
                         if let Some(hook) = finished_hook {
                             hook();
-                        }
-                        if let Some(manager) = owner.upgrade() {
-                            manager.lock().publish_completed_starts();
                         }
                     });
                 if let Err(error) = worker {
@@ -2039,45 +2045,51 @@ impl LspManager {
         }
     }
 
-    /// Publish only results still owned by the current reservation. A cancelled
-    /// worker may finish after shutdown or a replacement start; its client drops
-    /// on the worker instead of reviving the old route.
+    /// Publish each completed startup phase under the manager lock. Notification
+    /// replay uses a cloned writer on its own worker, never this lock.
     fn publish_completed_starts(&mut self) {
-        let ready: Vec<_> = self
-            .starting
-            .iter()
-            .filter_map(|(key, reservation)| {
-                if !reservation.signal.wait_until(Instant::now()) {
-                    return None;
-                }
-                Some((
-                    key.clone(),
-                    reservation.definition.clone(),
-                    reservation.signal.completion.lock().take(),
-                ))
-            })
-            .collect();
-        for (key, definition, result) in ready {
+        let keys: Vec<_> = self.starting.keys().cloned().collect();
+        for key in keys {
+            let Some(reservation) = self.starting.get(&key) else {
+                continue;
+            };
+            let signal = Arc::clone(&reservation.signal);
+            if !signal.wait_until(Instant::now()) {
+                continue;
+            }
             let cancelled = self.is_quiesced()
-                || self.starting.get(&key).is_none_or(|r| {
-                    r.clients_generation != self.clients_generation
-                        || r.signal
-                            .cancelled
-                            .load(std::sync::atomic::Ordering::Acquire)
-                });
-            if cancelled || result.is_none() {
-                drop(result);
+                || reservation.clients_generation != self.clients_generation
+                || signal.cancelled.load(std::sync::atomic::Ordering::Acquire);
+            let replay_pid = reservation.replay_pid;
+            let definition = reservation.definition.clone();
+            if cancelled {
+                signal.cancel();
+                if replay_pid.is_some_and(|pid| {
+                    self.clients
+                        .get(&key)
+                        .is_some_and(|client| client.child_pid() == pid)
+                }) {
+                    self.clients.remove(&key);
+                    self.forget_server_state(Some(&key));
+                }
                 self.release_start_reservation(&key);
-            } else if let Some(definition) = definition {
-                self.finish_file_server_start(&definition, &key, result.unwrap());
+            } else if replay_pid.is_some() {
+                let completed = signal.replay_completion.lock().take();
+                if let Some(result) = completed {
+                    self.finish_notification_replay(&key, result);
+                }
+            } else {
+                let completed = signal.completion.lock().take();
+                if let (Some(result), Some(definition)) = (completed, definition) {
+                    self.finish_file_server_start(&definition, &key, result);
+                }
             }
         }
     }
 
-    /// Wait for starts already admitted by a locked call. A standalone
-    /// LspManager has no startup_owner mutex to upgrade; this method publishes
-    /// its completions. Callers sharing a mutex should use
-    /// ensure_server_for_file_detailed_unlocked instead of waiting under a guard.
+    /// Wait for starts admitted by a locked call, including queued document
+    /// replay. A standalone manager publishes its own completed worker phases.
+    /// Shared-manager callers should prefer the unlocked startup helpers.
     pub fn wait_for_startups(&mut self, deadline: Instant) -> bool {
         let signals: Vec<_> = self
             .starting
@@ -2085,16 +2097,193 @@ impl LspManager {
             .map(|r| Arc::clone(&r.signal))
             .collect();
         for signal in signals {
-            if !signal.wait_until(deadline) {
-                return false;
+            loop {
+                self.publish_completed_starts();
+                if signal.outcome.lock().is_some() {
+                    break;
+                }
+                if !signal.wait_until(deadline) {
+                    return false;
+                }
             }
         }
-        self.publish_completed_starts();
         true
     }
 
     pub fn has_pending_startups(&self) -> bool {
         !self.starting.is_empty()
+    }
+
+    fn queue_startup_notification(
+        &mut self,
+        key: &ServerKey,
+        path: &Path,
+    ) -> Result<i32, LspError> {
+        self.mark_pulled_report_stale(key, path);
+        let reservation = self
+            .starting
+            .get_mut(key)
+            .expect("startup reservation exists");
+        if !reservation.notification_versions.contains_key(path)
+            && reservation.notification_versions.len() >= STARTUP_NOTIFICATION_PATH_CAP
+        {
+            return Err(LspError::ServerNotReady(
+                STARTUP_NOTIFICATION_QUEUE_FULL.into(),
+            ));
+        }
+        let version = reservation
+            .notification_versions
+            .get(path)
+            .copied()
+            .or_else(|| {
+                self.documents
+                    .get(key)
+                    .and_then(|store| store.version(path))
+            })
+            .map_or(0, |version| version + 1);
+        reservation
+            .notification_versions
+            .insert(path.to_path_buf(), version);
+        reservation.pending_notifications.insert(path.to_path_buf());
+        Ok(version)
+    }
+
+    /// Snapshot paths and reserve their versions under the manager lock. The
+    /// worker reads current disk contents and sends through this client's writer.
+    fn start_notification_replay(&mut self, key: &ServerKey) {
+        let sender = self
+            .clients
+            .get(key)
+            .ok_or_else(|| LspError::ServerNotReady("server not found".into()))
+            .and_then(|client| {
+                Ok((
+                    client.startup_notification_writer()?,
+                    client.save_notification(),
+                    client.child_pid(),
+                ))
+            });
+        let (writer, save, pid) = match sender {
+            Ok(sender) => sender,
+            Err(error) => {
+                self.complete_startup_outcome(
+                    key,
+                    Some(ServerAttemptResult::SpawnFailed {
+                        binary: self.server_binaries.get(key).cloned().unwrap_or_default(),
+                        reason: error.to_string(),
+                    }),
+                );
+                return;
+            }
+        };
+        let reservation = self
+            .starting
+            .get_mut(key)
+            .expect("startup reservation exists");
+        let paths = std::mem::take(&mut reservation.pending_notifications);
+        let mut jobs: Vec<_> = paths
+            .into_iter()
+            .map(|path| {
+                let version = reservation.notification_versions[&path];
+                let opened = !self
+                    .documents
+                    .get(key)
+                    .is_some_and(|store| store.is_open(&path));
+                (path, version, opened)
+            })
+            .collect();
+        jobs.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+        for (path, version, _) in &jobs {
+            self.documents
+                .entry(key.clone())
+                .or_default()
+                .sync_at_version(path.clone(), *version, &DiskSnapshot::default());
+        }
+        reservation.replay_pid = Some(pid);
+        let signal = Arc::clone(&reservation.signal);
+        *signal
+            .finished
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        let owner = self.startup_owner.clone();
+        let worker_signal = Arc::clone(&signal);
+        let worker = std::thread::Builder::new()
+            .name("lsp-startup-sync".into())
+            .spawn(move || {
+                let guard = StartupWorkerGuard(Arc::clone(&worker_signal));
+                let result = replay_startup_notifications(writer, save, pid, &worker_signal, jobs);
+                *worker_signal.replay_completion.lock() = Some(result);
+                worker_signal.finish();
+                drop(guard);
+                if let Some(manager) = owner.upgrade() {
+                    manager.lock().publish_completed_starts();
+                }
+            });
+        if let Err(error) = worker {
+            *signal.replay_completion.lock() = Some(StartupReplayResult {
+                pid,
+                documents: Vec::new(),
+                error: Some(error.into()),
+            });
+            signal.finish();
+        }
+    }
+
+    fn finish_notification_replay(&mut self, key: &ServerKey, result: StartupReplayResult) {
+        if !self
+            .clients
+            .get(key)
+            .is_some_and(|client| client.child_pid() == result.pid)
+        {
+            self.complete_startup_outcome(
+                key,
+                Some(ServerAttemptResult::SpawnFailed {
+                    binary: self.server_binaries.get(key).cloned().unwrap_or_default(),
+                    reason: "server not found".into(),
+                }),
+            );
+            return;
+        }
+        for document in result.documents {
+            self.documents
+                .entry(key.clone())
+                .or_default()
+                .sync_at_version(document.path.clone(), document.version, &document.disk);
+            if let Ok(uri) = uri_for_path(&document.path) {
+                if let Some(client) = self.clients.get_mut(key) {
+                    let saved = client.save_notification().is_some();
+                    client.record_startup_sync(&uri, document.opened, saved);
+                }
+            }
+            self.queue_background_document_pull(key, &document.path);
+        }
+        if let Some(error) = result.error {
+            self.complete_startup_outcome(
+                key,
+                Some(ServerAttemptResult::SpawnFailed {
+                    binary: self.server_binaries.get(key).cloned().unwrap_or_default(),
+                    reason: error.to_string(),
+                }),
+            );
+        } else if self
+            .starting
+            .get(key)
+            .is_some_and(|r| !r.pending_notifications.is_empty())
+        {
+            self.start_notification_replay(key);
+        } else {
+            self.complete_startup_outcome(key, None);
+        }
+    }
+
+    /// Publish the final startup outcome for all waiters before releasing the reservation.
+    fn complete_startup_outcome(&mut self, key: &ServerKey, outcome: Option<ServerAttemptResult>) {
+        if let Some(reservation) = self.starting.get(key) {
+            *reservation.signal.outcome.lock() =
+                Some(outcome.unwrap_or_else(|| ServerAttemptResult::Ok {
+                    server_key: key.clone(),
+                }));
+        }
+        self.release_start_reservation(key);
     }
 
     pub(crate) fn pending_startup_files(&self) -> Vec<(ServerKey, PathBuf)> {
@@ -2141,10 +2330,6 @@ impl LspManager {
         key: &ServerKey,
         result: Result<LspClient, SpawnFailure>,
     ) -> Option<ServerAttemptResult> {
-        let signal = self
-            .starting
-            .get(key)
-            .map(|reservation| Arc::clone(&reservation.signal));
         let started_generation = self
             .starting
             .get(key)
@@ -2195,17 +2380,30 @@ impl LspManager {
                 if self.clients.contains_key(key) {
                     None
                 } else {
-                    Some(self.record_file_start_failure(def, key, failure))
+                    Some(
+                        if self.starting.get(key).is_some_and(|r| {
+                            r.signal
+                                .request_deadline_exceeded
+                                .load(std::sync::atomic::Ordering::Acquire)
+                        }) {
+                            classify_spawn_error(&def.binary, &failure.error)
+                        } else {
+                            self.record_file_start_failure(def, key, failure)
+                        },
+                    )
                 }
             }
         };
-        if let Some(signal) = signal {
-            *signal.outcome.lock() =
-                Some(outcome.clone().unwrap_or_else(|| ServerAttemptResult::Ok {
-                    server_key: key.clone(),
-                }));
+        if outcome.is_none()
+            && self
+                .starting
+                .get(key)
+                .is_some_and(|r| !r.pending_notifications.is_empty())
+        {
+            self.start_notification_replay(key);
+        } else {
+            self.complete_startup_outcome(key, outcome.clone());
         }
-        self.release_start_reservation(key);
         outcome
     }
 
@@ -2224,7 +2422,7 @@ impl LspManager {
         servers_for_file(file_path, config)
             .into_iter()
             .filter_map(|def| server_key_for_definition(&def, file_path, config))
-            .filter(|key| self.clients.contains_key(key))
+            .filter(|key| self.clients.contains_key(key) || self.starting.contains_key(key))
             .collect()
     }
 
@@ -2482,7 +2680,16 @@ impl LspManager {
         config: &Config,
     ) -> Result<Vec<(ServerKey, i32)>, LspError> {
         let canonical_path = canonicalize_for_lsp(file_path)?;
-        let server_keys = self.ensure_server_for_file(&canonical_path, config);
+        let outcomes = self.ensure_server_for_file_detailed(&canonical_path, config);
+        let server_keys = outcomes
+            .attempts
+            .into_iter()
+            .filter_map(|attempt| match attempt.result {
+                ServerAttemptResult::Ok { server_key }
+                | ServerAttemptResult::InProgress { server_key } => Some(server_key),
+                _ => None,
+            })
+            .collect();
         self.notify_file_changed_for_server_keys(canonical_path, content, server_keys)
     }
 
@@ -2540,6 +2747,11 @@ impl LspManager {
         let disk = DiskSnapshot::read(&canonical_path);
 
         for key in server_keys {
+            if self.starting.contains_key(&key) {
+                let version = self.queue_startup_notification(&key, &canonical_path)?;
+                versions.push((key, version));
+                continue;
+            }
             // The server is about to hold text its pulled report may not
             // describe. A pull-only server publishes nothing after the
             // change, so without this a scoped inspect would keep certifying
@@ -3617,6 +3829,7 @@ impl LspManager {
         max_events: usize,
         preserve_pull_observations: bool,
     ) -> DrainedLspEvents {
+        self.publish_completed_starts();
         let mut events = Vec::new();
         let mut deferred_pull_events = Vec::new();
         let mut accepted_snapshots = if preserve_pull_observations {
@@ -4262,6 +4475,10 @@ impl LspManager {
     ) -> Vec<StoredDiagnostic> {
         let lookup_path = normalize_lookup_path(file_path);
 
+        // A locked notification may have admitted startup without waiting. An
+        // explicit diagnostics wait must drive both startup and replay phases.
+        self.wait_for_startups(deadline);
+
         if self.server_key_for_file(&lookup_path, config).is_none() {
             return Vec::new();
         }
@@ -4349,6 +4566,10 @@ impl LspManager {
         config: &Config,
         deadline: Option<Instant>,
     ) -> Result<Vec<PullFileResult>, LspError> {
+        self.ensure_server_for_file_detailed(file_path, config);
+        self.wait_for_startups(deadline.unwrap_or_else(|| {
+            Instant::now() + super::client::HANDSHAKE_REQUEST_TIMEOUT + INITIALIZE_EXIT_WAIT
+        }));
         let pulls = self.begin_file_pulls(file_path, config, deadline)?;
         Ok(pulls
             .into_iter()
@@ -7495,6 +7716,84 @@ impl PreparedSpawn {
     }
 }
 
+struct StartupReplayDocument {
+    path: PathBuf,
+    version: i32,
+    opened: bool,
+    disk: DiskSnapshot,
+}
+
+struct StartupReplayResult {
+    pid: u32,
+    documents: Vec<StartupReplayDocument>,
+    error: Option<LspError>,
+}
+
+/// Read each queued path only when its client is installed. The writer belongs
+/// to that exact client. Cancellation prevents later replay sends from starting;
+/// the child registry terminates the process for already queued writer jobs.
+fn replay_startup_notifications(
+    writer: super::writer::LspWriter,
+    save: Option<SaveNotification>,
+    pid: u32,
+    signal: &StartSignal,
+    jobs: Vec<(PathBuf, i32, bool)>,
+) -> StartupReplayResult {
+    let mut result = StartupReplayResult {
+        pid,
+        documents: Vec::new(),
+        error: None,
+    };
+    for (path, version, opened) in jobs {
+        let sent = (|| -> Result<DiskSnapshot, LspError> {
+            let disk = DiskSnapshot::read(&path);
+            let content = std::fs::read_to_string(&path)?;
+            let uri = uri_for_path(&path)?;
+            #[cfg(test)]
+            if let Some(hook) = signal.replay_hook.lock().clone() {
+                hook();
+            }
+            let _send = signal.replay_gate.lock();
+            if signal.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(LspError::ProjectClosed);
+            }
+            let payload = if opened {
+                let language = language_id_for_extension(
+                    path.extension()
+                        .and_then(|ext| ext.to_str())
+                        .unwrap_or_default(),
+                );
+                serde_json::to_string(
+                    &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": uri.as_str(), "languageId": language, "version": version, "text": content}}}),
+                )?
+            } else {
+                super::client::full_did_change_message(&uri, version, &content)?
+            };
+            writer.send(payload)?;
+            if let Some(save) = save {
+                writer.send(super::client::did_save_message(
+                    &uri,
+                    (save == SaveNotification::IncludeText).then_some(content.as_str()),
+                )?)?;
+            }
+            Ok(disk)
+        })();
+        match sent {
+            Ok(disk) => result.documents.push(StartupReplayDocument {
+                path,
+                version,
+                opened,
+                disk,
+            }),
+            Err(error) => {
+                result.error = Some(error);
+                break;
+            }
+        }
+    }
+    result
+}
+
 /// Completion flag for a server start running without the manager lock. A
 /// second start of the same server waits on it instead of spawning a twin.
 #[derive(Default)]
@@ -7503,7 +7802,12 @@ struct StartSignal {
     changed: std::sync::Condvar,
     completion: parking_lot::Mutex<Option<Result<LspClient, SpawnFailure>>>,
     outcome: parking_lot::Mutex<Option<ServerAttemptResult>>,
+    replay_completion: parking_lot::Mutex<Option<StartupReplayResult>>,
+    replay_gate: parking_lot::Mutex<()>,
     cancelled: std::sync::atomic::AtomicBool,
+    request_deadline_exceeded: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    replay_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl StartSignal {
@@ -7517,6 +7821,7 @@ impl StartSignal {
     }
 
     fn cancel(&self) {
+        let _replay = self.replay_gate.lock();
         self.cancelled
             .store(true, std::sync::atomic::Ordering::Release);
         *self.outcome.lock() = Some(ServerAttemptResult::ProjectClosed);
@@ -7566,6 +7871,34 @@ struct StartReservation {
     /// `LspManager::clients_generation` when the start began.
     clients_generation: u64,
     signal: Arc<StartSignal>,
+    /// Keep assigned versions until replay ends, including paths already sent,
+    /// so an edit arriving during replay cannot reset the document version.
+    notification_versions: HashMap<PathBuf, i32>,
+    /// Paths only: replay reads current disk text rather than retaining edits.
+    /// New distinct paths are rejected at the cap, never silently evicted.
+    pending_notifications: HashSet<PathBuf>,
+    /// The installed client instance whose writer is replaying these paths.
+    replay_pid: Option<u32>,
+}
+
+/// Wait through spawn and replay until a final startup outcome or the deadline.
+fn wait_for_startup_outcome<G>(
+    lock: impl Fn() -> G,
+    signal: &StartSignal,
+    deadline: Instant,
+) -> Option<ServerAttemptResult>
+where
+    G: std::ops::DerefMut<Target = LspManager>,
+{
+    loop {
+        lock().publish_completed_starts();
+        if let Some(outcome) = signal.outcome.lock().clone() {
+            return Some(outcome);
+        }
+        if !signal.wait_until(deadline) {
+            return None;
+        }
+    }
 }
 
 /// Start or join one producer's reserved startup without holding the manager
@@ -7608,13 +7941,12 @@ pub fn start_applicable_server_unlocked(
     };
     let result = if let (ServerAttemptResult::InProgress { .. }, Some(signal)) = (&initial, signal)
     {
-        if signal.wait_until(deadline) {
-            manager.lock().publish_completed_starts();
-            let completed = signal.outcome.lock().clone();
-            completed.unwrap_or(initial)
-        } else {
+        wait_for_startup_outcome(|| manager.lock(), &signal, deadline).unwrap_or_else(|| {
+            signal
+                .request_deadline_exceeded
+                .store(true, std::sync::atomic::Ordering::Release);
             initial
-        }
+        })
     } else {
         initial
     };
@@ -7675,13 +8007,14 @@ where
                 (result, signal)
             };
             if let (ServerAttemptResult::InProgress { .. }, Some(signal)) = (&initial, signal) {
-                if signal.wait_until(Instant::now() + Duration::from_secs(30)) {
-                    lock().publish_completed_starts();
-                    let completed = signal.outcome.lock().clone();
-                    completed.unwrap_or(initial)
-                } else {
-                    initial
-                }
+                wait_for_startup_outcome(
+                    &lock,
+                    &signal,
+                    Instant::now()
+                        + super::client::HANDSHAKE_REQUEST_TIMEOUT
+                        + INITIALIZE_EXIT_WAIT,
+                )
+                .unwrap_or(initial)
             } else {
                 initial
             }
@@ -9220,6 +9553,9 @@ mod unlocked_start_tests {
             StartReservation {
                 definition: None,
                 source_file: None,
+                notification_versions: HashMap::new(),
+                pending_notifications: HashSet::new(),
+                replay_pid: None,
                 deferred_events: Vec::new(),
                 clients_generation: manager.clients_generation,
                 signal: Arc::clone(&signal),
