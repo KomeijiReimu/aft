@@ -8,7 +8,9 @@ use crate::blob_store::v2::FamilyPlane;
 
 use super::contracts::{LoaderStage, PlaneError, ViewAccess};
 use super::manifest_v2::Producers;
-use super::snapshot::{LiveEntry, OpenGeneration, Snapshot};
+use super::snapshot::{
+    ComposedGeneration, InstallCut, LiveDelta, LiveEntry, PlaneReaders, Snapshot,
+};
 use super::RelPath;
 
 /// A complete strict content walk under the checkout's current ignore rules.
@@ -18,11 +20,34 @@ use super::RelPath;
 pub struct ReconciledCheckout {
     pub revision: u64,
     pub entries: BTreeMap<RelPath, LiveEntry>,
+    pub cut: Option<InstallCut>,
+    /// Content-bound readiness already known at the strict cut.
+    pub readiness: BTreeMap<RelPath, super::snapshot::PlanePatch>,
+    /// Outer None delegates CAS to an external driver; Some(None) is an empty pointer.
+    pub publication_base: Option<Option<String>>,
 }
 
 /// The runtime owner supplies source reads and generation construction. Plane
 /// implementations attach their data here rather than writing shared runtime code.
 pub trait FirstLoadDriver: Send + Sync {
+    fn validate_cut(
+        &self,
+        access: &ViewAccess,
+        _snapshot: &Snapshot,
+        revision: u64,
+    ) -> Result<(), PlaneError> {
+        if self.revision(access) == revision {
+            Ok(())
+        } else {
+            Err(PlaneError::loader(
+                LoaderStage::Installation,
+                CHECKOUT_CHANGED_BEFORE_INSTALL,
+            ))
+        }
+    }
+    fn installed_after(&self, fallback: &Snapshot) -> Snapshot {
+        fallback.clone()
+    }
     /// The loader calls this before choosing a seed. It must not write or block
     /// on model work; every selected manifest must match these producer identities.
     fn producers(&self, access: &ViewAccess) -> Producers;
@@ -49,12 +74,12 @@ pub trait FirstLoadDriver: Send + Sync {
         access: &ViewAccess,
         snapshot: &Snapshot,
         seed_derived: bool,
-    ) -> Result<Arc<OpenGeneration>, PlaneError>;
+    ) -> Result<Arc<ComposedGeneration>, PlaneError>;
 
     /// Called with a reconciled seed snapshot, then with the rebased own snapshot.
-    /// It must atomically install resident data and snapshot under the root lock,
-    /// rejecting an obsolete revision. It may block on that lock, never build,
-    /// publish, repair another checkout's state, or report success before data is installed.
+    /// It atomically installs resident data and snapshot under the root lock,
+    /// replaying delivered edits and refusing a changed epoch or bundle identity.
+    /// It may block on that lock, never build, publish or repair foreign state.
     fn install(
         &self,
         access: &ViewAccess,
@@ -86,6 +111,356 @@ pub const CHECKOUT_CHANGED_BEFORE_INSTALL: &str = "checkout changed before snaps
 
 /// The reason a [`PublishFence`] gives when it refuses a publication.
 pub const SUPERSEDED_PUBLISH: &str = "checkout view owner superseded; publication refused";
+
+/// Operations supplied by the durable base/referrer owner. The defaults refuse
+/// every operation: a legacy view registration does not protect a shared base.
+/// The registry implementation must supply markers that pin the exact base,
+/// intent rows that protect the pending worker-to-base reference, and flushes
+/// that make every referenced artifact durable before publishing the pointer.
+pub trait PublicationBinding {
+    fn cut(&mut self) -> Result<(), PlaneError> {
+        Err(binding_unavailable())
+    }
+    fn acquire(&mut self) -> Result<(), PlaneError> {
+        Err(binding_unavailable())
+    }
+    fn build_and_flush(&mut self) -> Result<(), PlaneError> {
+        Err(binding_unavailable())
+    }
+    fn open_readers(&mut self) -> Result<(), PlaneError> {
+        Err(binding_unavailable())
+    }
+    fn verify_held(&mut self) -> Result<(), PlaneError> {
+        Err(binding_unavailable())
+    }
+    fn publish(&mut self) -> Result<super::manifest_v2::PublishV2, PlaneError> {
+        Err(binding_unavailable())
+    }
+    /// Hold the ownership PublishFence across final marker verification and
+    /// pointer CAS, and return only after the pointer is synced. Keeping both
+    /// operations in one callback prevents a validation-to-CAS ownership race.
+    /// Mark `MayHaveLanded` immediately before CAS, before any error can hide a
+    /// committed transaction. Leave it `NotAttempted` if verification refuses.
+    fn publish_verified(
+        &mut self,
+        _progress: &mut PublicationProgress,
+    ) -> Result<super::manifest_v2::PublishV2, PlaneError> {
+        Err(binding_unavailable())
+    }
+    fn referrer_published(&mut self) -> Result<(), PlaneError> {
+        Err(binding_unavailable())
+    }
+    fn install_replayed(&mut self) -> Result<(), PlaneError> {
+        Err(binding_unavailable())
+    }
+    fn schedule_revalidated(&mut self) -> Result<(), PlaneError> {
+        Err(binding_unavailable())
+    }
+    /// Preserve intent and temporary protection for a publication that landed or
+    /// whose CAS outcome is uncertain. Recovery must reconcile the pointer and
+    /// finish its referrer/install; it must not abort the published reference.
+    fn recover_published(&mut self) -> Result<(), PlaneError> {
+        Err(binding_unavailable())
+    }
+    /// Remove the temporary insertion intent and acquisition marker after a
+    /// known unpublished attempt, or after InstalledBundle.readers retains
+    /// independent ComposedGeneration residency markers. Never called to abort
+    /// a landed or uncertain CAS after a later step failed.
+    fn terminal_cleanup(&mut self) -> Result<(), PlaneError> {
+        Err(binding_unavailable())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PublicationProgress {
+    #[default]
+    NotAttempted,
+    /// Set before invoking CAS: a storage error may hide a committed transaction.
+    MayHaveLanded,
+    Published,
+}
+
+fn binding_unavailable() -> PlaneError {
+    PlaneError::loader(
+        LoaderStage::Driver,
+        "durable base publication binding is not wired",
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BindingOutcome {
+    Installed,
+    Revalidate,
+}
+
+/// The sole shared-base publication/install ordering seam. `publish_verified`
+/// holds the ownership fence across verification and the synced pointer CAS; `install_replayed` must hold the root write lock through journal
+/// replay, epoch/base checks and the exact installed-bundle identity check.
+pub fn publish_and_install(
+    binding: &mut dyn PublicationBinding,
+) -> Result<BindingOutcome, PlaneError> {
+    let mut progress = PublicationProgress::NotAttempted;
+    let result: Result<BindingOutcome, PlaneError> = (|| {
+        binding.cut()?;
+        binding.acquire()?;
+        binding.build_and_flush()?;
+        binding.open_readers()?;
+        match binding.publish_verified(&mut progress)? {
+            super::manifest_v2::PublishV2::Published => {
+                progress = PublicationProgress::Published;
+            }
+            super::manifest_v2::PublishV2::Conflict { .. }
+            | super::manifest_v2::PublishV2::EquivalentWinner { .. } => {
+                progress = PublicationProgress::NotAttempted;
+                return Ok(BindingOutcome::Revalidate);
+            }
+        }
+        binding.referrer_published()?;
+        binding.install_replayed()?;
+        Ok(BindingOutcome::Installed)
+    })();
+    let recovering = result.is_err() && progress != PublicationProgress::NotAttempted;
+    let cleanup = if recovering {
+        binding.recover_published()
+    } else {
+        binding.terminal_cleanup()
+    };
+    match (result, cleanup) {
+        (Err(error), Err(cleanup)) => Err(SiblingLoader::error(format!(
+            "publication failed: {}; {} failed: {}",
+            error.reason,
+            if recovering {
+                "published recovery"
+            } else {
+                "terminal cleanup"
+            },
+            cleanup.reason
+        ))),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(outcome), Ok(())) => {
+            if outcome == BindingOutcome::Revalidate {
+                binding.schedule_revalidated()?;
+            }
+            Ok(outcome)
+        }
+    }
+}
+
+#[cfg(test)]
+mod publication_binding_tests {
+    use super::super::manifest_v2::PublishV2;
+    use super::*;
+
+    struct DefaultBinding;
+    impl PublicationBinding for DefaultBinding {}
+
+    #[test]
+    fn unwired_publication_binding_refuses_every_step() {
+        let mut binding = DefaultBinding;
+        assert!(binding.cut().is_err());
+        assert!(binding.acquire().is_err());
+        assert!(binding.build_and_flush().is_err());
+        assert!(binding.open_readers().is_err());
+        assert!(binding.verify_held().is_err());
+        assert!(binding.publish().is_err());
+        let mut progress = PublicationProgress::NotAttempted;
+        assert!(binding.publish_verified(&mut progress).is_err());
+        assert_eq!(progress, PublicationProgress::NotAttempted);
+        assert!(binding.referrer_published().is_err());
+        assert!(binding.install_replayed().is_err());
+        assert!(binding.schedule_revalidated().is_err());
+        assert!(binding.recover_published().is_err());
+        assert!(binding.terminal_cleanup().is_err());
+        let error = publish_and_install(&mut binding).unwrap_err();
+        assert!(error.reason.contains("terminal cleanup failed"));
+    }
+
+    struct Binding {
+        steps: Vec<&'static str>,
+        fail: Option<&'static str>,
+        outcome: PublishV2,
+        intent: Option<std::path::PathBuf>,
+    }
+    impl Binding {
+        fn step(&mut self, name: &'static str) -> Result<(), PlaneError> {
+            self.steps.push(name);
+            if self.fail == Some(name) {
+                Err(SiblingLoader::error(name))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    impl PublicationBinding for Binding {
+        fn cut(&mut self) -> Result<(), PlaneError> {
+            self.step("cut")
+        }
+        fn acquire(&mut self) -> Result<(), PlaneError> {
+            self.step("acquire")?;
+            if let Some(path) = &self.intent {
+                std::fs::write(path, b"pending reference").unwrap();
+            }
+            Ok(())
+        }
+        fn build_and_flush(&mut self) -> Result<(), PlaneError> {
+            self.step("closure-flushed")
+        }
+        fn open_readers(&mut self) -> Result<(), PlaneError> {
+            self.step("readers-opened")
+        }
+        fn verify_held(&mut self) -> Result<(), PlaneError> {
+            self.step("verify-held")
+        }
+        fn publish(&mut self) -> Result<PublishV2, PlaneError> {
+            self.step("pointer-synced")?;
+            Ok(self.outcome.clone())
+        }
+        fn publish_verified(
+            &mut self,
+            progress: &mut PublicationProgress,
+        ) -> Result<PublishV2, PlaneError> {
+            self.verify_held()?;
+            *progress = PublicationProgress::MayHaveLanded;
+            self.publish()
+        }
+        fn referrer_published(&mut self) -> Result<(), PlaneError> {
+            self.step("referrer-published")
+        }
+        fn install_replayed(&mut self) -> Result<(), PlaneError> {
+            self.step("installed")
+        }
+        fn schedule_revalidated(&mut self) -> Result<(), PlaneError> {
+            self.step("revalidated-job")
+        }
+        fn terminal_cleanup(&mut self) -> Result<(), PlaneError> {
+            self.step("terminal-cleanup")?;
+            if let Some(path) = &self.intent {
+                if path.exists() {
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+            Ok(())
+        }
+        fn recover_published(&mut self) -> Result<(), PlaneError> {
+            self.step("published-recovery")
+        }
+    }
+
+    #[test]
+    fn publication_binding_nine_steps_and_phase_appropriate_failure_recovery() {
+        let expected = [
+            "cut",
+            "acquire",
+            "closure-flushed",
+            "readers-opened",
+            "verify-held",
+            "pointer-synced",
+            "referrer-published",
+            "installed",
+            "terminal-cleanup",
+        ];
+        let mut binding = Binding {
+            steps: Vec::new(),
+            fail: None,
+            outcome: PublishV2::Published,
+            intent: None,
+        };
+        assert_eq!(
+            publish_and_install(&mut binding).unwrap(),
+            BindingOutcome::Installed
+        );
+        assert_eq!(binding.steps, expected);
+        for (index, step) in expected.iter().enumerate() {
+            let mut binding = Binding {
+                steps: Vec::new(),
+                fail: Some(step),
+                outcome: PublishV2::Published,
+                intent: None,
+            };
+            assert!(publish_and_install(&mut binding).is_err(), "{step}");
+            let mut prefix = expected[..=index].to_vec();
+            if *step != "terminal-cleanup" {
+                prefix.push(if index >= 5 {
+                    "published-recovery"
+                } else {
+                    "terminal-cleanup"
+                });
+            }
+            assert_eq!(binding.steps, prefix, "{step}");
+        }
+    }
+
+    #[test]
+    fn losing_and_equivalent_jobs_cleanup_then_revalidate_never_install() {
+        for outcome in [
+            PublishV2::Conflict {
+                current: Some("foreign".into()),
+            },
+            PublishV2::EquivalentWinner {
+                current: "equivalent".into(),
+            },
+        ] {
+            let mut binding = Binding {
+                steps: Vec::new(),
+                fail: None,
+                outcome,
+                intent: None,
+            };
+            assert_eq!(
+                publish_and_install(&mut binding).unwrap(),
+                BindingOutcome::Revalidate
+            );
+            assert_eq!(
+                binding.steps,
+                [
+                    "cut",
+                    "acquire",
+                    "closure-flushed",
+                    "readers-opened",
+                    "verify-held",
+                    "pointer-synced",
+                    "terminal-cleanup",
+                    "revalidated-job"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn landed_or_ambiguous_cas_failure_preserves_insertion_protection() {
+        for failed in ["pointer-synced", "referrer-published", "installed"] {
+            let directory = tempfile::tempdir().unwrap();
+            let intent = directory.path().join("insertion-intent");
+            let mut binding = Binding {
+                steps: Vec::new(),
+                fail: Some(failed),
+                outcome: PublishV2::Published,
+                intent: Some(intent.clone()),
+            };
+            assert!(publish_and_install(&mut binding).is_err());
+            assert!(
+                intent.is_file(),
+                "{failed}: recovery discarded the published reference's protection"
+            );
+            assert!(!binding.steps.contains(&"terminal-cleanup"));
+            assert_eq!(binding.steps.last(), Some(&"published-recovery"));
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let intent = directory.path().join("insertion-intent");
+        let mut binding = Binding {
+            steps: Vec::new(),
+            fail: Some("verify-held"),
+            outcome: PublishV2::Published,
+            intent: Some(intent.clone()),
+        };
+        assert!(publish_and_install(&mut binding).is_err());
+        assert!(
+            !intent.exists(),
+            "a known pre-CAS refusal should release its temporary protection"
+        );
+    }
+}
 
 /// Decides, atomically with the pointer publication itself, whether the
 /// driver may still publish its checkout's view. A runtime that can be
@@ -126,7 +501,7 @@ impl SiblingLoader {
         PlaneError::loader(stage, reason)
     }
 
-    fn seed(&self, access: &ViewAccess) -> Result<Arc<OpenGeneration>, PlaneError> {
+    fn seed(&self, access: &ViewAccess) -> Result<Arc<ComposedGeneration>, PlaneError> {
         let producers = self.driver.producers(access);
         if let ViewAccess::Reader {
             registration,
@@ -159,7 +534,7 @@ impl SiblingLoader {
             if let Ok(Some(generation)) =
                 super::read::open_foreign_generation(&reader, &member.scope, &producers)
             {
-                let exact_head = head.is_some() && generation.manifest().header().head_tree == head;
+                let exact_head = head.is_some() && generation.header().head_tree == head;
                 candidates.push((
                     member.scope == owner.scope(),
                     exact_head,
@@ -173,7 +548,7 @@ impl SiblingLoader {
         if let Some((_, _, _, _, generation)) = candidates.into_iter().next() {
             return Ok(generation);
         }
-        Ok(Arc::new(OpenGeneration::new(
+        Ok(Arc::new(ComposedGeneration::new(
             "empty",
             super::manifest_v2::ManifestV2::new(super::manifest_v2::ManifestHeader {
                 producers,
@@ -188,7 +563,7 @@ impl SiblingLoader {
     fn reconciled(
         &self,
         access: &ViewAccess,
-        base: Arc<OpenGeneration>,
+        base: Arc<ComposedGeneration>,
     ) -> Result<(Snapshot, u64), PlaneError> {
         for _ in 0..3 {
             // Read before the walk, so an ignore edit racing the walk shows up
@@ -201,7 +576,7 @@ impl SiblingLoader {
                 _ => None,
             };
             let checkout = self.driver.reconcile(access)?;
-            if self.driver.revision(access) != checkout.revision {
+            if checkout.cut.is_none() && self.driver.revision(access) != checkout.revision {
                 continue;
             }
             let mut delta = super::snapshot::LiveDelta::new(Arc::clone(&base));
@@ -209,7 +584,7 @@ impl SiblingLoader {
             delta.record_root_ignore_files(ignore_files);
             // Full walker membership replaces seed membership, including ignored
             // sibling paths and files deleted in this checkout.
-            for (path, _) in base.manifest().entries() {
+            for (path, _) in base.entries() {
                 if !checkout.entries.contains_key(path) {
                     delta.apply(
                         path.clone(),
@@ -220,7 +595,18 @@ impl SiblingLoader {
             for (path, entry) in checkout.entries {
                 delta.apply(path, entry);
             }
-            return Ok((delta.snapshot(), checkout.revision));
+            for (path, patch) in checkout.readiness {
+                delta.set_readiness(path, patch);
+            }
+            let strict_epoch = checkout.cut.as_ref().map_or(delta.epoch(), |cut| cut.epoch);
+            let mut snapshot = delta.snapshot().with_reconciled_epoch(strict_epoch);
+            if let Some(base) = checkout.publication_base {
+                snapshot = snapshot.with_publication_base(base);
+            }
+            if let Some(cut) = checkout.cut {
+                snapshot = snapshot.with_install_cut(cut);
+            }
+            return Ok((snapshot, checkout.revision));
         }
         Err(Self::stage_error(
             LoaderStage::Reconciliation,
@@ -231,7 +617,11 @@ impl SiblingLoader {
     fn open_planes(&self, access: &ViewAccess, snapshot: &Snapshot) -> Vec<PlaneError> {
         let mut pending = Vec::new();
         for adapter in &self.adapters {
-            if let Err(error) = adapter.open_generation(access, snapshot.generation()) {
+            if let Err(error) = if snapshot.readers().is_none() {
+                adapter.open_generation(access, snapshot.generation())
+            } else {
+                Ok(())
+            } {
                 pending.push(error);
                 continue;
             }
@@ -255,67 +645,57 @@ impl SiblingLoader {
     pub(crate) fn refresh(
         &self,
         access: &ViewAccess,
-        base: Arc<OpenGeneration>,
+        base: Arc<ComposedGeneration>,
     ) -> Result<Snapshot, PlaneError> {
         let (snapshot, revision) = self.reconciled(access, base)?;
         self.driver.install(access, &snapshot, revision)?;
+        let snapshot = self.driver.installed_after(&snapshot);
         self.fold(access, &snapshot, revision)
     }
 
-    /// Fold plane completions from a revision-fenced cut. Publication is not a
-    /// source edit: only a delivered edit during the build requires a new walk.
+    /// Fold plane completions from an installed cut. Ordinary delivered edits
+    /// replay during installation; watcher or membership gaps invalidate its epoch.
     pub(crate) fn fold(
         &self,
         access: &ViewAccess,
         snapshot: &Snapshot,
         revision: u64,
     ) -> Result<Snapshot, PlaneError> {
-        if self.driver.revision(access) != revision
-            || snapshot.pending_intent().next().is_some()
-            || matches!(access, ViewAccess::Owner(owner) if super::intent::active(owner.root()))
-        {
-            return Err(Self::stage_error(
-                LoaderStage::Installation,
-                CHECKOUT_CHANGED_BEFORE_INSTALL,
-            ));
-        }
+        self.driver.validate_cut(access, snapshot, revision)?;
         let own = self
             .driver
             .build_own_generation(access, snapshot, DERIVED_CALLGRAPH_SEEDING)?;
-        own.manifest()
-            .ensure_producers(&self.driver.producers(access))
+        own.ensure_producers(&self.driver.producers(access))
             .map_err(|error| {
                 Self::stage_error(LoaderStage::ProducerValidation, error.to_string())
             })?;
-        let (snapshot, revision) = if self.driver.revision(access) == revision {
+        if snapshot.install_cut().is_none() {
+            // Legacy drivers do not supply a replayable cut. They must obtain
+            // new disk facts instead of treating a builder's claims as a walk.
+            let (fresh, revision) = self.reconciled(access, own)?;
+            self.driver.install(access, &fresh, revision)?;
+            return Ok(self.driver.installed_after(&fresh));
+        }
+        let snapshot = {
             // Rebase the reconciled disk facts, not the new manifest's claims.
             // A builder can leave pending data without changing source bytes.
-            let members = snapshot.membership();
-            let mut delta = super::snapshot::LiveDelta::new(Arc::clone(&own));
-            delta.bump_epoch();
-            // The membership is the reconciled one, so are its ignore rules.
-            delta.record_root_ignore_files(snapshot.root_ignore_files().cloned());
-            for (path, _) in own.manifest().entries() {
-                if !members.contains_key(path) {
-                    delta.apply(
-                        path.clone(),
-                        LiveEntry::new(super::snapshot::DiskState::Absent, revision),
-                    );
-                }
+            let mut delta = LiveDelta::from_snapshot(snapshot);
+            let draft = super::snapshot::derive_successor(
+                &delta.cut(),
+                own,
+                &super::snapshot::carry_disk_state_only,
+            );
+            delta
+                .replay_and_swap(draft, &super::snapshot::carry_disk_state_only)
+                .map_err(|error| Self::error(format!("{error:?}")))?;
+            let next = delta.snapshot();
+            match snapshot.install_cut() {
+                Some(cut) => next.with_install_cut(cut.clone()),
+                None => next,
             }
-            for (path, disk) in members {
-                let entry = match snapshot.source(&path) {
-                    super::snapshot::Source::Live(entry) => entry.clone(),
-                    _ => LiveEntry::new(disk, revision),
-                };
-                delta.apply(path, entry);
-            }
-            (delta.snapshot(), revision)
-        } else {
-            self.reconciled(access, own)?
         };
         self.driver.install(access, &snapshot, revision)?;
-        Ok(snapshot)
+        Ok(self.driver.installed_after(&snapshot))
     }
 }
 
@@ -324,7 +704,14 @@ impl super::contracts::PlaneLoader for SiblingLoader {
         let seed = self.seed(access)?;
         if access.is_read_only() {
             let snapshot = super::snapshot::LiveDelta::new(seed).snapshot();
-            let pending_planes = self.open_planes(access, &snapshot);
+            let (readers, mut pending_planes) =
+                PlaneReaders::open_available(access, snapshot.generation().clone(), &self.adapters);
+            let snapshot = snapshot.with_readers(readers);
+            for gap in self.open_planes(access, &snapshot) {
+                if !pending_planes.iter().any(|error| error.plane == gap.plane) {
+                    pending_planes.push(gap);
+                }
+            }
             return Ok(super::contracts::LoadOutcome {
                 snapshot,
                 pending_planes,
@@ -332,6 +719,7 @@ impl super::contracts::PlaneLoader for SiblingLoader {
         }
         let (snapshot, revision) = self.reconciled(access, seed)?;
         self.driver.install(access, &snapshot, revision)?;
+        let snapshot = self.driver.installed_after(&snapshot);
         let snapshot = self.fold(access, &snapshot, revision)?;
         let pending_planes = self.open_planes(access, &snapshot);
         Ok(super::contracts::LoadOutcome {
@@ -426,14 +814,20 @@ mod tests {
             if self.walks.fetch_add(1, Ordering::SeqCst) == 0 {
                 self.revision.fetch_add(1, Ordering::SeqCst);
             }
-            Ok(ReconciledCheckout { revision, entries })
+            Ok(ReconciledCheckout {
+                revision,
+                entries,
+                cut: None,
+                readiness: Default::default(),
+                publication_base: None,
+            })
         }
         fn build_own_generation(
             &self,
             _: &ViewAccess,
             _: &Snapshot,
             seed_derived: bool,
-        ) -> Result<Arc<OpenGeneration>, PlaneError> {
+        ) -> Result<Arc<ComposedGeneration>, PlaneError> {
             assert!(!seed_derived, "derived callgraph reuse must stay disabled");
             if std::env::var("AFT_FIRST_LOAD_PAUSE").as_deref() == Ok("before") {
                 park_child(self.owner.registry().storage());
@@ -558,7 +952,7 @@ mod tests {
             super::super::read::open_foreign_generation(&reader, "foreign", &producers())
                 .unwrap()
                 .unwrap();
-        assert_eq!(generation.manifest().len(), 1);
+        assert_eq!(generation.len(), 1);
         assert_eq!(std::fs::read(store.pointer_path()).unwrap(), before);
         assert_eq!(inventory(temp.path()), inventory_before);
         assert_eq!(registry.gc_epoch().unwrap(), epoch_before);
@@ -778,8 +1172,12 @@ mod tests {
             .register_view_with_storage(registry.storage(), "local", temp.path())
             .unwrap();
         let access = ViewAccess::Owner(owner);
-        let snapshot =
-            LiveDelta::new(Arc::new(OpenGeneration::new("test", manifest(&[]), None))).snapshot();
+        let snapshot = LiveDelta::new(Arc::new(ComposedGeneration::new(
+            "test",
+            manifest(&[]),
+            None,
+        )))
+        .snapshot();
         let state = Arc::new(State {
             polls: AtomicU64::new(0),
             snapshot: snapshot.clone(),
@@ -867,10 +1265,17 @@ pub trait MembershipWalker: Send + Sync {
     fn files(&self, root: &std::path::Path) -> Result<Vec<std::path::PathBuf>, PlaneError>;
 }
 
-struct InstalledCheckout {
+#[derive(Clone)]
+/// One installed checkout authority. Cloned query handles keep the composed
+/// generation, journal cut, coverage and resident readers from the same install.
+pub struct InstalledBundle {
+    pub seq: u64,
+    pub composed: Arc<ComposedGeneration>,
+    pub coverage: BTreeMap<FamilyPlane, super::readiness::PlaneReadiness>,
+    pub readers: Arc<PlaneReaders>,
+    pub published: super::manifest_v2::PublishedFrontier,
     revision: u64,
     snapshot: Snapshot,
-    prepared_generation: Option<String>,
     uncertain_paths: std::collections::BTreeSet<std::path::PathBuf>,
     own_installed: bool,
 }
@@ -1037,9 +1442,20 @@ pub struct CheckoutDriver {
     adapters: Vec<Arc<dyn super::contracts::PlaneAdapter>>,
     publish_fence: std::sync::RwLock<Option<Arc<dyn PublishFence>>>,
     observed: std::sync::Mutex<ObservedCheckout>,
-    installed: std::sync::Mutex<InstalledCheckout>,
+    installed: std::sync::Mutex<Arc<InstalledBundle>>,
+    live: std::sync::Mutex<LiveDelta>,
+    prepared_readers: std::sync::Mutex<BTreeMap<String, PreparedReaders>>,
+    // Serialize the final identity check/CAS with the installed sequence swap,
+    // without holding query locks during I/O or plane-reader retirement.
+    publication_transition: std::sync::Mutex<()>,
+    retry: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     work: std::sync::Mutex<ReconcileWork>,
+}
+
+struct PreparedReaders {
+    seq: u64,
+    readers: Arc<PlaneReaders>,
 }
 
 /// Source work only; publication and model counters belong to their stores.
@@ -1054,6 +1470,16 @@ pub(crate) struct ReconcileWork {
 }
 
 impl CheckoutDriver {
+    pub fn take_revalidated_job(&self) -> bool {
+        self.retry.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    pub fn installed_bundle(&self) -> Arc<InstalledBundle> {
+        self.installed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
     pub fn new(
         owner: super::registry::ViewRegistration,
         producers: Producers,
@@ -1067,9 +1493,23 @@ impl CheckoutDriver {
             ignore_fingerprint: None,
             segment: None,
         });
-        let mut delta =
-            super::snapshot::LiveDelta::new(Arc::new(OpenGeneration::new("empty", empty, None)));
+        let mut delta = super::snapshot::LiveDelta::new(Arc::new(ComposedGeneration::new(
+            "empty", empty, None,
+        )));
         delta.set_watcher(super::snapshot::WatcherState::Reconciling);
+        let composed = delta.base().clone();
+        let readers = PlaneReaders::open(&ViewAccess::Owner(owner.clone()), composed.clone(), &[])
+            .expect("empty reader lease");
+        let snapshot = delta
+            .snapshot()
+            .with_readers(readers.clone())
+            .with_install_cut(InstallCut {
+                seq: 0,
+                resident: composed.clone(),
+                epoch: delta.epoch(),
+                version: delta.version(),
+                intent_version: delta.snapshot().intent_version(),
+            });
         Self {
             owner,
             producers,
@@ -1079,13 +1519,21 @@ impl CheckoutDriver {
             adapters: Vec::new(),
             publish_fence: std::sync::RwLock::new(None),
             observed: Default::default(),
-            installed: std::sync::Mutex::new(InstalledCheckout {
+            installed: std::sync::Mutex::new(Arc::new(InstalledBundle {
+                seq: 0,
+                composed,
+                readers,
+                coverage: BTreeMap::new(),
+                published: Default::default(),
                 revision: 0,
-                snapshot: delta.snapshot(),
-                prepared_generation: None,
+                snapshot,
                 uncertain_paths: std::collections::BTreeSet::new(),
                 own_installed: false,
-            }),
+            })),
+            live: std::sync::Mutex::new(delta),
+            prepared_readers: Default::default(),
+            publication_transition: Default::default(),
+            retry: Default::default(),
             #[cfg(test)]
             work: Default::default(),
         }
@@ -1107,28 +1555,42 @@ impl CheckoutDriver {
         self
     }
 
-    /// Invalidates in-flight walks/builds and records an unreflected path under
-    /// the same lock as installation. This method performs no filesystem writes.
+    /// Journals an unreflected write under the same root lock as installation.
+    /// Ordinary edits replay onto a draft instead of invalidating its whole build.
+    /// This method performs no filesystem writes.
     pub fn record_change(&self, path: RelPath) {
+        let mut delta = self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut installed = self
             .installed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let installed = Arc::make_mut(&mut installed);
         installed.revision += 1;
         // Keep prior membership until reconciliation, but mark the edited path
         // as unreflected so queries cannot report stale data as installed.
-        let mut delta =
-            super::snapshot::LiveDelta::new(Arc::clone(installed.snapshot.generation()));
-        for (path, entry) in installed.snapshot.live_entries() {
-            delta.apply(path.clone(), entry.clone());
-        }
-        for pending in installed.snapshot.pending_intent() {
-            delta.record_intent(pending.clone());
+        for plane in &self.planes {
+            if plane.applies_to(&path) {
+                installed
+                    .coverage
+                    .insert(plane.plane(), super::readiness::PlaneReadiness::Building);
+            }
         }
         delta.record_intent(path);
         // Membership is unchanged, so are the ignore rules it was walked under.
         delta.record_root_ignore_files(installed.snapshot.root_ignore_files().cloned());
-        installed.snapshot = delta.snapshot();
+        installed.snapshot = delta
+            .snapshot()
+            .with_readers(installed.readers.clone())
+            .with_install_cut(InstallCut {
+                seq: installed.seq,
+                resident: installed.composed.clone(),
+                epoch: delta.epoch(),
+                version: delta.version(),
+                intent_version: delta.snapshot().intent_version(),
+            });
     }
 
     fn check_owner(&self, access: &ViewAccess) -> Result<(), PlaneError> {
@@ -1143,9 +1605,60 @@ impl CheckoutDriver {
             )),
         }
     }
+
+    fn validate_install_identity(
+        &self,
+        snapshot: &Snapshot,
+        cut: &InstallCut,
+        live: &super::snapshot::LiveDelta,
+        installed: &InstalledBundle,
+    ) -> Result<(), PlaneError> {
+        if cut.seq != installed.seq || !Arc::ptr_eq(&cut.resident, &installed.composed) {
+            return Err(SiblingLoader::error(format!(
+                "{CHECKOUT_CHANGED_BEFORE_INSTALL}: BaseChanged: installed bundle superseded"
+            )));
+        }
+        // A prior ignore-file record is not proof that the current membership
+        // epoch was walked. Only the completed strict walk carries this tag.
+        let strict = snapshot.reconciled_epoch() == Some(live.epoch());
+        if !installed.uncertain_paths.is_empty() && !strict {
+            return Err(SiblingLoader::error(format!(
+                "{CHECKOUT_CHANGED_BEFORE_INSTALL}: membership requires strict reconciliation"
+            )));
+        }
+        match live.watcher() {
+            super::snapshot::WatcherState::Healthy => Ok(()),
+            super::snapshot::WatcherState::Reconciling if strict => Ok(()),
+            _ => Err(SiblingLoader::error(format!(
+                "{CHECKOUT_CHANGED_BEFORE_INSTALL}: watcher is not healthy or strictly reconciled"
+            ))),
+        }
+    }
 }
 
 impl FirstLoadDriver for CheckoutDriver {
+    fn installed_after(&self, _: &Snapshot) -> Snapshot {
+        self.installed_snapshot()
+    }
+    fn validate_cut(&self, _: &ViewAccess, snapshot: &Snapshot, _: u64) -> Result<(), PlaneError> {
+        let cut = snapshot
+            .install_cut()
+            .ok_or_else(|| SiblingLoader::error("missing installed bundle identity"))?;
+        let live = self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        live.replay_onto(snapshot, cut)
+            .map(|_| ())
+            .map_err(|error| {
+                SiblingLoader::error(format!("{CHECKOUT_CHANGED_BEFORE_INSTALL}: {error:?}"))
+            })?;
+        let installed = self
+            .installed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.validate_install_identity(snapshot, cut, &live, &installed)
+    }
     fn producers(&self, _: &ViewAccess) -> Producers {
         self.producers.clone()
     }
@@ -1163,6 +1676,13 @@ impl FirstLoadDriver for CheckoutDriver {
         if super::intent::active(self.owner.root()) {
             return Err(SiblingLoader::error(CHECKOUT_WRITE_ACTIVE));
         }
+        let publication_base =
+            match super::ViewStore::existing_dir(self.owner.view_dir().to_path_buf()) {
+                Some(store) => store
+                    .current_generation_read_only()
+                    .map_err(|error| SiblingLoader::error(error.to_string()))?,
+                None => None,
+            };
         let (installed, revision) = self.installed_cut();
         let pending: std::collections::BTreeSet<_> = installed.pending_intent().cloned().collect();
         let previous = self
@@ -1249,40 +1769,175 @@ impl FirstLoadDriver for CheckoutDriver {
             entries: entries.clone(),
             stats,
         };
-        Ok(ReconciledCheckout { revision, entries })
+        Ok(ReconciledCheckout {
+            revision,
+            entries,
+            cut: installed.install_cut().cloned(),
+            readiness: installed.readiness_patches().clone(),
+            publication_base: Some(publication_base),
+        })
     }
     fn install(
         &self,
         access: &ViewAccess,
         snapshot: &Snapshot,
-        revision: u64,
+        _revision: u64,
     ) -> Result<(), PlaneError> {
         self.check_owner(access)?;
+        let cut = snapshot
+            .install_cut()
+            .ok_or_else(|| SiblingLoader::error("missing installed bundle identity"))?;
+        let old_bundle = self.installed_bundle();
+        let previously_owned = old_bundle.own_installed
+            && old_bundle.composed.resident_key() == snapshot.generation().resident_key();
+        drop(old_bundle);
+        let prepared = self
+            .prepared_readers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(snapshot.generation().name())
+            .map(|prepared| prepared.readers.clone());
+        let from_prepared = prepared.is_some();
+        let own_installed = prepared.is_some() || previously_owned;
+        let readers = match prepared {
+            Some(readers) => readers,
+            None => {
+                let old = self
+                    .installed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if Arc::ptr_eq(&old.composed, snapshot.generation()) {
+                    old.readers.clone()
+                } else {
+                    drop(old);
+                    let adapters: Vec<_> = self
+                        .adapters
+                        .iter()
+                        .filter(|adapter| {
+                            snapshot.generation().name() != "empty"
+                                && (adapter.plane() != FamilyPlane::Callgraph || own_installed)
+                        })
+                        .cloned()
+                        .collect();
+                    PlaneReaders::open(access, snapshot.generation().clone(), &adapters)?
+                }
+            }
+        };
+        let publication_guard = self
+            .publication_transition
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut live = self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let install_error = |error: PlaneError| {
+            if from_prepared {
+                self.retry.store(true, std::sync::atomic::Ordering::Release);
+                SiblingLoader::error(format!(
+                    "{CHECKOUT_CHANGED_BEFORE_INSTALL}: published installation refused: {}",
+                    error.reason
+                ))
+            } else {
+                error
+            }
+        };
+        let mut successor = live.replay_onto(snapshot, cut).map_err(|error| {
+            install_error(SiblingLoader::error(format!(
+                "{CHECKOUT_CHANGED_BEFORE_INSTALL}: {error:?}"
+            )))
+        })?;
         let mut installed = self
             .installed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if revision != installed.revision {
-            return Err(SiblingLoader::error(CHECKOUT_CHANGED_BEFORE_INSTALL));
-        }
-        let own_installed =
-            installed.prepared_generation.as_deref() == Some(snapshot.generation().name());
-        for adapter in &self.adapters {
-            if snapshot.generation().name() != "empty"
-                && (adapter.plane() != FamilyPlane::Callgraph || own_installed)
-            {
-                adapter.open_generation(access, snapshot.generation())?;
+        self.validate_install_identity(snapshot, cut, &live, &installed)
+            .map_err(install_error)?;
+        let seq = installed.seq + 1;
+        successor.set_watcher(super::snapshot::WatcherState::Healthy);
+        let published = snapshot
+            .generation()
+            .published()
+            .cloned()
+            .unwrap_or_default();
+        let mut installed_snapshot = successor
+            .snapshot()
+            .with_readers(readers.clone())
+            .with_install_cut(InstallCut {
+                seq,
+                resident: snapshot.generation().clone(),
+                epoch: successor.epoch(),
+                version: successor.version(),
+                intent_version: successor.snapshot().intent_version(),
+            });
+        if snapshot.reconciled_epoch().is_some() {
+            if let Some(base) = snapshot.publication_base() {
+                installed_snapshot = installed_snapshot.with_publication_base(base.clone());
             }
         }
-        let old_name = installed.snapshot.generation().name().to_owned();
-        installed.snapshot = snapshot.clone();
-        installed.uncertain_paths.clear();
-        installed.own_installed = own_installed;
-        if old_name != snapshot.generation().name() {
-            for adapter in &self.adapters {
-                adapter.release_generation(access, &old_name);
-            }
+        let coverage = FamilyPlane::ALL
+            .into_iter()
+            .map(|plane| {
+                (
+                    plane,
+                    if installed_snapshot.pending_intent().any(|path| {
+                        self.planes
+                            .iter()
+                            .any(|driver| driver.plane() == plane && driver.applies_to(path))
+                    }) {
+                        super::readiness::PlaneReadiness::Building
+                    } else {
+                        super::readiness::plane_readiness(
+                            plane,
+                            Some(snapshot.generation()),
+                            &installed_snapshot,
+                            &Default::default(),
+                            &|path| {
+                                self.planes.iter().any(|bridge| {
+                                    bridge.plane() == plane && bridge.applies_to(path)
+                                })
+                            },
+                        )
+                    },
+                )
+            })
+            .collect();
+        let replacement = Arc::new(InstalledBundle {
+            seq,
+            composed: snapshot.generation().clone(),
+            coverage,
+            readers,
+            published,
+            revision: installed.revision,
+            snapshot: installed_snapshot,
+            uncertain_paths: Default::default(),
+            own_installed,
+        });
+        let retired_bundle = std::mem::replace(&mut *installed, replacement);
+        let retired_delta = std::mem::replace(&mut *live, successor);
+        drop(installed);
+        drop(live);
+        drop(publication_guard);
+        // Last-drop reader close and residency-pin cleanup can perform I/O.
+        // Keep displaced owners alive until both root locks are released.
+        drop(retired_bundle);
+        drop(retired_delta);
+        let mut retired_prepared = Vec::new();
+        {
+            let mut prepared = self
+                .prepared_readers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            prepared.retain(|_, entry| {
+                if entry.seq < seq {
+                    retired_prepared.push(entry.readers.clone());
+                    false
+                } else {
+                    true
+                }
+            });
         }
+        drop(retired_prepared);
         Ok(())
     }
     fn build_own_generation(
@@ -1290,8 +1945,11 @@ impl FirstLoadDriver for CheckoutDriver {
         access: &ViewAccess,
         snapshot: &Snapshot,
         seed_derived: bool,
-    ) -> Result<Arc<OpenGeneration>, PlaneError> {
+    ) -> Result<Arc<ComposedGeneration>, PlaneError> {
         self.check_owner(access)?;
+        if snapshot.generation().base_header().is_some() {
+            return Err(binding_unavailable());
+        }
         super::io::WORK
             .own_generation_folds
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1299,10 +1957,16 @@ impl FirstLoadDriver for CheckoutDriver {
             .owner
             .view_store()
             .map_err(|error| SiblingLoader::error(error.to_string()))?;
-        let base = store
-            .current_generation()
+        let base = match snapshot.publication_base() {
+            Some(base) => base.clone(),
+            None => store
+                .current_generation()
+                .map_err(|error| SiblingLoader::error(error.to_string()))?,
+        };
+        let mut manifest = snapshot
+            .generation()
+            .flatten()
             .map_err(|error| SiblingLoader::error(error.to_string()))?;
-        let mut manifest = snapshot.generation().manifest().clone();
         for (path, entry) in snapshot.live_entries() {
             let value = match entry.disk {
                 super::snapshot::DiskState::Absent => None,
@@ -1376,47 +2040,77 @@ impl FirstLoadDriver for CheckoutDriver {
                 .prepare_v2(&name, base.as_deref(), &manifest, None)
                 .map_err(|error| SiblingLoader::error(error.to_string()))?,
         );
+        let marker =
+            crate::root_cache::ReadMarker::create(self.owner.view_dir(), &name.to_string())
+                .map_err(|error| SiblingLoader::error(error.to_string()))?;
+        let generation = Arc::new(ComposedGeneration::new(
+            name.to_string(),
+            manifest,
+            Some(super::snapshot::Residency::Marker(marker)),
+        ));
+        // Reader construction is fallible and may open SQLite. It must finish
+        // before publication and never run under the installed-bundle mutex.
+        let readers = PlaneReaders::open(access, generation.clone(), &self.adapters)?;
+        let mut published = false;
+        let mut progress = PublicationProgress::NotAttempted;
+        let mut retired_readers = Vec::new();
         let mut commit = || {
+            let _publication_guard = self
+                .publication_transition
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.validate_cut(access, snapshot, 0)?;
             let prepared = prepared
                 .take()
                 .ok_or_else(|| SiblingLoader::error("publication committed twice"))?;
+            progress = PublicationProgress::MayHaveLanded;
             store
-                .commit_v2(prepared, None)
-                .map(|outcome| {
-                    if outcome == super::manifest_v2::PublishV2::Published {
+                .commit_v2_before_sweep(prepared, None, || store.current_generation_read_only().map(|_| ()))
+                .map_err(|error| SiblingLoader::error(error.to_string()))
+                .and_then(|outcome| match outcome {
+                    super::manifest_v2::PublishV2::Published => {
+                        progress = PublicationProgress::Published;
                         unpublished.complete();
+                        published = true;
+                        self.owner.registry().note_publish(self.owner.scope()).map_err(|error| SiblingLoader::error(error.to_string()))?;
+                        for adapter in &self.adapters {
+                            adapter.generation_published(access, &generation, &|| self.installed_snapshot())?;
+                        }
+                        let rebound = readers.rebind(access)?;
+                        let retired = self.prepared_readers.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(generation.name().to_owned(), PreparedReaders { seq: snapshot.install_cut().map_or(0, |cut| cut.seq), readers: rebound });
+                        if let Some(retired) = retired { retired_readers.push(retired.readers); }
+                        Ok(())
+                    },
+                    outcome @ (super::manifest_v2::PublishV2::Conflict { .. } | super::manifest_v2::PublishV2::EquivalentWinner { .. }) => {
+                        progress = PublicationProgress::NotAttempted;
+                        self.retry.store(true, std::sync::atomic::Ordering::Release);
+                        Err(SiblingLoader::error(format!("{CHECKOUT_CHANGED_BEFORE_INSTALL}: publication lost ({outcome:?}); revalidate a fresh job")))
                     }
                 })
-                .map_err(|error| SiblingLoader::error(error.to_string()))
         };
         let fence = self
             .publish_fence
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        match fence {
-            Some(fence) => fence.publish(&mut commit)?,
-            None => commit()?,
+        let publication = match fence {
+            Some(fence) => fence.publish(&mut commit),
+            None => commit(),
+        };
+        drop(commit);
+        drop(retired_readers);
+        if let Err(error) = publication {
+            if progress != PublicationProgress::NotAttempted {
+                unpublished.complete();
+                self.retry.store(true, std::sync::atomic::Ordering::Release);
+                return Err(SiblingLoader::error(format!("{CHECKOUT_CHANGED_BEFORE_INSTALL}: publication may have landed; revalidate: {}", error.reason)));
+            }
+            return Err(error);
         }
-        self.owner
-            .registry()
-            .note_publish(self.owner.scope())
-            .map_err(|error| SiblingLoader::error(error.to_string()))?;
-        let reader = self
-            .owner
-            .registry()
-            .register_reader("installed-owner")
-            .map_err(|error| SiblingLoader::error(error.to_string()))?;
-        let generation =
-            super::read::open_foreign_generation(&reader, self.owner.scope(), &self.producers)
-                .map_err(|error| SiblingLoader::error(error.to_string()))?
-                .ok_or_else(|| {
-                    SiblingLoader::error("own publication has no installed generation")
-                })?;
-        self.installed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .prepared_generation = Some(generation.name().to_owned());
+        if !published {
+            return Err(SiblingLoader::error("publication fence did not commit"));
+        }
         Ok(generation)
     }
 }
@@ -1465,11 +2159,11 @@ impl QueryState for CheckoutDriver {
                 .filter(|(path, _)| applicable(path))
                 .map(|(path, _)| path.clone()),
         );
-        for (path, entry) in snapshot.generation().manifest().entries() {
+        for (path, _entry) in snapshot.generation().entries() {
             if applicable(path)
                 && ((plane == FamilyPlane::Callgraph && !installed.own_installed)
                     || !matches!(
-                        entry.plane_state(plane),
+                        snapshot.plane_readiness(path, plane),
                         Some(super::readiness::PlaneState::Ready { .. })
                     ))
             {
@@ -1499,7 +2193,7 @@ impl QueryState for CheckoutDriver {
 
 #[cfg(test)]
 mod composite_tests {
-    use super::super::contracts::{PlaneLoader, QueryWait, WaitOutcome};
+    use super::super::contracts::{PlaneAdapter, PlaneLoader, QueryWait, WaitOutcome};
     use super::super::manifest_v2::{EntryPlanes, EntryV2, ManifestV2};
     use super::super::snapshot::{DiskState, PlaneAttachment};
     use super::*;
@@ -1634,6 +2328,530 @@ mod composite_tests {
         ));
         (driver, walker, plane, ViewAccess::Owner(owner))
     }
+
+    struct RetirePauseAdapter {
+        armed: AtomicBool,
+        entered: std::sync::mpsc::Sender<()>,
+        resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    struct PublicationOrderAdapter {
+        owner: super::super::registry::ViewRegistration,
+        producer: String,
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl PlaneAdapter for PublicationOrderAdapter {
+        fn plane(&self) -> FamilyPlane {
+            FamilyPlane::Trigram
+        }
+        fn producer(&self) -> String {
+            self.producer.clone()
+        }
+        fn applies_to(&self, _: &RelPath) -> bool {
+            true
+        }
+        fn open_generation(
+            &self,
+            access: &ViewAccess,
+            generation: &Arc<ComposedGeneration>,
+        ) -> Result<(), PlaneError> {
+            self.open_reader(access, generation).map(|_| ())
+        }
+        fn open_reader(
+            &self,
+            _: &ViewAccess,
+            generation: &Arc<ComposedGeneration>,
+        ) -> Result<Option<PlaneAttachment>, PlaneError> {
+            let view = self
+                .owner
+                .view_store()
+                .map_err(|e| SiblingLoader::error(e.to_string()))?;
+            let manifest = view
+                .load_manifest_v2(generation.name())
+                .map_err(|e| SiblingLoader::error(e.to_string()))?;
+            let store = self
+                .owner
+                .open_store(FamilyPlane::Trigram)
+                .map_err(|e| SiblingLoader::error(e.to_string()))?;
+            let reader = store.reader();
+            let keys: Vec<_> = manifest.ready_keys().collect();
+            assert!(
+                !keys.is_empty(),
+                "the real builder must have materialized a blob"
+            );
+            for key in keys {
+                assert!(reader.get(&key).unwrap().is_some());
+            }
+            self.events.lock().unwrap().push("reader-open");
+            Ok(Some(Arc::new(std::sync::Mutex::new(reader))))
+        }
+        fn release_generation(&self, _: &ViewAccess, _: &str) {}
+        fn readiness(
+            &self,
+            _: &ViewAccess,
+            _: &Snapshot,
+        ) -> super::super::readiness::PlaneReadiness {
+            super::super::readiness::PlaneReadiness::Ready {
+                pending: 0,
+                failed: 0,
+            }
+        }
+    }
+
+    struct PublicationOrderFence {
+        driver: std::sync::Weak<CheckoutDriver>,
+        store: super::super::ViewStore,
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl PublishFence for PublicationOrderFence {
+        fn publish(
+            &self,
+            commit: &mut dyn FnMut() -> Result<(), PlaneError>,
+        ) -> Result<(), PlaneError> {
+            assert_eq!(*self.events.lock().unwrap(), ["reader-open"]);
+            let driver = self.driver.upgrade().unwrap();
+            assert_eq!(driver.installed_bundle().composed.name(), "empty");
+            assert!(self.store.current_generation_read_only().unwrap().is_none());
+            commit()?;
+            assert!(self.store.current_generation_read_only().unwrap().is_some());
+            assert_eq!(
+                driver.installed_bundle().composed.name(),
+                "empty",
+                "pointer publication must not pretend installation happened"
+            );
+            self.events.lock().unwrap().push("pointer-published");
+            Ok(())
+        }
+    }
+
+    struct FailAfterLandedCas;
+    impl PublishFence for FailAfterLandedCas {
+        fn publish(
+            &self,
+            commit: &mut dyn FnMut() -> Result<(), PlaneError>,
+        ) -> Result<(), PlaneError> {
+            commit()?;
+            Err(SiblingLoader::error("failure after durable CAS"))
+        }
+    }
+
+    #[test]
+    fn real_checkout_post_cas_error_preserves_publication_and_requires_revalidation() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        driver.set_publish_fence(Arc::new(FailAfterLandedCas));
+        let error = SiblingLoader::new(driver.clone(), vec![])
+            .load(&access)
+            .unwrap_err();
+        assert!(
+            error.reason.contains("publication may have landed"),
+            "{error:?}"
+        );
+        assert!(driver.take_revalidated_job());
+        assert_eq!(driver.installed_bundle().composed.name(), "empty");
+        let store = driver.owner.view_store().unwrap();
+        let published = store.current_generation_read_only().unwrap().unwrap();
+        let manifest = store.load_manifest_v2(&published).unwrap();
+        let blobs = driver.owner.open_store(FamilyPlane::Trigram).unwrap();
+        for key in manifest.ready_keys() {
+            assert!(blobs.get(&key).unwrap().is_some());
+        }
+        driver.set_publish_fence(Arc::new(AcceptPublication));
+        drop(
+            SiblingLoader::new(driver.clone(), vec![])
+                .load(&access)
+                .unwrap(),
+        );
+        assert_ne!(driver.installed_bundle().composed.name(), "empty");
+    }
+
+    struct AcceptPublication;
+    impl PublishFence for AcceptPublication {
+        fn publish(
+            &self,
+            commit: &mut dyn FnMut() -> Result<(), PlaneError>,
+        ) -> Result<(), PlaneError> {
+            commit()
+        }
+    }
+
+    #[test]
+    fn real_checkout_publication_opens_blob_readers_before_cas_and_installs_after() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        let owner = driver.owner.clone();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = Arc::new(PublicationOrderAdapter {
+            owner: owner.clone(),
+            producer: driver.producers.trigram.clone(),
+            events: events.clone(),
+        });
+        let driver = Arc::new(
+            Arc::try_unwrap(driver)
+                .ok()
+                .unwrap()
+                .with_adapters(vec![adapter.clone()]),
+        );
+        let store = owner.view_store().unwrap();
+        driver.set_publish_fence(Arc::new(PublicationOrderFence {
+            driver: Arc::downgrade(&driver),
+            store: store.clone(),
+            events: events.clone(),
+        }));
+        let outcome = SiblingLoader::new(driver.clone(), vec![])
+            .load(&access)
+            .unwrap();
+        let published = store.current_generation_read_only().unwrap().unwrap();
+        assert_eq!(outcome.snapshot.generation().name(), published);
+        assert_eq!(driver.installed_bundle().composed.name(), published);
+        assert!(outcome
+            .snapshot
+            .readers()
+            .unwrap()
+            .resource(
+                Arc::as_ptr(&adapter) as usize,
+                access.family(),
+                access.scope(),
+                &outcome.snapshot.generation().resident_key()
+            )
+            .is_some());
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["reader-open", "pointer-published"]
+        );
+    }
+
+    impl PlaneAdapter for RetirePauseAdapter {
+        fn plane(&self) -> FamilyPlane {
+            FamilyPlane::Trigram
+        }
+        fn producer(&self) -> String {
+            "test".into()
+        }
+        fn applies_to(&self, _: &RelPath) -> bool {
+            true
+        }
+        fn open_generation(
+            &self,
+            _: &ViewAccess,
+            _: &Arc<ComposedGeneration>,
+        ) -> Result<(), PlaneError> {
+            Ok(())
+        }
+        fn release_generation(&self, _: &ViewAccess, _: &str) {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.entered.send(()).unwrap();
+                self.resume
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            }
+        }
+        fn readiness(
+            &self,
+            _: &ViewAccess,
+            _: &Snapshot,
+        ) -> super::super::readiness::PlaneReadiness {
+            super::super::readiness::PlaneReadiness::Ready {
+                pending: 0,
+                failed: 0,
+            }
+        }
+    }
+
+    #[test]
+    fn installed_bundle_retirement_releases_live_and_installed_locks() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        let (entered, arrived) = std::sync::mpsc::channel();
+        let (resume, released) = std::sync::mpsc::channel();
+        let adapter = Arc::new(RetirePauseAdapter {
+            armed: false.into(),
+            entered,
+            resume: std::sync::Mutex::new(released),
+        });
+        let driver = Arc::new(
+            Arc::try_unwrap(driver)
+                .ok()
+                .unwrap()
+                .with_adapters(vec![adapter.clone()]),
+        );
+        drop(
+            SiblingLoader::new(driver.clone(), vec![])
+                .load(&access)
+                .unwrap(),
+        );
+        let (previous, revision) = driver.installed_cut();
+        let cut = previous.install_cut().unwrap().clone();
+        let generation = Arc::new(ComposedGeneration::new(
+            "replacement",
+            previous.generation().flatten().unwrap(),
+            None,
+        ));
+        let successor = super::super::snapshot::LiveDelta::new(generation)
+            .snapshot()
+            .with_install_cut(cut);
+        drop(previous);
+        adapter.armed.store(true, Ordering::SeqCst);
+        let installing = driver.clone();
+        let worker = std::thread::spawn(move || installing.install(&access, &successor, revision));
+        arrived
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let live_unlocked = driver.live.try_lock().is_ok();
+        let installed_unlocked = driver.installed.try_lock().is_ok();
+        resume.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        assert!(
+            live_unlocked,
+            "reader retirement ran while the live lock was held"
+        );
+        assert!(
+            installed_unlocked,
+            "reader retirement ran while the installed lock was held"
+        );
+    }
+
+    #[test]
+    fn install_never_promotes_overflowed_or_stopped_watchers() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        drop(
+            SiblingLoader::new(driver.clone(), vec![])
+                .load(&access)
+                .unwrap(),
+        );
+        for watcher in [
+            super::super::snapshot::WatcherState::Overflowed,
+            super::super::snapshot::WatcherState::Stopped,
+        ] {
+            driver.live.lock().unwrap().set_watcher(watcher);
+            driver.record_change(RelPath::new(b"file.rs".to_vec()).unwrap());
+            let (snapshot, revision) = driver.installed_cut();
+            assert!(driver.install(&access, &snapshot, revision).is_err());
+            assert_eq!(driver.live.lock().unwrap().watcher(), watcher);
+        }
+    }
+
+    #[test]
+    fn initial_reconciling_state_requires_a_completed_strict_walk() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        assert!(root.path().join("file.rs").is_file());
+        let (snapshot, revision) = driver.installed_cut();
+        assert!(snapshot.membership().is_empty());
+        assert!(driver.install(&access, &snapshot, revision).is_err());
+        assert_eq!(
+            driver.live.lock().unwrap().watcher(),
+            super::super::snapshot::WatcherState::Reconciling
+        );
+    }
+
+    #[test]
+    fn rejected_install_does_not_consume_prepared_readers() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        drop(
+            SiblingLoader::new(driver.clone(), vec![])
+                .load(&access)
+                .unwrap(),
+        );
+        let (current, revision) = driver.installed_cut();
+        let seq = driver.installed_bundle().seq;
+        let mut cut = current.install_cut().unwrap().clone();
+        cut.seq = cut.seq.saturating_sub(1);
+        let generation = driver
+            .build_own_generation(&access, &current, false)
+            .unwrap();
+        let readers = driver
+            .prepared_readers
+            .lock()
+            .unwrap()
+            .get(generation.name())
+            .unwrap()
+            .readers
+            .clone();
+        let snapshot = super::super::snapshot::LiveDelta::new(generation.clone())
+            .snapshot()
+            .with_install_cut(cut);
+        assert!(driver.install(&access, &snapshot, revision).is_err());
+        let retained = driver
+            .prepared_readers
+            .lock()
+            .unwrap()
+            .get(generation.name())
+            .unwrap()
+            .readers
+            .clone();
+        assert!(Arc::ptr_eq(&retained, &readers));
+        assert_eq!(driver.installed_bundle().seq, seq);
+        assert!(driver.take_revalidated_job());
+        assert_eq!(
+            driver
+                .owner
+                .view_store()
+                .unwrap()
+                .current_generation_read_only()
+                .unwrap()
+                .as_deref(),
+            Some(generation.name())
+        );
+    }
+
+    #[test]
+    fn superseded_cut_is_refused_before_its_pointer_can_publish() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        let loader = SiblingLoader::new(driver.clone(), vec![]);
+        drop(loader.load(&access).unwrap());
+        let store = driver.owner.view_store().unwrap();
+        let before = store.current_generation_read_only().unwrap();
+        std::fs::write(root.path().join("file.rs"), b"candidate B").unwrap();
+        driver.record_change(RelPath::new(b"file.rs".to_vec()).unwrap());
+        let (candidate, revision) = loader
+            .reconciled(&access, driver.installed_snapshot().generation().clone())
+            .unwrap();
+        driver.install(&access, &candidate, revision).unwrap();
+        assert!(loader.fold(&access, &candidate, revision).is_err());
+        assert_eq!(store.current_generation_read_only().unwrap(), before);
+    }
+
+    #[test]
+    fn a_foreign_pointer_after_the_walk_cut_cannot_become_its_cas_base() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        let loader = SiblingLoader::new(driver.clone(), vec![]);
+        drop(loader.load(&access).unwrap());
+        let store = driver.owner.view_store().unwrap();
+        let before = store.current_generation_read_only().unwrap();
+        std::fs::write(root.path().join("file.rs"), b"candidate B").unwrap();
+        driver.record_change(RelPath::new(b"file.rs".to_vec()).unwrap());
+        let (candidate, revision) = loader
+            .reconciled(&access, driver.installed_snapshot().generation().clone())
+            .unwrap();
+        assert_eq!(candidate.publication_base(), Some(&before));
+        let mut foreign = driver.installed_snapshot().generation().flatten().unwrap();
+        foreign.header_mut().ignore_fingerprint = Some("foreign-winner".into());
+        let name = super::super::manifest_v2::GenerationName::for_manifest(&foreign).unwrap();
+        let prepared = store
+            .prepare_v2(&name, before.as_deref(), &foreign, None)
+            .unwrap();
+        assert_eq!(
+            store.commit_v2(prepared, None).unwrap(),
+            super::super::manifest_v2::PublishV2::Published
+        );
+        let error = loader.fold(&access, &candidate, revision).unwrap_err();
+        assert!(error.reason.contains("publication lost"), "{error:?}");
+        assert_eq!(
+            store.current_generation_read_only().unwrap(),
+            Some(name.to_string())
+        );
+        assert!(driver.take_revalidated_job());
+    }
+
+    #[test]
+    fn strict_walk_preserves_pre_cut_readiness_when_disk_equals_the_base() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        let loader = SiblingLoader::new(driver.clone(), vec![]);
+        drop(loader.load(&access).unwrap());
+        let file = RelPath::new(b"file.rs".to_vec()).unwrap();
+        driver.live.lock().unwrap().set_readiness(
+            file.clone(),
+            super::super::snapshot::PlanePatch {
+                content: crate::blob_store::v2::ContentHash::of(b"strict content"),
+                planes: EntryPlanes {
+                    trigram: Some(super::super::readiness::PlaneState::pending(
+                        "checkout repair",
+                    )),
+                    ..Default::default()
+                },
+            },
+        );
+        driver.record_change(file.clone());
+        let (walk, _) = loader
+            .reconciled(&access, driver.installed_snapshot().generation().clone())
+            .unwrap();
+        assert_eq!(
+            walk.readiness_patches().get(&file).unwrap().planes.trigram,
+            Some(super::super::readiness::PlaneState::pending(
+                "checkout repair"
+            ))
+        );
+    }
+
+    #[test]
+    fn coverage_does_not_invent_work_for_unregistered_planes() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        drop(
+            SiblingLoader::new(driver.clone(), vec![])
+                .load(&access)
+                .unwrap(),
+        );
+        let (current, revision) = driver.installed_cut();
+        std::fs::write(root.path().join("file.rs"), b"new bytes").unwrap();
+        let mut delta = super::super::snapshot::LiveDelta::new(current.generation().clone());
+        delta.apply(
+            RelPath::new(b"file.rs".to_vec()).unwrap(),
+            LiveEntry::new(DiskState::of_bytes(b"new bytes"), 1),
+        );
+        let snapshot = delta
+            .snapshot()
+            .with_install_cut(current.install_cut().unwrap().clone());
+        driver.install(&access, &snapshot, revision).unwrap();
+        let installed = driver.installed_bundle();
+        for plane in [FamilyPlane::Semantic, FamilyPlane::Callgraph] {
+            assert_eq!(
+                installed.coverage[&plane],
+                super::super::readiness::PlaneReadiness::Ready {
+                    pending: 0,
+                    failed: 0
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn directory_uncertainty_survives_non_strict_install_until_a_full_walk() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        let loader = SiblingLoader::new(driver.clone(), vec![]);
+        drop(loader.load(&access).unwrap());
+        let directory = root.path().join("new-directory");
+        std::fs::create_dir(&directory).unwrap();
+        super::super::intent::WriteIntentListener::record_change(
+            &*driver,
+            &super::super::intent::WriteIntent::Directory(directory.clone()),
+            super::super::intent::WritePhase::Before,
+        );
+        let (snapshot, revision) = driver.installed_cut();
+        assert!(driver.install(&access, &snapshot, revision).is_err());
+        assert!(driver
+            .installed_bundle()
+            .uncertain_paths
+            .contains(&directory));
+        drop(
+            loader
+                .refresh(&access, snapshot.generation().clone())
+                .unwrap(),
+        );
+        assert!(driver.installed_bundle().uncertain_paths.is_empty());
+    }
     #[test]
     fn composite_reconcile_omits_file_deleted_after_listing() {
         let root = tempfile::tempdir().unwrap();
@@ -1729,23 +2947,201 @@ mod composite_tests {
             .is_none());
     }
     #[test]
-    fn composite_install_losing_revision_race_refuses_obsolete_snapshot() {
+    fn composite_install_epoch_race_refuses_obsolete_snapshot() {
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let (driver, _, _, access) = fixture(root.path(), storage.path());
         let checkout = driver.reconcile(&access).unwrap();
         let snapshot = driver.installed_state(&access, FamilyPlane::Trigram).0;
         driver.record_change(RelPath::new(b"file.rs".to_vec()).unwrap());
+        driver.live.lock().unwrap().bump_epoch();
         let error = driver
             .install(&access, &snapshot, checkout.revision)
             .unwrap_err();
-        assert!(error
-            .reason
-            .contains("changed before snapshot installation"));
+        assert!(error.reason.contains("EpochChanged"));
         assert_eq!(
             driver.installed_state(&access, FamilyPlane::Trigram).1,
             vec![root.path().join("file.rs")]
         );
+    }
+
+    struct EditingFence {
+        driver: std::sync::Weak<CheckoutDriver>,
+    }
+    impl PublishFence for EditingFence {
+        fn publish(
+            &self,
+            commit: &mut dyn FnMut() -> Result<(), PlaneError>,
+        ) -> Result<(), PlaneError> {
+            let driver = self.driver.upgrade().unwrap();
+            std::fs::write(
+                driver.owner.root().join("file.rs"),
+                b"delivered during publication",
+            )
+            .unwrap();
+            driver.record_change(RelPath::new(b"file.rs".to_vec()).unwrap());
+            commit()
+        }
+    }
+
+    #[test]
+    fn sustained_writes_install_without_a_quiet_period_and_keep_gaps() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        let loader = SiblingLoader::new(driver.clone(), vec![]);
+        loader.load(&access).unwrap();
+        driver.set_publish_fence(Arc::new(EditingFence {
+            driver: Arc::downgrade(&driver),
+        }));
+        for sequence in 0..32 {
+            let (snapshot, revision) = driver.installed_cut();
+            let seq = driver.installed_bundle().seq;
+            std::fs::write(
+                root.path().join("file.rs"),
+                format!("edit before fold {sequence}"),
+            )
+            .unwrap();
+            driver.record_change(RelPath::new(b"file.rs".to_vec()).unwrap());
+            let installed = loader.fold(&access, &snapshot, revision).unwrap();
+            assert_eq!(driver.installed_bundle().seq, seq + 1);
+            assert_eq!(
+                driver.installed_bundle().coverage[&FamilyPlane::Trigram],
+                super::super::readiness::PlaneReadiness::Building
+            );
+            assert_eq!(installed.pending_intent().count(), 1);
+            assert_eq!(
+                driver.installed_state(&access, FamilyPlane::Trigram).1,
+                vec![root.path().join("file.rs")]
+            );
+        }
+        eprintln!("32/32 installs: edits after every cut, before fold, and inside every publication fence; no quiet-period retry");
+    }
+
+    #[test]
+    fn install_refuses_a_superseded_bundle_even_with_equal_base_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        let loader = SiblingLoader::new(driver.clone(), vec![]);
+        loader.load(&access).unwrap();
+        let (snapshot, revision) = driver.installed_cut();
+        driver.install(&access, &snapshot, revision).unwrap();
+        let current = driver.installed_bundle().seq;
+        let error = driver.install(&access, &snapshot, revision).unwrap_err();
+        assert!(error.reason.contains("BaseChanged"));
+        assert_eq!(driver.installed_bundle().seq, current);
+    }
+
+    struct RacingPublisher {
+        driver: std::sync::Weak<CheckoutDriver>,
+        equivalent: bool,
+    }
+    impl PublishFence for RacingPublisher {
+        fn publish(
+            &self,
+            commit: &mut dyn FnMut() -> Result<(), PlaneError>,
+        ) -> Result<(), PlaneError> {
+            let driver = self.driver.upgrade().unwrap();
+            let store = driver.owner.view_store().unwrap();
+            let current = store.current_generation().unwrap();
+            let candidate = std::fs::read_dir(driver.owner.view_dir())
+                .unwrap()
+                .filter_map(|entry| {
+                    let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                    name.strip_prefix("manifest-")
+                        .and_then(|name| name.strip_suffix(".json"))
+                        .map(str::to_owned)
+                })
+                .find(|name| Some(name) != current.as_ref())
+                .unwrap();
+            let mut manifest = store.load_manifest_v2(&candidate).unwrap();
+            if !self.equivalent {
+                manifest.header_mut().head_tree = Some("foreign proof".into());
+            }
+            let name = super::super::manifest_v2::GenerationName::for_manifest(&manifest).unwrap();
+            let prepared = store
+                .prepare_v2(&name, current.as_deref(), &manifest, None)
+                .unwrap();
+            assert_eq!(
+                store.commit_v2(prepared, None).unwrap(),
+                super::super::manifest_v2::PublishV2::Published
+            );
+            commit()
+        }
+    }
+
+    #[test]
+    fn unwired_worker_publication_refuses_before_any_legacy_write() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        let base = driver.installed_snapshot().generation().clone();
+        let worker = super::super::manifest_v2::ManifestV2::new_v3(
+            base.header().clone(),
+            Some(super::super::manifest_v2::BaseHeader {
+                scope: "base".into(),
+                membership_digest: "11".repeat(32),
+                identity_digest: "22".repeat(32),
+                bound_generation: base.name().into(),
+            }),
+            Default::default(),
+        );
+        let composed = Arc::new(ComposedGeneration::compose("worker", worker, base, None).unwrap());
+        let snapshot = LiveDelta::new(composed).snapshot();
+        let store = driver.owner.view_store().unwrap();
+        assert!(store.current_generation().unwrap().is_none());
+        let error = driver
+            .build_own_generation(&access, &snapshot, false)
+            .unwrap_err();
+        assert!(error
+            .reason
+            .contains("durable base publication binding is not wired"));
+        assert!(store.current_generation().unwrap().is_none());
+        assert!(!storage.path().join("blobs/v3").exists());
+    }
+
+    #[test]
+    fn actual_cas_losers_never_install_foreign_verification_and_request_fresh_jobs() {
+        for equivalent in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let storage = tempfile::tempdir().unwrap();
+            let (driver, _, _, access) = fixture(root.path(), storage.path());
+            let loader = SiblingLoader::new(driver.clone(), vec![]);
+            loader.load(&access).unwrap();
+            let before = driver.installed_bundle();
+            driver.set_publish_fence(Arc::new(RacingPublisher {
+                driver: Arc::downgrade(&driver),
+                equivalent,
+            }));
+            let (snapshot, revision) = driver.installed_cut();
+            let error = loader.fold(&access, &snapshot, revision).unwrap_err();
+            assert!(error.reason.contains("publication lost"));
+            assert!(
+                error.reason.contains(if equivalent {
+                    "EquivalentWinner"
+                } else {
+                    "Conflict"
+                }),
+                "{error:?}"
+            );
+            assert!(driver.take_revalidated_job());
+            assert_eq!(driver.installed_bundle().seq, before.seq);
+            assert_eq!(
+                driver.installed_snapshot().generation().name(),
+                before.composed.name()
+            );
+            assert_ne!(
+                driver
+                    .owner
+                    .view_store()
+                    .unwrap()
+                    .current_generation()
+                    .unwrap()
+                    .as_deref(),
+                Some(before.composed.name())
+            );
+        }
     }
 }
 
@@ -1817,6 +3213,11 @@ impl CompositePlane for CallgraphBridge {
             if entry.disk == super::snapshot::DiskState::Absent || !self.applies_to(path) {
                 continue;
             }
+            // A concurrent reconcile may have replaced the observation cache.
+            // Never label manifest content with a key computed for other bytes.
+            if super::snapshot::DiskState::in_generation(manifest, path) != entry.disk {
+                continue;
+            }
             let attachment = entry
                 .attachments
                 .get(&FamilyPlane::Callgraph)
@@ -1862,7 +3263,11 @@ impl CompositePlane for CallgraphBridge {
         );
         let database = super::resolve_derived_path(owner.view_dir(), generation)
             .map_err(|e| error(e.to_string()))?;
-        super::callgraph::materialize(&database, manifest, &reader)
+        super::callgraph::materialize(
+            &database,
+            &ComposedGeneration::new(generation, manifest.clone(), None),
+            &reader,
+        )
     }
     fn finish_generation(
         &self,
@@ -1907,7 +3312,7 @@ impl CompositePlane for CallgraphBridge {
 
 #[cfg(test)]
 mod callgraph_bridge_tests {
-    use super::super::contracts::PlaneAdapter;
+    use super::super::contracts::{PlaneAdapter, PlaneLoader};
     use super::*;
 
     struct Walker;
@@ -1915,6 +3320,209 @@ mod callgraph_bridge_tests {
         fn files(&self, root: &std::path::Path) -> Result<Vec<std::path::PathBuf>, PlaneError> {
             Ok(vec![root.join("file.rs")])
         }
+    }
+
+    fn graph_driver(
+        root: &std::path::Path,
+        storage: &std::path::Path,
+        bridge: &Arc<CallgraphBridge>,
+        plane: Arc<dyn CompositePlane>,
+    ) -> (Arc<CheckoutDriver>, ViewAccess) {
+        let registry =
+            super::super::registry::FamilyRegistry::open(storage, "coherent-graph").unwrap();
+        let owner = registry
+            .register_view_with_storage(storage, "local", root)
+            .unwrap();
+        let driver = Arc::new(
+            CheckoutDriver::new(
+                owner.clone(),
+                Producers {
+                    trigram: "test".into(),
+                    semantic: None,
+                    callgraph: super::super::callgraph::PRODUCER.into(),
+                },
+                None,
+                Arc::new(Walker),
+                vec![plane],
+            )
+            .with_adapters(vec![bridge.adapter.clone()]),
+        );
+        (driver, ViewAccess::Owner(owner))
+    }
+
+    fn graph_key(bytes: &[u8]) -> crate::blob_store::v2::FamilyKey {
+        let mut entry = LiveEntry::new(super::super::snapshot::DiskState::of_bytes(bytes), 0);
+        super::super::callgraph::attach(&mut entry, bytes, "rust").unwrap();
+        entry.attachments[&FamilyPlane::Callgraph]
+            .downcast_ref::<super::super::callgraph::CallgraphAttachment>()
+            .unwrap()
+            .key
+    }
+
+    struct RevertAfterAttachment {
+        bridge: Arc<CallgraphBridge>,
+        driver: std::sync::Mutex<std::sync::Weak<CheckoutDriver>>,
+        root: std::path::PathBuf,
+        armed: std::sync::atomic::AtomicBool,
+    }
+    impl CompositePlane for RevertAfterAttachment {
+        fn plane(&self) -> FamilyPlane {
+            FamilyPlane::Callgraph
+        }
+        fn applies_to(&self, path: &RelPath) -> bool {
+            self.bridge.applies_to(path)
+        }
+        fn attachment(
+            &self,
+            path: &RelPath,
+            bytes: &[u8],
+        ) -> Result<super::super::snapshot::PlaneAttachment, PlaneError> {
+            let attachment = self.bridge.attachment(path, bytes)?;
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                std::fs::write(
+                    self.root.join("file.rs"),
+                    b"fn original() {} fn caller() { original(); }",
+                )
+                .unwrap();
+                let driver = self.driver.lock().unwrap().upgrade().unwrap();
+                driver.record_change(path.clone());
+            }
+            Ok(attachment)
+        }
+        fn materialize(
+            &self,
+            owner: &super::super::registry::ViewRegistration,
+            generation: &str,
+            snapshot: &Snapshot,
+            observed: &BTreeMap<RelPath, LiveEntry>,
+            manifest: &mut super::super::manifest_v2::ManifestV2,
+            live: &mut crate::pins::LivePin,
+            seed_derived: bool,
+        ) -> Result<(), PlaneError> {
+            self.bridge.materialize(
+                owner,
+                generation,
+                snapshot,
+                observed,
+                manifest,
+                live,
+                seed_derived,
+            )
+        }
+        fn finish_generation(
+            &self,
+            owner: &super::super::registry::ViewRegistration,
+            staging: &str,
+            published: &str,
+        ) -> Result<(), PlaneError> {
+            self.bridge.finish_generation(owner, staging, published)
+        }
+    }
+
+    #[test]
+    fn a_mid_walk_revert_cannot_publish_a_key_for_other_manifest_bytes() {
+        let a = b"fn original() {} fn caller() { original(); }";
+        let b = b"fn replacement() {} fn caller() { replacement(); }";
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file.rs"), a).unwrap();
+        let bridge = Arc::new(CallgraphBridge::default());
+        let plane = Arc::new(RevertAfterAttachment {
+            bridge: bridge.clone(),
+            driver: Default::default(),
+            root: root.path().to_path_buf(),
+            armed: false.into(),
+        });
+        let (driver, access) = graph_driver(root.path(), storage.path(), &bridge, plane.clone());
+        *plane.driver.lock().unwrap() = Arc::downgrade(&driver);
+        let loader = SiblingLoader::new(driver.clone(), vec![bridge.adapter.clone()]);
+        drop(loader.load(&access).unwrap());
+        let key_a = graph_key(a);
+        let key_b = graph_key(b);
+        assert_ne!(key_a, key_b);
+        std::fs::write(root.path().join("file.rs"), b).unwrap();
+        driver.record_change(RelPath::new(b"file.rs".to_vec()).unwrap());
+        plane.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let snapshot = loader
+            .refresh(&access, driver.installed_snapshot().generation().clone())
+            .unwrap();
+        let store = driver.owner.view_store().unwrap();
+        let current = store.current_generation_read_only().unwrap().unwrap();
+        let manifest = store.load_manifest_v2(&current).unwrap();
+        let file = RelPath::new(b"file.rs".to_vec()).unwrap();
+        let entry = manifest.get(&file).unwrap();
+        let expected = if entry.content() == Some(crate::blob_store::v2::ContentHash::of(a)) {
+            key_a
+        } else {
+            assert_eq!(
+                entry.content(),
+                Some(crate::blob_store::v2::ContentHash::of(b))
+            );
+            key_b
+        };
+        assert_eq!(
+            entry.plane_state(FamilyPlane::Callgraph),
+            Some(&super::super::readiness::PlaneState::ready(&expected))
+        );
+        assert!(snapshot.pending_intent().any(|path| path == &file));
+        assert_eq!(
+            bridge.adapter.readiness(&access, &snapshot),
+            super::super::readiness::PlaneReadiness::Building
+        );
+    }
+
+    #[test]
+    fn callgraph_materialization_ignores_an_observation_for_other_content() {
+        let a = b"fn original() {} fn caller() { original(); }";
+        let b = b"fn replacement() {} fn caller() { replacement(); }";
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file.rs"), a).unwrap();
+        let bridge = Arc::new(CallgraphBridge::default());
+        let (driver, access) = graph_driver(root.path(), storage.path(), &bridge, bridge.clone());
+        let snapshot = SiblingLoader::new(driver.clone(), vec![bridge.adapter.clone()])
+            .load(&access)
+            .unwrap()
+            .snapshot;
+        let mut manifest = snapshot.generation().flatten().unwrap();
+        let file = RelPath::new(b"file.rs".to_vec()).unwrap();
+        let mut other = LiveEntry::new(super::super::snapshot::DiskState::of_bytes(b), 1);
+        other
+            .attachments
+            .insert(FamilyPlane::Callgraph, bridge.attachment(&file, b).unwrap());
+        let observed = BTreeMap::from([(file.clone(), other)]);
+        let _assembly = crate::pins::AssemblyPin::create_v2(
+            &driver.owner,
+            "guard-build",
+            &manifest.ready_keys().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let mut live = crate::pins::LivePin::create(&driver.owner).unwrap();
+        bridge
+            .materialize(
+                &driver.owner,
+                "guard-build",
+                &snapshot,
+                &observed,
+                &mut manifest,
+                &mut live,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            manifest
+                .get(&file)
+                .unwrap()
+                .plane_state(FamilyPlane::Callgraph),
+            Some(&super::super::readiness::PlaneState::ready(&graph_key(a)))
+        );
+        assert!(driver
+            .owner
+            .open_store(FamilyPlane::Callgraph)
+            .unwrap()
+            .get(&graph_key(b))
+            .unwrap()
+            .is_none());
     }
 
     struct RejectAfterBuild {
@@ -1998,6 +3606,7 @@ mod callgraph_bridge_tests {
             .reconciled(&access, loader.seed(&access).unwrap())
             .unwrap();
         driver.install(&access, &snapshot, revision).unwrap();
+        let snapshot = driver.installed_snapshot();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             driver.build_own_generation(&access, &snapshot, false)
         }));
@@ -2067,6 +3676,7 @@ mod callgraph_bridge_tests {
         let seed = loader.seed(&access).unwrap();
         let (seed_snapshot, revision) = loader.reconciled(&access, seed).unwrap();
         driver.install(&access, &seed_snapshot, revision).unwrap();
+        let seed_snapshot = driver.installed_snapshot();
         assert_eq!(
             driver.installed_state(&access, FamilyPlane::Callgraph).1,
             vec![root.path().join("file.rs")]
@@ -2097,6 +3707,48 @@ mod callgraph_bridge_tests {
             .installed_state(&access, FamilyPlane::Callgraph)
             .1
             .is_empty());
+        drop(reader);
+        let old_bundle = driver.installed_bundle();
+        let old_snapshot = old_bundle.snapshot.clone();
+        let old_readers = Arc::downgrade(&old_bundle.readers);
+        std::fs::write(root.path().join("file.rs"), b"fn replacement() {}\n").unwrap();
+        driver.record_change(RelPath::new(b"file.rs".to_vec()).unwrap());
+        loader.load(&access).unwrap();
+        let new_snapshot = driver.installed_snapshot();
+        assert_eq!(
+            bridge
+                .adapter
+                .reader(&access, &new_snapshot)
+                .unwrap()
+                .store
+                .direct_callers_of(std::path::Path::new("file.rs"), "target")
+                .unwrap()
+                .len(),
+            0
+        );
+        drop(old_bundle);
+        assert!(
+            old_readers.upgrade().is_some(),
+            "an old query still owns its readers"
+        );
+        // Open lazily after replacement; retaining a reader opened before the
+        // swap would not exercise residency in the adapter's generation map.
+        assert_eq!(
+            bridge
+                .adapter
+                .reader(&access, &old_snapshot)
+                .unwrap()
+                .store
+                .direct_callers_of(std::path::Path::new("file.rs"), "target")
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(old_snapshot);
+        assert!(
+            old_readers.upgrade().is_none(),
+            "the last old query releases the reader lease"
+        );
     }
 }
 
@@ -2140,10 +3792,12 @@ pub struct InstalledDriver(Arc<std::sync::RwLock<Option<Arc<CheckoutDriver>>>>);
 impl InstalledDriver {
     pub fn install(&self, driver: Arc<CheckoutDriver>) {
         driver.register_write_intent();
-        *self
+        let retired = self
             .0
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(driver);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(driver);
+        drop(retired);
     }
 
     /// Removes `driver` unless another one replaced it meanwhile.
@@ -2152,19 +3806,25 @@ impl InstalledDriver {
             .0
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if installed
+        let retired = if installed
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, driver))
         {
-            *installed = None;
-        }
+            installed.take()
+        } else {
+            None
+        };
+        drop(installed);
+        drop(retired);
     }
 
     pub fn clear(&self) {
-        *self
+        let retired = self
             .0
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(retired);
     }
 
     pub fn get(&self) -> Option<Arc<CheckoutDriver>> {
@@ -2310,12 +3970,28 @@ impl super::intent::WriteIntentListener for CheckoutDriver {
                     return;
                 }
                 {
+                    let mut live = self
+                        .live
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    live.bump_epoch();
                     let mut installed = self
                         .installed
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let installed = Arc::make_mut(&mut installed);
                     installed.revision += 1;
                     installed.uncertain_paths.insert(absolute.clone());
+                    installed.snapshot = live
+                        .snapshot()
+                        .with_readers(installed.readers.clone())
+                        .with_install_cut(InstallCut {
+                            seq: installed.seq,
+                            resident: installed.composed.clone(),
+                            epoch: live.epoch(),
+                            version: live.version(),
+                            intent_version: live.snapshot().intent_version(),
+                        });
                 }
                 let snapshot = self
                     .installed
@@ -2336,6 +4012,7 @@ impl super::intent::WriteIntentListener for CheckoutDriver {
                             .installed
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let installed = Arc::make_mut(&mut installed);
                         installed.revision += 1;
                     }
                 }

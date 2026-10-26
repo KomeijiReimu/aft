@@ -2088,7 +2088,7 @@ fn callgraph_producer_change_republishes_an_existing_generation() {
     let (_, built) = load();
     let views = owner.view_store().unwrap();
     let built_name = built.snapshot.generation().name().to_string();
-    let mut previous = built.snapshot.generation().manifest().clone();
+    let mut previous = built.snapshot.generation().flatten().unwrap();
     previous.header_mut().producers.callgraph = PREVIOUS_PRODUCER.into();
     let previous_name = GenerationName::for_manifest(&previous).unwrap();
     let store = owner.open_store(FamilyPlane::Callgraph).unwrap();
@@ -2117,7 +2117,7 @@ fn callgraph_producer_change_republishes_an_existing_generation() {
     );
     let generation = current.snapshot.generation();
     assert_ne!(generation.name(), previous_name);
-    assert_eq!(generation.manifest().header().producers.callgraph, PRODUCER);
+    assert_eq!(generation.header().producers.callgraph, PRODUCER);
     assert_eq!(
         views.current_generation().unwrap().as_deref(),
         Some(generation.name())
@@ -2134,8 +2134,7 @@ fn callgraph_producer_change_republishes_an_existing_generation() {
     // The served database equals a cold build of the new manifest.
     let cold_dir = tempfile::tempdir().unwrap();
     let cold = cold_dir.path().join("cold.sqlite");
-    crate::views::callgraph::materialize(&cold, generation.manifest(), &BlobReader(store.reader()))
-        .unwrap();
+    crate::views::callgraph::materialize(&cold, generation, &BlobReader(store.reader())).unwrap();
     crate::views::materialization::parity::assert_logical_parity(
         &views.derived_path(generation.name()).unwrap(),
         &cold,

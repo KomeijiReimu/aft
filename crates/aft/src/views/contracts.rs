@@ -29,7 +29,7 @@ use crate::blob_store::v2::FamilyPlane;
 
 use super::readiness::PlaneReadiness;
 use super::registry::{ReaderRegistration, ViewRegistration};
-use super::snapshot::{OpenGeneration, Snapshot};
+use super::snapshot::{ComposedGeneration, Snapshot};
 use super::RelPath;
 
 /// Durability boundaries of view construction. V3-only boundaries are appended
@@ -208,11 +208,48 @@ pub trait PlaneAdapter: Send + Sync {
     fn open_generation(
         &self,
         access: &ViewAccess,
-        generation: &Arc<OpenGeneration>,
+        generation: &Arc<ComposedGeneration>,
     ) -> Result<(), PlaneError>;
+
+    /// Open the resident state and optionally retain its actual read handle.
+    /// Adapters whose scope caches may be cleared while queries outlive them
+    /// return an owned handle; simpler adapters use the release-generation lease.
+    fn open_reader(
+        &self,
+        access: &ViewAccess,
+        generation: &Arc<ComposedGeneration>,
+    ) -> Result<Option<super::snapshot::PlaneAttachment>, PlaneError> {
+        self.open_generation(access, generation)?;
+        Ok(None)
+    }
+
+    /// Bind a shared immutable reader to this bundle's query state. This runs
+    /// for every bundle, including cache hits, so a new binding cannot inherit
+    /// mutable fill state from a retired binding of the same generation.
+    fn bind_reader(
+        &self,
+        _access: &ViewAccess,
+        _generation: &Arc<ComposedGeneration>,
+        reader: Option<super::snapshot::PlaneAttachment>,
+    ) -> Result<Option<super::snapshot::PlaneAttachment>, PlaneError> {
+        Ok(reader)
+    }
 
     /// Drops resident state for a generation that no snapshot holds.
     fn release_generation(&self, access: &ViewAccess, generation: &str);
+
+    /// Called only after durable pointer publication for this generation succeeded.
+    /// Opening draft readers must not drop live protection for unpublished fills.
+    /// `current` returns installed disk facts without I/O or building; sample it
+    /// after capturing a fill-state version so a concurrent completion is not lost.
+    fn generation_published(
+        &self,
+        _access: &ViewAccess,
+        _generation: &Arc<ComposedGeneration>,
+        _current: &dyn Fn() -> Snapshot,
+    ) -> Result<(), PlaneError> {
+        Ok(())
+    }
 
     /// This plane's readiness for the view `access` names, as of `snapshot`.
     ///

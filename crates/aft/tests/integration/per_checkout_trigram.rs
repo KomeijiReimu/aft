@@ -480,7 +480,8 @@ fn trigram_ten_and_forty_view_memory() {
                     + std::mem::size_of::<LiveDelta>()
                     + delta
                         .base()
-                        .manifest()
+                        .flatten()
+                        .unwrap()
                         .entries()
                         .map(|(path, entry)| {
                             path.as_bytes().len()
@@ -557,7 +558,7 @@ fn trigram_persistence_child() {
         .register_view_with_storage(registry.storage(), "scope", &root)
         .unwrap();
     let files: &[(&str, &[u8])] = &[("a.txt", b"old\n")];
-    let mut manifest = generation(files, "a").manifest().clone();
+    let mut manifest = generation(files, "a").flatten().unwrap().clone();
     let store = registration.open_store(FamilyPlane::Trigram).unwrap();
     let key = TrigramKey {
         content: ContentHash::of(files[0].1),
@@ -686,7 +687,7 @@ fn trigram_driver_rejects_obsolete_install_and_reports_actual_gaps() {
     write(&root, "a.txt", b"old\n");
     let files: &[(&str, &[u8])] = &[("a.txt", b"old\n")];
     let generation = generation(files, "a");
-    let producers = generation.manifest().header().producers.clone();
+    let producers = generation.flatten().unwrap().header().producers.clone();
     let delta = Arc::new(Mutex::new(LiveDelta::new(generation)));
     let registry = aft::views::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
     let access = ViewAccess::Owner(
@@ -833,7 +834,10 @@ fn trigram_materializer_preserves_shared_segment_and_other_planes() {
         .register_view_with_storage(registry.storage(), "scope", &root)
         .unwrap();
     let access = ViewAccess::Owner(registration.clone());
-    let mut manifest = generation(&[("a.txt", b"old\n")], "a").manifest().clone();
+    let mut manifest = generation(&[("a.txt", b"old\n")], "a")
+        .flatten()
+        .unwrap()
+        .clone();
     if let EntryV2::Regular { planes, .. } = manifest.get_mut(&rel("a.txt")).unwrap() {
         planes.semantic = Some(PlaneState::pending("model work"));
     }
@@ -863,7 +867,8 @@ fn trigram_materializer_preserves_shared_segment_and_other_planes() {
         .set(
             rel("renamed.txt"),
             generation(&[("renamed.txt", b"new needle\n")], "b")
-                .manifest()
+                .flatten()
+                .unwrap()
                 .get(&rel("renamed.txt"))
                 .cloned(),
         )
@@ -919,7 +924,7 @@ fn trigram_materializer_pins_all_keys_with_one_key_file_write() {
     let registration = registry
         .register_view_with_storage(registry.storage(), "scope", &root)
         .unwrap();
-    let mut manifest = generation(&files, "a").manifest().clone();
+    let mut manifest = generation(&files, "a").flatten().unwrap().clone();
     let observed = live_delta::strict_walk(&root, &policy(), 1);
     let (writes_before, syncs_before) = key_file_work();
     let materialized = materialize(

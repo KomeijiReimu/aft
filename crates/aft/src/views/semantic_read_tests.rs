@@ -63,6 +63,12 @@ fn resident_chunk_shortcut_matches_store_and_full_rebuild() {
         drop(run);
         arena.trim();
         assert!(
+            arena.chunk_vector(&chunk_key).is_some(),
+            "unbind evicted a run while the installed bundle still holds its reader"
+        );
+        drop(checkout);
+        arena.trim();
+        assert!(
             arena.chunk_vector(&chunk_key).is_none(),
             "the chunk index retained an evicted run"
         );
