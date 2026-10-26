@@ -1630,8 +1630,36 @@ fn bounded_dirs(directory: &Path, cap: usize) -> io::Result<Vec<fs::DirEntry>> {
     Ok(result)
 }
 
-fn bindings(storage: &StoragePaths) -> io::Result<BTreeMap<String, Vec<Binding>>> {
-    bindings_with_admission(storage, false)
+#[derive(Default)]
+struct RootIdentities {
+    // History is reread under admission before retirement. Reuse the same
+    // canonical_root output across those reads, but never across passes: a
+    // checkout path can be removed or repointed between retention runs.
+    by_root: HashMap<PathBuf, PathBuf>,
+    #[cfg(test)]
+    resolutions: usize,
+}
+
+impl RootIdentities {
+    fn canonical_root(&mut self, root: &Path) -> PathBuf {
+        if let Some(canonical) = self.by_root.get(root) {
+            return canonical.clone();
+        }
+        #[cfg(test)]
+        {
+            self.resolutions += 1;
+        }
+        let canonical = crate::root_cache::canonical_root(root);
+        self.by_root.insert(root.to_path_buf(), canonical.clone());
+        canonical
+    }
+}
+
+fn bindings(
+    storage: &StoragePaths,
+    roots: &mut RootIdentities,
+) -> io::Result<BTreeMap<String, Vec<Binding>>> {
+    bindings_with_admission(storage, false, roots)
 }
 
 /// Retention bookkeeping (root bindings, the cache-key memo, owner manifests,
@@ -1639,6 +1667,15 @@ fn bindings(storage: &StoragePaths) -> io::Result<BTreeMap<String, Vec<Binding>>
 fn bindings_with_admission(
     storage: &StoragePaths,
     admission: bool,
+    roots: &mut RootIdentities,
+) -> io::Result<BTreeMap<String, Vec<Binding>>> {
+    bindings_with_root_resolver(storage, admission, &mut |root| roots.canonical_root(root))
+}
+
+fn bindings_with_root_resolver(
+    storage: &StoragePaths,
+    admission: bool,
+    canonical_root: &mut impl FnMut(&Path) -> PathBuf,
 ) -> io::Result<BTreeMap<String, Vec<Binding>>> {
     #[derive(Deserialize)]
     struct Memo {
@@ -1718,7 +1755,7 @@ fn bindings_with_admission(
         };
         if binding.linked_worktree {
             linked_roots.insert(
-                crate::root_cache::canonical_root(&binding.root),
+                canonical_root(&binding.root),
                 (binding.volume.clone(), binding.stable_volume.clone()),
             );
         }
@@ -1789,8 +1826,12 @@ fn bindings_with_admission(
             if admission {
                 yield_to_bind(&storage.durable)?;
             }
-            if let Some((volume, stable_volume)) =
-                linked_roots.get(&crate::root_cache::canonical_root(&binding.root))
+            // Keep yield_to_bind above the empty-map check so checkout binding
+            // can still interrupt this scan, even when there is no topology to copy.
+            if linked_roots.is_empty() {
+                continue;
+            }
+            if let Some((volume, stable_volume)) = linked_roots.get(&canonical_root(&binding.root))
             {
                 binding.linked_worktree = true;
                 if binding.volume.is_none() {
@@ -3235,6 +3276,7 @@ impl DueBatch {
     fn flush(
         &mut self,
         storage: &StoragePaths,
+        roots: &mut RootIdentities,
         now: u64,
         deadline: Instant,
         clock: &dyn Fn() -> Instant,
@@ -3301,7 +3343,7 @@ impl DueBatch {
             yield_to_bind(&storage.durable)?;
             Ok(Some((
                 barrier,
-                bindings_with_admission(storage, true)?,
+                bindings_with_admission(storage, true, roots)?,
                 OwnerManifests::read_with_admission(storage, true),
             )))
         });
@@ -3660,6 +3702,7 @@ fn view_member_scopes(storage: &StoragePaths) -> io::Result<HashSet<String>> {
 
 fn candidate(
     storage: &StoragePaths,
+    roots: &mut RootIdentities,
     directory: &Path,
     key: &str,
     flat: bool,
@@ -3675,6 +3718,7 @@ fn candidate(
     let mut orphan = false;
     let result = candidate_inner(
         storage,
+        roots,
         directory,
         key,
         flat,
@@ -3704,6 +3748,7 @@ fn candidate(
 
 fn candidate_inner(
     storage: &StoragePaths,
+    roots: &mut RootIdentities,
     directory: &Path,
     key: &str,
     flat: bool,
@@ -3893,7 +3938,7 @@ fn candidate_inner(
             _artifacts: artifacts,
         })
     })?;
-    let current_history = bindings_with_admission(storage, true)?;
+    let current_history = bindings_with_admission(storage, true, roots)?;
     if !eligible(
         storage,
         key,
@@ -3980,6 +4025,7 @@ fn due_keys(history: &BTreeMap<String, Vec<Binding>>, now: u64) -> Vec<String> {
 /// already due, starting after the key the previous pass ended on.
 fn due_first(
     storage: &StoragePaths,
+    roots: &mut RootIdentities,
     domains: &[(PathBuf, bool)],
     history: &BTreeMap<String, Vec<Binding>>,
     deadline: Instant,
@@ -4045,6 +4091,7 @@ fn due_first(
         report.examined += 1;
         if let Err(error) = candidate(
             storage,
+            roots,
             &directory,
             &key,
             false,
@@ -4076,10 +4123,26 @@ fn due_first(
             .add(&delta);
         last = Some(key);
         if batch.full() {
-            batch.flush(storage, report.at_ms, deadline, clock, cancelled, report)?;
+            batch.flush(
+                storage,
+                roots,
+                report.at_ms,
+                deadline,
+                clock,
+                cancelled,
+                report,
+            )?;
         }
     }
-    let flushed = batch.flush(storage, report.at_ms, deadline, clock, cancelled, report);
+    let flushed = batch.flush(
+        storage,
+        roots,
+        report.at_ms,
+        deadline,
+        clock,
+        cancelled,
+        report,
+    );
     batch.due_lane = false;
     flushed?;
     if let Some(last) = last {
@@ -4113,6 +4176,7 @@ fn persist_cursor(storage: &StoragePaths, path: &Path, cursor: &TraversalCursor)
 /// or a lexical batch full of bound views must not postpone orphan observation.
 fn orphan_first(
     storage: &StoragePaths,
+    roots: &mut RootIdentities,
     history: &BTreeMap<String, Vec<Binding>>,
     deadline: Instant,
     clock: &dyn Fn() -> Instant,
@@ -4151,6 +4215,7 @@ fn orphan_first(
         if item.entry.file_type()?.is_dir() {
             if let Err(error) = candidate(
                 storage,
+                roots,
                 &item.directory,
                 &key,
                 false,
@@ -4181,7 +4246,15 @@ fn orphan_first(
     }
     // Views this lane visits have no binding history, so none is due; flush
     // anyway so nothing prepared here can outlive the lane.
-    due.flush(storage, report.at_ms, deadline, clock, cancelled, report)?;
+    due.flush(
+        storage,
+        roots,
+        report.at_ms,
+        deadline,
+        clock,
+        cancelled,
+        report,
+    )?;
     if completed {
         last = Some(batch.end);
     }
@@ -4199,6 +4272,22 @@ fn run_pass_with_budget(
     cancelled: &dyn Fn() -> bool,
     clock: &dyn Fn() -> Instant,
     budget: Duration,
+) -> SweepReport {
+    run_pass_with_root_identities(
+        storage,
+        cancelled,
+        clock,
+        budget,
+        &mut RootIdentities::default(),
+    )
+}
+
+fn run_pass_with_root_identities(
+    storage: &StoragePaths,
+    cancelled: &dyn Fn() -> bool,
+    clock: &dyn Fn() -> Instant,
+    budget: Duration,
+    roots: &mut RootIdentities,
 ) -> SweepReport {
     let started = Instant::now();
     let mut report = SweepReport {
@@ -4226,7 +4315,7 @@ fn run_pass_with_budget(
             return Ok(());
         }
         prune_bindings(storage, cancelled, &mut report)?;
-        let history = bindings(storage)?;
+        let history = bindings(storage, roots)?;
         let domains = domain_paths(storage)?;
         for (directory, _) in &domains {
             report
@@ -4251,6 +4340,7 @@ fn run_pass_with_budget(
         // at the rate new checkouts arrive.
         due_first(
             storage,
+            roots,
             &domains,
             &history,
             deadline - budget / 2,
@@ -4269,6 +4359,7 @@ fn run_pass_with_budget(
         let phase = Instant::now();
         let orphan_visited = orphan_first(
             storage,
+            roots,
             &history,
             deadline - budget / 4,
             clock,
@@ -4320,6 +4411,7 @@ fn run_pass_with_budget(
             {
                 if let Err(error) = candidate(
                     storage,
+                    roots,
                     &directory,
                     key,
                     flat,
@@ -4349,6 +4441,7 @@ fn run_pass_with_budget(
             if due.full() {
                 due.flush(
                     storage,
+                    roots,
                     report.at_ms,
                     deadline,
                     clock,
@@ -4359,6 +4452,7 @@ fn run_pass_with_budget(
         }
         due.flush(
             storage,
+            roots,
             report.at_ms,
             deadline,
             clock,
@@ -6159,10 +6253,11 @@ mod storage_retention_tests {
         let mut report = SweepReport::default();
         let result = super::candidate(
             &paths,
+            &mut RootIdentities::default(),
             &domain,
             &key,
             true,
-            &super::bindings(&paths).unwrap(),
+            &super::bindings(&paths, &mut RootIdentities::default()).unwrap(),
             crate::pins::now_ms(),
             Instant::now() + PASS_BUDGET,
             &|| false,
@@ -6376,7 +6471,204 @@ mod storage_retention_tests {
             work: impl FnMut(&fs::DirEntry) -> io::Result<()>,
         ) -> io::Result<()>
     );
-    fixture_roots!(bindings() -> io::Result<BTreeMap<String, Vec<Binding>>>);
+    fn bindings(storage: &Path) -> io::Result<BTreeMap<String, Vec<Binding>>> {
+        super::bindings(&StoragePaths::same(storage), &mut RootIdentities::default())
+    }
+
+    fn root_identity_pass_fixture(linked: bool) -> (tempfile::TempDir, StoragePaths) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StoragePaths::same(&temp.path().join("storage"));
+        for index in 0..20 {
+            fs::create_dir_all(temp.path().join(format!("checkout-{index}"))).unwrap();
+        }
+        for index in 0..1000 {
+            let binding = Binding {
+                root: temp.path().join(format!("checkout-{}", index % 20)),
+                artifact_key: format!("{index:016x}"),
+                last_bound_ms: crate::pins::now_ms(),
+                volume: None,
+                stable_volume: None,
+                linked_worktree: linked,
+            };
+            atomic_json(
+                &storage
+                    .durable
+                    .join(format!("retention/roots/{index:016x}.json")),
+                &binding,
+            )
+            .unwrap();
+        }
+        // candidate_inner rereads history under sweep.lock before deleting an
+        // unbound cache whose observation grace has expired.
+        let key = "fffffffffffffffe";
+        let cache = storage.artifacts.join("symbols").join(key);
+        fs::create_dir_all(&cache).unwrap();
+        atomic_json(
+            &storage
+                .durable
+                .join(format!("retention/unknown/{key}.json")),
+            &0u64,
+        )
+        .unwrap();
+        (temp, storage)
+    }
+
+    fn assert_pass_root_resolutions(linked: bool, expected: usize) {
+        let (_temp, storage) = root_identity_pass_fixture(linked);
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = reads.clone();
+        let _hook = observe_test_hook(
+            &storage.artifacts,
+            Arc::new(move |step| {
+                if step == "history-read" {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }),
+        );
+        let mut roots = RootIdentities::default();
+        let now = Instant::now();
+        let report = super::run_pass_with_root_identities(
+            &storage,
+            &|| false,
+            &|| now,
+            Duration::from_secs(3600),
+            &mut roots,
+        );
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert!(
+            reads.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "{report:?}"
+        );
+        assert_eq!(report.removed_roots, 1, "{report:?}");
+        assert_eq!(roots.resolutions, expected);
+    }
+
+    #[test]
+    fn storage_retention_skips_root_resolution_without_linked_roots() {
+        assert_pass_root_resolutions(false, 0);
+    }
+
+    #[test]
+    fn storage_retention_resolves_distinct_roots_once_per_pass() {
+        assert_pass_root_resolutions(true, 20);
+    }
+
+    #[test]
+    fn storage_retention_root_memo_preserves_merged_bindings_and_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StoragePaths::same(&temp.path().join("storage"));
+        let linked = temp.path().join("linked-worktree");
+        let live = temp.path().join("main-checkout");
+        let missing = temp.path().join("removed-worktree");
+        fs::create_dir(&linked).unwrap();
+        fs::create_dir(&live).unwrap();
+        let file = temp.path().join("not-a-directory");
+        fs::write(&file, b"file").unwrap();
+        let unresolved = file.join("checkout");
+        assert!(fs::canonicalize(&unresolved).is_err());
+        let now = crate::pins::now_ms();
+        let mut memo = BTreeMap::new();
+        for (index, root) in [&linked, &live, &missing, &unresolved]
+            .into_iter()
+            .enumerate()
+        {
+            memo.insert(
+                root.clone(),
+                serde_json::json!({
+                    "key": format!("{:016x}", index + 100), "recorded_at_ms": 0,
+                }),
+            );
+            let binding = Binding {
+                root: root.clone(),
+                artifact_key: format!("{index:016x}"),
+                last_bound_ms: if root == &live { now } else { 0 },
+                volume: Some((temp.path().to_path_buf(), 7)),
+                stable_volume: None,
+                linked_worktree: root != &live,
+            };
+            atomic_json(
+                &storage
+                    .durable
+                    .join(format!("retention/roots/{index:016x}.json")),
+                &binding,
+            )
+            .unwrap();
+        }
+        atomic_json(&storage.durable.join("cache-keys.json"), &memo).unwrap();
+        let owner_key = "fffffffffffffffc";
+        crate::artifact_owner::write_synthetic_manifest_for_test(
+            &storage.durable,
+            &linked,
+            owner_key,
+            &crate::path_identity::project_scope_key(&linked),
+            std::process::id(),
+            0,
+        );
+
+        // The reference reader resolves every binding independently, as it did
+        // before the pass-local memo, including nearest-ancestor fallbacks.
+        let expected =
+            bindings_with_root_resolver(&storage, false, &mut crate::root_cache::canonical_root)
+                .unwrap();
+        let mut roots = RootIdentities::default();
+        for admission in [false, true, true] {
+            let actual = bindings_with_admission(&storage, admission, &mut roots).unwrap();
+            assert_eq!(actual, expected);
+            for key in expected.keys() {
+                let mut old_report = SweepReport::default();
+                let mut new_report = SweepReport::default();
+                assert_eq!(
+                    eligible(&storage, key, &actual, now, ROOT_GRACE_MS, &mut new_report).unwrap(),
+                    eligible(
+                        &storage,
+                        key,
+                        &expected,
+                        now,
+                        ROOT_GRACE_MS,
+                        &mut old_report
+                    )
+                    .unwrap(),
+                    "{key}",
+                );
+                assert_eq!(new_report.skipped_live, old_report.skipped_live);
+                assert_eq!(new_report.skipped_recent, old_report.skipped_recent);
+                assert_eq!(
+                    new_report.skipped_mount_mismatch,
+                    old_report.skipped_mount_mismatch
+                );
+            }
+        }
+        assert_eq!(roots.resolutions, 4);
+        let inherited = &expected[owner_key][0];
+        assert!(inherited.linked_worktree);
+        assert_eq!(inherited.volume, Some((temp.path().to_path_buf(), 7)));
+        let unresolved_records = &expected[&format!("{:016x}", 103)];
+        assert!(unresolved_records
+            .iter()
+            .all(|binding| binding.linked_worktree));
+        assert_eq!(
+            roots.canonical_root(&unresolved),
+            crate::root_cache::canonical_root(&unresolved)
+        );
+
+        fs::write(
+            storage.durable.join("retention/bind-pending.lock"),
+            b"pending",
+        )
+        .unwrap();
+        assert_eq!(
+            bindings_with_admission(&storage, true, &mut roots)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted,
+        );
+        assert_eq!(
+            bindings_with_root_resolver(&storage, true, &mut crate::root_cache::canonical_root)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted,
+        );
+    }
     fixture_roots!(record_bind(root: &Path, artifact_key: &str) -> io::Result<()>);
     fixture_roots!(reap_retired() -> io::Result<()>);
     fn schedule(
@@ -9768,6 +10060,7 @@ mod storage_retention_tests {
         .unwrap();
         due.flush(
             &StoragePaths::same(temp.path()),
+            &mut RootIdentities::default(),
             crate::pins::now_ms(),
             deadline,
             &Instant::now,
@@ -9928,8 +10221,10 @@ mod storage_retention_tests {
         let mut report = SweepReport::default();
         let mut due = DueBatch::default();
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut roots = RootIdentities::default();
         candidate(
             &storage,
+            &mut roots,
             &storage.artifacts.join("symbols"),
             key,
             false,
@@ -9944,6 +10239,7 @@ mod storage_retention_tests {
         .unwrap();
         due.flush(
             &storage,
+            &mut roots,
             now,
             deadline,
             &Instant::now,
