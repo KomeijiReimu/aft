@@ -1,0 +1,829 @@
+use super::*;
+use std::collections::HashMap;
+use std::io::{BufRead, Write};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::AtomicUsize;
+
+use hyper::header::HeaderValue;
+use hyper::Version;
+use rustls::pki_types::pem::PemObject;
+use secret_rules::location::Location;
+use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use crate::secret::vault::{AuditError, Material, MaterialError, Resolution};
+
+const K1: &[u8] = b"test-key-12345678";
+const K2: &[u8] = b"rotated-key-987654321";
+const MARKER: &str = "{{ck-secret:test}}";
+
+struct Vault {
+    calls: AtomicUsize,
+    denied: AtomicBool,
+    rotate: AtomicBool,
+}
+
+impl Vault {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            calls: AtomicUsize::new(0),
+            denied: AtomicBool::new(false),
+            rotate: AtomicBool::new(false),
+        })
+    }
+}
+
+impl SecretVault for Vault {
+    fn resolve(&self, _: &SecretScope, _: &str) -> Resolution {
+        panic!("proxy must not resolve or file consent")
+    }
+    fn material(&self, _: &SecretScope, _: &str, _: &str) -> Result<Material, MaterialError> {
+        let count = self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.denied.load(Ordering::SeqCst) {
+            return Err(MaterialError::GrantLapsed);
+        }
+        Ok(Material::new(
+            if self.rotate.load(Ordering::SeqCst) && count > 0 {
+                K2
+            } else {
+                K1
+            }
+            .to_vec(),
+        ))
+    }
+    fn audit(&self, _: &secret_rules::audit::AuditRecordV1) -> Result<(), AuditError> {
+        Ok(())
+    }
+}
+
+fn scope(reference: &str) -> SecretScope {
+    SecretScope::from_stamp(
+        &serde_json::from_value(json!({
+            "owner": {"kind":"reserved", "module_id":"prefrontal-core"},
+            "owner_authorized":true, "kind":"head", "ref":reference, "scope_epoch":1
+        }))
+        .unwrap(),
+    )
+}
+
+fn config(vault: Arc<Vault>, port: u16, locations: &[(&str, Location)]) -> ProxyConfig {
+    ProxyConfig {
+        vault,
+        authorization_scope: scope("head"),
+        lifetime_scope: scope("run"),
+        scanned_labels: locations.iter().map(|(l, _)| (*l).to_owned()).collect(),
+        grants: locations
+            .iter()
+            .map(|(label, location)| GrantedLabel {
+                rule: LabelRule {
+                    label: (*label).to_owned(),
+                    host: "localhost".into(),
+                    port,
+                    path_prefix: "/approved".into(),
+                    location: location.clone(),
+                    grant_id: "grant".into(),
+                },
+                expires_at_ms: u64::MAX,
+            })
+            .collect(),
+        origin: "test-task".into(),
+    }
+}
+
+struct Server {
+    address: SocketAddr,
+    root_pem: String,
+    client_tls: rustls::ClientConfig,
+    seen: Arc<Mutex<Vec<Value>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl Server {
+    async fn new(mode: &'static str) -> Self {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut params = CertificateParams::new(Vec::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = params.self_signed(&ca_key).unwrap();
+        let names = if mode == "wrong-name" {
+            vec!["wrong.invalid".into()]
+        } else {
+            vec!["localhost".into(), "127.0.0.1".into()]
+        };
+        let mut params = CertificateParams::new(names).unwrap();
+        if mode == "expired" {
+            params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        }
+        let key = KeyPair::generate().unwrap();
+        let leaf = params.signed_by(&key, &ca, &ca_key).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.der().clone()).unwrap();
+        let client_tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![leaf.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            )
+            .unwrap();
+        tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let overlap = Arc::new(tokio::sync::Barrier::new(2));
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                let recorded = recorded.clone();
+                let overlap = overlap.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(socket).await else {
+                        return;
+                    };
+                    let service = service_fn(move |mut request: Request<Incoming>| {
+                        let recorded = recorded.clone();
+                        let overlap = overlap.clone();
+                        async move {
+                            let upgrade = if mode.starts_with("ws") {
+                                Some(hyper::upgrade::on(&mut request))
+                            } else {
+                                None
+                            };
+                            let (parts, incoming) = request.into_parts();
+                            let data = incoming.collect().await.unwrap().to_bytes();
+                            let fields: HashMap<_, _> = parts
+                                .headers
+                                .iter()
+                                .map(|(k, v)| {
+                                    (
+                                        k.to_string(),
+                                        String::from_utf8_lossy(v.as_bytes()).to_string(),
+                                    )
+                                })
+                                .collect();
+                            recorded.lock().push(json!({"target":parts.uri.to_string(),"headers":fields,
+                                "body":String::from_utf8_lossy(&data),"sensitive":parts.headers.get("authorization").is_some_and(HeaderValue::is_sensitive)}));
+                            if let Some(upgrade) = upgrade {
+                                let mut response = Response::new(full(Bytes::new()));
+                                *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+                                response
+                                    .headers_mut()
+                                    .insert("connection", HeaderValue::from_static("upgrade"));
+                                response
+                                    .headers_mut()
+                                    .insert("upgrade", HeaderValue::from_static("websocket"));
+                                response.headers_mut().insert(
+                                    "sec-websocket-accept",
+                                    HeaderValue::from_static("fixture"),
+                                );
+                                if mode == "ws-extension" {
+                                    response.headers_mut().insert(
+                                        "sec-websocket-extensions",
+                                        HeaderValue::from_static("permessage-deflate"),
+                                    );
+                                }
+                                tokio::spawn(async move {
+                                    if let Ok(upgraded) = upgrade.await {
+                                        let mut io = TokioIo::new(upgraded);
+                                        let frames = if mode == "ws-rsv" {
+                                            [vec![0xc1, K1.len() as u8], K1.to_vec()].concat()
+                                        } else {
+                                            [
+                                                vec![0x01, 8],
+                                                K1[..8].to_vec(),
+                                                vec![0x80, (K1.len() - 8) as u8],
+                                                K1[8..].to_vec(),
+                                            ]
+                                            .concat()
+                                        };
+                                        let _ = io.write_all(&frames).await;
+                                        let _ = io.shutdown().await;
+                                    }
+                                });
+                                return Ok::<_, std::convert::Infallible>(response);
+                            }
+                            if mode == "overlap" {
+                                overlap.wait().await;
+                            }
+                            let mut payload = if mode == "echo-request" {
+                                [
+                                    parts.uri.to_string().as_bytes(),
+                                    b"|",
+                                    &data,
+                                    b"|",
+                                    parts
+                                        .headers
+                                        .get("authorization")
+                                        .map(|v| v.as_bytes())
+                                        .unwrap_or(b""),
+                                ]
+                                .concat()
+                            } else {
+                                representations(K1)
+                            };
+                            if mode == "overlap" {
+                                payload.extend_from_slice(K2);
+                            }
+                            let payload = match mode {
+                                "gzip" => {
+                                    let mut encoder =
+                                        async_compression::tokio::bufread::GzipEncoder::new(
+                                            payload.as_slice(),
+                                        );
+                                    let mut out = Vec::new();
+                                    encoder.read_to_end(&mut out).await.unwrap();
+                                    out
+                                }
+                                "deflate" => {
+                                    let mut encoder =
+                                        async_compression::tokio::bufread::ZlibEncoder::new(
+                                            payload.as_slice(),
+                                        );
+                                    let mut out = Vec::new();
+                                    encoder.read_to_end(&mut out).await.unwrap();
+                                    out
+                                }
+                                "br" => {
+                                    let mut encoder =
+                                        async_compression::tokio::bufread::BrotliEncoder::new(
+                                            payload.as_slice(),
+                                        );
+                                    let mut out = Vec::new();
+                                    encoder.read_to_end(&mut out).await.unwrap();
+                                    out
+                                }
+                                _ => payload,
+                            };
+                            let mut trailers = hyper::HeaderMap::new();
+                            trailers.insert("x-trailer", HeaderValue::from_bytes(K1).unwrap());
+                            let mut frames: Vec<Result<_, std::io::Error>> = payload
+                                .chunks(3)
+                                .map(|chunk| {
+                                    Ok(hyper::body::Frame::data(Bytes::copy_from_slice(chunk)))
+                                })
+                                .collect();
+                            frames.push(Ok(hyper::body::Frame::trailers(trailers)));
+                            let mut response = Response::new(
+                                http_body_util::StreamBody::new(futures_util::stream::iter(frames))
+                                    .boxed_unsync(),
+                            );
+                            response
+                                .headers_mut()
+                                .insert("x-echo", HeaderValue::from_bytes(K1).unwrap());
+                            response
+                                .headers_mut()
+                                .insert("trailer", HeaderValue::from_static("x-trailer"));
+                            if ["gzip", "deflate", "br", "unknown"].contains(&mode) {
+                                response
+                                    .headers_mut()
+                                    .insert("content-encoding", HeaderValue::from_static(mode));
+                            }
+                            Ok::<_, std::convert::Infallible>(response)
+                        }
+                    });
+                    let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(TokioIo::new(tls), service)
+                        .await;
+                });
+            }
+        });
+        Self {
+            address,
+            root_pem: ca.pem(),
+            client_tls,
+            seen,
+            task,
+        }
+    }
+}
+
+fn representations(key: &[u8]) -> Vec<u8> {
+    let mut payload = key.to_vec();
+    for offset in 0..3 {
+        let mut data = vec![0x9a; offset];
+        data.extend_from_slice(key);
+        data.extend_from_slice(b"suffix");
+        for alphabet in [
+            &base64::engine::general_purpose::STANDARD,
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        ] {
+            payload.push(b'|');
+            payload.extend_from_slice(alphabet.encode(&data).as_bytes());
+        }
+    }
+    payload.push(b'|');
+    payload.extend_from_slice(
+        key.iter()
+            .map(|b| format!("%{b:02x}"))
+            .collect::<String>()
+            .as_bytes(),
+    );
+    payload.push(b'|');
+    payload.extend_from_slice(
+        key.iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<String>()
+            .as_bytes(),
+    );
+    payload.push(b'|');
+    payload.extend_from_slice(
+        key.iter()
+            .map(|b| format!("\\u{b:04x}"))
+            .collect::<String>()
+            .as_bytes(),
+    );
+    payload
+}
+
+struct Client {
+    process: Child,
+    input: ChildStdin,
+    output: std::io::BufReader<ChildStdout>,
+}
+
+impl Client {
+    fn spawn(proxy: &SecretProxy, server: &Server) -> Self {
+        use std::os::unix::process::CommandExt;
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "secret_proxy::tests::client_child",
+                "--nocapture",
+            ])
+            .env("AFT_SECRET_PROXY_CHILD", "1")
+            .env("AFT_PROXY", proxy.proxy_url().as_str())
+            .env("AFT_PROXY_CA", proxy.ca_pem())
+            .env("AFT_UPSTREAM_CA", &server.root_pem)
+            .env(
+                "AFT_UPSTREAM",
+                format!("localhost:{}", server.address.port()),
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut process = command.spawn().unwrap();
+        Self {
+            input: process.stdin.take().unwrap(),
+            output: std::io::BufReader::new(process.stdout.take().unwrap()),
+            process,
+        }
+    }
+
+    fn command(&mut self, value: Value) -> Value {
+        writeln!(self.input, "{value}").unwrap();
+        self.input.flush().unwrap();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(
+                self.output.read_line(&mut line).unwrap(),
+                0,
+                "client exited: {:?}",
+                self.process.try_wait()
+            );
+            if let Ok(value) = serde_json::from_str(line.trim()) {
+                return value;
+            }
+        }
+    }
+
+    fn connect(&mut self, h2: bool) {
+        assert_eq!(self.command(json!({"op":"connect","h2":h2}))["ok"], true);
+    }
+    fn request(&mut self, path: &str, headers: Value, body: &str) -> Value {
+        self.command(json!({"op":"request","path":path,"headers":headers,"body":body}))
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+    }
+}
+
+#[test]
+fn client_child() {
+    if std::env::var_os("AFT_SECRET_PROXY_CHILD").is_none() {
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        enum Sender {
+            H1(hyper::client::conn::http1::SendRequest<http_body_util::Full<Bytes>>),
+            H2(hyper::client::conn::http2::SendRequest<http_body_util::Full<Bytes>>),
+        }
+        let mut senders: Vec<Sender> = Vec::new();
+        for line in std::io::stdin().lock().lines() {
+            let value: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(10), async {
+                if value["op"] == "connect" {
+                    let proxy = url::Url::parse(&std::env::var("AFT_PROXY").unwrap()).unwrap();
+                    let authority = value["authority"].as_str().map(str::to_owned).unwrap_or_else(|| std::env::var("AFT_UPSTREAM").unwrap());
+                    let mut socket = TcpStream::connect((proxy.host_str().unwrap(), proxy.port().unwrap())).await.map_err(|_| ())?;
+                    let credentials = base64::engine::general_purpose::STANDARD.encode(format!("{}:", proxy.username()));
+                    socket.write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Authorization: Basic {credentials}\r\n\r\n").as_bytes()).await.map_err(|_| ())?;
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") { header.push(socket.read_u8().await.map_err(|_| ())?); }
+                    if !header.starts_with(b"HTTP/1.1 200") { return Err(()); }
+                    let mut roots = rustls::RootCertStore::empty();
+                    for name in ["AFT_PROXY_CA", "AFT_UPSTREAM_CA"] {
+                        for cert in rustls::pki_types::CertificateDer::pem_slice_iter(std::env::var(name).unwrap().as_bytes()) { roots.add(cert.unwrap()).unwrap(); }
+                    }
+                    let mut config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+                    let h2 = value["h2"] == true;
+                    config.alpn_protocols = vec![if h2 { b"h2".to_vec() } else { b"http/1.1".to_vec() }];
+                    let host = authority.rsplit_once(':').unwrap().0.to_owned();
+                    let tls = tokio_rustls::TlsConnector::from(Arc::new(config)).connect(rustls::pki_types::ServerName::try_from(host).unwrap(), socket).await.map_err(|_| ())?;
+                    if h2 {
+                        let (sender, connection) = hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls)).await.map_err(|_| ())?;
+                        tokio::spawn(async move { let _ = connection.await; }); senders.push(Sender::H2(sender));
+                    } else {
+                        let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls)).await.map_err(|_| ())?;
+                        tokio::spawn(async move { let _ = connection.with_upgrades().await; }); senders.push(Sender::H1(sender));
+                    }
+                    return Ok(json!({"ok":true}));
+                }
+                let index = value["connection"].as_u64().map(|v| v as usize).unwrap_or(senders.len().saturating_sub(1));
+                let sender = senders.get_mut(index).ok_or(())?;
+                let authority = value["authority"].as_str().map(str::to_owned).unwrap_or_else(|| std::env::var("AFT_UPSTREAM").unwrap());
+                let path = value["path"].as_str().unwrap_or("/approved");
+                let uri = if matches!(sender, Sender::H2(_)) { format!("https://{authority}{path}") } else { path.to_owned() };
+                let mut request = Request::builder().uri(uri).method("POST").header("host", &authority);
+                if let Some(headers) = value["headers"].as_object() {
+                    for (key, val) in headers { request = request.header(key, val.as_str().unwrap()); }
+                }
+                let request = request.body(Full::new(Bytes::copy_from_slice(value["body"].as_str().unwrap_or("").as_bytes()))).unwrap();
+                let mut response = match sender {
+                    Sender::H1(sender) => sender.send_request(request).await.map_err(|_| ())?,
+                    Sender::H2(sender) => sender.send_request(request).await.map_err(|_| ())?,
+                };
+                let status = response.status().as_u16();
+                let headers: HashMap<_, _> = response.headers().iter().map(|(n,v)| (n.to_string(), String::from_utf8_lossy(v.as_bytes()).to_string())).collect();
+                if status == 101 {
+                    let upgraded = hyper::upgrade::on(&mut response).await.map_err(|_| ())?;
+                    let mut io = TokioIo::new(upgraded); let mut frames = Vec::new();
+                    let _ = io.read_to_end(&mut frames).await;
+                    return Ok(json!({"status":status,"frames":base64::engine::general_purpose::STANDARD.encode(frames)}));
+                }
+                let collected = response.into_body().collect().await.map_err(|_| ())?;
+                let trailers: HashMap<_,_> = collected.trailers().map(|h| h.iter().map(|(n,v)| (n.to_string(), String::from_utf8_lossy(v.as_bytes()).to_string())).collect()).unwrap_or_default();
+                Ok(json!({"status":status,"headers":headers,"body":String::from_utf8_lossy(&collected.to_bytes()),"trailers":trailers}))
+            }).await;
+            println!("{}", result.ok().and_then(Result::ok).unwrap_or(json!({"error":true})));
+            std::io::stdout().flush().unwrap();
+        }
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_h1_h2_locations_keepalive_authority_and_scanned_set() {
+    let server = Server::new("echo-request").await;
+    let vault = Vault::new();
+    let cfg = config(
+        vault.clone(),
+        server.address.port(),
+        &[
+            ("test", Location::Bearer),
+            ("query", Location::Query("key".into())),
+            ("json", Location::Json("/a~1b/~0".into())),
+            ("header", Location::Header("x-api-key".into())),
+        ],
+    );
+    let mut proxy = SecretProxy::start_with_tls(cfg, server.client_tls.clone()).unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    for h2 in [false, true] {
+        client.connect(h2);
+        let response = client.request("/approved/./one?key=%7B%7Bck-secret%3Aquery%7D%7D", json!({
+            "authorization":format!("Bearer {MARKER}"), "x-api-key":"{{ck-secret:header}}", "content-type":"application/json"
+        }), r#"{"a/b":{"~":"{{ck-secret:json}}"},"literal":"{{ck-secret:unscanned}}"}"#);
+        assert_eq!(response["status"], 200, "{response}");
+        let seen = server.seen.lock().last().unwrap().clone();
+        assert!(seen["target"]
+            .as_str()
+            .unwrap()
+            .contains("/approved/one?key=test-key-12345678"));
+        assert_eq!(seen["headers"]["authorization"], "Bearer test-key-12345678");
+        assert_eq!(seen["headers"]["x-api-key"], "test-key-12345678");
+        assert_eq!(seen["headers"]["accept-encoding"], "identity");
+        assert_eq!(
+            seen["body"],
+            r#"{"a/b":{"~":"test-key-12345678"},"literal":"{{ck-secret:unscanned}}"}"#
+        );
+        if h2 {
+            assert_eq!(seen["sensitive"], true);
+        }
+        assert!(!response
+            .to_string()
+            .contains(std::str::from_utf8(K1).unwrap()));
+        // Reuse the connection: approval belongs to each request, not a socket.
+        let response = client.request(
+            "/outside",
+            json!({"authorization":format!("Bearer {MARKER}")}),
+            "",
+        );
+        assert_eq!(response["status"], 200, "{response}");
+        assert_eq!(
+            server.seen.lock().last().unwrap()["headers"]["authorization"],
+            format!("Bearer {MARKER}")
+        );
+        assert_eq!(client.request("/approved/two", json!({"authorization":format!("Bearer {MARKER}"),"content-type":"application/json"}), "{}")["status"], 200);
+        let response = client.command(json!({"op":"request", "authority":"other.invalid", "path":"/approved", "headers":{"authorization":format!("Bearer {MARKER}")}}));
+        assert_eq!(response["status"], 403, "{response}");
+    }
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 16);
+    proxy.stop();
+    assert!(proxy.state.patterns.lock().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_scrubs_encodings_headers_trailers_and_unexpected_compression() {
+    for mode in ["plain", "gzip", "deflate", "br", "unknown"] {
+        let server = Server::new(mode).await;
+        let vault = Vault::new();
+        let proxy = SecretProxy::start_with_tls(
+            config(
+                vault.clone(),
+                server.address.port(),
+                &[("test", Location::Bearer)],
+            ),
+            server.client_tls.clone(),
+        )
+        .unwrap();
+        let mut client = Client::spawn(&proxy, &server);
+        proxy.arm_command(client.process.id()).unwrap();
+        for h2 in [false, true] {
+            client.connect(h2);
+            let response = client.request(
+                "/approved",
+                json!({"authorization":format!("Bearer {MARKER}")}),
+                "",
+            );
+            if mode == "unknown" {
+                assert_eq!(response["status"], 403);
+                continue;
+            }
+            assert_eq!(response["status"], 200, "{mode}: {response}");
+            assert_eq!(response["headers"]["x-echo"], MARKER);
+            assert_eq!(response["headers"]["content-encoding"], Value::Null);
+            assert_eq!(response["headers"]["content-length"], Value::Null);
+            assert_eq!(
+                response["trailers"]["x-trailer"], MARKER,
+                "{mode}: {response}"
+            );
+            let body = response["body"].as_str().unwrap();
+            assert_eq!(body.matches(MARKER).count(), 10, "{mode}: {body}");
+            for encoding in [
+                String::from_utf8(K1.to_vec()).unwrap(),
+                base64::engine::general_purpose::STANDARD.encode(K1),
+                K1.iter().map(|b| format!("{b:02X}")).collect(),
+            ] {
+                assert!(!response.to_string().contains(&encoding));
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_literal_responses_only_gain_matchers_after_material() {
+    let server = Server::new("plain").await;
+    let vault = Vault::new();
+    let proxy = SecretProxy::start_with_tls(
+        config(
+            vault.clone(),
+            server.address.port(),
+            &[("test", Location::Bearer)],
+        ),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let before = client.request("/outside", json!({}), "");
+    assert!(before["body"]
+        .as_str()
+        .unwrap()
+        .contains(std::str::from_utf8(K1).unwrap()));
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        client.request(
+            "/approved",
+            json!({"authorization":format!("Bearer {MARKER}")}),
+            ""
+        )["status"],
+        200
+    );
+    let after = client.request(
+        "/outside",
+        json!({"authorization":"Bearer {{ck-secret:from-file}}"}),
+        "",
+    );
+    assert!(!after.to_string().contains(std::str::from_utf8(K1).unwrap()));
+    assert_eq!(
+        server.seen.lock().last().unwrap()["headers"]["authorization"],
+        "Bearer {{ck-secret:from-file}}"
+    );
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_atomic_json_and_material_refusals_send_nothing_upstream() {
+    let server = Server::new("plain").await;
+    let vault = Vault::new();
+    let proxy = SecretProxy::start_with_tls(
+        config(
+            vault.clone(),
+            server.address.port(),
+            &[
+                ("test", Location::Bearer),
+                ("json", Location::Json("/key".into())),
+            ],
+        ),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    for body in [
+        r#"{"key":4}"#,
+        r#"{"key":"{{ck-secret:json}}","key":"{{ck-secret:json}}"}"#,
+    ] {
+        assert_eq!(client.request("/approved", json!({"authorization":format!("Bearer {MARKER}"),"content-type":"application/json"}), body)["status"], 403);
+    }
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 0);
+    assert!(server.seen.lock().is_empty());
+    vault.denied.store(true, Ordering::SeqCst);
+    assert_eq!(
+        client.request(
+            "/approved",
+            json!({"authorization":format!("Bearer {MARKER}"),"content-type":"application/json"}),
+            r#"{"key":"{{ck-secret:json}}"}"#
+        )["status"],
+        403
+    );
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 1);
+    assert!(server.seen.lock().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_upstream_tls_refuses_wrong_name_expiry_and_untrusted_root() {
+    for mode in ["wrong-name", "expired", "untrusted"] {
+        let server = Server::new(mode).await;
+        let vault = Vault::new();
+        let cfg = config(
+            vault.clone(),
+            server.address.port(),
+            &[("test", Location::Bearer)],
+        );
+        let proxy = if mode == "untrusted" {
+            SecretProxy::start(cfg).unwrap()
+        } else {
+            SecretProxy::start_with_tls(cfg, server.client_tls.clone()).unwrap()
+        };
+        let mut client = Client::spawn(&proxy, &server);
+        proxy.arm_command(client.process.id()).unwrap();
+        client.connect(false);
+        let response = client.request(
+            "/approved",
+            json!({"authorization":format!("Bearer {MARKER}")}),
+            "",
+        );
+        assert_eq!(response["status"], 403, "{mode}: {response}");
+        assert!(server.seen.lock().is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_websocket_scrubs_fragments_and_refuses_extensions_and_rsv() {
+    for mode in ["ws", "ws-extension", "ws-rsv"] {
+        let server = Server::new(mode).await;
+        let vault = Vault::new();
+        let proxy = SecretProxy::start_with_tls(
+            config(vault, server.address.port(), &[("test", Location::Bearer)]),
+            server.client_tls.clone(),
+        )
+        .unwrap();
+        let mut client = Client::spawn(&proxy, &server);
+        proxy.arm_command(client.process.id()).unwrap();
+        client.connect(false);
+        let response = client.request("/approved", json!({"authorization":format!("Bearer {MARKER}"),"connection":"upgrade","upgrade":"websocket","sec-websocket-extensions":"permessage-deflate"}), "");
+        assert!(server.seen.lock()[0]["headers"]
+            .get("sec-websocket-extensions")
+            .is_none());
+        if mode == "ws-extension" {
+            assert_eq!(response["status"], 403);
+        } else {
+            assert_eq!(response["status"], 101, "{response}");
+            let frames = base64::engine::general_purpose::STANDARD
+                .decode(response["frames"].as_str().unwrap())
+                .unwrap();
+            if mode == "ws-rsv" {
+                assert!(frames.is_empty());
+            } else {
+                assert_eq!(
+                    frames,
+                    [vec![0x81, MARKER.len() as u8], MARKER.as_bytes().to_vec()].concat()
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_non_rule_connect_is_tunnelled_without_interception() {
+    let server = Server::new("echo-request").await;
+    let vault = Vault::new();
+    let proxy = SecretProxy::start_with_tls(
+        config(
+            vault.clone(),
+            server.address.port(),
+            &[("test", Location::Bearer)],
+        ),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    assert_eq!(
+        client.command(json!({"op":"connect","authority":server.address.to_string()}))["ok"],
+        true
+    );
+    let response = client.request(
+        "/approved",
+        json!({"authorization":format!("Bearer {MARKER}")}),
+        "",
+    );
+    assert_eq!(response["status"], 200);
+    assert_eq!(
+        server.seen.lock()[0]["headers"]["authorization"],
+        format!("Bearer {MARKER}")
+    );
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 0);
+    assert!(proxy.state.patterns.lock().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_scope_stop_closes_listener_and_open_connections() {
+    let server = Server::new("plain").await;
+    let vault = Vault::new();
+    let mut proxy = SecretProxy::start_with_tls(
+        config(
+            vault.clone(),
+            server.address.port(),
+            &[("test", Location::Bearer)],
+        ),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(true);
+    assert_eq!(
+        client.request(
+            "/approved",
+            json!({"authorization":format!("Bearer {MARKER}")}),
+            ""
+        )["status"],
+        200
+    );
+    proxy.stop_if_scope_ended(&scope("head"));
+    assert!(!proxy.state.stopped.load(Ordering::Acquire));
+    proxy.stop_if_scope_ended(&scope("run"));
+    assert!(TcpStream::connect(proxy.address()).await.is_err());
+    assert_eq!(
+        client.request(
+            "/approved",
+            json!({"authorization":format!("Bearer {MARKER}")}),
+            ""
+        )["error"],
+        true
+    );
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 1);
+    assert!(proxy.state.patterns.lock().is_empty());
+}

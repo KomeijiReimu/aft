@@ -184,6 +184,15 @@ aft-tokenizer = { path = "../aft-tokenizer", version = "0.62.0" }
 # seam speaks. AFT owns the crate; basal links it later.
 secret-rules = { path = "../secret-rules", version = "0.1.0" }
 zeroize = "1"
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
+async-compression = { version = "0.4", features = ["tokio", "gzip", "zlib", "brotli"] }
+rcgen = "0.13"
 # Shared CortexKit-neutral path-canonicalization primitive (ProjectRootId).
 # Lives in github.com/cortexkit/commons (product-neutral, used without subc);
 # its CI runs the cfg(windows) verbatim/UNC/drive-case vectors continuously.
@@ -256,6 +265,7 @@ landlock = "=0.4.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 fsevent-sys = "4.1"
+libproc = "0.14"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -283,4 +293,3 @@ async-trait = "0.1"
 tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 filetime = "0.2"
-rcgen = "0.13"
