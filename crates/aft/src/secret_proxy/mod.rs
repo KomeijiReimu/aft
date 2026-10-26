@@ -4,6 +4,12 @@
 //! configured lifetime SecretScope, either of which stops the proxy.
 //! The armed leader's start time pins its generation. Loss or replacement of
 //! that leader also stops the proxy, even if orphaned descendants remain.
+//! Each proxy admits at most 16 connections and 32 in-flight requests/streams.
+//! Sockets have a 30-second activity-based idle timeout (also the TCP connect
+//! deadline). Response coding depth is at most four. At most 32 label/key
+//! matcher sets and 4096 bytes per material value are accepted; old matchers
+//! are never evicted to make room. JSON input remains capped at 1 MiB and grows
+//! only as body bytes arrive. Limits refuse new work rather than weaken scrub.
 //!
 //! # Memory boundary
 //!
@@ -21,6 +27,7 @@
 //! `Debug` or `Display`. Zeroization is defence in depth in the daemon, not a claim
 //! that third-party protocol implementations erase every transient copy.
 
+mod limits;
 mod peer;
 mod request;
 mod response;
@@ -93,6 +100,8 @@ pub(crate) struct State {
     ca_key: KeyPair,
     upstream: rustls::ClientConfig,
     material_gate: Mutex<()>,
+    connections: Arc<tokio::sync::Semaphore>,
+    requests: Arc<tokio::sync::Semaphore>,
     // Keep each installed key as an exact-byte matcher for response scrubbers.
     // Rotation adds a matcher instead of replacing earlier key values.
     patterns: Mutex<Vec<(String, Zeroizing<Vec<u8>>)>>,
@@ -105,6 +114,16 @@ pub(crate) struct State {
 }
 
 impl State {
+    fn idle_timeout(&self) -> Duration {
+        #[cfg(test)]
+        {
+            let ms = self.test_idle_timeout_ms.load(Ordering::Acquire);
+            if ms != 0 {
+                return Duration::from_millis(ms);
+            }
+        }
+        limits::IDLE
+    }
     fn generation_valid(&self) -> bool {
         let pid = self.session.load(Ordering::Acquire);
         if pid <= 0 {
@@ -148,6 +167,9 @@ impl State {
     }
 
     fn install(&self, label: &str, key: &[u8]) -> Result<(), ()> {
+        if key.len() > limits::MATERIAL_BYTES {
+            return Err(());
+        }
         let mut patterns = self.patterns.lock();
         if self.stopped.load(Ordering::Acquire) {
             return Err(());
@@ -157,6 +179,9 @@ impl State {
             .any(|(l, k)| l == label && k.as_slice() == key)
         {
             return Ok(());
+        }
+        if patterns.len() >= limits::MATCHERS {
+            return Err(());
         }
         let mut sets = patterns
             .iter()
@@ -257,6 +282,8 @@ impl SecretProxy {
             ca_key,
             upstream,
             material_gate: Mutex::new(()),
+            connections: Arc::new(tokio::sync::Semaphore::new(limits::CONNECTIONS)),
+            requests: Arc::new(tokio::sync::Semaphore::new(limits::REQUESTS)),
             patterns: Mutex::new(Vec::new()),
             #[cfg(test)]
             headers_sensitive: AtomicBool::new(false),
@@ -381,11 +408,14 @@ async fn serve(
             }
             accepted = listener.accept() => {
                 let Ok((socket, _)) = accepted else { break; };
+                let Ok(lease) = state.connections.clone().try_acquire_owned() else { continue; };
+                let lease = Arc::new(lease);
                 let state = state.clone();
                 connections.spawn(async move {
                     let session = state.session.load(Ordering::Acquire);
                     if session <= 0 || !state.generation_valid() || !peer::authorized(&socket, session) || !state.generation_valid() { return; }
-                    let service = service_fn(move |request| connect(request, state.clone()));
+                    let socket = limits::IdleIo::new(socket, state.idle_timeout());
+                    let service = service_fn(move |request| connect(request, state.clone(), lease.clone()));
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(TokioIo::new(socket), service).with_upgrades().await;
                 });
@@ -401,6 +431,7 @@ async fn serve(
 async fn connect(
     mut request: Request<Incoming>,
     state: Arc<State>,
+    lease: Arc<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<Response<Body>, std::convert::Infallible> {
     let refused = || refusal("", "");
     if request.method() != Method::CONNECT || state.stopped.load(Ordering::Acquire) {
@@ -445,12 +476,18 @@ async fn connect(
     let upstream = if intercepted {
         None
     } else {
-        match TcpStream::connect((authority.host.as_str(), authority.port)).await {
-            Ok(socket) => Some(socket),
-            Err(_) => return Ok(refused()),
+        match tokio::time::timeout(
+            state.idle_timeout(),
+            TcpStream::connect((authority.host.as_str(), authority.port)),
+        )
+        .await
+        {
+            Ok(Ok(socket)) => Some(limits::IdleIo::new(socket, state.idle_timeout())),
+            _ => return Ok(refused()),
         }
     };
     tokio::spawn(async move {
+        let _lease = lease;
         let Ok(upgraded) = hyper::upgrade::on(&mut request).await else {
             return;
         };

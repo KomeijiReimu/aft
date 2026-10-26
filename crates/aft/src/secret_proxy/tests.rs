@@ -543,7 +543,7 @@ fn client_child() {
                 }
                 if value["op"] == "idle" {
                     let socket = raw_sockets.last_mut().ok_or(())?;
-                    let closed = matches!(tokio::time::timeout(Duration::from_millis(250), socket.read_u8()).await, Ok(Err(_)));
+                    let closed = matches!(tokio::time::timeout(Duration::from_millis(1000), socket.read_u8()).await, Ok(Err(_)));
                     return Ok(json!({"closed":closed}));
                 }
                 if value["op"] == "cap_connections" {

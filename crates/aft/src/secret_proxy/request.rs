@@ -25,6 +25,12 @@ pub(super) async fn forward(
     authority: ConnectAuthority,
     state: Arc<State>,
 ) -> Result<Response<Body>, std::convert::Infallible> {
+    let lease = state
+        .requests
+        .clone()
+        .try_acquire_owned()
+        .ok()
+        .map(Arc::new);
     let websocket = request
         .headers()
         .get("upgrade")
@@ -35,8 +41,12 @@ pub(super) async fn forward(
         .first()
         .map(|g| g.rule.label.as_str())
         .unwrap_or("");
-    let result = prepare_and_send(request, &authority, &state).await;
-    Ok(result.unwrap_or_else(|label| {
+    let result = if let Some(lease) = &lease {
+        prepare_and_send(request, &authority, &state, lease.clone()).await
+    } else {
+        Err(String::new())
+    };
+    let response = result.unwrap_or_else(|label| {
         let label = if label.is_empty() { fallback } else { &label };
         let bytes = Zeroizing::new(format!(
             "{}: {label} ({})\n",
@@ -55,13 +65,23 @@ pub(super) async fn forward(
             );
         }
         response
-    }))
+    });
+    let (parts, body) = response.into_parts();
+    Ok(Response::from_parts(
+        parts,
+        body.map_frame(move |frame| {
+            let _ = &lease;
+            frame
+        })
+        .boxed_unsync(),
+    ))
 }
 
 async fn prepare_and_send(
     mut request: Request<Incoming>,
     authority: &ConnectAuthority,
     state: &Arc<State>,
+    lease: Arc<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<Response<Body>, String> {
     let fail = || String::new();
     if state.stopped.load(Ordering::Acquire) || !state.generation_valid() {
@@ -129,6 +149,13 @@ async fn prepare_and_send(
             if let Some(data) = frame.data_ref() {
                 if body.len().saturating_add(data.len()) > 1024 * 1024 {
                     return Err(fail());
+                }
+                if body.len() + data.len() > body.capacity() {
+                    let mut grown = Zeroizing::new(Vec::with_capacity(
+                        (body.len() + data.len()).next_power_of_two(),
+                    ));
+                    grown.extend_from_slice(&body);
+                    body = grown;
                 }
                 body.extend_from_slice(data);
             }
@@ -315,13 +342,13 @@ async fn prepare_and_send(
     };
     let response = response.await.map_err(|_| fail())?;
     let _request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-    super::response::forward(response, state.clone(), client_upgrade)
+    super::response::forward(response, state.clone(), client_upgrade, lease)
         .await
         .map_err(|_| fail())
 }
 
-pub(super) fn body_buffer(has_json: bool) -> Zeroizing<Vec<u8>> {
-    Zeroizing::new(Vec::with_capacity(if has_json { 1024 * 1024 } else { 0 }))
+pub(super) fn body_buffer(_has_json: bool) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(Vec::new())
 }
 
 fn apply_edits(
@@ -382,9 +409,14 @@ async fn connect_upstream(
     websocket: bool,
 ) -> Result<Upstream, String> {
     let fail = || String::new();
-    let socket = tokio::net::TcpStream::connect((authority.host.as_str(), authority.port))
-        .await
-        .map_err(|_| fail())?;
+    let socket = tokio::time::timeout(
+        state.idle_timeout(),
+        tokio::net::TcpStream::connect((authority.host.as_str(), authority.port)),
+    )
+    .await
+    .map_err(|_| fail())?
+    .map_err(|_| fail())?;
+    let socket = super::limits::IdleIo::new(socket, state.idle_timeout());
     let mut config = state.upstream.clone();
     config.alpn_protocols = if websocket {
         vec![b"http/1.1".to_vec()]

@@ -68,6 +68,7 @@ pub(super) async fn forward(
     mut response: Response<Incoming>,
     state: Arc<State>,
     client_upgrade: Option<hyper::upgrade::OnUpgrade>,
+    lease: Arc<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<Response<Body>, ()> {
     // Hyper removes chunk framing, not arbitrary preceding transfer codings.
     // Do not discard that declaration and pass its still-encoded bytes onward.
@@ -93,6 +94,7 @@ pub(super) async fn forward(
         let upstream_upgrade = hyper::upgrade::on(&mut response);
         let client_upgrade = client_upgrade.ok_or(())?;
         tokio::spawn(async move {
+            let _lease = lease;
             if let (Ok(client), Ok(upstream)) = tokio::join!(client_upgrade, upstream_upgrade) {
                 super::websocket::relay(client, upstream, state).await;
             }
@@ -147,6 +149,7 @@ pub(super) async fn forward(
     let mut scrubber = state.scrubber()?;
     let (sender, receiver) = tokio::sync::mpsc::channel(2);
     tokio::spawn(async move {
+        let _lease = lease;
         let run = async {
             let mut buffer = Zeroizing::new(vec![0u8; 8192]);
             loop {
@@ -217,9 +220,10 @@ pub(super) fn content_codings(headers: &HeaderMap) -> Result<Vec<String>, ()> {
         .flat_map(|v| v.split(','))
         .map(|s| s.trim().to_ascii_lowercase())
         .collect();
-    if encodings
-        .iter()
-        .any(|s| !matches!(s.as_str(), "identity" | "gzip" | "deflate" | "br"))
+    if encodings.len() > super::limits::CODINGS
+        || encodings
+            .iter()
+            .any(|s| !matches!(s.as_str(), "identity" | "gzip" | "deflate" | "br"))
     {
         return Err(());
     }

@@ -157,7 +157,10 @@ async fn audit_resource_limits() {
     drop(proxy);
     let server = Server::new("plain").await;
     let (proxy, mut client) = launch(&server, Vault::new());
-    proxy.state.test_idle_timeout_ms.store(25, Ordering::SeqCst);
+    proxy
+        .state
+        .test_idle_timeout_ms
+        .store(500, Ordering::SeqCst);
     assert_eq!(
         client.command(json!({"op":"connect","raw":true}))["ok"],
         true
