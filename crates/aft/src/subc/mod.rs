@@ -11971,6 +11971,13 @@ fn opaque_field_refusal_frame(
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    /// Write user configuration with indexes and views disabled for transport tests.
+    /// Default configure can start index builds that these tests do not exercise.
+    pub(super) fn bind_config_without_indexes(root: &std::path::Path) -> std::path::PathBuf {
+        let path = root.join("protocol-user-config.json");
+        std::fs::write(&path, r#"{"indexes":{"trigram":false,"semantic":false,"callgraph":false},"views":{"enabled":false}}"#).unwrap();
+        path
+    }
     use super::*;
     use crate::bash_background::BgTaskStatus;
     use crate::protocol::{
@@ -14090,7 +14097,7 @@ mod tests {
                         Response::success(request.id, json!({}))
                     }
                 },
-                Some(fixture_path.join("absent-user-config.json")),
+                Some(test_support::bind_config_without_indexes(&fixture_path)),
                 false,
                 usize::MAX,
                 None,
@@ -14260,7 +14267,7 @@ mod tests {
                         Response::success(request.id, json!({}))
                     }
                 },
-                Some(fixture_path.join("absent-user-config.json")),
+                Some(test_support::bind_config_without_indexes(&fixture_path)),
                 false,
                 usize::MAX,
                 None,
@@ -14769,7 +14776,7 @@ mod tests {
                         Response::success(request.id, json!({}))
                     }
                 },
-                Some(&dir.path().join("absent-user-config.json")),
+                Some(&test_support::bind_config_without_indexes(dir.path())),
                 usize::MAX,
                 None,
             )
@@ -23747,7 +23754,7 @@ mod pong_priority_tests {
                         Response::success(request.id, json!({}))
                     }
                 },
-                Some(storage_path.join("user.json")),
+                Some(test_support::bind_config_without_indexes(&storage_path)),
                 false,
                 usize::MAX,
                 None,

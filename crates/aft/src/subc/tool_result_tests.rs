@@ -232,7 +232,7 @@ async fn tool_result_ast_search_t6_complete_and_budget_cut_on_negotiated_route()
     // Reuse a configured actor without starting unrelated background indexing.
     let ctx = Arc::new(context(&root));
     let app = ctx.app().clone();
-    executor.register_actor(root_id, ctx);
+    executor.register_actor(root_id, ctx.clone());
     let loop_executor = executor.clone();
     let (mut daemon, module) = tokio::io::duplex(64 * 1024);
     let module_thread = std::thread::spawn(move || {
@@ -254,7 +254,7 @@ async fn tool_result_ast_search_t6_complete_and_budget_cut_on_negotiated_route()
                     crate::commands::ast_search::handle_ast_search(&request, &ctx)
                 }
             },
-            Some(module_root.join("absent-user-config.json")),
+            Some(test_support::bind_config_without_indexes(&module_root)),
             false,
             usize::MAX,
             None,
@@ -327,6 +327,14 @@ async fn tool_result_ast_search_t6_complete_and_budget_cut_on_negotiated_route()
         serde_json::from_slice::<ModuleControlResponse>(&ack.body).unwrap(),
         ModuleControlResponse::RouteBindAck {}
     ));
+    let configured = ctx.config();
+    assert!(
+        !configured.indexes.trigram
+            && !configured.indexes.semantic
+            && !configured.indexes.callgraph,
+        "protocol fixture unexpectedly enabled background indexes"
+    );
+    drop(configured);
     let mut replies = Vec::new();
     for (corr, file) in [(10, "small.js"), (11, "large.js")] {
         let call = json!({"name":"ast_search", "arguments":{
@@ -528,7 +536,7 @@ async fn tool_result_capability_is_selected_per_bind_not_per_call() {
                     json!({"producer_budget": result_body::active()}),
                 )
             },
-            Some(module_root.join("absent-user-config.json")),
+            Some(test_support::bind_config_without_indexes(&module_root)),
             false,
             usize::MAX,
             None,

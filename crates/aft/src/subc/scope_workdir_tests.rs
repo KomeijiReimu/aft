@@ -157,7 +157,7 @@ fn bind_observed(
                     }
                     Response::success(request.id, request.params)
                 },
-                Some(&root.join("absent-user-config.json")),
+                Some(&test_support::bind_config_without_indexes(&root)),
                 usize::MAX,
                 None,
             )
