@@ -1706,6 +1706,33 @@ impl fmt::Debug for PlaneReaders {
 }
 
 impl PlaneReaders {
+    /// Refresh per-binding query state after publication without reopening any
+    /// immutable reader or taking the global reader-cache lock.
+    pub(crate) fn rebind(
+        &self,
+        access: &super::contracts::ViewAccess,
+    ) -> Result<Arc<Self>, super::contracts::PlaneError> {
+        let mut resources = Vec::with_capacity(self.adapters.len());
+        for lease in &self.adapters {
+            if lease.key.1 != access.family() || lease.key.2 != access.scope() {
+                return Err(super::contracts::PlaneError::loader(
+                    super::contracts::LoaderStage::Installation,
+                    "reader lease belongs to another view",
+                ));
+            }
+            resources.push(lease.adapter.bind_reader(
+                access,
+                &self.generation,
+                lease.resource.clone(),
+            )?);
+        }
+        Ok(Arc::new(Self {
+            resources,
+            adapters: self.adapters.clone(),
+            generation: self.generation.clone(),
+        }))
+    }
+
     pub(super) fn resource(
         &self,
         adapter: usize,

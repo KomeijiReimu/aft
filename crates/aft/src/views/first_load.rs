@@ -1432,10 +1432,15 @@ pub struct CheckoutDriver {
     observed: std::sync::Mutex<ObservedCheckout>,
     installed: std::sync::Mutex<Arc<InstalledBundle>>,
     live: std::sync::Mutex<LiveDelta>,
-    prepared_readers: std::sync::Mutex<BTreeMap<String, Arc<PlaneReaders>>>,
+    prepared_readers: std::sync::Mutex<BTreeMap<String, PreparedReaders>>,
     retry: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     work: std::sync::Mutex<ReconcileWork>,
+}
+
+struct PreparedReaders {
+    seq: u64,
+    readers: Arc<PlaneReaders>,
 }
 
 /// Source work only; publication and model counters belong to their stores.
@@ -1593,9 +1598,9 @@ impl CheckoutDriver {
         installed: &InstalledBundle,
     ) -> Result<(), PlaneError> {
         if cut.seq != installed.seq || !Arc::ptr_eq(&cut.resident, &installed.composed) {
-            return Err(SiblingLoader::error(
-                "BaseChanged: installed bundle superseded",
-            ));
+            return Err(SiblingLoader::error(format!(
+                "{CHECKOUT_CHANGED_BEFORE_INSTALL}: BaseChanged: installed bundle superseded"
+            )));
         }
         // A prior ignore-file record is not proof that the current membership
         // epoch was walked. Only the completed strict walk carries this tag.
@@ -1629,7 +1634,9 @@ impl FirstLoadDriver for CheckoutDriver {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         live.replay_onto(snapshot, cut)
             .map(|_| ())
-            .map_err(|error| SiblingLoader::error(format!("{error:?}")))?;
+            .map_err(|error| {
+                SiblingLoader::error(format!("{CHECKOUT_CHANGED_BEFORE_INSTALL}: {error:?}"))
+            })?;
         let installed = self
             .installed
             .lock()
@@ -1763,7 +1770,9 @@ impl FirstLoadDriver for CheckoutDriver {
             .prepared_readers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(snapshot.generation().name());
+            .get(snapshot.generation().name())
+            .map(|prepared| prepared.readers.clone());
+        let from_prepared = prepared.is_some();
         let own_installed = prepared.is_some() || previously_owned;
         let readers = match prepared {
             Some(readers) => readers,
@@ -1793,14 +1802,28 @@ impl FirstLoadDriver for CheckoutDriver {
             .live
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut successor = live
-            .replay_onto(snapshot, cut)
-            .map_err(|error| SiblingLoader::error(format!("{error:?}")))?;
+        let install_error = |error: PlaneError| {
+            if from_prepared {
+                self.retry.store(true, std::sync::atomic::Ordering::Release);
+                SiblingLoader::error(format!(
+                    "{CHECKOUT_CHANGED_BEFORE_INSTALL}: published installation refused: {}",
+                    error.reason
+                ))
+            } else {
+                error
+            }
+        };
+        let mut successor = live.replay_onto(snapshot, cut).map_err(|error| {
+            install_error(SiblingLoader::error(format!(
+                "{CHECKOUT_CHANGED_BEFORE_INSTALL}: {error:?}"
+            )))
+        })?;
         let mut installed = self
             .installed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.validate_install_identity(snapshot, cut, &live, &installed)?;
+        self.validate_install_identity(snapshot, cut, &live, &installed)
+            .map_err(install_error)?;
         let seq = installed.seq + 1;
         successor.set_watcher(super::snapshot::WatcherState::Healthy);
         let published = snapshot
@@ -1860,6 +1883,22 @@ impl FirstLoadDriver for CheckoutDriver {
         // Keep displaced owners alive until both root locks are released.
         drop(retired_bundle);
         drop(retired_delta);
+        let mut retired_prepared = Vec::new();
+        {
+            let mut prepared = self
+                .prepared_readers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            prepared.retain(|_, entry| {
+                if entry.seq < seq {
+                    retired_prepared.push(entry.readers.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        drop(retired_prepared);
         Ok(())
     }
     fn build_own_generation(
@@ -1971,18 +2010,22 @@ impl FirstLoadDriver for CheckoutDriver {
         // before publication and never run under the installed-bundle mutex.
         let readers = PlaneReaders::open(access, generation.clone(), &self.adapters)?;
         let mut published = false;
+        let mut progress = PublicationProgress::NotAttempted;
         let mut commit = || {
+            self.validate_cut(access, snapshot, 0)?;
             let prepared = prepared
                 .take()
                 .ok_or_else(|| SiblingLoader::error("publication committed twice"))?;
+            progress = PublicationProgress::MayHaveLanded;
             store
-                .commit_v2(prepared, None)
+                .commit_v2_before_sweep(prepared, None, || store.current_generation_read_only().map(|_| ()))
                 .map_err(|error| SiblingLoader::error(error.to_string()))
                 .and_then(|outcome| match outcome {
-                    super::manifest_v2::PublishV2::Published => { unpublished.complete(); published = true; Ok(()) },
-                    super::manifest_v2::PublishV2::Conflict { .. } | super::manifest_v2::PublishV2::EquivalentWinner { .. } => {
+                    super::manifest_v2::PublishV2::Published => { progress = PublicationProgress::Published; unpublished.complete(); published = true; Ok(()) },
+                    outcome @ (super::manifest_v2::PublishV2::Conflict { .. } | super::manifest_v2::PublishV2::EquivalentWinner { .. }) => {
+                        progress = PublicationProgress::NotAttempted;
                         self.retry.store(true, std::sync::atomic::Ordering::Release);
-                        Err(SiblingLoader::error(format!("{CHECKOUT_CHANGED_BEFORE_INSTALL}: publication lost; revalidate a fresh job")))
+                        Err(SiblingLoader::error(format!("{CHECKOUT_CHANGED_BEFORE_INSTALL}: publication lost ({outcome:?}); revalidate a fresh job")))
                     }
                 })
         };
@@ -1991,31 +2034,52 @@ impl FirstLoadDriver for CheckoutDriver {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        match fence {
-            Some(fence) => fence.publish(&mut commit)?,
-            None => commit()?,
+        let publication = match fence {
+            Some(fence) => fence.publish(&mut commit),
+            None => commit(),
+        };
+        drop(commit);
+        if let Err(error) = publication {
+            if progress != PublicationProgress::NotAttempted {
+                unpublished.complete();
+                self.retry.store(true, std::sync::atomic::Ordering::Release);
+                return Err(SiblingLoader::error(format!("{CHECKOUT_CHANGED_BEFORE_INSTALL}: publication may have landed; revalidate: {}", error.reason)));
+            }
+            return Err(error);
         }
         if !published {
             return Err(SiblingLoader::error("publication fence did not commit"));
         }
-        self.owner
-            .registry()
-            .note_publish(self.owner.scope())
-            .map_err(|error| SiblingLoader::error(error.to_string()))?;
-        // Successful publication must also be readable through the registry's
-        // read-only pointer path. Let SQLite establish its WAL sidecars here;
-        // skipping this probe changes later opens of a read-only view directory.
-        let _ = store
-            .current_generation_read_only()
-            .map_err(|error| SiblingLoader::error(error.to_string()))?;
-        for adapter in &self.adapters {
-            adapter.generation_published(access, &generation)?;
-        }
-        self.prepared_readers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(generation.name().to_owned(), readers);
-        Ok(generation)
+        let finish = (|| {
+            self.owner
+                .registry()
+                .note_publish(self.owner.scope())
+                .map_err(|error| SiblingLoader::error(error.to_string()))?;
+            for adapter in &self.adapters {
+                adapter.generation_published(access, &generation)?;
+            }
+            let readers = readers.rebind(access)?;
+            let retired = self
+                .prepared_readers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(
+                    generation.name().to_owned(),
+                    PreparedReaders {
+                        seq: snapshot.install_cut().map_or(0, |cut| cut.seq),
+                        readers,
+                    },
+                );
+            drop(retired);
+            Ok(generation)
+        })();
+        finish.map_err(|error: PlaneError| {
+            self.retry.store(true, std::sync::atomic::Ordering::Release);
+            SiblingLoader::error(format!(
+                "{CHECKOUT_CHANGED_BEFORE_INSTALL}: durable publication needs revalidation: {}",
+                error.reason
+            ))
+        })
     }
 }
 
@@ -2330,6 +2394,58 @@ mod composite_tests {
         }
     }
 
+    struct FailAfterLandedCas;
+    impl PublishFence for FailAfterLandedCas {
+        fn publish(
+            &self,
+            commit: &mut dyn FnMut() -> Result<(), PlaneError>,
+        ) -> Result<(), PlaneError> {
+            commit()?;
+            Err(SiblingLoader::error("failure after durable CAS"))
+        }
+    }
+
+    #[test]
+    fn real_checkout_post_cas_error_preserves_publication_and_requires_revalidation() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        driver.set_publish_fence(Arc::new(FailAfterLandedCas));
+        let error = SiblingLoader::new(driver.clone(), vec![])
+            .load(&access)
+            .unwrap_err();
+        assert!(
+            error.reason.contains("publication may have landed"),
+            "{error:?}"
+        );
+        assert!(driver.take_revalidated_job());
+        assert_eq!(driver.installed_bundle().composed.name(), "empty");
+        let store = driver.owner.view_store().unwrap();
+        let published = store.current_generation_read_only().unwrap().unwrap();
+        let manifest = store.load_manifest_v2(&published).unwrap();
+        let blobs = driver.owner.open_store(FamilyPlane::Trigram).unwrap();
+        for key in manifest.ready_keys() {
+            assert!(blobs.get(&key).unwrap().is_some());
+        }
+        driver.set_publish_fence(Arc::new(AcceptPublication));
+        drop(
+            SiblingLoader::new(driver.clone(), vec![])
+                .load(&access)
+                .unwrap(),
+        );
+        assert_ne!(driver.installed_bundle().composed.name(), "empty");
+    }
+
+    struct AcceptPublication;
+    impl PublishFence for AcceptPublication {
+        fn publish(
+            &self,
+            commit: &mut dyn FnMut() -> Result<(), PlaneError>,
+        ) -> Result<(), PlaneError> {
+            commit()
+        }
+    }
+
     #[test]
     fn real_checkout_publication_opens_blob_readers_before_cas_and_installs_after() {
         let root = tempfile::tempdir().unwrap();
@@ -2504,6 +2620,58 @@ mod composite_tests {
         assert_eq!(
             driver.live.lock().unwrap().watcher(),
             super::super::snapshot::WatcherState::Reconciling
+        );
+    }
+
+    #[test]
+    fn rejected_install_does_not_consume_prepared_readers() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        drop(
+            SiblingLoader::new(driver.clone(), vec![])
+                .load(&access)
+                .unwrap(),
+        );
+        let (current, revision) = driver.installed_cut();
+        let seq = driver.installed_bundle().seq;
+        let mut cut = current.install_cut().unwrap().clone();
+        cut.seq = cut.seq.saturating_sub(1);
+        let generation = driver
+            .build_own_generation(&access, &current, false)
+            .unwrap();
+        let readers = driver
+            .prepared_readers
+            .lock()
+            .unwrap()
+            .get(generation.name())
+            .unwrap()
+            .readers
+            .clone();
+        let snapshot = super::super::snapshot::LiveDelta::new(generation.clone())
+            .snapshot()
+            .with_install_cut(cut);
+        assert!(driver.install(&access, &snapshot, revision).is_err());
+        let retained = driver
+            .prepared_readers
+            .lock()
+            .unwrap()
+            .get(generation.name())
+            .unwrap()
+            .readers
+            .clone();
+        assert!(Arc::ptr_eq(&retained, &readers));
+        assert_eq!(driver.installed_bundle().seq, seq);
+        assert!(driver.take_revalidated_job());
+        assert_eq!(
+            driver
+                .owner
+                .view_store()
+                .unwrap()
+                .current_generation_read_only()
+                .unwrap()
+                .as_deref(),
+            Some(generation.name())
         );
     }
 
@@ -2799,6 +2967,14 @@ mod composite_tests {
             let (snapshot, revision) = driver.installed_cut();
             let error = loader.fold(&access, &snapshot, revision).unwrap_err();
             assert!(error.reason.contains("publication lost"));
+            assert!(
+                error.reason.contains(if equivalent {
+                    "EquivalentWinner"
+                } else {
+                    "Conflict"
+                }),
+                "{error:?}"
+            );
             assert!(driver.take_revalidated_job());
             assert_eq!(driver.installed_bundle().seq, before.seq);
             assert_eq!(

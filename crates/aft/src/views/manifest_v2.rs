@@ -744,6 +744,18 @@ impl ViewStore {
         prepared: PreparedV2,
         observer: Option<&dyn DurabilityObserver>,
     ) -> Result<PublishV2> {
+        self.commit_v2_before_sweep(prepared, observer, || Ok(()))
+    }
+
+    /// Complete publication-time SQLite reads before scheduling retirement.
+    /// The callback must close its connections before returning, including on
+    /// error; a callback error does not roll back the already durable pointer.
+    pub(crate) fn commit_v2_before_sweep(
+        &self,
+        prepared: PreparedV2,
+        observer: Option<&dyn DurabilityObserver>,
+        after_publish: impl FnOnce() -> Result<()>,
+    ) -> Result<PublishV2> {
         let name = prepared.generation.to_string();
         // Keep both the private attempt and the resolved pointer generation
         // protected through observer callbacks and return, not merely CAS.
@@ -758,7 +770,9 @@ impl ViewStore {
                 super::checkpoint_pointer_after_cas(&self.pointer_path())?;
                 sync_directory(self.view_dir())?;
                 observe(observer, DurabilityStep::PointerSynced);
+                let completion = after_publish();
                 super::generation::schedule_generation_sweep(self.clone());
+                completion?;
                 Ok(PublishV2::Published)
             }
             super::PublishOutcome::Conflict { current_generation } => {
@@ -882,6 +896,121 @@ fn write_bytes_once(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_probe_closes_before_generation_maintenance_is_scheduled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let registry =
+            super::super::registry::FamilyRegistry::open(storage.path(), "probe-order").unwrap();
+        let owner = registry
+            .register_view_with_storage(storage.path(), "worker", root.path())
+            .unwrap();
+        let view = owner.view_store().unwrap();
+        let first_manifest = manifest();
+        let first = GenerationName::for_manifest(&first_manifest).unwrap();
+        let prepared = view
+            .prepare_v2(&first, None, &first_manifest, None)
+            .unwrap();
+        assert_eq!(
+            view.commit_v2(prepared, None).unwrap(),
+            PublishV2::Published
+        );
+        super::super::wait_for_generation_maintenance_for_test(view.view_dir());
+        let mut next_manifest = first_manifest;
+        next_manifest.header_mut().head_tree = Some("next-tree".into());
+        let next = GenerationName::for_manifest(&next_manifest).unwrap();
+        let open = Arc::new(AtomicBool::new(false));
+        let overlap = Arc::new(AtomicBool::new(false));
+        let (started, maintenance_started) = mpsc::channel();
+        let observed_open = open.clone();
+        let observed_overlap = overlap.clone();
+        let _hook = crate::storage_retention::observe_test_hook(
+            view.view_dir(),
+            Arc::new(move |step| {
+                if step == "post-publication-sweep" {
+                    observed_overlap
+                        .fetch_or(observed_open.load(Ordering::SeqCst), Ordering::SeqCst);
+                    let _ = started.send(());
+                }
+            }),
+        );
+        let (entered, probe_opened) = mpsc::channel();
+        let (resume, finish_probe) = mpsc::channel();
+        let publishing = view.clone();
+        let next_for_worker = next.clone();
+        let first_name = first.to_string();
+        let worker = std::thread::spawn(move || {
+            let prepared = publishing
+                .prepare_v2(&next_for_worker, Some(&first_name), &next_manifest, None)
+                .unwrap();
+            publishing.commit_v2_before_sweep(prepared, None, || {
+                let connection = crate::db::file_identity::IdentityConnection::open_with_flags(
+                    publishing.pointer_path(),
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    "publication probe ordering test",
+                )
+                .unwrap();
+                let _: String = connection
+                    .query_row(
+                        "SELECT generation FROM pointer WHERE singleton=1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                open.store(true, Ordering::SeqCst);
+                entered.send(()).unwrap();
+                finish_probe
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                drop(connection);
+                open.store(false, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        probe_opened
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert!(crate::db::file_identity::open_connections(&view.pointer_path()) > 0);
+        let scheduled_while_open = maintenance_started
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_ok();
+        resume.send(()).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap(), PublishV2::Published);
+        super::super::wait_for_generation_maintenance_for_test(view.view_dir());
+        assert!(
+            !scheduled_while_open,
+            "maintenance started before the publication probe closed"
+        );
+        assert!(!overlap.load(Ordering::SeqCst));
+        assert_eq!(
+            view.current_generation_read_only().unwrap(),
+            Some(next.to_string())
+        );
+        assert!(view.load_manifest_v2(&next.to_string()).is_ok());
+    }
+
+    #[test]
+    fn completion_error_does_not_undo_a_landed_pointer() {
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "completion-error").unwrap();
+        let manifest = manifest();
+        let name = GenerationName::for_manifest(&manifest).unwrap();
+        let prepared = view.prepare_v2(&name, None, &manifest, None).unwrap();
+        assert!(view
+            .commit_v2_before_sweep(prepared, None, || Err(ViewError::InvalidManifest(
+                "probe failure".into()
+            )))
+            .is_err());
+        super::super::wait_for_generation_maintenance_for_test(view.view_dir());
+        assert_eq!(
+            view.current_generation_read_only().unwrap(),
+            Some(name.to_string())
+        );
+        assert!(view.load_manifest_v2(&name.to_string()).is_ok());
+    }
 
     pub(crate) fn producers() -> Producers {
         Producers {

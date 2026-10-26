@@ -2008,6 +2008,8 @@ impl std::fmt::Display for RefreshError {
 /// retried is SQLite's busy/locked
 /// (another connection holds the database for a moment); every other store
 /// error is surfaced as the checkout's named gap.
+/// A publication or installation that may already have committed carries the
+/// checkout-change marker so the worker revalidates a fresh job before serving it.
 pub fn is_transient_reason(reason: &str) -> bool {
     crate::semantic_index::embedding_failure_is_transient(reason)
         || [
