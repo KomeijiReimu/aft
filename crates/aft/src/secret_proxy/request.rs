@@ -440,7 +440,7 @@ async fn connect_upstream(
     let fail = || String::new();
     let socket = tokio::time::timeout(
         state.idle_timeout(),
-        tokio::net::TcpStream::connect((authority.host.as_str(), authority.port)),
+        tokio::net::TcpStream::connect((super::network_host(&authority.host), authority.port)),
     )
     .await
     .map_err(|_| fail())?
@@ -453,7 +453,8 @@ async fn connect_upstream(
         vec![b"h2".to_vec(), b"http/1.1".to_vec()]
     };
     let name =
-        rustls::pki_types::ServerName::try_from(authority.host.clone()).map_err(|_| fail())?;
+        rustls::pki_types::ServerName::try_from(super::network_host(&authority.host).to_owned())
+            .map_err(|_| fail())?;
     let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
         .connect(name, socket)
         .await

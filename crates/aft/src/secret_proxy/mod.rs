@@ -206,6 +206,7 @@ impl State {
     }
 
     fn tls_for(&self, host: &str) -> Result<rustls::ServerConfig, ()> {
+        let host = network_host(host);
         let key = KeyPair::generate().map_err(|_| ())?;
         let cert = CertificateParams::new(vec![host.to_owned()])
             .map_err(|_| ())?
@@ -486,7 +487,7 @@ async fn connect(
     } else {
         match tokio::time::timeout(
             state.idle_timeout(),
-            TcpStream::connect((authority.host.as_str(), authority.port)),
+            TcpStream::connect((network_host(&authority.host), authority.port)),
         )
         .await
         {
@@ -549,6 +550,13 @@ impl AsRef<[u8]> for SecretBytes {
 
 pub(crate) fn secret_bytes(bytes: Zeroizing<Vec<u8>>) -> Bytes {
     Bytes::from_owner(SecretBytes(bytes))
+}
+
+// Brackets belong to an HTTP authority, not an IP SAN, socket lookup or TLS name.
+pub(super) fn network_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
 }
 
 pub(crate) fn refusal(label: &str, host: &str) -> Response<Body> {
