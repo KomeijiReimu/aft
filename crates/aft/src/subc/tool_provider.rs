@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use cortexkit_role_tool_provider::{
@@ -243,21 +243,49 @@ struct ServedTool {
     /// Admission validates those calls against it, and the command refuses
     /// `ref` by name when the setting is off.
     with_ref: Option<CatalogTool>,
-    validator: OnceLock<jsonschema::Validator>,
+    /// Compiled once, when the catalog is built, and never during admission:
+    /// the module admits calls on its frame loop's thread, whose stack the host
+    /// may size as small as Windows' 1 MiB default, and compiling a JSON Schema
+    /// recurses through the meta-schema.
+    validator: jsonschema::Validator,
 }
 
 static SERVED_TOOLS: LazyLock<[Vec<ServedTool>; 3]> = LazyLock::new(|| {
-    CatalogPreset::ALL.map(|preset| {
-        build_tools(preset)
-            .into_iter()
-            .map(|(catalog, with_runon, with_ref)| ServedTool {
-                catalog,
-                with_runon,
-                with_ref,
-                validator: OnceLock::new(),
+    // The first caller to need a catalog is the first tool call, admitted on
+    // the frame loop's thread. Build the catalog, and compile every admission
+    // validator, on a thread with the ordinary default stack, so the frame loop
+    // only ever iterates validators that are already compiled.
+    std::thread::Builder::new()
+        .name("aft-admission-validators".into())
+        .spawn(|| {
+            CatalogPreset::ALL.map(|preset| {
+                build_tools(preset)
+                    .into_iter()
+                    .map(|(catalog, with_runon, with_ref)| {
+                        let tool = with_runon
+                            .as_ref()
+                            .or(with_ref.as_ref())
+                            .unwrap_or(&catalog);
+                        #[cfg(test)]
+                        ADMISSION_WORK.with(|count| {
+                            let (catalogs, validators) = count.get();
+                            count.set((catalogs, validators + 1));
+                        });
+                        let validator = jsonschema::validator_for(&tool.input_schema)
+                            .expect("embedded schemas are valid JSON schemas");
+                        ServedTool {
+                            catalog,
+                            with_runon,
+                            with_ref,
+                            validator,
+                        }
+                    })
+                    .collect()
             })
-            .collect()
-    })
+        })
+        .expect("spawning the admission-validator builder")
+        .join()
+        .expect("embedded tool catalog builds on a worker")
 });
 
 fn served_tools(preset: CatalogPreset) -> &'static [ServedTool] {
@@ -3114,16 +3142,7 @@ fn admit_as(
             return Err(errors::invalid_request(key, "host-only argument"));
         }
     }
-    let validator = served.validator.get_or_init(|| {
-        #[cfg(test)]
-        ADMISSION_WORK.with(|count| {
-            let (catalogs, validators) = count.get();
-            count.set((catalogs, validators + 1));
-        });
-        jsonschema::validator_for(&tool.input_schema)
-            .expect("embedded schemas are valid JSON schemas")
-    });
-    if let Some(error) = validator.iter_errors(checked).next() {
+    if let Some(error) = served.validator.iter_errors(checked).next() {
         let field = error.instance_path.to_string();
         return Err(errors::invalid_request(
             if field.is_empty() {
@@ -4993,7 +5012,7 @@ mod route_tests {
             tool_result_body: false,
             disabled_tools: Arc::new(disabled),
             scope,
-            run_scope: OnceLock::new(),
+            run_scope: std::sync::OnceLock::new(),
             call_mode: subc_protocol::call_mode::CallMode::Classic,
             made_tool_call: AtomicBool::new(false),
             run_owner: None,
@@ -6219,7 +6238,7 @@ mod route_tests {
             tool_result_body: false,
             disabled_tools: Arc::default(),
             scope: None,
-            run_scope: OnceLock::new(),
+            run_scope: std::sync::OnceLock::new(),
             call_mode: subc_protocol::call_mode::CallMode::Classic,
             made_tool_call: AtomicBool::new(false),
             run_owner: None,
@@ -6707,7 +6726,7 @@ mod route_tests {
             tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             scope: Some(stamp("worker")),
-            run_scope: OnceLock::new(),
+            run_scope: std::sync::OnceLock::new(),
             call_mode,
             made_tool_call: AtomicBool::new(false),
             run_owner: None,
