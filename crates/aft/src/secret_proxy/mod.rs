@@ -27,6 +27,7 @@
 //! `Debug` or `Display`. Zeroization is defence in depth in the daemon, not a claim
 //! that third-party protocol implementations erase every transient copy.
 
+mod audit;
 mod limits;
 mod peer;
 mod request;

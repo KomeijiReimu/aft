@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -18,13 +18,12 @@ use zeroize::Zeroizing;
 
 use super::{full, refusal, Body, State};
 
-static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
-
 pub(super) async fn forward(
     request: Request<Incoming>,
     authority: ConnectAuthority,
     state: Arc<State>,
 ) -> Result<Response<Body>, std::convert::Infallible> {
+    let mut audit = super::audit::RequestAudit::new(&state, &authority, &request);
     let lease = state
         .requests
         .clone()
@@ -42,10 +41,13 @@ pub(super) async fn forward(
         .map(|g| g.rule.label.as_str())
         .unwrap_or("");
     let result = if let Some(lease) = &lease {
-        prepare_and_send(request, &authority, &state, lease.clone()).await
+        prepare_and_send(request, &authority, &state, lease.clone(), &mut audit).await
     } else {
         Err(String::new())
     };
+    if let Err(label) = &result {
+        audit.refused_for(label);
+    }
     let response = result.unwrap_or_else(|label| {
         let label = if label.is_empty() { fallback } else { &label };
         let bytes = Zeroizing::new(format!(
@@ -82,6 +84,7 @@ async fn prepare_and_send(
     authority: &ConnectAuthority,
     state: &Arc<State>,
     lease: Arc<tokio::sync::OwnedSemaphorePermit>,
+    audit: &mut super::audit::RequestAudit<'_>,
 ) -> Result<Response<Body>, String> {
     let fail = || String::new();
     if state.stopped.load(Ordering::Acquire) || !state.generation_valid() {
@@ -336,12 +339,20 @@ async fn prepare_and_send(
                 return Err(grant.rule.label.clone());
             }
         }
+        audit.decide(&plan.labels)?;
+        if state.stopped.load(Ordering::Acquire) || !state.generation_valid() {
+            return Err(fail());
+        }
+        for (grant, matched) in state.config.grants.iter().zip(&matches) {
+            if *matched && crate::secret::vault::now_ms() >= grant.expires_at_ms {
+                return Err(grant.rule.label.clone());
+            }
+        }
         let response = upstream.send(outbound);
         drop(materials);
         response
     };
     let response = response.await.map_err(|_| fail())?;
-    let _request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     super::response::forward(response, state.clone(), client_upgrade, lease)
         .await
         .map_err(|_| fail())
