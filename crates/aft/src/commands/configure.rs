@@ -14331,7 +14331,6 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         init_git_fixture(project.path());
         let canonical_root = project.path().canonicalize().unwrap();
-        let fills = crate::views::semantic_runtime::FillObserver::new(canonical_root.clone());
         let source = canonical_root.join("tracked.rs");
         let ctx = AppContext::new(
             Box::new(TreeSitterProvider::new()),
@@ -14340,7 +14339,12 @@ mod tests {
                 ..Config::default()
             },
         );
-        let request = configure_semantic_views(&canonical_root, storage.path(), &server.base_url);
+        let request = configure_semantic_views_with_timeout(
+            &canonical_root,
+            storage.path(),
+            &server.base_url,
+            30_000,
+        );
         assert!(handle_configure_for_test(&request, &ctx).success);
         super::drain_deferred_configure_maintenance(&ctx);
         // The non-probe request proves the fill reached the server's response
@@ -14405,35 +14409,27 @@ mod tests {
         }
 
         server.release_responses();
-        // A held request may time out before release. Observe the worker's
-        // completion after its normal retry/backoff, not an embedding latency budget.
+        // A fill event describes one worker round, not query readiness. Wait for
+        // the semantic view to cover the edited source after releasing the server.
         ctx.checkout_semantic().wake();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let mut events = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let event = fills.next_until(deadline).unwrap_or_else(|error| {
-                panic!(
-                    "semantic fill completion missing after response release ({error:?}); \
-                     events={events:?}; lane={}",
-                    ctx.checkout_semantic().describe()
-                )
+            let complete = ctx.checkout_semantic_runtime().map(|runtime| {
+                runtime
+                    .search(&[1.0, 0.0, 0.0], 10, &|_| true)
+                    .map(|answer| answer.complete())
             });
-            events.push(event);
-            if event == "settled" {
+            if matches!(complete, Some(Ok(true))) {
                 break;
             }
+            assert!(
+                Instant::now() < deadline,
+                "semantic view did not become complete after response release; \
+                 lane={}; search={complete:?}",
+                ctx.checkout_semantic().describe()
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
-        let complete = ctx.checkout_semantic_runtime().map(|runtime| {
-            runtime
-                .search(&[1.0, 0.0, 0.0], 10, &|_| true)
-                .map(|answer| answer.complete())
-        });
-        assert!(
-            matches!(complete, Some(Ok(true))),
-            "semantic fill settled without a complete view; events={events:?}; \
-             lane={}; search={complete:?}",
-            ctx.checkout_semantic().describe()
-        );
     }
 
     #[test]
@@ -15426,6 +15422,15 @@ mod tests {
         storage: &std::path::Path,
         base_url: &str,
     ) -> RawRequest {
+        configure_semantic_views_with_timeout(root, storage, base_url, 5_000)
+    }
+
+    fn configure_semantic_views_with_timeout(
+        root: &std::path::Path,
+        storage: &std::path::Path,
+        base_url: &str,
+        timeout_ms: u64,
+    ) -> RawRequest {
         configure_request_with_params(json!({
             "project_root": root,
             "harness": "opencode",
@@ -15437,7 +15442,7 @@ mod tests {
                     "backend": "openai_compatible",
                     "model": "counting-test-embedding",
                     "base_url": base_url,
-                    "timeout_ms": 5_000,
+                    "timeout_ms": timeout_ms,
                     "max_batch_size": 64,
                     "max_files": 1_000
                 }

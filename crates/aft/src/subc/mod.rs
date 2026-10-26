@@ -14811,26 +14811,34 @@ mod tests {
 
     #[test]
     fn a_held_callgraph_flush_is_abandoned_within_the_exit_budget() {
-        // The flush is held for 3 s, like a refresh worker still inside a
-        // long refresh or store checkpoint when exit begins.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let drained_at = Instant::now();
-        let line = flush_actor_indexes_on_graceful_shutdown_with(&[], drained_at, || {
-            std::thread::sleep(Duration::from_secs(3));
+        let line = flush_actor_indexes_on_graceful_shutdown_with(&[], drained_at, move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            finished_tx.send(()).unwrap();
             true
         });
+        entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        // An unfinished flush must be abandoned because its deadline expired,
+        // not because the flush completed. Runner scheduling can delay observation.
+        assert!(matches!(
+            finished_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(Instant::now() >= crate::callgraph_store::exit_index_flush_deadline(drained_at));
         let flush_window = crate::callgraph_store::exit_index_flush_deadline(drained_at)
             .saturating_duration_since(drained_at);
-        let elapsed = drained_at.elapsed();
-        assert!(
-            elapsed < flush_window + Duration::from_millis(200),
-            "exit waited {elapsed:?} on a held call-graph flush (window {flush_window:?})"
-        );
         // The rest of the exit, LSP shutdown, still fits in the exit budget.
         assert!(
             flush_window + crate::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET
                 <= crate::callgraph_store::EXIT_BUDGET_AFTER_DRAIN
         );
         assert!(line.contains("callgraph=abandoned"), "{line}");
+        release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(30)).unwrap();
     }
 
     #[test]

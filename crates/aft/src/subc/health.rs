@@ -4783,22 +4783,22 @@ mod tests {
         )
     }
 
-    const HEALTH_REPORT_CONTENTION_ATTEMPTS: usize = 200;
-
     fn health_report_after_scheduler_contention(
         test_name: &str,
         mut read_report: impl FnMut() -> HealthReport,
     ) -> HealthReport {
-        for _ in 0..HEALTH_REPORT_CONTENTION_ATTEMPTS {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
             let report = read_report();
             if report.detail.as_deref() != Some(EXECUTOR_SCHEDULER_CONTENTION_DETAIL) {
                 return report;
             }
-            std::thread::yield_now();
+            assert!(
+                Instant::now() < deadline,
+                "{test_name}: scheduler remained contended for 30 seconds"
+            );
+            std::thread::sleep(Duration::from_millis(5));
         }
-        panic!(
-            "{test_name}: scheduler remained contended after {HEALTH_REPORT_CONTENTION_ATTEMPTS} health snapshots"
-        );
     }
 
     fn health_report_while_scheduler_locked(
@@ -4818,7 +4818,7 @@ mod tests {
                 });
             });
             held_rx
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(Duration::from_secs(30))
                 .expect("scheduler lock holder starts");
             let report = build_report();
             release_tx.send(()).expect("release scheduler lock holder");

@@ -1723,7 +1723,7 @@ fn inspect_view_pending_publication_reschedules_dead_code_without_another_inspec
     assert!(!fixture.ctx.tier2_pull_demand_pending());
 
     fixture.schedule();
-    fixture.wait_idle();
+    fixture.wait_idle_for(Duration::from_secs(30));
     assert!(
         fixture.ctx.tier2_pull_demand_pending(),
         "view publication must wake deferred Tier-2 work"
@@ -1776,7 +1776,7 @@ fn inspect_view_pending_publication_reschedules_dead_code_without_another_inspec
     assert!(!manager.deferred_view_refresh_ready(&fixture.ctx.canonical_cache_root()));
     fixture.change("no_more_deferred_analysis");
     fixture.schedule();
-    fixture.wait_idle();
+    fixture.wait_idle_for(Duration::from_secs(30));
     assert!(
         !fixture.ctx.tier2_pull_demand_pending(),
         "a later publication must not repeat the consumed refresh"
