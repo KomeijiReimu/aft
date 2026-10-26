@@ -1993,7 +1993,10 @@ struct GraphqlDocumentShape {
 /// Parser recovery trees cannot authorize reads. GitHub still validates fields
 /// against its schema; only queries and fragments may cross this boundary.
 fn graphql_document_shape(document: &str) -> GraphqlDocumentShape {
-    use apollo_parser::{cst::Definition, Parser};
+    use apollo_parser::{
+        cst::{CstNode, Definition},
+        Parser,
+    };
 
     let parsed = Parser::new(document).parse();
     if parsed.errors().next().is_some() {
@@ -2019,6 +2022,24 @@ fn graphql_document_shape(document: &str) -> GraphqlDocumentShape {
         }
     }
     shape.read_only &= has_operation;
+    // The review-thread mutations are admitted only as their own governed
+    // documents. A read-only document that names either field anywhere (in a
+    // fragment, behind an alias) is not passed through as an operator read:
+    // GitHub would reject it, and refusing it keeps the one admitted shape of
+    // these mutations unambiguous.
+    shape.read_only &= !parsed
+        .document()
+        .syntax()
+        .descendants()
+        .filter_map(apollo_parser::cst::Field::cast)
+        .any(|field| {
+            field.name().is_some_and(|name| {
+                matches!(
+                    name.text().as_str(),
+                    "resolveReviewThread" | "unresolveReviewThread"
+                )
+            })
+        });
     shape
 }
 

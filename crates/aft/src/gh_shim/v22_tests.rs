@@ -502,6 +502,94 @@ fn v22_graphql_admits_only_the_two_review_thread_mutations() {
     ));
 }
 
+/// Documents that name a review-thread mutation but are not the one admitted
+/// shape. Each is refused on v22 (and was never admitted before it), and none
+/// passes through as an operator read.
+const REVIEW_THREAD_LOOKALIKES: &[(&str, &str)] = &[
+    (
+        "second-mutation-same-operation",
+        r#"mutation { resolveReviewThread(input: {threadId: "PRRT_a"}) { thread { id } } unresolveReviewThread(input: {threadId: "PRRT_b"}) { thread { id } } }"#,
+    ),
+    (
+        "second-mutation-addcomment",
+        r#"mutation { resolveReviewThread(input: {threadId: "PRRT_a"}) { thread { id } } addComment(input: {subjectId: "X", body: "y"}) { clientMutationId } }"#,
+    ),
+    (
+        "input-extra-field",
+        r#"mutation { resolveReviewThread(input: {threadId: "PRRT_a", clientMutationId: "c"}) { thread { id } } }"#,
+    ),
+    (
+        "input-extra-unknown-field",
+        r#"mutation { resolveReviewThread(input: {threadId: "PRRT_a", body: "x"}) { thread { id } } }"#,
+    ),
+    (
+        "query-fragment",
+        r#"query { ...F } fragment F on Mutation { resolveReviewThread(input: {threadId: "PRRT_a"}) { thread { id } } }"#,
+    ),
+    (
+        "query-alias",
+        r#"query { x: resolveReviewThread(input: {threadId: "PRRT_a"}) { thread { id } } }"#,
+    ),
+    (
+        "mutation-alias",
+        r#"mutation { x: resolveReviewThread(input: {threadId: "PRRT_a"}) { thread { id } } }"#,
+    ),
+    (
+        "mutation-fragment-spread",
+        r#"mutation { ...F } fragment F on Mutation { resolveReviewThread(input: {threadId: "PRRT_a"}) { thread { id } } }"#,
+    ),
+    (
+        "two-mutation-operations",
+        r#"mutation A { resolveReviewThread(input: {threadId: "PRRT_a"}) { thread { id } } } mutation B { unresolveReviewThread(input: {threadId: "PRRT_a"}) { thread { id } } }"#,
+    ),
+    (
+        "query-and-mutation-operations",
+        r#"query Q { viewer { login } } mutation M { resolveReviewThread(input: {threadId: "PRRT_a"}) { thread { id } } }"#,
+    ),
+];
+
+#[test]
+fn v22_review_thread_lookalikes_are_refused_and_never_read_through() {
+    let current = manifest();
+    let previous = v21_manifest();
+    for (name, document) in REVIEW_THREAD_LOOKALIKES {
+        let raw = ["api", "graphql", "-f", &format!("query={document}")];
+        let argv = raw.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(review_thread_mutation(&argv).is_err(), "{name}");
+        for manifest in [&current, &previous] {
+            assert!(
+                matches!(
+                    classify(&argv, manifest, "linux"),
+                    Classification::Unclassified
+                ),
+                "{name} on manifest {}",
+                manifest.manifest_version
+            );
+        }
+        assert!(!graphql_query_is_read_only(&argv[..]), "{name}");
+        assert!(!is_unbound_safe(&argv), "{name}");
+    }
+    // The plain admitted document is the control: the same field, without
+    // the lookalike's extra, is governed.
+    let raw = ["api", "graphql", "-f", &format!("query={RESOLVE_LITERAL}")];
+    let argv = raw.iter().map(OsString::from).collect::<Vec<_>>();
+    assert_eq!(
+        governed_tuple(classify(&argv, &current, "linux")).as_deref(),
+        Some(REVIEW_THREAD_RESOLVE_TUPLE)
+    );
+    // An ordinary read that only mentions the name in a string is still a read.
+    let read = args(&[
+        "api",
+        "graphql",
+        "-f",
+        r#"query=query { search(query: "resolveReviewThread", type: ISSUE, first: 1) { issueCount } }"#,
+    ]);
+    assert!(matches!(
+        classify(&read, &current, "linux"),
+        Classification::Mechanical
+    ));
+}
+
 fn wire_of(request: GovernedRequest) -> Value {
     governed_wire_request(&rung(), "alfonso-aft", request)
 }

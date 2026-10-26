@@ -843,6 +843,12 @@ fn review_thread_document(
         Some("unresolveReviewThread") => REVIEW_THREAD_UNRESOLVE_TUPLE,
         _ => return Err("only resolveReviewThread and unresolveReviewThread are declared".into()),
     };
+    // An alias changes nothing GitHub does, but the admitted document is kept
+    // to the one plain spelling rather than reasoning about what an alias
+    // could hide.
+    if field.alias().is_some() {
+        return Err("an aliased review-thread mutation is not admitted".into());
+    }
     if !no_directives(field.directives()) {
         return Err("field directives are not admitted".into());
     }
