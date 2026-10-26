@@ -164,7 +164,8 @@ const V22_STACK_WRITE_TUPLES: &[&str] = &[
 ];
 /// Refusal for a `gh stack` subcommand that would write as the operator.
 /// `{tuple}` is replaced with the verb.
-/// PLACEHOLDER: the wording awaits operator approval.
+/// Placeholder wording, marked PLACEHOLDER in the text itself; replace it with
+/// the approved refusal message before a signed v22 manifest ships.
 const STACK_WRITE_REFUSAL_TEXT: &str = "PLACEHOLDER(stack-write): `{tuple}` would write to GitHub as the operator: the gh-stack extension calls the GitHub API with the operator's gh login, not the bot's. As the bot: push the branch with git, open each pull request with `gh pr create --base <parent branch>`, then build the stack with `gh api -X POST repos/<owner>/<repo>/stacks --input <file with {\"pull_requests\":[...]}>` (append with `.../stacks/<number>/add`, dissolve with `.../stacks/<number>/unstack`). To run it as the operator instead, re-run with GH_SHIM_BYPASS=operator; the shim records an operator-attributed audit line.";
 /// The stack REST endpoints admitted as bot speech, and the asynchronous merge
 /// endpoint kept as operator administration like `pr merge`.
@@ -202,10 +203,12 @@ const PULL_PATCH_FIELDS: &[&str] = &["title", "body", "base"];
 /// route refuses them by name rather than as unknown flags.
 const PR_EDIT_LABEL_FLAGS: &[&str] = &["--add-label", "--remove-label"];
 /// Refusal for a governed `pr edit` that also changes labels.
-/// PLACEHOLDER: the wording awaits operator approval.
+/// Placeholder wording, marked PLACEHOLDER in the text itself; replace it with
+/// the approved refusal message before a signed v22 manifest ships.
 const PR_EDIT_LABEL_REFUSAL_TEXT: &str = "PLACEHOLDER(pr-edit-labels): a bot `pr edit` changes only the title and body of a pull request the bot opened; label changes run as the operator's label-only row (GH_SHIM_BYPASS=operator, labels and nothing else)";
 /// Refusal for any other `gh pr edit` flag on the governed route.
-/// PLACEHOLDER: the wording awaits operator approval.
+/// Placeholder wording, marked PLACEHOLDER in the text itself; replace it with
+/// the approved refusal message before a signed v22 manifest ships.
 const PR_EDIT_FLAG_REFUSAL_TEXT: &str = "PLACEHOLDER(pr-edit-flags): a bot `pr edit` admits only --title/-t, --body/-b, --body-file/-F and --repo";
 /// The body fields the `pr create` reader produces, in the order the manifest
 /// declares them. The reader is purpose-built for this list, so a signed

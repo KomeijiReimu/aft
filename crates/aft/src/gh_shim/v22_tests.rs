@@ -1151,7 +1151,8 @@ m.prepare(pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]), int(sys.argv[4])
         prepared.bindings.get("cortexkit/aft").map(String::as_str),
         Some("alfonso-aft")
     );
-    // The prepared payload classifies exactly like the in-test v22 manifest.
+    // For every speech row, the prepared payload yields the same governed tuple
+    // as the in-test v22 manifest.
     let expected = manifest();
     for (raw, _) in speech_rows() {
         assert_eq!(
