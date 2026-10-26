@@ -477,7 +477,7 @@ fn watchdog_cost_persisted_gc_deadlines_bypass_paced_validation() {
     }
     gc_until_lap(&registry, storage.path(), 1);
     registry
-        .scheduled_gc_persisted(storage.path(), tick, wall)
+        .scheduled_gc_persisted(storage.path(), tick, || wall)
         .unwrap();
     work_counts::reset();
     let start = Instant::now();
@@ -486,11 +486,8 @@ fn watchdog_cost_persisted_gc_deadlines_bypass_paced_validation() {
     );
     assert_eq!(
         registry
-            .scheduled_gc_persisted(
-                storage.path(),
-                tick + Duration::from_secs(1),
-                wall + Duration::from_secs(2 * 60 * 60)
-            )
+            .scheduled_gc_persisted(storage.path(), tick + Duration::from_secs(1), || wall
+                + Duration::from_secs(2 * 60 * 60))
             .unwrap(),
         10
     );
@@ -523,12 +520,12 @@ fn watchdog_cost_persisted_gc_deadlines_bypass_paced_validation() {
     assert!(paths[10..].iter().all(|path| path.json.exists()));
     work_counts::reset();
     registry
-        .scheduled_gc_persisted(storage.path(), tick + Duration::from_secs(59), wall)
+        .scheduled_gc_persisted(storage.path(), tick + Duration::from_secs(59), || wall)
         .unwrap();
     assert_eq!(work_counts::get().gc_entries, 0);
     work_counts::reset();
     registry
-        .scheduled_gc_persisted(storage.path(), tick + Duration::from_secs(60), wall)
+        .scheduled_gc_persisted(storage.path(), tick + Duration::from_secs(60), || wall)
         .unwrap();
     let entries = work_counts::get().gc_entries;
     assert!(
@@ -565,6 +562,57 @@ fn watchdog_cost_persisted_gc_many_roots_share_one_store_sweep() {
         start.elapsed()
     );
     assert_eq!(runs, 1, "project roots multiplied shared-store work");
+}
+
+#[test]
+fn gc_grace_rechecks_clock_after_mid_pass_ack() {
+    let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let (mut metadata, paths) = fixture(storage.path(), "session", false, 2);
+    fs::write(&paths.stdout, b"saved output\n").unwrap();
+    let pass_started = SystemTime::now();
+    let rewritten_at = pass_started + Duration::from_secs(1);
+    let examined_at = pass_started + Duration::from_secs(2);
+    let write_paths = paths.clone();
+    let mut clock_samples = Vec::new();
+    let deleted = with_gc_after_start_for_test(
+        move || {
+            metadata.completion_delivered = true;
+            let task = resolve_task_layout(&write_paths.session_dir, &write_paths.task_id).unwrap();
+            write_task_at(&task, &metadata).unwrap();
+            filetime::set_file_mtime(
+                &write_paths.json,
+                filetime::FileTime::from_system_time(rewritten_at),
+            )
+            .unwrap();
+        },
+        || {
+            registry
+                .gc_persisted_with_clock(
+                    storage.path(),
+                    || {
+                        let now = if clock_samples.is_empty() {
+                            pass_started
+                        } else {
+                            examined_at
+                        };
+                        clock_samples.push(now);
+                        now
+                    },
+                    true,
+                )
+                .unwrap()
+        },
+    );
+    assert_eq!(
+        deleted, 0,
+        "acknowledged output lost its modification grace"
+    );
+    assert!(paths.json.exists(), "the rewritten task bundle was deleted");
+    assert_eq!(fs::read(&paths.stdout).unwrap(), b"saved output\n");
+    // Keeping future timestamps alone would mask reuse of the pass-start
+    // clock. Require a fresh sample after the acknowledgement as well.
+    assert_eq!(clock_samples, [pass_started, examined_at]);
 }
 
 /// Remembering undeletable tasks must not delay or prevent deletion: a pass

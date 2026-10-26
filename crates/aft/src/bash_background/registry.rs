@@ -236,6 +236,24 @@ fn with_memory_prepare_gate_for_test<R>(
     run()
 }
 
+#[cfg(test)]
+thread_local! {
+    static GC_AFTER_START_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn with_gc_after_start_for_test<R>(hook: impl FnOnce() + 'static, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Box<dyn FnOnce()>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            GC_AFTER_START_FOR_TEST.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(GC_AFTER_START_FOR_TEST.with(|slot| slot.replace(Some(Box::new(hook)))));
+    run()
+}
+
 /// How long a reader that must answer with a settled status (`bash_status`,
 /// a second kill) waits for a kill already in flight on the same task: the
 /// SIGTERM grace period plus a margin for the SIGKILL, the reap and the
@@ -5520,7 +5538,7 @@ impl BgTaskRegistry {
             .spawn(move || {
                 let mut finish = FinishSlot(Some(slot_key));
                 if let Err(error) =
-                    registry.scheduled_gc_persisted(&storage_dir, Instant::now(), SystemTime::now())
+                    registry.scheduled_gc_persisted(&storage_dir, Instant::now(), SystemTime::now)
                 {
                     crate::slog_warn!("failed to GC persisted background bash tasks: {error}");
                 }
@@ -7990,25 +8008,33 @@ impl BgTaskRegistry {
     /// Run one explicit bounded validation slice and any due deadline work.
     /// Recurring/replay requests additionally rate-limit validation slices.
     pub fn maybe_gc_persisted(&self, storage_dir: &Path) -> Result<usize, String> {
-        self.gc_persisted_at(storage_dir, SystemTime::now(), true)
+        self.gc_persisted_with_clock(storage_dir, SystemTime::now, true)
     }
 
     fn scheduled_gc_persisted(
         &self,
         storage_dir: &Path,
         now: Instant,
-        wall: SystemTime,
+        clock: impl FnMut() -> SystemTime,
     ) -> Result<usize, String> {
         let memo = super::gc_memo::GcMemo::new(canonicalized_path(&storage_dir.join("bash-tasks")));
-        self.gc_persisted_at(storage_dir, wall, memo.validation_due(now))
+        self.gc_persisted_with_clock(storage_dir, clock, memo.validation_due(now))
     }
 
-    fn gc_persisted_at(
+    fn gc_persisted_with_clock(
         &self,
         storage_dir: &Path,
-        now: SystemTime,
+        mut clock: impl FnMut() -> SystemTime,
         validate: bool,
     ) -> Result<usize, String> {
+        let now = clock();
+        #[cfg(test)]
+        {
+            let hook = GC_AFTER_START_FOR_TEST.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let now_ms = now
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -8133,6 +8159,9 @@ impl BgTaskRegistry {
                     if !examined.insert((session_dir.clone(), task_id.clone())) {
                         continue;
                     }
+                    // Deadline selection uses the pass clock, but a task may
+                    // have been acknowledged after that clock was sampled.
+                    let examined_at = clock();
                     let write_generation = memo.write_generation(&session_dir);
                     // A task judged not deletable on an earlier lap, whose
                     // folders and metadata are unchanged since, is skipped
@@ -8142,7 +8171,7 @@ impl BgTaskRegistry {
                         session_stamp.as_ref(),
                         task_id,
                         PERSISTED_GC_GRACE,
-                        now,
+                        examined_at,
                     ) {
                         pass.unchanged += 1;
                         continue;
@@ -8225,7 +8254,11 @@ impl BgTaskRegistry {
                         .and_then(|metadata| metadata.modified())
                         .ok()
                         .is_some_and(|modified| {
-                            super::gc_memo::within_grace_at(modified, PERSISTED_GC_GRACE, now)
+                            super::gc_memo::within_grace_at(
+                                modified,
+                                PERSISTED_GC_GRACE,
+                                examined_at,
+                            )
                         })
                     {
                         if let Some(evidence) = evidence.take() {

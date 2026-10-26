@@ -72,13 +72,13 @@ impl Stamp {
     }
 }
 
-/// True while a file modified at `modified` is inside `grace`. Matches the
-/// sweep's own grace test: a modification time in the future is not inside it.
+/// True while a file is within its modification grace. A future timestamp has
+/// an unknown age, so retain it rather than treating it as expired.
 pub(crate) fn within_grace_at(modified: SystemTime, grace: Duration, now: SystemTime) -> bool {
     now.duration_since(modified)
         .ok()
         .map(|age| age < grace)
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// Whether an undelivered, finished task's result is abandoned: it finished
@@ -213,6 +213,8 @@ impl Verdict {
 struct Remembered {
     verdict: Verdict,
     deadline: Option<SystemTime>,
+    /// The deadline is a retry installed by selection, not a writer wakeup.
+    provisional_retry: bool,
     /// The lap in which the sweep last reached this task. Entries not reached
     /// during a whole lap belong to deleted tasks and are dropped at its end.
     seen_lap: u64,
@@ -355,6 +357,7 @@ pub(crate) fn metadata_written(path: &Path) {
             .remove(&(deadline, session.to_path_buf(), id.to_string()));
     }
     entry.deadline = Some(UNIX_EPOCH);
+    entry.provisional_retry = false;
     state
         .deadlines
         .insert((UNIX_EPOCH, session.to_path_buf(), id.to_string()));
@@ -453,6 +456,7 @@ impl GcMemo {
                 {
                     let retry = now.checked_add(Duration::from_secs(60));
                     entry.deadline = retry;
+                    entry.provisional_retry = true;
                     if let Some(retry) = retry {
                         state.deadlines.insert((retry, session.clone(), id.clone()));
                     }
@@ -513,7 +517,8 @@ impl GcMemo {
                     .get_mut(session_dir)
                     .and_then(|tasks| tasks.get_mut(task_id))
                 {
-                    if entry.deadline == now.checked_add(Duration::from_secs(60)) {
+                    if entry.provisional_retry {
+                        entry.provisional_retry = false;
                         if let Some(deadline) = entry.deadline.take() {
                             state.deadlines.remove(&(
                                 deadline,
@@ -624,6 +629,7 @@ impl GcMemo {
                     task_id.to_string(),
                     Remembered {
                         deadline,
+                        provisional_retry: false,
                         verdict: Verdict {
                             layout: evidence.layout,
                             session: evidence.session,
@@ -845,6 +851,16 @@ pub(crate) fn persisted_gc_health_for(root: &Path) -> Option<PersistedGcHealth> 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn gc_grace_keeps_future_mtime() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert!(within_grace_at(
+            now + Duration::from_secs(60),
+            super::super::registry::PERSISTED_GC_GRACE,
+            now
+        ));
+    }
+
+    #[test]
     fn expired_abandonment_age_with_live_worktree_returns_to_validation() {
         let storage = tempfile::tempdir().unwrap();
         let root = storage.path().join("bash-tasks");
@@ -916,7 +932,7 @@ mod tests {
             Some(&Stamp::of(&session).unwrap()),
             "bash-0000000000000001",
             super::super::registry::PERSISTED_GC_GRACE,
-            now
+            now + Duration::from_secs(1)
         ));
         assert!(
             memo.due_batches(now + Duration::from_secs(60)).is_empty(),
@@ -925,16 +941,15 @@ mod tests {
     }
 
     #[test]
-    fn grace_keeps_its_exact_boundary_and_future_timestamp_policy() {
+    fn grace_keeps_its_exact_boundary() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
         let grace = super::super::registry::PERSISTED_GC_GRACE;
         assert!(within_grace_at(
-            now - grace + Duration::from_nanos(1),
+            now - grace + Duration::from_micros(1),
             grace,
             now
         ));
         assert!(!within_grace_at(now - grace, grace, now));
-        assert!(!within_grace_at(now + Duration::from_nanos(1), grace, now));
     }
 
     use super::*;

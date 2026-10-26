@@ -11,3 +11,6 @@
 - The 24-hour metadata grace, seven-day abandonment test, replay and live-process
   safeguards, retained artifacts, and deletion rules are unchanged. GC continues
   to use the owning SQLite connection; it does not open a separate database.
+- Each task's modification grace uses its examination time, so a completion
+  acknowledged during a sweep keeps its saved output. Future modification times
+  are conservatively retained rather than treated as expired.
