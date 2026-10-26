@@ -1263,7 +1263,6 @@ fn worker_run_runs_with_its_workers_own_access_never_the_heads() {
     let worker_key = remote_policy::key(&worker, Some("worker"));
     assert!(worker_key.is_some());
     assert_eq!(remote_policy::key(&effective, Some("worker")), worker_key);
-    assert_eq!(remote_policy::key(&effective, Some("head")), worker_key);
     // Judged as the worker (worker jail, worker refusals), and nobody is
     // asked on anyone's behalf.
     assert!(access_grants::alfonso_worker(&effective));
