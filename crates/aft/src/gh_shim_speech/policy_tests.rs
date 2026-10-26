@@ -11,6 +11,7 @@ fn snapshot(manifest: &Manifest) -> crate::gh_shim_speech::model::PolicySnapshot
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn comment_input(manifest: &Manifest, body: &Path) -> (Vec<OsString>, AgentBinding) {
     let (repo, agent) = manifest.bindings.iter().next().unwrap();
     (
@@ -31,6 +32,7 @@ fn comment_input(manifest: &Manifest, body: &Path) -> (Vec<OsString>, AgentBindi
 }
 
 #[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn frozen_body_is_replayed_under_both_signed_envelopes_without_reopening_the_file() {
     let manifest = super::tests::fixture_manifest();
     let dir = tempfile::tempdir().unwrap();
@@ -71,6 +73,7 @@ fn frozen_body_is_replayed_under_both_signed_envelopes_without_reopening_the_fil
 }
 
 #[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn a_current_only_classification_cannot_expand_the_start_envelope() {
     let mut old = super::tests::fixture_manifest();
     let dir = tempfile::tempdir().unwrap();
@@ -247,6 +250,7 @@ fn protected_dormant_invalid_regressed_and_operator_arms_never_delegate_ambient(
             unix_seconds(),
         );
         let expected = match mode {
+            "unbound-write" | "non-r3" if current_platform() == "unsupported" => "not_governed",
             "operator-disable" | "non-r3" => "not_r3",
             "operator-credential" | "operator-bypass" => "not_governed",
             "unbound-write" => "repository_denied",
