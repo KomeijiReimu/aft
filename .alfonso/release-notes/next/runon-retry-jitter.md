@@ -1,0 +1,1 @@
+- When the build server is draining or its signer is busy, remote bash commands now wait at least 5 seconds, plus a random share of the delay, before resubmitting, so many waiting commands no longer retry at the same instant.
