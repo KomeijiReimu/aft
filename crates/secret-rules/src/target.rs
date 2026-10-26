@@ -300,15 +300,14 @@ pub fn normalize_path_prefix(prefix: &str) -> Result<String, TargetRefusal> {
     if !prefix.starts_with('/') {
         return Err(TargetRefusal::MalformedPath);
     }
+    // A prefix is compared as written. Dot segments, empty segments and a
+    // trailing separator all refuse: each of them is a second spelling for a
+    // location, and AFT must not guess which one the operator meant.
     let path = canonicalize_path(prefix)?;
-    // Dot segments and empty segments are refused by the normalizer; a trailing
-    // separator adds no segment and is dropped here, nothing else is.
-    let value = path.value.trim_end_matches('/');
-    Ok(if value.is_empty() {
-        "/".to_string()
-    } else {
-        value.to_string()
-    })
+    if path.value != prefix {
+        return Err(TargetRefusal::MalformedPath);
+    }
+    Ok(path.value)
 }
 
 /// Uppercase hex of one byte, without the format machinery's locale and

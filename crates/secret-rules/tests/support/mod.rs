@@ -3,11 +3,14 @@
 use serde_json::Value;
 
 /// The audit's key: sixteen bytes, the shortest a rule admits.
+#[allow(dead_code)]
 pub const MIN_KEY: &[u8] = b"0123456789abcdef";
 /// Lowercase hex of [`MIN_KEY`].
+#[allow(dead_code)]
 pub const MIN_KEY_HEX: &str = "30313233343536373839616263646566";
 
 /// Groups every vector file must carry.
+#[allow(dead_code)]
 pub const REQUIRED_GROUPS: &[&str] = &[
     "P1", "P2", "P3", "P4", "M1", "M2", "M3", "M4", "S1", "S2", "A1",
 ];
@@ -72,6 +75,7 @@ pub fn run_group(
 ///
 /// Naming the group per file, instead of accepting a group from anywhere, is
 /// what stops a group from being "present" somewhere the runner never loads.
+#[allow(dead_code)]
 pub const FILE_GROUPS: &[(&str, &[&str])] = &[
     ("secret_rules_v1.json", &["P1", "P2", "P4"]),
     ("secret_rules_p3.json", &["P3"]),
@@ -86,6 +90,7 @@ pub const FILE_GROUPS: &[(&str, &[&str])] = &[
 
 /// Check that each file carries its groups and that every required group has a
 /// home.
+#[allow(dead_code)]
 pub fn check_groups_present() {
     let mut covered: Vec<String> = Vec::new();
     for (file, groups) in FILE_GROUPS {
@@ -108,6 +113,20 @@ pub fn check_groups_present() {
 pub fn discloses(key: &[u8], output: &[u8]) -> bool {
     if key.is_empty() {
         return false;
+    }
+    // JSON \uXXXX escapes and form `+` stand for key bytes as much as the
+    // percent family does, so both are decoded before the comparison.
+    for variant in [
+        json_unescape(&String::from_utf8_lossy(output)),
+        form_unescape(&String::from_utf8_lossy(output)),
+    ] {
+        if variant
+            .as_bytes()
+            .windows(key.len())
+            .any(|window| window == key)
+        {
+            return true;
+        }
     }
     // The raw bytes, not a lossy string: lossy conversion collapses every
     // invalid sequence to U+FFFD, which can make unrelated bytes look absent or
@@ -142,7 +161,41 @@ pub fn discloses(key: &[u8], output: &[u8]) -> bool {
     false
 }
 
-pub fn percent_decodes(text: &str) -> Vec<Vec<u8>> {
+/// Decode `\uXXXX` escapes so an escaped key compares like a plain one.
+fn json_unescape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("\\u") {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at + 2..];
+        match tail
+            .get(..4)
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        {
+            Some(code) => {
+                if let Some(ch) = char::from_u32(code) {
+                    out.push(ch);
+                }
+                rest = &tail[4..];
+            }
+            None => {
+                out.push_str("\\u");
+                rest = tail;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Decode form `+` to a space, then percent escapes.
+fn form_unescape(text: &str) -> String {
+    let with_spaces = text.replace('+', " ");
+    let decoded = percent_decodes(&with_spaces);
+    String::from_utf8_lossy(decoded.first().map(Vec::as_slice).unwrap_or_default()).into_owned()
+}
+
+fn percent_decodes(text: &str) -> Vec<Vec<u8>> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut index = 0;
@@ -198,14 +251,21 @@ pub fn hex_decodes(text: &str) -> Vec<Vec<u8>> {
 }
 
 pub fn base64_decodes(text: &str) -> Vec<Vec<u8>> {
-    const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-_";
+    // Both RFC 4648 spellings of the two special characters map to the same
+    // index, so a token that mixes them decodes like either alphabet alone.
+    const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = Vec::new();
     for offset in 0..4 {
         let mut buffer = 0u32;
         let mut bits = 0u32;
         let mut decoded = Vec::new();
         for byte in text.bytes().skip(offset) {
-            let Some(value) = ALPHA.iter().position(|candidate| *candidate == byte) else {
+            let mapped = match byte {
+                b'-' => b'+',
+                b'_' => b'/',
+                other => other,
+            };
+            let Some(value) = ALPHA.iter().position(|candidate| *candidate == mapped) else {
                 // A decoded run only counts once it is long enough to hold a key.
                 if decoded.len() >= secret_rules::MIN_KEY_LEN {
                     out.push(std::mem::take(&mut decoded));

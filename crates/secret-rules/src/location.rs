@@ -902,7 +902,12 @@ pub(crate) fn validate_rule(rule: &LabelRule) -> Option<RequestRefusal> {
             return Some(err);
         }
     }
-    if !rule.path_prefix.starts_with('/') {
+    // The prefix must be exactly the normalized path the rule declares. A
+    // doubled separator, a dot segment or a trailing slash is a second spelling
+    // for a location, so it refuses instead of being normalised for the rule.
+    if crate::target::normalize_path_prefix(&rule.path_prefix)
+        .map_or(true, |normalized| normalized != rule.path_prefix)
+    {
         return Some(RequestRefusal::TargetMismatch(TargetRefusal::MalformedPath));
     }
     None

@@ -29,15 +29,6 @@ fn connect() -> ConnectAuthority {
     ConnectAuthority::parse("api.example.com:443").unwrap()
 }
 
-fn target<'a>(request_target: &'a str) -> RequestTarget<'a> {
-    RequestTarget {
-        host: "api.example.com".to_string(),
-        port: 443,
-        scheme: "https",
-        target: request_target,
-    }
-}
-
 // --- item 4 (per-label keys) and item 5 (per-label redirect verdicts) -------
 
 #[test]
@@ -571,12 +562,6 @@ fn item4_a_request_for_label_b_never_receives_label_a_key() {
         "/v1/x",
         vec![HeaderField::value("X-Beta", b"{{ck-secret:beta}}")],
     );
-    let target = RequestTarget {
-        host: "beta.example.com".to_string(),
-        port: 443,
-        scheme: "https",
-        target: "/v1/x",
-    };
     let connect = ConnectAuthority::parse("beta.example.com:443").unwrap();
     let outcome = evaluate_request_with_connect(
         &request,
@@ -599,12 +584,6 @@ fn item6_absolute_form_target_on_another_host_refuses() {
         "https://evil.example/v1/x",
         vec![HeaderField::value("Authorization", bearer.as_bytes())],
     );
-    let target = RequestTarget {
-        host: "api.example.com".to_string(),
-        port: 443,
-        scheme: "https",
-        target: "https://evil.example/v1/x",
-    };
     let outcome = evaluate_request_with_connect(
         &request,
         &connect(),

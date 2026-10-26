@@ -48,8 +48,6 @@ pub(crate) enum Family {
     Json,
     /// Hex digits in any case.
     Hex,
-    /// Standard or URL-safe base64, padded or not.
-    Base64,
 }
 
 /// Every literal a response may use for one key (S1).
@@ -501,14 +499,6 @@ fn match_hex(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
     (decoded.as_slice() == key).then_some(end)
 }
 
-/// A base64 run at `index`, in either alphabet, padded or not, that decodes to
-/// a string containing the key.
-///
-/// The run is extended while it stays inside the alphabet, so the match covers
-/// the whole encoded token that overlaps the key rather than only its aligned
-/// middle. Bytes outside the key are replaced with it as well: leaving them
-/// would let a reader decode the edge key bytes from the surviving groups.
-
 /// True when decoding the whole `run` (with either alphabet, `+`/`/` and
 /// `-`/`_` mixed) yields the key anywhere inside.
 ///
@@ -536,7 +526,7 @@ fn base64_run_contains(run: &[u8], key: &[u8]) -> bool {
                 bits = 0;
                 continue;
             };
-            buffer = (buffer << 6) | value as u32;
+            buffer = (buffer << 6) | value;
             bits += 6;
             if bits >= 8 {
                 bits -= 8;

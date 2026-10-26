@@ -3,8 +3,7 @@
 
 use secret_rules::{
     apply_target_edits, evaluate_request_with_connect, is_json_content_type, location_kind_token,
-    ConnectAuthority, HeaderField, LabelOutcome, LabelRule, Location, RequestRefusal,
-    RequestTarget, RequestView,
+    ConnectAuthority, HeaderField, LabelOutcome, LabelRule, Location, RequestRefusal, RequestView,
 };
 
 const KEY: &[u8] = b"sk-live-0123456789abcdef";
@@ -26,15 +25,6 @@ fn connect() -> ConnectAuthority {
 
 fn keys(key: &[u8]) -> Vec<(String, Vec<u8>)> {
     vec![("repo_key".to_string(), key.to_vec())]
-}
-
-fn target_t<'a>(request_target: &'a str) -> RequestTarget<'a> {
-    RequestTarget {
-        host: "api.example.com".to_string(),
-        port: 443,
-        scheme: "https",
-        target: request_target,
-    }
 }
 
 fn placeholder() -> &'static str {
