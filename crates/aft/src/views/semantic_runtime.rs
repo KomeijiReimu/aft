@@ -1547,13 +1547,6 @@ impl FillObserver {
             .recv_timeout(Duration::from_secs(60))
             .expect("semantic fill event")
     }
-
-    pub(crate) fn next_until(
-        &self,
-        deadline: Instant,
-    ) -> Result<&'static str, crossbeam_channel::RecvTimeoutError> {
-        self.rx.recv_deadline(deadline)
-    }
 }
 #[cfg(test)]
 impl Drop for FillObserver {

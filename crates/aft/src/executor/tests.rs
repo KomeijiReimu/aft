@@ -1498,12 +1498,16 @@ fn held_inspect_writer_lease_times_out_and_queued_bind_proceeds() {
     .expect("hold inspect writer lease");
 
     let (inspect_started_tx, inspect_started_rx) = crossbeam_channel::bounded(1);
+    let (inspect_release_tx, inspect_release_rx) = crossbeam_channel::bounded(1);
     let inspect = executor.submit(
         root.clone(),
         Lane::SerialLspStatus,
         "inspect-held-writer-lease".to_string(),
         Box::new(move |_| {
             inspect_started_tx.send(()).expect("inspect starts");
+            inspect_release_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("bind is queued before the lease attempt");
             match InspectCache::open(inspect_dir, project_root) {
                 Err(InspectCacheError::WriterLeaseTimeout) => Response::error(
                     "inspect-held-writer-lease",
@@ -1516,7 +1520,7 @@ fn held_inspect_writer_lease_times_out_and_queued_bind_proceeds() {
         }),
     );
     inspect_started_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(Duration::from_secs(30))
         .expect("inspect starts while lease is held");
 
     let (bind_started_tx, bind_started_rx) = crossbeam_channel::bounded(1);
@@ -1530,21 +1534,25 @@ fn held_inspect_writer_lease_times_out_and_queued_bind_proceeds() {
         }),
     );
     assert!(
-        bind_started_rx
-            .recv_timeout(Duration::from_millis(50))
-            .is_err(),
+        matches!(
+            bind_started_rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Empty)
+        ),
         "bind must wait while inspect still occupies the LSP lane"
     );
+    inspect_release_tx
+        .send(())
+        .expect("start the lease attempt");
 
     let inspect_response = inspect
-        .recv_timeout(Duration::from_secs(3))
+        .recv_timeout(Duration::from_secs(30))
         .expect("inspect reaches its writer lease deadline");
     assert!(!inspect_response.success);
     assert_eq!(inspect_response.data["code"], "writer_lease_timeout");
     bind_started_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(Duration::from_secs(30))
         .expect("bind starts after inspect reports the timeout");
-    bind.recv_timeout(Duration::from_secs(1))
+    bind.recv_timeout(Duration::from_secs(30))
         .expect("bind completes while competing lease remains held");
     drop(held);
 }

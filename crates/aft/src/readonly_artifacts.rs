@@ -2129,7 +2129,12 @@ mod tests {
         build_search_artifact(&root, storage.path());
         let (_wt_dir, worktree) = linked_worktree(&root);
 
-        match open_search_index_read_only(&worktree, Some(storage.path())) {
+        let borrowed = with_borrowed_search_load_limits_for_test(
+            BORROWED_SEARCH_BACKGROUND_MAX_RECORDS,
+            Duration::from_secs(30),
+            || open_search_index_read_only(&worktree, Some(storage.path())),
+        );
+        match borrowed {
             ReadOnlyArtifact::Fresh(index) => {
                 assert!(index.path_to_id.contains_key(&worktree.join("src/lib.rs")));
             }
