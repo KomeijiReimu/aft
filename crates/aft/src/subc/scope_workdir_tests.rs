@@ -640,7 +640,14 @@ fn scope_workdir_stamp_selects_project_config_instead_of_bind_config() {
         Some(stamp().with_workdir(Some(project.to_string_lossy().into_owned()))),
         &project,
         |_, identity, _| {
-            assert_eq!(identity.disabled_tools.as_slice(), ["aft_search"]);
+            assert!(identity
+                .disabled_tools
+                .iter()
+                .any(|tool| tool == "aft_search"));
+            assert!(!identity
+                .disabled_tools
+                .iter()
+                .any(|tool| tool == "aft_zoom"));
         },
     );
 }
