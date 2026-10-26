@@ -2314,6 +2314,34 @@ impl BgTaskRegistry {
         }
     }
 
+    pub(crate) fn speech_database_path(&self) -> Option<PathBuf> {
+        self.inner
+            .speech_db_path
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn queued_bot_writes(&self, session: &str, task: &str) -> Option<u64> {
+        let mut paths = std::collections::BTreeSet::new();
+        if let Some(path) = self.speech_database_path() {
+            paths.insert(path);
+        } else {
+            for speech in crate::gh_shim_ticket::speech_for_task(session, task) {
+                paths.insert(speech.prepared.context.service.store.path().to_path_buf());
+            }
+        }
+        let mut queued = 0_u64;
+        for path in paths {
+            queued = queued.saturating_add(
+                crate::db::gh_speech::Store::new(path)
+                    .pending_legacy_for_identity(session, task)
+                    .ok()?,
+            );
+        }
+        Some(queued)
+    }
+
     pub fn set_db_pool(&self, conn: Arc<Mutex<TrackedConnection>>) {
         let path = conn
             .lock()
@@ -11268,6 +11296,17 @@ impl BgTaskRegistry {
         let mut errors = Vec::new();
         for storage_dir in storage_dirs {
             let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+            // Harness task directories share the module-root authority database.
+            // Deriving a database beside a harness's bash-tasks would revoke in
+            // the wrong store (or silently fall back to warm tickets only).
+            let speech_db = storage_root.join("aft.db");
+            if speech_db.is_file() {
+                *registry
+                    .inner
+                    .speech_db_path
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(speech_db);
+            }
             registry
                 .inner
                 .saved_task_recovery

@@ -172,6 +172,7 @@ where
         let mut pending = HashSet::new();
         let mut next_poll: HashMap<_, tokio::time::Instant> = HashMap::new();
         let mut inflight = tokio::task::JoinSet::new();
+        let mut fanout = tokio::task::JoinSet::new();
         let mut next_scan = tokio::time::Instant::now() + interval;
         loop {
             while inflight.len() < 4 && !queued.is_empty() {
@@ -216,12 +217,12 @@ where
             tokio::select! {
                 Some(stamp)=observations.recv()=>{
                     if let Some(service)=&speech{
-                        if service.store.scope_ended(&stamp).unwrap_or(false){
-                            let keys=revoke(executor.clone(),&stamp).await;
-                            let _=ended.send(EndedScope{stamp,keys});
-                        }
+                        let service=service.clone();
+                        let executor=executor.clone();
+                        fanout.spawn(async move { finish_fenced_notice(executor, stamp.clone(), || service.store.scope_ended(&stamp)).await });
                     }
                 }
+                Some(Ok(Some(notice)))=fanout.join_next(), if !fanout.is_empty()=>{ let _=ended.send(notice); }
                 Some(stamp) = closes.recv() => {
                     // An idle route needs no RPC; parked consent asks still
                     // need a scope-end determination even without a process.
@@ -295,6 +296,37 @@ where
     });
     (handle, receiver, worker)
 }
+
+async fn finish_fenced_notice(
+    executor: Arc<Executor>,
+    stamp: ScopeStamp,
+    mut check: impl FnMut() -> Result<bool, crate::gh_shim_speech::Refusal> + Send,
+) -> Option<EndedScope> {
+    let mut delay = Duration::from_millis(100);
+    loop {
+        match check() {
+            Ok(true) => {
+                let keys = revoke(executor, &stamp).await;
+                return Some(EndedScope { stamp, keys });
+            }
+            Ok(false) => {
+                log::warn!("committed scope-end notice is not yet visible; retaining fanout")
+            }
+            Err(error) => log::warn!(
+                "scope-end fence read failed ({}); retaining fanout",
+                error.reason
+            ),
+        }
+        // A committed notice remains pending until it can complete lifecycle cleanup.
+        // Each notice has its own task so storage trouble does not stop other probes.
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(5));
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "scope_describe_speech_tests.rs"]
+mod speech_fanout_tests;
 
 async fn work_scopes(
     executor: Arc<Executor>,

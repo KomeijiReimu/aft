@@ -14,6 +14,10 @@ use super::access_grants::ScopeKey;
 use super::{SqliteStore, TrackedConnection};
 use crate::gh_shim_speech::scope::ValidatedEnd;
 
+mod legacy_dispatch;
+pub(crate) use legacy_dispatch::LegacyDispatchStatus;
+pub(crate) use legacy_dispatch::MIGRATION as LEGACY_DISPATCH_MIGRATION;
+
 pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_millis(50);
 
 pub(crate) const MIGRATION: &str = r#"

@@ -58,7 +58,7 @@ fn plex_route_end_names_the_session() {
 fn plex_run_end_names_the_program() {
     refusal(json!({"status":"refused","refusal_code":"scope_ended","code":"scope_ended","scope_role":"run","transmission":"not_sent"}),
         "task_gh_scope_ended",
-        "the program this command started from has ended (ended), so it can no longer write as the bot; start the command again from a live session.");
+        "the codemode program this command started from has ended (ended), so it can no longer write as the bot; start the command again from a live session.");
 }
 
 #[test]
@@ -72,7 +72,7 @@ fn plex_delegation_withdrawal_maps_to_lasting_authority_refusal() {
 fn plex_unsynced_run_maps_to_retryable_program_unknown() {
     refusal(json!({"status":"refused","refusal_code":"scope_not_synced","code":"scope_not_synced","scope_role":"run","transmission":"not_sent"}),
         "task_gh_scope_unknown",
-        "AFT could not confirm that the program this command started from is still active (not_synced); retry in a minute.");
+        "AFT could not confirm that the codemode program this command started from is still active (not_synced); retry in a minute.");
 }
 
 #[test]
@@ -86,7 +86,7 @@ fn plex_unverifiable_route_maps_to_session_unknown() {
 fn plex_non_child_run_maps_to_program_unverifiable() {
     refusal(json!({"status":"refused","refusal_code":"run_scope_not_child","code":"run_scope_not_child","scope_role":"run","transmission":"not_sent"}),
         "task_gh_scope_unknown",
-        "AFT could not confirm that the program this command started from is still active (unverifiable); retry in a minute.");
+        "AFT could not confirm that the codemode program this command started from is still active (unverifiable); retry in a minute.");
 }
 
 #[test]

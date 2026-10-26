@@ -2169,3 +2169,113 @@ async fn gh_shim_relay_cancellation_after_forwarding_closes_route() {
         "no canceled lease/map entry may remain"
     );
 }
+
+#[tokio::test]
+async fn worker_and_parented_ephemeral_writes_have_the_same_specific_refusal() {
+    use subc_protocol::scope::{ParentState, ScopeKind, ScopeParent};
+    let head = delegating_stamp();
+    for kind in [ScopeKind::Worker, ScopeKind::Ephemeral] {
+        let mut worker = head.clone();
+        worker.kind = kind;
+        if kind == ScopeKind::Ephemeral {
+            worker.scope_ref = "worker-run".into();
+            worker.parent = Some(ScopeParent::new(
+                head.owner.clone(),
+                head.scope_ref.clone(),
+                head.scope_epoch,
+            ));
+            worker.parent_state = Some(ParentState::Linked);
+        }
+        let ticket =
+            crate::bash_background::registry::with_scope_spawn(Some(worker.clone()), || {
+                crate::gh_shim_ticket::PendingTicket::issue("worker-run-post", "/project")
+            });
+        let mut params = bot_params(ticket.value().unwrap(), "worker-run-write");
+        params["request"]["metadata"]["agent_id"] = json!("agent-fixture");
+        let transport = FakeTransport::scoped();
+        let routes = scopes_for("worker-run-post", Some(worker));
+        let answer = relay(
+            &transport,
+            RelayCall {
+                operation: BOT_REQUEST_OPERATION,
+                params: &params,
+                first_party: true,
+                route_scopes: &routes,
+            },
+            &|_| {},
+        )
+        .await;
+        assert_eq!(
+            answer.data["refusal_code"],
+            crate::gh_shim_speech::WORKER_WRITE_CODE,
+            "{kind:?}"
+        );
+        assert_eq!(
+            answer.data["message"],
+            crate::gh_shim_speech::WORKER_WRITE_REFUSED
+        );
+        assert!(transport.calls().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn validated_head_codemode_is_not_a_worker_write_but_invalid_head_is() {
+    use subc_protocol::scope::{ParentState, ScopeKind, ScopeParent};
+    let head = delegating_stamp();
+    let run = ScopeStamp::new(head.owner.clone(), "codemode-run", 3, ScopeKind::Ephemeral)
+        .with_parent(Some(ScopeParent::new(
+            head.owner.clone(),
+            head.scope_ref.clone(),
+            head.scope_epoch,
+        )))
+        .with_parent_state(Some(ParentState::Linked))
+        .with_attributes(
+            subc_protocol::scope::ScopeAttributes::new()
+                .with_agent_id(Some("agent-fixture".into()))
+                .with_run_id(Some("program-a".into())),
+        )
+        .with_owner_authorized(true);
+    let launch = crate::gh_shim_speech::model::LaunchAuthority::codemode(
+        head.clone(),
+        run.clone(),
+        None,
+        None,
+    )
+    .unwrap();
+    for valid in [true, false] {
+        let mut launch = launch.clone();
+        if !valid {
+            launch.authority.owner_authorized = false;
+        }
+        let redeemed = crate::gh_shim_ticket::Redeemed {
+            session_id: "head-codemode".into(),
+            task_id: String::new(),
+            project_root: "/project".into(),
+            read_repository: None,
+            lifecycle_scope: Some(run.clone()),
+            launch: Some(launch),
+        };
+        let mut params = bot_params("not-used-by-this-admission-unit", "codemode-write");
+        params["request"]["metadata"]["agent_id"] = json!("agent-fixture");
+        let transport = FakeTransport::scoped();
+        let (answer, _) = bot_request(
+            &transport,
+            &redeemed,
+            Some(&head),
+            &params,
+            &RouteScopes::default(),
+            false,
+        )
+        .await;
+        if valid {
+            assert!(answer.ok);
+            assert_eq!(transport.calls().len(), 1);
+        } else {
+            assert_eq!(
+                answer.data["refusal_code"],
+                crate::gh_shim_speech::WORKER_WRITE_CODE
+            );
+            assert!(transport.calls().is_empty());
+        }
+    }
+}

@@ -147,3 +147,44 @@ async fn scope_probe_cannot_reset_an_exhausted_shared_codemode_deadline() {
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn older_definitive_end_fences_even_after_a_newer_live_or_unknown_answer() {
+    for newer_live in [true, false] {
+        let (_dir, service, _calls) = fixture();
+        let scope = head();
+        let weak = Arc::downgrade(&service);
+        service.runtime.lock().unwrap().as_mut().unwrap().describe = Arc::new(move |queried| {
+            let service = weak.upgrade().unwrap();
+            let newer = if newer_live {
+                Ok(live(queried.clone()))
+            } else {
+                Err("newer unknown".into())
+            };
+            service.remember_probe(&queried, "control-a", Instant::now(), newer);
+            Box::pin(async move {
+                Ok(ModuleControlResponseToModule::ScopeDescribe {
+                    status: ScopeStatus::Ended,
+                    scope_epoch: Some(queried.scope_epoch),
+                    daemon_incarnation: "restarted-daemon".into(),
+                    owner_synced: true,
+                    owner_configured: true,
+                    scope: Some(queried),
+                })
+            })
+        });
+        let refusal = service
+            .check_scope(
+                &scope,
+                ScopeRole::Authority,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (refusal.code, refusal.reason.as_str()),
+            (Code::ScopeEnded, "ended")
+        );
+        assert!(service.store.scope_ended(&scope).unwrap());
+    }
+}

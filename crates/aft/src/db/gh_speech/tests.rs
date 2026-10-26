@@ -237,24 +237,42 @@ fn own_run_memory_miss_cannot_use_the_cold_path() {
 #[test]
 fn execution_seal_is_write_once_and_outer_identity_drift_is_refused() {
     let (_dir, store, record) = fixture();
-    activate(&store, &record);
-    assert!(store
-        .seal(
-            &record.incarnation,
-            &ExecutionSeal {
-                child_pid: 999,
-                child_start_time_ms: 456,
-                birth_identity: "other".into()
-            }
-        )
-        .is_err());
+    store.capture(&record).unwrap();
+    let original = ExecutionSeal {
+        child_pid: 123,
+        child_start_time_ms: 456,
+        birth_identity: "original".into(),
+    };
+    store.seal(&record.incarnation, &original).unwrap();
+    assert_eq!(
+        store
+            .seal(
+                &record.incarnation,
+                &ExecutionSeal {
+                    child_pid: 999,
+                    child_start_time_ms: 456,
+                    birth_identity: "other".into()
+                }
+            )
+            .unwrap_err()
+            .reason,
+        "snapshot_invalid"
+    );
+    assert_eq!(store.get(&record.incarnation).unwrap().phase, "candidate");
+    assert_eq!(
+        store.get(&record.incarnation).unwrap().record.seal,
+        Some(original)
+    );
     let conn = store.connect().unwrap();
     conn.execute(
         "UPDATE gh_speech_authorities SET task_id='different-task'",
         [],
     )
     .unwrap();
-    assert!(store.get(&record.incarnation).is_err());
+    assert_eq!(
+        store.get(&record.incarnation).unwrap_err().reason,
+        "snapshot_invalid"
+    );
 }
 
 #[test]
@@ -333,7 +351,16 @@ fn final_gate_rereads_task_tuple_and_policy_state_before_local_admission() {
                 Ok(())
             },
         );
-        assert!(matches!(result, Err(GateError::BeforeSend(_))), "{change}");
+        let expected = match change {
+            "task" => "revoked",
+            "scope" => "ended_previously",
+            "policy" => "manifest_rollback",
+            _ => unreachable!(),
+        };
+        match result {
+            Err(GateError::BeforeSend(error)) => assert_eq!(error.reason, expected, "{change}"),
+            result => panic!("{change}: expected {expected}, got {result:?}"),
+        }
         assert!(
             !called.load(Ordering::SeqCst),
             "{change} must be checked before admission"
@@ -403,7 +430,10 @@ fn two_process_revocation_committed_first_prevents_gate_admission() {
             Ok(())
         },
     );
-    assert!(matches!(result, Err(GateError::BeforeSend(_))));
+    match result {
+        Err(GateError::BeforeSend(error)) => assert_eq!(error.reason, "revoked"),
+        result => panic!("expected revoked, got {result:?}"),
+    }
     assert!(
         !admitted.load(Ordering::SeqCst),
         "an earlier cross-process revocation commit must prevent admission"
@@ -439,5 +469,178 @@ fn two_process_nonholder_cannot_commit_between_gate_read_and_enqueue() {
     assert_eq!(
         store.get(&record.incarnation).unwrap_err().reason,
         "revoked"
+    );
+}
+
+#[test]
+fn legacy_bound_cancel_committed_before_enqueue_is_revoked_without_queueing() {
+    let (dir, store, record) = fixture();
+    let _holder = crate::root_cache::acquire_speech_serving_lease(dir.path()).unwrap();
+    let preflight = activate(&store, &record);
+    store
+        .prepare_request(
+            "legacy-before",
+            &record.incarnation,
+            &[3; 32],
+            "legacy-route",
+        )
+        .unwrap();
+    revoke_in_other_process(&store, "committed");
+    let enqueued = AtomicBool::new(false);
+    let result = store.final_legacy_gate(
+        &record.incarnation,
+        "legacy-before",
+        preflight.generation,
+        0,
+        record.policy.as_ref().unwrap(),
+        "forward-a",
+        || {
+            enqueued.store(true, Ordering::SeqCst);
+            Ok(())
+        },
+    );
+    assert!(
+        !enqueued.load(Ordering::SeqCst),
+        "an earlier cancellation commit must prevent even local enqueue"
+    );
+    match result {
+        Err(GateError::BeforeSend(error)) => assert_eq!(error.reason, "revoked"),
+        result => panic!("expected revoked before enqueue, got {result:?}"),
+    }
+    assert_eq!(
+        store
+            .pending_legacy_for_identity(&record.session_id, &record.task_id)
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn legacy_queue_full_rolls_back_dispatch_without_erasing_prepared_nonce() {
+    let (_dir, store, record) = fixture();
+    let stored = activate(&store, &record);
+    store
+        .prepare_request("legacy-full", &record.incarnation, &[3; 32], "legacy-route")
+        .unwrap();
+    let result: Result<(), GateError> = store.final_legacy_gate(
+        &record.incarnation,
+        "legacy-full",
+        stored.generation,
+        0,
+        record.policy.as_ref().unwrap(),
+        "forward-a",
+        || {
+            Err(Refusal::new(
+                Code::AuthorityUnavailable,
+                "dispatch_queue_full",
+            ))
+        },
+    );
+    match result {
+        Err(GateError::BeforeSend(error)) => assert_eq!(error.reason, "dispatch_queue_full"),
+        result => panic!("expected dispatch_queue_full, got {result:?}"),
+    }
+    assert_eq!(
+        store
+            .legacy_dispatch_status("legacy-full", &record.incarnation, &[3; 32])
+            .unwrap(),
+        None
+    );
+    let conn = store.connect().unwrap();
+    let prepared: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM gh_speech_requests WHERE request_nonce='legacy-full'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(prepared, 1);
+}
+
+#[test]
+fn legacy_enqueue_survives_consumer_loss_as_unknown_and_does_not_enqueue_twice() {
+    let (_dir, store, record) = fixture();
+    let stored = activate(&store, &record);
+    store
+        .prepare_request(
+            "legacy-crash",
+            &record.incarnation,
+            &[3; 32],
+            "legacy-route",
+        )
+        .unwrap();
+    store
+        .final_legacy_gate(
+            &record.incarnation,
+            "legacy-crash",
+            stored.generation,
+            0,
+            record.policy.as_ref().unwrap(),
+            "forward-a",
+            || Ok(()),
+        )
+        .unwrap();
+    let restarted = Store::new(store.path());
+    assert_eq!(
+        restarted
+            .legacy_dispatch_status("legacy-crash", &record.incarnation, &[3; 32])
+            .unwrap(),
+        Some(LegacyDispatchStatus::Queued)
+    );
+    let second: Result<(), GateError> = restarted.final_legacy_gate(
+        &record.incarnation,
+        "legacy-crash",
+        stored.generation,
+        0,
+        record.policy.as_ref().unwrap(),
+        "forward-b",
+        || panic!("an unknown old dispatch cannot be blindly resent"),
+    );
+    assert!(matches!(second, Err(GateError::AfterSend)));
+}
+
+#[test]
+fn legacy_cancel_after_enqueue_keeps_the_unsettled_dispatch_visible() {
+    let (dir, store, record) = fixture();
+    let _holder = crate::root_cache::acquire_speech_serving_lease(dir.path()).unwrap();
+    let stored = activate(&store, &record);
+    store
+        .prepare_request(
+            "legacy-after",
+            &record.incarnation,
+            &[3; 32],
+            "legacy-route",
+        )
+        .unwrap();
+    store
+        .final_legacy_gate(
+            &record.incarnation,
+            "legacy-after",
+            stored.generation,
+            0,
+            record.policy.as_ref().unwrap(),
+            "forward-a",
+            || Ok(()),
+        )
+        .unwrap();
+    revoke_in_other_process(&store, "committed");
+    assert_eq!(
+        store.get(&record.incarnation).unwrap_err().reason,
+        "revoked"
+    );
+    assert_eq!(
+        store
+            .pending_legacy_for_identity(&record.session_id, &record.task_id)
+            .unwrap(),
+        1
+    );
+    store
+        .settle_legacy_dispatch("legacy-after", &record.incarnation, "forward-a")
+        .unwrap();
+    assert_eq!(
+        store
+            .pending_legacy_for_identity(&record.session_id, &record.task_id)
+            .unwrap(),
+        0
     );
 }

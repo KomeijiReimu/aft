@@ -106,6 +106,7 @@ pub(crate) struct Service {
     lease: Mutex<Option<Arc<crate::root_cache::SpeechServingLease>>>,
     pending_tasks: Mutex<HashSet<String>>,
     pending_ids: Mutex<HashSet<(String, String)>>,
+    legacy_slots: Arc<tokio::sync::Semaphore>,
     pending_scopes: Mutex<HashSet<ScopeKey>>,
     pub(crate) admission: Mutex<()>,
     cache: Mutex<HashMap<ScopeKey, Cached>>,
@@ -159,6 +160,7 @@ pub(crate) fn start(
                 lease: Mutex::new(None),
                 pending_tasks: Mutex::new(HashSet::new()),
                 pending_ids: Mutex::new(HashSet::new()),
+                legacy_slots: Arc::new(tokio::sync::Semaphore::new(16)),
                 pending_scopes: Mutex::new(HashSet::new()),
                 admission: Mutex::new(()),
                 cache: Mutex::new(HashMap::new()),
@@ -212,6 +214,12 @@ impl Service {
             *held = crate::root_cache::acquire_speech_serving_lease(&self.root).ok();
         }
         held.is_some()
+    }
+
+    pub(crate) fn try_legacy_slot(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Refusal> {
+        Arc::clone(&self.legacy_slots)
+            .try_acquire_owned()
+            .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "dispatch_queue_full"))
     }
     pub(crate) fn set_end_notice(&self, notice: EndNotice) {
         *self
@@ -621,6 +629,21 @@ impl Service {
                 generation: generation.clone(),
                 reply,
             };
+            // Definitive ends are irreversible evidence, not replaceable cache entries.
+            // Validate the received answer before a newer Live/unknown can supersede it.
+            if let Ok(reply) = &cached.reply {
+                if let Ok(Answer::Ended(proof)) = validate_scope_identity(
+                    scope,
+                    role,
+                    reply,
+                    &self.generation(),
+                    &cached.generation,
+                    crate::db::call_ledger::now_ms() as u64,
+                ) {
+                    let _ = self.record_end(scope, proof);
+                    return Err(Refusal::scoped(Code::ScopeEnded, "ended", role));
+                }
+            }
             self.remember_probe(scope, &generation, sent, cached.reply.clone());
             self.cache
                 .lock()
@@ -771,6 +794,7 @@ pub(crate) fn record_service(root: &Path) -> Arc<Service> {
                 lease: Mutex::new(None),
                 pending_tasks: Mutex::new(HashSet::new()),
                 pending_ids: Mutex::new(HashSet::new()),
+                legacy_slots: Arc::new(tokio::sync::Semaphore::new(16)),
                 pending_scopes: Mutex::new(HashSet::new()),
                 admission: Mutex::new(()),
                 cache: Mutex::new(HashMap::new()),

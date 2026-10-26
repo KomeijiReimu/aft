@@ -79,12 +79,27 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         });
 
     let warning = crate::gh_shim_speech::service::revocation_pending(req.session(), &task_id);
+    let mut warnings = Vec::new();
+    if warning {
+        warnings.push(crate::gh_shim_speech::REVOCATION_NOT_DURABLE.to_string());
+    }
+    let queued = ctx
+        .bash_background()
+        .queued_bot_writes(req.session(), &task_id);
+    match queued {
+        Some(count) if count > 0 => warnings.push(queued_writes_warning(count)),
+        None => warnings.push("bot_writes_already_queued: writes already queued for this command may still post; the pending count could not be read.".to_string()),
+        _ => {},
+    }
+    let warning_text = (!warnings.is_empty()).then(|| warnings.join("\n"));
     match result {
         Ok(snapshot) => {
             let mut data = json!(snapshot);
-            if warning {
-                data["bot_write_revocation_warning"] =
-                    json!(crate::gh_shim_speech::REVOCATION_NOT_DURABLE);
+            if let Some(warning) = &warning_text {
+                data["bot_write_revocation_warning"] = json!(warning);
+            }
+            if queued.is_some_and(|count| count > 0) {
+                data["bot_writes_already_queued"] = json!(queued.unwrap());
             }
             Response::success(&req.id, data)
         }
@@ -96,16 +111,17 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(message) => Response::error(
             &req.id,
             "kill_failed",
-            if warning {
-                format!(
-                    "{message}\n{}",
-                    crate::gh_shim_speech::REVOCATION_NOT_DURABLE
-                )
+            if let Some(warning) = warning_text {
+                format!("{message}\n{warning}")
             } else {
                 message.to_string()
             },
         ),
     }
+}
+
+pub(crate) fn queued_writes_warning(count: u64) -> String {
+    format!("bot_writes_already_queued: {count} writes already queued for this command may still post; cancellation cannot unsend them.")
 }
 
 #[cfg(test)]

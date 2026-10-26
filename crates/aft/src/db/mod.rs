@@ -35,7 +35,7 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod wal_credit_probe;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 22;
+pub const CURRENT_SCHEMA_VERSION: u32 = 23;
 
 const MIGRATION_VERSIONS: &[u32] = &[
     1,
@@ -60,6 +60,7 @@ const MIGRATION_VERSIONS: &[u32] = &[
     rich_ui::SCHEMA_VERSION,
     21,
     22,
+    23,
 ];
 
 // Performance-only indexes do not change the table format or reader floor.
@@ -1022,6 +1023,7 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
         rich_ui::SCHEMA_VERSION => conn.execute_batch(rich_ui::MIGRATION),
         21 => apply_migration_v21(conn),
         22 => conn.execute_batch(gh_speech::MIGRATION),
+        23 => conn.execute_batch(gh_speech::LEGACY_DISPATCH_MIGRATION),
         _ => Ok(()),
     }
 }
@@ -1068,7 +1070,7 @@ mod tests {
             apply_migration(&mut conn, version).unwrap();
         }
         assert_eq!(current_schema_version(&conn).unwrap(), 21);
-        assert_eq!(run_migrations(&mut conn).unwrap(), 22);
+        assert_eq!(run_migrations(&mut conn).unwrap(), 23);
         for table in [
             "gh_speech_authorities",
             "gh_speech_task_revocations",
@@ -1076,6 +1078,7 @@ mod tests {
             "gh_speech_policy_versions",
             "gh_speech_policy_watermarks",
             "gh_speech_requests",
+            "gh_speech_legacy_dispatch",
         ] {
             let present: bool = conn
                 .query_row(
@@ -1086,7 +1089,40 @@ mod tests {
                 .unwrap();
             assert!(present, "missing {table}");
         }
-        assert_eq!(MIGRATION_VERSIONS, (1..=22).collect::<Vec<_>>());
+        assert_eq!(MIGRATION_VERSIONS, (1..=23).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn schema_twenty_two_upgrade_preserves_revocations_and_adds_dispatch_outcomes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)")
+            .unwrap();
+        for version in 1..=22 {
+            apply_migration(&mut conn, version).unwrap();
+        }
+        conn.execute("INSERT INTO gh_speech_task_revocations(incarnation,reason,recorded_at_ms) VALUES('old-task','cancelled',1)", []).unwrap();
+        let absent: bool = conn.query_row("SELECT NOT EXISTS(SELECT 1 FROM sqlite_master WHERE name='gh_speech_legacy_dispatch')", [], |row| row.get(0)).unwrap();
+        assert!(
+            absent,
+            "schema 22 must not silently acquire schema 23 tables"
+        );
+        assert_eq!(run_migrations(&mut conn).unwrap(), 23);
+        let reason: String = conn
+            .query_row(
+                "SELECT reason FROM gh_speech_task_revocations WHERE incarnation='old-task'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, "cancelled");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM gh_speech_legacy_dispatch",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
     use rusqlite::params;
     use tempfile::tempdir;

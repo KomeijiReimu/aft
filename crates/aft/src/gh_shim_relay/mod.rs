@@ -281,6 +281,8 @@ pub struct RelayCall<'a> {
     pub route_scopes: &'a RouteScopes,
 }
 
+mod bound;
+
 /// How a call reached plexus, for the relay log line: under the session's
 /// scope stamp, or (for the binding read) on an unscoped route.
 const PATH_STAMP: &str = "stamp";
@@ -767,6 +769,23 @@ async fn bot_request<T: RelayTransport>(
     // Applying the partner guards to foreground speech is a separate rollout
     // after those guards are deployed, not a prerequisite for existing writes.
     if !captured_background {
+        if redeemed.launch.is_some()
+            && params
+                .get("ticket")
+                .and_then(Value::as_str)
+                .and_then(crate::gh_shim_ticket::speech_for_ticket)
+                .is_some_and(|speech| speech.background.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            let reply = match bound::post_bound_background(
+                transport, redeemed, _stamp, params, routes, nonce, request,
+            )
+            .await
+            {
+                Ok(reply) => reply,
+                Err(error) => RelayReply::task_refused(error),
+            };
+            return (reply, PATH_STAMP);
+        }
         let selector = scope_selector(_stamp);
         let body = github_call(json!({"op":"bot_request","request_nonce":nonce,"request":request}));
         let reply = match transport

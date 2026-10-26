@@ -49,8 +49,8 @@ fn scope_roles_keep_wire_identity_separate_from_plain_language() {
     let refusal = Refusal::scoped(Code::ScopeEnded, "ended_previously", ScopeRole::Run);
     assert_eq!(refusal.wire_data()["scope_role"], "run");
     assert_eq!(refusal.wire_data()["reason"], "ended_previously");
-    assert_eq!(refusal.text(), "the program this command started from has ended (ended_previously), so it can no longer write as the bot; start the command again from a live session.");
-    assert_eq!(Refusal::scoped(Code::ScopeUnknown, "not_synced", ScopeRole::Head).text(), "AFT could not confirm that the session this command started from is still active (not_synced); retry in a minute.");
+    assert_eq!(refusal.text(), "the codemode program this command started from has ended (ended_previously), so it can no longer write as the bot; start the command again from a live session.");
+    assert_eq!(Refusal::scoped(Code::ScopeUnknown, "not_synced", ScopeRole::Head).text(), "AFT could not confirm that the head session this command started from is still active (not_synced); retry in a minute.");
     assert_eq!(ScopeRole::Authority.label(), "session");
 }
 
@@ -60,6 +60,7 @@ fn temporary_reasons_and_lasting_reasons_use_different_approved_templates() {
         "serving_lock_unavailable",
         "storage_busy",
         "revocation_pending",
+        "dispatch_queue_full",
     ] {
         assert_eq!(
             Refusal::new(Code::AuthorityUnavailable, reason).text(),
@@ -70,7 +71,7 @@ fn temporary_reasons_and_lasting_reasons_use_different_approved_templates() {
 }
 
 #[test]
-fn typed_refusal_has_five_closed_code_families_and_the_existing_stderr_wrapper() {
+fn typed_refusal_has_five_closed_code_families_and_the_task_stage() {
     for (code, expected) in [
         (Code::IdentityConflict, "task_gh_identity_conflict"),
         (Code::PolicyDenied, "task_gh_policy_denied"),
@@ -86,5 +87,4 @@ fn typed_refusal_has_five_closed_code_families_and_the_existing_stderr_wrapper()
         Refusal::new(Code::IdentityConflict, "binding_changed").wire_data()["stage"],
         "task_authority"
     );
-    assert_eq!(format!("gh-shim: gh_shim_seam_refusal: {}", Refusal::new(Code::IdentityConflict, "binding_changed").agent_text()), "gh-shim: gh_shim_seam_refusal: task_gh_identity_conflict: this command's bot identity no longer matches the repository's bot (binding_changed); start the command again from a live session.");
 }

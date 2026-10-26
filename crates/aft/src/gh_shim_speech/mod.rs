@@ -67,8 +67,9 @@ pub(crate) enum ScopeRole {
 impl ScopeRole {
     pub(crate) const fn label(self) -> &'static str {
         match self {
-            Self::Authority | Self::Head => "session",
-            Self::Run => "program",
+            Self::Authority => "session",
+            Self::Head => "head session",
+            Self::Run => "codemode program",
         }
     }
 }
@@ -102,9 +103,10 @@ impl Refusal {
             Code::IdentityConflict => IDENTITY_TEXT,
             Code::PolicyDenied => POLICY_TEXT,
             Code::AuthorityUnavailable => match self.reason.as_str() {
-                "serving_lock_unavailable" | "storage_busy" | "revocation_pending" => {
-                    TEMPORARY_TEXT
-                }
+                "serving_lock_unavailable"
+                | "storage_busy"
+                | "revocation_pending"
+                | "dispatch_queue_full" => TEMPORARY_TEXT,
                 _ => UNAVAILABLE_TEXT,
             },
             Code::ScopeEnded => ENDED_TEXT,
