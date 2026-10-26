@@ -440,6 +440,17 @@ fn client_child() {
         for line in std::io::stdin().lock().lines() {
             let value: Value = serde_json::from_str(&line.unwrap()).unwrap();
             let result = tokio::time::timeout(Duration::from_secs(10), async {
+                if value["op"] == "escaped" {
+                    use std::os::unix::process::CommandExt;
+                    let mut command = Command::new(std::env::current_exe().unwrap());
+                    command.args(["--exact", "secret_proxy::tests::client_child", "--nocapture"])
+                        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+                    unsafe { command.pre_exec(|| { if libc::setsid() < 0 { return Err(std::io::Error::last_os_error()); } Ok(()) }); }
+                    let mut process = command.spawn().map_err(|_| ())?;
+                    writeln!(process.stdin.take().unwrap(), "{{\"op\":\"connect\"}}").map_err(|_| ())?;
+                    let output = process.wait_with_output().map_err(|_| ())?;
+                    return Ok(String::from_utf8_lossy(&output.stdout).lines().find_map(|line| serde_json::from_str::<Value>(line).ok()).ok_or(())?);
+                }
                 if value["op"] == "connect" {
                     let proxy = url::Url::parse(&std::env::var("AFT_PROXY").unwrap()).unwrap();
                     let authority = value["authority"].as_str().map(str::to_owned).unwrap_or_else(|| std::env::var("AFT_UPSTREAM").unwrap());
@@ -469,6 +480,16 @@ fn client_child() {
                 }
                 let index = value["connection"].as_u64().map(|v| v as usize).unwrap_or(senders.len().saturating_sub(1));
                 let sender = senders.get_mut(index).ok_or(())?;
+                if value["op"] == "overlap" {
+                    let Sender::H2(sender) = sender else { return Err(()); };
+                    let mut second = sender.clone();
+                    let uri = format!("https://{}/approved", std::env::var("AFT_UPSTREAM").unwrap());
+                    let make = || Request::builder().uri(&uri).header("authorization",format!("Bearer {MARKER}"))
+                        .body(Full::new(Bytes::new())).unwrap();
+                    let (a, b) = tokio::join!(sender.send_request(make()), second.send_request(make()));
+                    let (a, b) = tokio::join!(a.map_err(|_| ())?.into_body().collect(), b.map_err(|_| ())?.into_body().collect());
+                    return Ok(json!({"a":String::from_utf8_lossy(&a.map_err(|_| ())?.to_bytes()),"b":String::from_utf8_lossy(&b.map_err(|_| ())?.to_bytes())}));
+                }
                 let authority = value["authority"].as_str().map(str::to_owned).unwrap_or_else(|| std::env::var("AFT_UPSTREAM").unwrap());
                 let path = value["path"].as_str().unwrap_or("/approved");
                 let uri = if matches!(sender, Sender::H2(_)) { format!("https://{authority}{path}") } else { path.to_owned() };
@@ -825,5 +846,117 @@ async fn proxy_scope_stop_closes_listener_and_open_connections() {
         true
     );
     assert_eq!(vault.calls.load(Ordering::SeqCst), 1);
+    assert!(proxy.state.patterns.lock().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_rotating_material_keeps_both_matchers_for_overlapping_responses() {
+    let server = Server::new("overlap").await;
+    let vault = Vault::new();
+    vault.rotate.store(true, Ordering::SeqCst);
+    let proxy = SecretProxy::start_with_tls(
+        config(
+            vault.clone(),
+            server.address.port(),
+            &[("test", Location::Bearer)],
+        ),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(true);
+    let responses = client.command(json!({"op":"overlap"}));
+    for field in ["a", "b"] {
+        let body = responses[field]
+            .as_str()
+            .expect("both h2 streams completed");
+        assert_eq!(body.matches(MARKER).count(), 11, "{body}");
+        assert!(!body.contains(std::str::from_utf8(K1).unwrap()));
+        assert!(!body.contains(std::str::from_utf8(K2).unwrap()));
+    }
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(proxy.state.patterns.lock().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_peer_identity_rejects_outside_process_other_session_and_setsid_descendant() {
+    let server = Server::new("plain").await;
+    let vault = Vault::new();
+    let proxy = SecretProxy::start_with_tls(
+        config(
+            vault.clone(),
+            server.address.port(),
+            &[("test", Location::Bearer)],
+        ),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut command = Client::spawn(&proxy, &server);
+    proxy.arm_command(command.process.id()).unwrap();
+    // An outside process has the right second factor but not the command SID.
+    let mut socket = TcpStream::connect(proxy.address()).await.unwrap();
+    let credentials = base64::engine::general_purpose::STANDARD
+        .encode(format!("{}:", proxy.state.token.as_str()));
+    socket.write_all(format!("CONNECT localhost:{} HTTP/1.1\r\nHost: localhost:{}\r\nProxy-Authorization: Basic {credentials}\r\n\r\n",server.address.port(),server.address.port()).as_bytes()).await.unwrap_or(());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), socket.read_u8())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    let mut other_session = Client::spawn(&proxy, &server);
+    assert_eq!(
+        other_session.command(json!({"op":"connect"}))["error"],
+        true
+    );
+    assert_eq!(command.command(json!({"op":"escaped"}))["error"], true);
+    command.connect(false);
+    assert_eq!(
+        command.request(
+            "/approved",
+            json!({"authorization":format!("Bearer {MARKER}")}),
+            ""
+        )["status"],
+        200
+    );
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_process_tree_end_stops_listener_and_discards_matchers() {
+    let server = Server::new("plain").await;
+    let vault = Vault::new();
+    let mut proxy = SecretProxy::start_with_tls(
+        config(
+            vault.clone(),
+            server.address.port(),
+            &[("test", Location::Bearer)],
+        ),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    assert_eq!(
+        client.request(
+            "/approved",
+            json!({"authorization":format!("Bearer {MARKER}")}),
+            ""
+        )["status"],
+        200
+    );
+    client.process.kill().unwrap();
+    client.process.wait().unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !proxy.state.stopped.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    proxy.process_tree_ended();
+    assert!(TcpStream::connect(proxy.address()).await.is_err());
     assert!(proxy.state.patterns.lock().is_empty());
 }

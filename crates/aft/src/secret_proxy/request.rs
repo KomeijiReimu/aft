@@ -104,7 +104,7 @@ async fn prepare_and_send(
         .any(|(r, m)| *m && matches!(r.location, Location::Json(_)));
     // Only JSON substitution needs a buffered body. Other uploads remain
     // streaming; they are never searched for placeholders outside their rule.
-    let mut body = Zeroizing::new(Vec::new());
+    let mut body = Zeroizing::new(Vec::with_capacity(if has_json { 1024 * 1024 } else { 0 }));
     if has_json {
         while let Some(frame) = incoming.frame().await {
             let frame = frame.map_err(|_| fail())?;
@@ -207,10 +207,10 @@ async fn prepare_and_send(
         let query = wire_target
             .iter()
             .position(|c| *c == b'?')
-            .map(|i| wire_target[i..].to_vec());
+            .map(|i| Zeroizing::new(wire_target[i..].to_vec()));
         wire_target = Zeroizing::new(normalized.wire);
         if let Some(query) = query {
-            wire_target.extend(query);
+            wire_target.extend_from_slice(&query);
         }
     }
     parts.uri = std::str::from_utf8(&wire_target)
@@ -301,7 +301,8 @@ fn apply_edits(
     edits: &mut [(usize, usize, Zeroizing<Vec<u8>>)],
 ) -> Result<Zeroizing<Vec<u8>>, String> {
     edits.sort_by_key(|e| e.0);
-    let mut out = Zeroizing::new(Vec::with_capacity(input.len()));
+    let capacity = input.len() + edits.iter().map(|e| e.2.len()).sum::<usize>();
+    let mut out = Zeroizing::new(Vec::with_capacity(capacity));
     let mut cursor = 0;
     for (start, end, value) in edits {
         if *start < cursor || *start > *end || *end > input.len() {

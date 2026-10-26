@@ -65,17 +65,27 @@ async fn server_frames<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             }
             1 | 2 if opcode.is_none() => {
                 opcode = Some(kind);
-                message.extend_from_slice(&payload);
+                extend_message(&mut message, &payload);
             }
-            0 if opcode.is_some() => message.extend_from_slice(&payload),
+            0 if opcode.is_some() => extend_message(&mut message, &payload),
             _ => return Err(()),
         }
         if kind < 8 && fin {
             let clean = state.scrub(&message)?;
             write_frame(writer, opcode.take().ok_or(())?, &clean).await?;
-            message.clear();
+            message = Zeroizing::new(Vec::new());
         }
     }
+}
+
+fn extend_message(message: &mut Zeroizing<Vec<u8>>, payload: &[u8]) {
+    let needed = message.len() + payload.len();
+    if needed > message.capacity() {
+        let mut grown = Zeroizing::new(Vec::with_capacity(needed.next_power_of_two()));
+        grown.extend_from_slice(message);
+        *message = grown;
+    }
+    message.extend_from_slice(payload);
 }
 
 async fn write_frame<W: AsyncWrite + Unpin>(

@@ -24,7 +24,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use parking_lot::Mutex;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
-use secret_rules::location::{validate_rule, LabelRule};
+use secret_rules::location::{validate_header_name, LabelRule, Location};
 use secret_rules::scrub::{MatcherSet, Scrubber};
 use secret_rules::target::{canonical_host, ConnectAuthority};
 use tokio::net::{TcpListener, TcpStream};
@@ -172,10 +172,13 @@ impl SecretProxy {
         if scanned.is_empty()
             || scanned != resolved
             || resolved.len() != config.grants.len()
-            || config
-                .grants
-                .iter()
-                .any(|g| validate_rule(&g.rule).is_some())
+            || config.grants.iter().any(|g| {
+                let r = &g.rule;
+                !secret_rules::placeholder::is_label(&r.label)
+                    || canonical_host(&r.host).is_err()
+                    || secret_rules::target::normalize_path_prefix(&r.path_prefix).map_or(true, |p| p != r.path_prefix)
+                    || matches!(&r.location, Location::Header(name) if validate_header_name(name).is_err())
+            })
         {
             return Err(ProxyError::InvalidRules);
         }
