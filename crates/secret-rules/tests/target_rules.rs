@@ -51,12 +51,9 @@ fn host_match_is_exact_after_lowercasing_and_idna() {
 #[test]
 fn scheme_and_port_must_match() {
     let target = request("api.example.com", 443, "https", "/v1/x");
-    assert_eq!(
-        target
-            .matches(&rules("api.example.com", 443, "/v1"))
-            .is_ok(),
-        true
-    );
+    assert!(target
+        .matches(&rules("api.example.com", 443, "/v1"))
+        .is_ok());
     assert_eq!(
         target.matches(&rules("api.example.com", 8443, "/v1")),
         Err(TargetRefusal::PortMismatch)

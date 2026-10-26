@@ -279,7 +279,7 @@ fn run_material(case: &Value) -> Result<Value, String> {
             Err(_) => json!(false),
         },
         "encoded": encoded.as_ref().ok().map(|bytes| support::lossy(bytes)),
-        "error": encoded.as_ref().err().map(|err| material_reason(err)),
+        "error": encoded.as_ref().err().map(material_reason),
     }))
 }
 
@@ -316,7 +316,7 @@ fn run_path(case: &Value) -> Result<Value, String> {
         Ok(path) => Ok(json!({
             "normalized": path.value,
             "wire": support::lossy(&path.wire),
-            "matches": secret_rules::path_covers(&path.value, &prefix.trim_end_matches('/')),
+            "matches": secret_rules::path_covers(&path.value, prefix.trim_end_matches('/')),
         })),
         Err(err) => Ok(json!({ "error": target_reason(&err) })),
     }

@@ -13,7 +13,6 @@ pub fn skip_missing_group(file: &str, group: &str) {
     let vectors = load(file);
     if vectors.pointer(&format!("/groups/{group}")).is_none() {
         eprintln!("{group}: no vectors in {file} yet");
-        return;
     }
 }
 

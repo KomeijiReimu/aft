@@ -622,7 +622,7 @@ impl<'a> QueryIndex<'a> {
     }
 
     fn claimed(&self, name: &str) -> bool {
-        self.claimed.iter().any(|claimed| *claimed == name)
+        self.claimed.contains(&name)
     }
 
     fn claim(&mut self, name: &'a str) {
@@ -637,7 +637,7 @@ impl<'a> QueryIndex<'a> {
             .iter()
             .filter(move |(field, _, _)| *field == name)
             .map(|(_, start, end)| {
-                let raw = self.text[*start..*end].as_bytes();
+                let raw = &self.text.as_bytes()[*start..*end];
                 (*start, *end, crate::placeholder::percent_decode_lossy(raw))
             })
     }

@@ -391,7 +391,7 @@ fn byte_eq(left: u8, right: u8, insensitive: bool) -> bool {
     if !insensitive {
         return false;
     }
-    left.to_ascii_lowercase() == right.to_ascii_lowercase()
+    left.eq_ignore_ascii_case(&right)
 }
 
 /// Replace every pattern occurrence in `input` (longest first).
