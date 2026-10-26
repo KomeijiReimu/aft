@@ -60,6 +60,14 @@ fn refused(code: &str, role: &str) -> Value {
     json!({"status":"refused","code":code,"scope_role":role,"transmission":"not_sent","legs_sent":[]})
 }
 
+fn wire_owner(owner: &subc_protocol::Principal) -> String {
+    match owner {
+        subc_protocol::Principal::Direct => "direct".into(),
+        subc_protocol::Principal::Unverified => "unverified".into(),
+        subc_protocol::Principal::Reserved { module_id } => format!("reserved:{module_id}"),
+    }
+}
+
 impl FakePlex {
     fn bindings(&self) -> Value {
         let state = self.state.lock().unwrap();
@@ -165,13 +173,13 @@ impl FakePlex {
                     return refused("invalid_request", "run");
                 }
                 if state.ended.iter().any(|key| {
-                    run == &json!({"owner":key.owner,"ref":key.scope_ref,"epoch":key.epoch})
+                    let owner: subc_protocol::Principal = serde_json::from_str(&key.owner).unwrap();
+                    run == &json!({"owner":wire_owner(&owner),"ref":key.scope_ref,"epoch":key.epoch})
                 }) {
                     return refused("scope_ended", "run");
                 }
                 let current = state.scopes.values().find(|stamp| {
-                    let key = ScopeKey::from_stamp(stamp);
-                    run == &json!({"owner":key.owner,"ref":key.scope_ref,"epoch":key.epoch})
+                    run == &json!({"owner":wire_owner(&stamp.owner),"ref":stamp.scope_ref,"epoch":stamp.scope_epoch})
                 });
                 let Some(current) = current else {
                     return refused("scope_ended", "run");
@@ -837,7 +845,7 @@ async fn bound_dispatch_refuses_a_sibling_cancel_committed_before_local_enqueue(
         partners.before_final_gate = Some(Arc::new(move || {
             let receipt = cancel_from_sibling(&root, &scope);
             assert_eq!(receipt["success"], true);
-            assert_eq!(receipt["data"]["killed"].as_array().unwrap().len(), 1);
+            assert_eq!(receipt["killed"].as_array().unwrap().len(), 1);
         }));
         partners.on_bound_enqueue = Some(Arc::new(move || {
             observer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -875,8 +883,8 @@ async fn bound_dispatch_queued_before_cancel_posts_once_and_cancel_discloses_the
     assert!(answer.ok, "{:?}", answer.data);
     let receipt = receipt.lock().unwrap().clone().unwrap();
     assert_eq!(receipt["success"], true);
-    assert_eq!(receipt["data"]["bot_writes_already_queued"], 1);
-    assert_eq!(receipt["data"]["bot_write_revocation_warning"],"bot_writes_already_queued: 1 writes already queued for this command may still post; cancellation cannot unsend them.");
+    assert_eq!(receipt["bot_writes_already_queued"], 1);
+    assert_eq!(receipt["bot_write_revocation_warning"],"bot_writes_already_queued: 1 writes already queued for this command may still post; cancellation cannot unsend them.");
     assert_eq!(fixture.plex.state.lock().unwrap().posts.len(), 1);
     assert_eq!(
         fixture
