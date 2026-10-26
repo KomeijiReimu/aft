@@ -1855,6 +1855,40 @@ fn codemode_call_runs_with_head_principal_and_run_route_finds_its_ledger_row() {
                 assert!(Instant::now() < until, "aft.db never opened");
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+            // Both contexts share App.db. Verify that configuration and the
+            // opened database stay in this fixture's private storage instead
+            // of using the process-global default data directory.
+            let storage = std::path::PathBuf::from(
+                std::env::var_os("AFT_STORAGE_DIR").expect("fixture storage selection"),
+            )
+            .canonicalize()
+            .unwrap();
+            for project in [&daemon.root1, &daemon.root2] {
+                let ctx = daemon
+                    .executor
+                    .actor_context(&ProjectRootId::from_path(project).unwrap())
+                    .expect("bound actor");
+                let actor_storage = ctx
+                    .config()
+                    .storage_dir
+                    .clone()
+                    .expect("configured storage");
+                assert_eq!(actor_storage.canonicalize().unwrap(), storage);
+                let db = ctx.db().expect("ready database");
+                let database: String = db
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT file FROM pragma_database_list WHERE name='main'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    std::path::PathBuf::from(database).canonicalize().unwrap(),
+                    storage.join("aft.db")
+                );
+            }
             let keyed = json!({
                 "name": "glob",
                 "preset": "head",

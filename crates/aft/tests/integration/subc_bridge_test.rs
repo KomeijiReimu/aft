@@ -1670,6 +1670,20 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     install_bridge_state(Arc::clone(&state));
 
     let roots = SubcBridgeTestRoots::new();
+    // Bind actors start with default configuration, so the entry context's
+    // explicit storage path alone does not isolate their database or recovery.
+    // Give this serialized fixture a private process-wide storage selection.
+    let _fixture_storage = if _env_guards
+        .iter()
+        .any(|guard| guard.key == "AFT_STORAGE_DIR")
+    {
+        None
+    } else {
+        Some(set_test_env(
+            "AFT_STORAGE_DIR",
+            &roots.storage.path().to_string_lossy(),
+        ))
+    };
     // Strict untrusted routes re-exec the native launcher. This fixture runs the
     // bridge in libtest, so use the real binary without bypassing confinement.
     #[cfg(unix)]
@@ -11077,6 +11091,22 @@ fn minimal_bind_doc() -> Value {
     })
 }
 
+fn write_bind_project_config(root: &std::path::Path, doc: &Value) {
+    let path = root.join(".cortexkit").join("aft.jsonc");
+    let parent = path.parent().expect("project config parent");
+    std::fs::create_dir_all(parent).expect("create .cortexkit dir");
+    // An earlier bind may be reading this path while the next bind is sent.
+    // Publish a complete sibling file instead of truncating the live document.
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).expect("create project config temp");
+    std::io::Write::write_all(
+        &mut temporary,
+        &serde_json::to_vec(doc).expect("serialize bind doc"),
+    )
+    .expect("write project config temp");
+    temporary.persist(&path).expect("publish project config");
+}
+
 fn subc_mcp_principal() -> Principal {
     Principal::Reserved {
         module_id: "subc-mcp".to_string(),
@@ -11122,14 +11152,7 @@ async fn send_route_bind_with_elicitation_capability(
     corr: u64,
     root: &std::path::Path,
 ) {
-    let project_cfg = root.join(".cortexkit").join("aft.jsonc");
-    std::fs::create_dir_all(project_cfg.parent().expect("cortexkit dir parent"))
-        .expect("create .cortexkit dir");
-    std::fs::write(
-        &project_cfg,
-        serde_json::to_string(&minimal_bind_doc()).expect("serialize bind doc"),
-    )
-    .expect("write project config");
+    write_bind_project_config(root, &minimal_bind_doc());
 
     let body = ModuleControlRequest::RouteBind {
         route_channel,
@@ -14273,14 +14296,7 @@ async fn send_route_bind_with_harness_session_principal_and_doc_epoch(
     // to the project config file so it reaches handle_control_request's local
     // read. The wire `config` is still attached but no longer consulted by
     // production; keeping it asserts it's harmlessly ignored.
-    let project_cfg = root.join(".cortexkit").join("aft.jsonc");
-    std::fs::create_dir_all(project_cfg.parent().expect("cortexkit dir parent"))
-        .expect("create .cortexkit dir");
-    std::fs::write(
-        &project_cfg,
-        serde_json::to_string(&doc).expect("serialize bind doc"),
-    )
-    .expect("write project config");
+    write_bind_project_config(root, &doc);
 
     let request = ModuleControlRequest::RouteBind {
         route_channel,
