@@ -24,7 +24,7 @@ pub use crate::material::json_escape;
 use crate::material::percent_encode_form;
 use crate::placeholder::PLACEHOLDER_PREFIX;
 use crate::work::Counted;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use zeroize::Zeroizing;
 
 /// Why a key cannot be turned into scrub patterns.
@@ -92,17 +92,16 @@ impl KeyPatterns {
         if key.len() < crate::material::MIN_KEY_LEN {
             return Err(ScrubError::TooShort);
         }
-        let mut set: BTreeSet<Vec<u8>> = BTreeSet::new();
-        set.insert(key.to_vec());
-        set.extend(base64_patterns(key));
-        set.extend(percent_patterns(key));
-        set.extend(hex_patterns(key));
+        let mut patterns = vec![Zeroizing::new(key.to_vec())];
+        patterns.extend(base64_patterns(key).into_iter().map(Zeroizing::new));
+        patterns.extend(percent_patterns(key).into_iter().map(Zeroizing::new));
+        patterns.extend(hex_patterns(key).into_iter().map(Zeroizing::new));
         let json = json_escape(key);
         if !json.is_empty() {
-            set.insert(json.into_bytes());
+            patterns.push(Zeroizing::new(json.into_bytes()));
         }
-        let mut patterns: Vec<Zeroizing<Vec<u8>>> = set.into_iter().map(Zeroizing::new).collect();
         patterns.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        patterns.dedup();
         Ok(Self {
             patterns,
             key_len: key.len(),
@@ -222,9 +221,10 @@ pub fn base64_encode(bytes: &[u8], alphabet: &[u8; 64], pad: bool) -> Vec<u8> {
 /// Percent-encoded forms: every byte as `%XX`, and RFC 3986 with unreserved
 /// bytes literal, plus the form variant that leaves spaces literal.
 pub fn percent_patterns(key: &[u8]) -> Vec<Vec<u8>> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut all = Vec::with_capacity(key.len() * 3);
     for byte in key {
-        all.extend_from_slice(format!("%{byte:02X}").as_bytes());
+        all.extend_from_slice(&[b'%', HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]]);
     }
     vec![
         all,
@@ -584,7 +584,7 @@ fn base64_run_contains(run: &[u8], key: &[u8]) -> bool {
         let Some(slice) = run.get(offset..) else {
             continue;
         };
-        let mut decoded = Vec::with_capacity(slice.len());
+        let mut decoded = Zeroizing::new(Vec::with_capacity(slice.len()));
         let mut buffer = 0u32;
         let mut bits = 0u32;
         for byte in slice {
@@ -688,8 +688,8 @@ fn hex4(window: &[u8], at: usize) -> Option<u32> {
 /// that is how JSON writes an emoji or any other four-byte UTF-8 character. A
 /// surrogate without its partner is not valid JSON text and decodes to
 /// nothing.
-fn decode_json_escape(window: &[u8], index: usize) -> Option<(Vec<u8>, usize)> {
-    match *window.get(index + 1)? {
+fn decode_json_escape(window: &[u8], index: usize) -> Option<(Zeroizing<Vec<u8>>, usize)> {
+    let (bytes, consumed) = match *window.get(index + 1)? {
         b'"' => Some((vec![b'"'], 2)),
         b'\\' => Some((vec![b'\\'], 2)),
         b'/' => Some((vec![b'/'], 2)),
@@ -716,7 +716,8 @@ fn decode_json_escape(window: &[u8], index: usize) -> Option<(Vec<u8>, usize)> {
             Some((char::from_u32(code)?.to_string().into_bytes(), len))
         }
         _ => None,
-    }
+    }?;
+    Some((Zeroizing::new(bytes), consumed))
 }
 
 /// How many bytes a scrubber withholds from the caller: one less than the
@@ -832,18 +833,20 @@ impl Scrubber {
         if self.matchers.is_empty() {
             return chunk.to_vec();
         }
-        let mut buffer = std::mem::take(&mut self.pending).to_vec();
+        let mut buffer = Zeroizing::new(Vec::with_capacity(self.pending.len() + chunk.len()));
+        buffer.extend_from_slice(&self.pending);
+        self.pending = Zeroizing::new(Vec::new());
         buffer.extend_from_slice(chunk);
         let (out, held) = self.scrub_buffer(&buffer);
-        self.pending = Zeroizing::new(held);
+        self.pending = held;
         out
     }
 
     /// Release the retained tail at end of stream.
     pub fn finish(&mut self) -> Vec<u8> {
-        let tail = std::mem::take(&mut self.pending).to_vec();
+        let tail = std::mem::take(&mut self.pending);
         if self.matchers.is_empty() {
-            return tail;
+            return tail.to_vec();
         }
         // End of stream: nothing can complete a match any more, so whatever is
         // left is scrubbed once and released.
@@ -911,7 +914,7 @@ impl Scrubber {
     /// at or after `split` stays in the held tail and is matched again once
     /// more bytes arrive. The holdback length does not depend on what the
     /// window contains.
-    fn scrub_buffer(&self, buffer: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    fn scrub_buffer(&self, buffer: &[u8]) -> (Vec<u8>, Zeroizing<Vec<u8>>) {
         let hold = overlap_for(self.longest).min(buffer.len());
         let split = buffer.len() - hold;
         let edits = self.find_edits(buffer);
@@ -936,7 +939,7 @@ impl Scrubber {
         // A replacement that ran past the split consumed those bytes already,
         // so the held tail starts no earlier than the end of the split.
         let tail_start = split.max(cursor);
-        let tail = buffer[tail_start..].to_vec();
+        let tail = Zeroizing::new(buffer[tail_start..].to_vec());
         (out, tail)
     }
 }
