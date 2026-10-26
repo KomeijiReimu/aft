@@ -3087,6 +3087,44 @@ fn walk_semantic_project_files_bounded(
     walk_project_files_bounded_matching(root, &filters, max_files, is_semantic_indexed_extension)
 }
 
+#[cfg(test)]
+mod nested_worktree_semantic_tests {
+    use super::*;
+
+    #[test]
+    fn semantic_enumeration_skips_nested_linked_worktrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture =
+            crate::git_probe::init_repo_with_nested_worktree_for_test(dir.path(), "semantic");
+        let files = walk_semantic_project_files_bounded(&fixture.root, 1000)
+            .expect("fixture walk must complete")
+            .into_iter()
+            .map(|path| {
+                path.strip_prefix(&fixture.root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            files.contains("src/main.rs"),
+            "missing main file: {files:?}"
+        );
+        assert!(
+            files.contains("vendor/independent/inner.rs"),
+            "nested independent repository must still be walked: {files:?}"
+        );
+        assert!(
+            files.contains("submod/code.rs"),
+            "submodule-style checkout must still be walked: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|path| path.starts_with("linked/")),
+            "nested linked worktree files were enumerated: {files:?}"
+        );
+    }
+}
+
 #[cfg(debug_assertions)]
 fn delay_search_rebuild_publish_for_debug() {
     let Some(delay_ms) = std::env::var("AFT_TEST_SEARCH_REBUILD_PUBLISH_DELAY_MS")

@@ -144,6 +144,8 @@ pub mod memory;
 pub mod migrate_storage;
 pub mod migration;
 pub mod ndjson_text;
+#[cfg(test)]
+mod nested_worktree_tests;
 pub mod ort_lifecycle;
 pub mod ort_pin;
 pub(crate) mod os_metadata;
