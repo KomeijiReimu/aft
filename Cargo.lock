@@ -97,6 +97,7 @@ dependencies = [
  "rustc-hash 2.1.2",
  "rustls",
  "rustls-platform-verifier",
+ "secret-rules",
  "serde",
  "serde_json",
  "sha1",
@@ -149,6 +150,7 @@ dependencies = [
  "vt100",
  "which",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
