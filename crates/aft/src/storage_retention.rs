@@ -2305,9 +2305,16 @@ fn tree_files(cache: &Path, deadline: Instant) -> io::Result<Vec<(PathBuf, u64)>
     validate_tree(cache, deadline, true)
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("retention deadline reached")]
+#[derive(Debug)]
 struct RetentionDeadline;
+
+impl std::fmt::Display for RetentionDeadline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("retention deadline reached")
+    }
+}
+
+impl std::error::Error for RetentionDeadline {}
 
 fn is_retention_deadline(error: &io::Error) -> bool {
     error
