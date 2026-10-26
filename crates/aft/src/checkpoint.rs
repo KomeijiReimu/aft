@@ -24,6 +24,9 @@ const NAMED_CHECKPOINT_RETENTION_DAYS: u64 = 14;
 const NAMED_CHECKPOINT_RETENTION_SECS: u64 = NAMED_CHECKPOINT_RETENTION_DAYS * 24 * 60 * 60;
 const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 const IMPORTED_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+#[cfg(test)]
+#[path = "agent_data/ordinary_checkpoint_format_tests.rs"]
+mod ordinary_format_tests;
 #[path = "agent_data/checkpoint.rs"]
 mod portable;
 const UNBOUND_HARNESS_SEGMENT: &str = "unbound";
@@ -115,7 +118,7 @@ struct CheckpointFile {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct DiskCheckpointMeta {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     imported_guards: HashMap<PathBuf, crate::agent_data::ImportedGuard>,
     schema_version: u32,
     session_id: String,

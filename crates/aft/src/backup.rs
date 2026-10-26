@@ -13,6 +13,9 @@ use crate::error::AftError;
 use crate::fs_lock::AdvisoryLockGuard;
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+#[path = "agent_data/ordinary_backup_format_tests.rs"]
+mod ordinary_format_tests;
 #[path = "agent_data/backup.rs"]
 mod portable;
 pub mod purge;
@@ -57,6 +60,7 @@ const V2_FORMAT_VERSION: &str = "v2";
 /// fields are absent or optional and read as unset. Version 3 carries the
 /// strict registry and baseline guard on imported history.
 const DB_RESTORE_META_VERSION: u32 = 3;
+const ORDINARY_DB_RESTORE_META_VERSION: u32 = 2;
 const MAX_RESTORE_OPERATION_LOCK_RETRIES: usize = 32;
 const MAX_SESSION_DISCOVERY_ENTRIES: usize = 100_000;
 /// Recovery must finish undo bookkeeping even after its caller is cancelled,
@@ -336,6 +340,9 @@ fn run_restore_before_lock_hook_for_tests(_session: &str, _attempt: usize) {}
 // readers enforcing this version gate reject it; the SQLite mirror needs
 // separate downgrade protection before imported history can be exposed.
 pub const SCHEMA_VERSION: u32 = 6;
+/// Ordinary local history must remain readable by the current main daemon.
+/// Only a stack containing imported guards needs the newer reader format.
+pub(crate) const ORDINARY_SCHEMA_VERSION: u32 = 5;
 
 /// A single backup entry for a file.
 #[derive(Debug, Clone)]
@@ -3689,7 +3696,7 @@ impl BackupStore {
             return;
         }
         let json = serde_json::json!({
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": ORDINARY_SCHEMA_VERSION,
             "session_id": session,
             "last_accessed": last_accessed,
         });
@@ -4106,7 +4113,7 @@ impl BackupStore {
             // Write a session.json marker so future scans don't re-migrate.
             let marker = default_session_dir.join("session.json");
             let json = serde_json::json!({
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": ORDINARY_SCHEMA_VERSION,
                 "session_id": crate::protocol::DEFAULT_SESSION_ID,
                 "last_accessed": current_timestamp(),
             });
@@ -4138,10 +4145,21 @@ impl BackupStore {
         }
         if let Some(obj) = parsed.as_object_mut() {
             let count = obj.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-            obj.insert(
-                "schema_version".to_string(),
-                serde_json::json!(SCHEMA_VERSION),
-            );
+            let version = if obj
+                .get("entries")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        entry
+                            .get("imported_guard")
+                            .is_some_and(|guard| !guard.is_null())
+                    })
+                }) {
+                SCHEMA_VERSION
+            } else {
+                ORDINARY_SCHEMA_VERSION
+            };
+            obj.insert("schema_version".to_string(), serde_json::json!(version));
             obj.insert("session_id".to_string(), serde_json::json!(session_id));
             obj.entry("entries").or_insert_with(|| {
                 serde_json::Value::Array(
@@ -4416,7 +4434,7 @@ impl BackupStore {
             return Ok(());
         }
         let json = serde_json::json!({
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": ORDINARY_SCHEMA_VERSION,
             "session_id": session,
             "last_accessed": current_timestamp(),
         });
@@ -5057,6 +5075,24 @@ impl BackupStore {
         let max_depth = self.policy.max_depth;
         let retained_start = stack.len().saturating_sub(max_depth);
         let retained = &stack[retained_start..];
+        let schema_version = if retained.iter().any(|entry| entry.imported_guard.is_some()) {
+            if let Some(root) = self.storage_dir.as_deref() {
+                crate::reader_floor::raise(
+                    root,
+                    &[(
+                        crate::persisted_format::PersistedStore::BackupMeta,
+                        SCHEMA_VERSION,
+                    )],
+                )
+                .map_err(|error| AftError::IoError {
+                    path: root.display().to_string(),
+                    message: error.to_string(),
+                })?;
+            }
+            SCHEMA_VERSION
+        } else {
+            ORDINARY_SCHEMA_VERSION
+        };
         let mut referenced_content = HashSet::new();
         let mut ledger_bytes = 0_u64;
 
@@ -5090,7 +5126,7 @@ impl BackupStore {
             })
             .collect();
         let meta = serde_json::json!({
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": schema_version,
             "format_version": V2_FORMAT_VERSION,
             "session_id": session,
             "path": key.display().to_string(),
@@ -5513,8 +5549,8 @@ fn check_backup_meta_format(
 }
 
 fn restore_metadata_json(entry: &BackupEntry) -> String {
-    serde_json::json!({
-        "version": DB_RESTORE_META_VERSION,
+    let mut value = serde_json::json!({
+        "version": if entry.imported_guard.is_some() { DB_RESTORE_META_VERSION } else { ORDINARY_DB_RESTORE_META_VERSION },
         "mode": entry.mode,
         "link_target": entry.link_target.as_ref().map(|target| target.display().to_string()),
         "created_dirs": entry
@@ -5527,9 +5563,11 @@ fn restore_metadata_json(entry: &BackupEntry) -> String {
         "external_change_checkpoint": entry.external_change_checkpoint,
         "link_to": entry.link_to.as_ref().map(|key| key.display().to_string()),
         "hardlink_detached": entry.hardlink_detached,
-        "imported_guard": entry.imported_guard,
-    })
-    .to_string()
+    });
+    if let Some(guard) = &entry.imported_guard {
+        value["imported_guard"] = serde_json::json!(guard);
+    }
+    value.to_string()
 }
 
 fn restore_metadata_from_json(value: &str) -> Option<BackupEntryDiskMetadata> {
@@ -6445,7 +6483,7 @@ fn content_bytes_for_disk(entry: &BackupEntry) -> std::io::Result<Arc<[u8]>> {
 }
 
 fn entry_meta_json(entry: &BackupEntry) -> serde_json::Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "backup_id": entry.backup_id,
         "timestamp": entry.timestamp,
         "order": entry.order.to_string(),
@@ -6465,8 +6503,11 @@ fn entry_meta_json(entry: &BackupEntry) -> serde_json::Value {
         "external_change_checkpoint": entry.external_change_checkpoint,
         "link_to": entry.link_to.as_ref().map(|key| key.display().to_string()),
         "hardlink_detached": entry.hardlink_detached,
-        "imported_guard": entry.imported_guard,
-    })
+    });
+    if let Some(guard) = &entry.imported_guard {
+        value["imported_guard"] = serde_json::json!(guard);
+    }
+    value
 }
 
 fn drain_stack_to_depth(stack: &mut Vec<BackupEntry>, max_depth: usize) -> Vec<BackupEntry> {
@@ -9362,7 +9403,7 @@ mod tests {
             fs::read_to_string(default_session_dir.join(&legacy_hash).join("meta.json")).unwrap();
         let meta: serde_json::Value = serde_json::from_str(&meta_content).unwrap();
         assert_eq!(meta["session_id"], DEFAULT_SESSION_ID);
-        assert_eq!(meta["schema_version"], SCHEMA_VERSION);
+        assert_eq!(meta["schema_version"], ORDINARY_SCHEMA_VERSION);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -10736,7 +10777,7 @@ mod tests {
             .unwrap();
         let written: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(path_dir.join("meta.json")).unwrap()).unwrap();
-        assert_eq!(written["schema_version"], SCHEMA_VERSION);
+        assert_eq!(written["schema_version"], ORDINARY_SCHEMA_VERSION);
         assert_eq!(written["entries"][0]["op_id"], serde_json::Value::Null);
         assert_eq!(written["entries"][1]["op_id"], "op-v3");
         let _ = fs::remove_dir_all(&dir);
