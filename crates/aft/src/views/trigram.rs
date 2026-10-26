@@ -491,6 +491,8 @@ impl TrigramDriver {
             revision: revision(&delta),
             entries: walk.entries,
             cut: None,
+            readiness: delta.readiness().clone(),
+            publication_base: None,
         })
     }
     pub fn revision(&self, _: &super::contracts::ViewAccess) -> u64 {

@@ -789,6 +789,7 @@ impl LiveDelta {
                 root_ignore_files: self.root_ignore_files.clone(),
                 install_cut: None,
                 reconciled_epoch: None,
+                publication_base: None,
                 readers: None,
             }),
         }
@@ -1560,6 +1561,7 @@ pub fn carry_disk_state_only(path: &RelPath, generation: &ComposedGeneration) ->
 #[derive(Clone, Debug)]
 struct SnapshotInner {
     reconciled_epoch: Option<u64>,
+    publication_base: Option<Option<String>>,
     generation: Arc<ComposedGeneration>,
     delta_version: u64,
     intent_version: u64,
@@ -1883,6 +1885,15 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    pub(crate) fn with_publication_base(mut self, base: Option<String>) -> Self {
+        Arc::make_mut(&mut self.inner).publication_base = Some(base);
+        self
+    }
+
+    pub(crate) fn publication_base(&self) -> Option<&Option<String>> {
+        self.inner.publication_base.as_ref()
+    }
+
     pub(crate) fn with_reconciled_epoch(mut self, epoch: u64) -> Self {
         Arc::make_mut(&mut self.inner).reconciled_epoch = Some(epoch);
         self

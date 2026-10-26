@@ -277,6 +277,8 @@ impl FirstLoadDriver for Driver {
         callgraph::attach(&mut live, &self.source, "typescript")?;
         Ok(ReconciledCheckout {
             cut: None,
+            readiness: Default::default(),
+            publication_base: None,
             revision: self.revision(access),
             entries: BTreeMap::from([(RelPath::new(b"fixture.ts").unwrap(), live)]),
         })

@@ -21,6 +21,10 @@ pub struct ReconciledCheckout {
     pub revision: u64,
     pub entries: BTreeMap<RelPath, LiveEntry>,
     pub cut: Option<InstallCut>,
+    /// Content-bound readiness already known at the strict cut.
+    pub readiness: BTreeMap<RelPath, super::snapshot::PlanePatch>,
+    /// Outer None delegates CAS to an external driver; Some(None) is an empty pointer.
+    pub publication_base: Option<Option<String>>,
 }
 
 /// The runtime owner supplies source reads and generation construction. Plane
@@ -591,8 +595,14 @@ impl SiblingLoader {
             for (path, entry) in checkout.entries {
                 delta.apply(path, entry);
             }
+            for (path, patch) in checkout.readiness {
+                delta.set_readiness(path, patch);
+            }
             let strict_epoch = checkout.cut.as_ref().map_or(delta.epoch(), |cut| cut.epoch);
             let mut snapshot = delta.snapshot().with_reconciled_epoch(strict_epoch);
+            if let Some(base) = checkout.publication_base {
+                snapshot = snapshot.with_publication_base(base);
+            }
             if let Some(cut) = checkout.cut {
                 snapshot = snapshot.with_install_cut(cut);
             }
@@ -808,6 +818,8 @@ mod tests {
                 revision,
                 entries,
                 cut: None,
+                readiness: Default::default(),
+                publication_base: None,
             })
         }
         fn build_own_generation(
@@ -1433,6 +1445,9 @@ pub struct CheckoutDriver {
     installed: std::sync::Mutex<Arc<InstalledBundle>>,
     live: std::sync::Mutex<LiveDelta>,
     prepared_readers: std::sync::Mutex<BTreeMap<String, PreparedReaders>>,
+    // Serialize the final identity check/CAS with the installed sequence swap,
+    // without holding query locks during I/O or plane-reader retirement.
+    publication_transition: std::sync::Mutex<()>,
     retry: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     work: std::sync::Mutex<ReconcileWork>,
@@ -1517,6 +1532,7 @@ impl CheckoutDriver {
             })),
             live: std::sync::Mutex::new(delta),
             prepared_readers: Default::default(),
+            publication_transition: Default::default(),
             retry: Default::default(),
             #[cfg(test)]
             work: Default::default(),
@@ -1660,6 +1676,13 @@ impl FirstLoadDriver for CheckoutDriver {
         if super::intent::active(self.owner.root()) {
             return Err(SiblingLoader::error(CHECKOUT_WRITE_ACTIVE));
         }
+        let publication_base =
+            match super::ViewStore::existing_dir(self.owner.view_dir().to_path_buf()) {
+                Some(store) => store
+                    .current_generation_read_only()
+                    .map_err(|error| SiblingLoader::error(error.to_string()))?,
+                None => None,
+            };
         let (installed, revision) = self.installed_cut();
         let pending: std::collections::BTreeSet<_> = installed.pending_intent().cloned().collect();
         let previous = self
@@ -1750,6 +1773,8 @@ impl FirstLoadDriver for CheckoutDriver {
             revision,
             entries,
             cut: installed.install_cut().cloned(),
+            readiness: installed.readiness_patches().clone(),
+            publication_base: Some(publication_base),
         })
     }
     fn install(
@@ -1798,6 +1823,10 @@ impl FirstLoadDriver for CheckoutDriver {
                 }
             }
         };
+        let publication_guard = self
+            .publication_transition
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut live = self
             .live
             .lock()
@@ -1831,7 +1860,7 @@ impl FirstLoadDriver for CheckoutDriver {
             .published()
             .cloned()
             .unwrap_or_default();
-        let installed_snapshot = successor
+        let mut installed_snapshot = successor
             .snapshot()
             .with_readers(readers.clone())
             .with_install_cut(InstallCut {
@@ -1841,6 +1870,11 @@ impl FirstLoadDriver for CheckoutDriver {
                 version: successor.version(),
                 intent_version: successor.snapshot().intent_version(),
             });
+        if snapshot.reconciled_epoch().is_some() {
+            if let Some(base) = snapshot.publication_base() {
+                installed_snapshot = installed_snapshot.with_publication_base(base.clone());
+            }
+        }
         let coverage = FamilyPlane::ALL
             .into_iter()
             .map(|plane| {
@@ -1879,6 +1913,7 @@ impl FirstLoadDriver for CheckoutDriver {
         let retired_delta = std::mem::replace(&mut *live, successor);
         drop(installed);
         drop(live);
+        drop(publication_guard);
         // Last-drop reader close and residency-pin cleanup can perform I/O.
         // Keep displaced owners alive until both root locks are released.
         drop(retired_bundle);
@@ -1918,9 +1953,12 @@ impl FirstLoadDriver for CheckoutDriver {
             .owner
             .view_store()
             .map_err(|error| SiblingLoader::error(error.to_string()))?;
-        let base = store
-            .current_generation()
-            .map_err(|error| SiblingLoader::error(error.to_string()))?;
+        let base = match snapshot.publication_base() {
+            Some(base) => base.clone(),
+            None => store
+                .current_generation()
+                .map_err(|error| SiblingLoader::error(error.to_string()))?,
+        };
         let mut manifest = snapshot
             .generation()
             .flatten()
@@ -2012,6 +2050,10 @@ impl FirstLoadDriver for CheckoutDriver {
         let mut published = false;
         let mut progress = PublicationProgress::NotAttempted;
         let mut commit = || {
+            let _publication_guard = self
+                .publication_transition
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.validate_cut(access, snapshot, 0)?;
             let prepared = prepared
                 .take()
@@ -2672,6 +2714,91 @@ mod composite_tests {
                 .unwrap()
                 .as_deref(),
             Some(generation.name())
+        );
+    }
+
+    #[test]
+    fn superseded_cut_is_refused_before_its_pointer_can_publish() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        let loader = SiblingLoader::new(driver.clone(), vec![]);
+        drop(loader.load(&access).unwrap());
+        let store = driver.owner.view_store().unwrap();
+        let before = store.current_generation_read_only().unwrap();
+        std::fs::write(root.path().join("file.rs"), b"candidate B").unwrap();
+        driver.record_change(RelPath::new(b"file.rs".to_vec()).unwrap());
+        let (candidate, revision) = loader
+            .reconciled(&access, driver.installed_snapshot().generation().clone())
+            .unwrap();
+        driver.install(&access, &candidate, revision).unwrap();
+        assert!(loader.fold(&access, &candidate, revision).is_err());
+        assert_eq!(store.current_generation_read_only().unwrap(), before);
+    }
+
+    #[test]
+    fn a_foreign_pointer_after_the_walk_cut_cannot_become_its_cas_base() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        let loader = SiblingLoader::new(driver.clone(), vec![]);
+        drop(loader.load(&access).unwrap());
+        let store = driver.owner.view_store().unwrap();
+        let before = store.current_generation_read_only().unwrap();
+        std::fs::write(root.path().join("file.rs"), b"candidate B").unwrap();
+        driver.record_change(RelPath::new(b"file.rs".to_vec()).unwrap());
+        let (candidate, revision) = loader
+            .reconciled(&access, driver.installed_snapshot().generation().clone())
+            .unwrap();
+        assert_eq!(candidate.publication_base(), Some(&before));
+        let mut foreign = driver.installed_snapshot().generation().flatten().unwrap();
+        foreign.header_mut().ignore_fingerprint = Some("foreign-winner".into());
+        let name = super::super::manifest_v2::GenerationName::for_manifest(&foreign).unwrap();
+        let prepared = store
+            .prepare_v2(&name, before.as_deref(), &foreign, None)
+            .unwrap();
+        assert_eq!(
+            store.commit_v2(prepared, None).unwrap(),
+            super::super::manifest_v2::PublishV2::Published
+        );
+        let error = loader.fold(&access, &candidate, revision).unwrap_err();
+        assert!(error.reason.contains("publication lost"), "{error:?}");
+        assert_eq!(
+            store.current_generation_read_only().unwrap(),
+            Some(name.to_string())
+        );
+        assert!(driver.take_revalidated_job());
+    }
+
+    #[test]
+    fn strict_walk_preserves_pre_cut_readiness_when_disk_equals_the_base() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        let loader = SiblingLoader::new(driver.clone(), vec![]);
+        drop(loader.load(&access).unwrap());
+        let file = RelPath::new(b"file.rs".to_vec()).unwrap();
+        driver.live.lock().unwrap().set_readiness(
+            file.clone(),
+            super::super::snapshot::PlanePatch {
+                content: crate::blob_store::v2::ContentHash::of(b"strict content"),
+                planes: EntryPlanes {
+                    trigram: Some(super::super::readiness::PlaneState::pending(
+                        "checkout repair",
+                    )),
+                    ..Default::default()
+                },
+            },
+        );
+        driver.record_change(file.clone());
+        let (walk, _) = loader
+            .reconciled(&access, driver.installed_snapshot().generation().clone())
+            .unwrap();
+        assert_eq!(
+            walk.readiness_patches().get(&file).unwrap().planes.trigram,
+            Some(super::super::readiness::PlaneState::pending(
+                "checkout repair"
+            ))
         );
     }
 
