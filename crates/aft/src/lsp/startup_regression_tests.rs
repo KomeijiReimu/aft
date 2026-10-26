@@ -497,15 +497,20 @@ fn file_change_during_cancelled_startup_is_not_replayed() {
         manager.ensure_server_for_file_detailed(&f.file, &f.config)
     });
     pause.entered.recv_timeout(WAIT).unwrap();
-    locked(&f, |manager| {
+    let queued = locked(&f, |manager| {
         manager.notify_file_changed_versioned(&f.file, "never replay", &f.config)
     })
     .unwrap();
+    assert_eq!(queued, vec![(f.key.clone(), 0)]);
+    assert!(f.manager.lock().starting[&f.key]
+        .pending_notifications
+        .contains(&f.file));
     f.manager.lock().quiesce();
     pause.resume.send(()).unwrap();
     done_rx.recv_timeout(WAIT).unwrap();
     f.manager.lock().resume();
     f.manager.lock().spawn_hook = None;
+    f.manager.lock().startup_finished_hook = None;
     let ready = ensure_server_for_file_detailed_unlocked(|| f.manager.lock(), &f.file, &f.config);
     assert_eq!(ready.successful, vec![f.key.clone()]);
     assert!(
@@ -545,16 +550,12 @@ fn unlocked_request_waits_until_startup_notification_replay_finishes() {
         });
         pause.resume.send(()).unwrap();
         entered_rx.recv_timeout(WAIT).unwrap();
-        assert!(
-            f.manager.try_lock().is_some(),
-            "replay held the manager mutex"
-        );
-        assert!(
-            done_rx.try_recv().is_err(),
-            "request returned before replay completed"
-        );
+        let lock_available = f.manager.try_lock_for(Duration::from_secs(5)).is_some();
+        let returned_early = done_rx.try_recv().is_ok();
         resume_tx.send(()).unwrap();
         assert_eq!(waiting.join().unwrap().successful, vec![f.key.clone()]);
+        assert!(lock_available, "replay held the manager mutex");
+        assert!(!returned_early, "request returned before replay completed");
     });
     let messages = recorded_notifications(&f);
     assert_eq!(

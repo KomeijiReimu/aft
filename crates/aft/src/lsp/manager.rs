@@ -9575,8 +9575,8 @@ mod unlocked_start_tests {
             StartReservation {
                 definition: None,
                 source_file: None,
-                notification_versions: HashMap::new(),
-                pending_notifications: HashSet::new(),
+                notification_versions: Default::default(),
+                pending_notifications: Default::default(),
                 replay_pid: None,
                 deferred_events: Vec::new(),
                 clients_generation: manager.clients_generation,
