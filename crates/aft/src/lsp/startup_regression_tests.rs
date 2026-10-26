@@ -393,3 +393,123 @@ fn in_progress_is_not_a_cached_executable_failure() {
     assert!(f.manager.lock().failed_spawns.is_empty());
     assert!(f.manager.lock().transient_backoff.is_empty());
 }
+
+fn notification_fixture() -> Fixture {
+    let f = fixture();
+    let binary = f.manager.lock().binary_overrides[&f.key.kind].clone();
+    std::fs::write(&binary, r#"#!/usr/bin/env python3
+import json, sys
+seen = []
+while True:
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            sys.exit(0)
+        if line in (b'\r\n', b'\n'):
+            break
+        key, value = line.decode().split(':', 1)
+        headers[key.lower()] = value.strip()
+    message = json.loads(sys.stdin.buffer.read(int(headers['content-length'])))
+    method = message.get('method')
+    if method in ('textDocument/didOpen', 'textDocument/didChange'):
+        seen.append(message)
+    if 'id' in message:
+        result = {'capabilities': {}} if method == 'initialize' else seen if method == 'test/notifications' else None
+        body = json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': result}).encode()
+        sys.stdout.buffer.write(('Content-Length: %d\r\n\r\n' % len(body)).encode() + body)
+        sys.stdout.buffer.flush()
+    if method == 'exit':
+        break
+"#).unwrap();
+    f
+}
+
+enum RecordedNotifications {}
+impl lsp_types::request::Request for RecordedNotifications {
+    type Params = serde_json::Value;
+    type Result = Vec<serde_json::Value>;
+    const METHOD: &'static str = "test/notifications";
+}
+
+fn recorded_notifications(f: &Fixture) -> Vec<serde_json::Value> {
+    let request = f
+        .manager
+        .lock()
+        .clients
+        .get_mut(&f.key)
+        .unwrap()
+        .start_request::<RecordedNotifications>(serde_json::json!({}))
+        .unwrap();
+    serde_json::from_value(request.wait(WAIT).unwrap()).unwrap()
+}
+
+#[test]
+fn file_change_during_startup_replays_latest_did_open() {
+    for changes in [1, 2] {
+        let f = notification_fixture();
+        let pause = pause_first_spawn(&f);
+        locked(&f, |manager| {
+            manager.ensure_server_for_file_detailed(&f.file, &f.config)
+        });
+        pause.entered.recv_timeout(WAIT).unwrap();
+        let mut expected = Vec::new();
+        for version in 0..changes {
+            let content = format!("content version {version}");
+            std::fs::write(&f.file, &content).unwrap();
+            expected = locked(&f, |manager| {
+                manager.notify_file_changed_versioned(&f.file, &content, &f.config)
+            })
+            .unwrap();
+        }
+        pause.resume.send(()).unwrap();
+        let ready =
+            ensure_server_for_file_detailed_unlocked(|| f.manager.lock(), &f.file, &f.config);
+        assert_eq!(ready.successful, vec![f.key.clone()]);
+        let messages = recorded_notifications(&f);
+        assert_eq!(
+            messages.len(),
+            1,
+            "startup changes must coalesce into one didOpen: {messages:?}"
+        );
+        assert_eq!(messages[0]["method"], "textDocument/didOpen");
+        assert_eq!(
+            messages[0]["params"]["textDocument"]["text"],
+            format!("content version {}", changes - 1)
+        );
+        assert_eq!(
+            messages[0]["params"]["textDocument"]["version"],
+            changes - 1
+        );
+        assert_eq!(expected, vec![(f.key.clone(), changes - 1)]);
+    }
+}
+
+#[test]
+fn file_change_during_cancelled_startup_is_not_replayed() {
+    let f = notification_fixture();
+    let pause = pause_first_spawn(&f);
+    let (done_tx, done_rx) = unbounded();
+    f.manager.lock().startup_finished_hook = Some(Arc::new(move || {
+        done_tx.send(()).unwrap();
+    }));
+    locked(&f, |manager| {
+        manager.ensure_server_for_file_detailed(&f.file, &f.config)
+    });
+    pause.entered.recv_timeout(WAIT).unwrap();
+    locked(&f, |manager| {
+        manager.notify_file_changed_versioned(&f.file, "never replay", &f.config)
+    })
+    .unwrap();
+    f.manager.lock().quiesce();
+    pause.resume.send(()).unwrap();
+    done_rx.recv_timeout(WAIT).unwrap();
+    f.manager.lock().resume();
+    f.manager.lock().spawn_hook = None;
+    let ready = ensure_server_for_file_detailed_unlocked(|| f.manager.lock(), &f.file, &f.config);
+    assert_eq!(ready.successful, vec![f.key.clone()]);
+    assert!(
+        recorded_notifications(&f).is_empty(),
+        "closed reservation leaked a notification into its replacement"
+    );
+}
