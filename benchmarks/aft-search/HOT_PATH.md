@@ -129,7 +129,3 @@ exact/concept recall and search-quality gate to remain unchanged.
 The work-count comparator normalizes only temporary corpus-root prefixes before
 hashing lane results. The measurement tests assert nonempty corpora and an
 8000-chunk semantic fixture, so skipped indexing cannot look like free work.
-The eight old-code counting controls each failed by name; four independent
-result-parity controls remained green. Both comparison guards were separately
-neutralized and their dedicated tests failed while unrelated tests passed.
-Full evidence and staged-restore diff pairs: `hot-path-mutations.json`.

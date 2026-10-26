@@ -801,16 +801,23 @@ fn bash_changed_files_flush_markers_are_excluded_from_project_walks() {
 #[test]
 #[cfg_attr(
     target_os = "macos",
-    ignore = "requires a live FSEvents service; this focused native gate includes its own concurrent 50k-file writer"
+    ignore = "requires a live FSEvents service and concurrent filesystem activity"
 )]
 fn bash_changed_files_flush_native_no_false_complete_during_50k_activity() {
     let _activity = filesystem_activity_lease();
     let root = tempfile::tempdir().unwrap();
     let activity = tempfile::tempdir().unwrap();
     let activity_path = activity.path().to_path_buf();
+    // Delayed journal intake below exercises the flush/delivery race even when
+    // the smaller default writer does not saturate the native event service.
+    let files = if std::env::var("AFT_STRESS").as_deref() == Ok("1") {
+        50_000
+    } else {
+        1_000
+    };
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
     let writer = std::thread::spawn(move || {
-        for i in 0..50_000 {
+        for i in 0..files {
             std::fs::write(activity_path.join(format!("fixture-{i}")), "fixture\n").unwrap();
             if i == 100 {
                 started_tx.send(()).unwrap();

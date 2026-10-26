@@ -2877,11 +2877,15 @@ mod reuse_tests {
 
     #[test]
     fn views_shared_checkout_presence_reads_no_payloads() {
-        const FILES: usize = 2048;
-        let project = super::cold_fallback_tests::repository(FILES);
+        let files = if std::env::var("AFT_STRESS").as_deref() == Ok("1") {
+            2048
+        } else {
+            32
+        };
+        let project = super::cold_fallback_tests::repository(files);
         let storage = tempfile::tempdir().unwrap();
         let store = BlobStore::open(storage.path(), "shared", BlobPlane::Callgraph).unwrap();
-        let payload_bytes = seed_callgraph_payloads(&store, project.path(), FILES);
+        let payload_bytes = seed_callgraph_payloads(&store, project.path(), files);
         let request = AssemblyRequest {
             storage: storage.path().to_path_buf(),
             project_root: project.path().to_path_buf(),
@@ -2899,7 +2903,7 @@ mod reuse_tests {
         let mut prepared = prepare_checkout(&request, &mut |phase| {
             if phase == "derived" {
                 let counts = PAYLOAD_READ_COUNTS.with(|counts| counts.get());
-                eprintln!("checkout_presence files={FILES} stored_payload_bytes={payload_bytes} reads={counts:?}");
+                eprintln!("checkout_presence files={files} stored_payload_bytes={payload_bytes} reads={counts:?}");
                 assert_eq!(counts, PayloadReadCounts::default());
                 measured = true;
             }
@@ -2910,7 +2914,7 @@ mod reuse_tests {
         assert!(report.published);
         assert_eq!(report.blob_puts, 0);
         let materialization = PAYLOAD_READ_COUNTS.with(|counts| counts.get());
-        eprintln!("checkout_materialization files={FILES} reads={materialization:?}");
+        eprintln!("checkout_materialization files={files} reads={materialization:?}");
         PAYLOAD_READ_COUNTS.with(|counts| counts.set(PayloadReadCounts::default()));
         let report = publish_checkout(&request).unwrap();
         assert!(!report.published);

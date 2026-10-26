@@ -1876,10 +1876,14 @@ fn completed_embedding_batches_survive_a_later_batch_failure() {
 
 #[test]
 fn repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_texts() {
+    // Eight 64-text batches still cross the seventh-call failure boundary;
+    // keep all three siblings and eight edit rounds in both workloads.
+    let stress = std::env::var("AFT_STRESS").as_deref() == Ok("1");
+    let files = if stress { 2048 } else { 512 };
     let storage = tempfile::tempdir().unwrap();
     let roots: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
     for root in &roots {
-        for i in 0..2048 {
+        for i in 0..files {
             std::fs::write(
                 root.path().join(format!("file_{i:04}.rs")),
                 format!("pub fn item_{i:04}() -> u32 {{ {i} }}\n"),
@@ -1982,12 +1986,20 @@ fn repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_te
         }
     }
     drop(embed);
-    assert_eq!(successful_texts.get(), 2056);
-    assert_eq!(new_keys, 2056);
-    assert_eq!(store.usage().unwrap().rows, 2056 * ROWS_PER_ONE_CHUNK_FILE);
-    assert_eq!(failed_texts, 321);
-    assert_eq!(model.texts(), 2377);
-    assert_eq!(model.calls(), 46);
+    let (successful, failed, sent, calls) = if stress {
+        (2056, 321, 2377, 46)
+    } else {
+        (520, 65, 585, 18)
+    };
+    assert_eq!(successful_texts.get(), successful);
+    assert_eq!(new_keys, successful);
+    assert_eq!(
+        store.usage().unwrap().rows,
+        successful as u64 * ROWS_PER_ONE_CHUNK_FILE
+    );
+    assert_eq!(failed_texts, failed);
+    assert_eq!(model.texts(), sent);
+    assert_eq!(model.calls(), calls);
     for (runtime, root) in runtimes.iter().zip(&roots) {
         assert_eq!(
             rows(root.path(), &query(runtime, "revised item").results),
@@ -1999,10 +2011,17 @@ fn repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_te
 
 #[test]
 fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admission() {
+    // Two batches retain cross-batch reuse in the default run. Nightly stress
+    // keeps the original 32-batch workload; siblings and edit rounds are equal.
+    let files = if std::env::var("AFT_STRESS").as_deref() == Ok("1") {
+        2048
+    } else {
+        128
+    };
     let storage = tempfile::tempdir().unwrap();
     let roots: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
     for root in &roots {
-        for i in 0..2048 {
+        for i in 0..files {
             std::fs::write(
                 root.path().join(format!("file_{i:04}.rs")),
                 format!("pub fn item_{i:04}() -> u32 {{ {i} }}\n"),
@@ -2026,8 +2045,8 @@ fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admissi
             .refresh(budget, &mut |texts| model.embed(texts))
             .unwrap();
         embedded_keys += report.embedded_keys;
-        assert_eq!(report.embedded_keys, if i == 0 { 2048 } else { 0 });
-        assert_eq!(report.model_calls, if i == 0 { 32 } else { 0 });
+        assert_eq!(report.embedded_keys, if i == 0 { files } else { 0 });
+        assert_eq!(report.model_calls, if i == 0 { files / 64 } else { 0 });
     }
     let store = runtimes[0]
         .owner
@@ -2077,10 +2096,13 @@ fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admissi
             assert_eq!((report.embedded_keys, report.model_calls), (0, 0));
         }
     }
-    assert_eq!(model.texts(), 2056);
-    assert_eq!(model.calls(), 40);
-    assert_eq!(embedded_keys, 2056);
-    assert_eq!(store.usage().unwrap().rows, 2056 * ROWS_PER_ONE_CHUNK_FILE);
+    assert_eq!(model.texts(), files + 8);
+    assert_eq!(model.calls(), files / 64 + 8);
+    assert_eq!(embedded_keys, files + 8);
+    assert_eq!(
+        store.usage().unwrap().rows,
+        (files + 8) as u64 * ROWS_PER_ONE_CHUNK_FILE
+    );
 
     // A source completion rejected at admission still stores its immutable
     // payload first. Retry and a sibling must reuse it, not re-embed it.
@@ -2131,9 +2153,12 @@ fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admissi
         .unwrap();
     assert_eq!((sibling.embedded_keys, sibling.model_calls), (0, 0));
     assert_eq!(model.texts(), before);
-    assert_eq!(model.texts(), 2057);
-    assert_eq!(model.calls(), 41);
-    assert_eq!(store.usage().unwrap().rows, 2057 * ROWS_PER_ONE_CHUNK_FILE);
+    assert_eq!(model.texts(), files + 9);
+    assert_eq!(model.calls(), files / 64 + 9);
+    assert_eq!(
+        store.usage().unwrap().rows,
+        (files + 9) as u64 * ROWS_PER_ONE_CHUNK_FILE
+    );
     for (runtime, root) in runtimes.iter().zip(&roots) {
         let answer = query(runtime, "revised item");
         assert!(answer.complete());

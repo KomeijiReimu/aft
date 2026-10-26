@@ -32,6 +32,12 @@ fn fixtures_dir() -> PathBuf {
         .join("bash")
 }
 
+fn capped_input() -> String {
+    (1..=4000)
+        .map(|i| format!("10\t./path/file_{i:04}.txt\n"))
+        .collect()
+}
+
 fn assert_no_bare_list_envelope_key_recursive(val: &Value) {
     match val {
         Value::Object(map) => {
@@ -84,12 +90,16 @@ fn test_bash_surface_registration() {
 
 #[test]
 fn test_compressor_seam_returns_input_line_count_and_counts_only() {
-    let fixture_dir = fixtures_dir().join("capped_4000_in_61_out");
-    let input_path = fixture_dir.join("input.txt");
-    let input_text = fs::read_to_string(&input_path).expect("read fixture input.txt");
+    let input_text = capped_input();
 
     let total_input_lines = input_text.lines().count();
     assert_eq!(total_input_lines, 4000);
+    // Freeze the original input bytes independently of the compressor output.
+    use sha2::{Digest, Sha256};
+    assert_eq!(
+        format!("{:x}", Sha256::digest(input_text.as_bytes())),
+        "e421455a863859c56de0da8e7e42ac9e3095ede9329e72aabfdf6a5ab2b1ffd1"
+    );
 
     let registry = build_registry(builtin_filters::ALL, None, None);
     let result = compress_with_registry_exit_code("du -a", &input_text, None, &registry);
@@ -117,10 +127,9 @@ fn test_compressor_seam_returns_input_line_count_and_counts_only() {
 #[test]
 fn test_4000_input_lines_count_only_sixty_output_lines() {
     let fixture_dir = fixtures_dir().join("capped_4000_in_61_out");
-    let input_path = fixture_dir.join("input.txt");
     let reply_path = fixture_dir.join("reply.json");
 
-    let input_text = fs::read_to_string(&input_path).expect("read fixture input.txt");
+    let input_text = capped_input();
     let reply_json = fs::read_to_string(&reply_path).expect("read fixture reply.json");
 
     let input_line_count = input_text.lines().count();
@@ -187,9 +196,7 @@ fn test_4000_input_lines_count_only_sixty_output_lines() {
 
 #[test]
 fn test_mutation_sourcing_either_count_from_dropped_by_class_reds() {
-    let fixture_dir = fixtures_dir().join("capped_4000_in_61_out");
-    let input_path = fixture_dir.join("input.txt");
-    let input_text = fs::read_to_string(&input_path).expect("read fixture input.txt");
+    let input_text = capped_input();
 
     let registry = build_registry(builtin_filters::ALL, None, None);
     let result = compress_with_registry_exit_code("du -a", &input_text, None, &registry);
@@ -279,10 +286,9 @@ fn test_subc_and_ndjson_transport_parity_on_fixture() {
 #[test]
 fn test_uncompressed_bash_output_stays_byte_identical_to_prespec_golden() {
     let fixture_dir = fixtures_dir().join("uncompressed");
-    let input_path = fixture_dir.join("input.txt");
     let reply_path = fixture_dir.join("reply.json");
 
-    let input_text = fs::read_to_string(&input_path).expect("read fixture input.txt");
+    let input_text = capped_input();
     let reply_json = fs::read_to_string(&reply_path).expect("read fixture reply.json");
 
     let input_line_count = input_text.lines().count();
@@ -656,9 +662,10 @@ fn shell_quote(path: &Path) -> String {
 }
 
 #[cfg(unix)]
-fn real_capped_command() -> String {
-    let input = fixtures_dir().join("capped_4000_in_61_out/input.txt");
-    format!("cat {}", shell_quote(&input))
+fn real_capped_input() -> tempfile::NamedTempFile {
+    let input = tempfile::NamedTempFile::new().expect("capped input");
+    fs::write(input.path(), capped_input()).expect("write capped input");
+    input
 }
 
 #[cfg(unix)]
@@ -712,12 +719,13 @@ fn real_background_completion_and_status_attach_compressor_counts() {
     let project = tempfile::tempdir().expect("project tempdir");
     configure_real_bash(&mut aft, project.path());
 
+    let input = real_capped_input();
     let launch = aft.send(
         &serde_json::json!({
             "id": "real-background-capped",
             "command": "bash",
             "params": {
-                "command": real_capped_command(),
+                "command": format!("cat {}", shell_quote(input.path())),
                 "background": true
             }
         })
@@ -804,12 +812,13 @@ fn real_foreground_transports_attach_compressor_counts() {
     let project = tempfile::tempdir().expect("project tempdir");
     configure_real_bash(&mut aft, project.path());
 
+    let input = real_capped_input();
     let capped = aft.send(
         &serde_json::json!({
             "id": "real-foreground-capped",
             "command": "bash",
             "params": {
-                "command": real_capped_command(),
+                "command": format!("cat {}", shell_quote(input.path())),
                 "foreground_orchestrate": true,
                 "block_to_completion": true
             }
@@ -888,8 +897,8 @@ fn real_live_status_stays_raw_without_an_envelope() {
     let mut aft = AftProcess::spawn();
     let project = tempfile::tempdir().expect("project tempdir");
     configure_real_bash(&mut aft, project.path());
-    let input = fixtures_dir().join("capped_4000_in_61_out/input.txt");
-    let command = format!("cat {}; sleep 10", shell_quote(&input));
+    let input = real_capped_input();
+    let command = format!("cat {}; sleep 10", shell_quote(input.path()));
 
     let launch = aft.send(
         &serde_json::json!({

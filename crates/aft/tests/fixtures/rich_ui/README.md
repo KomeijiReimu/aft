@@ -232,6 +232,11 @@ actual served definitions and the golden Bash pin list.
 
 CKIOS's page polls status every two seconds and uses output pages of up to 200
 items. It does not need `bash_watch`; that operation remains in the manifest.
+The long-line raw input in `bash-output.json` uses `repeatByte`, `count` and
+`suffix` to avoid storing thousands of identical bytes. The test loader expands
+only the input and checks its original SHA-256; expected page text and splits
+remain literal, independently frozen values.
+
 `bash-output.json` freezes line, cursor and retention rules plus source-byte
 vectors. These rules supersede the earlier whole-unit chunk-run item sketch,
 before publication. Each output item now has:
