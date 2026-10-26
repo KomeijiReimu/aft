@@ -2202,6 +2202,45 @@ async fn bind_worker(stream: &mut tokio::net::TcpStream, root: &Path, channel: u
     .await;
 }
 
+/// Answer the worker run's pre-shell `scope.describe` with "live".
+async fn answer_worker_run_live(stream: &mut tokio::net::TcpStream) {
+    let request = read_frame_timeout(stream, "worker run describe").await;
+    assert_eq!(
+        request.header.ty,
+        FrameType::Request,
+        "{}",
+        String::from_utf8_lossy(&request.body)
+    );
+    let body: subc_protocol::session::ModuleControlRequestFromModule =
+        serde_json::from_slice(&request.body).unwrap();
+    assert!(
+        matches!(&body, subc_protocol::session::ModuleControlRequestFromModule::ScopeDescribe {scope_ref, ..}
+        if scope_ref == "worker-run-scope"),
+        "{body:?}"
+    );
+    let reply = subc_protocol::session::ModuleControlResponseToModule::ScopeDescribe {
+        status: subc_protocol::scope::ScopeStatus::Live,
+        scope_epoch: Some(1),
+        daemon_incarnation: "daemon-a".into(),
+        owner_synced: true,
+        owner_configured: true,
+        scope: Some(worker_run_stamp()),
+    };
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Response,
+            control_flags(),
+            0,
+            0,
+            request.header.corr,
+            serde_json::to_vec(&reply).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await;
+}
+
 /// The error code a call's reply carries: a provider error frame's code, or
 /// a tool response's native code.
 fn any_code(frame: &Frame) -> String {
@@ -2325,15 +2364,7 @@ fn worker_codemode_run_uses_the_workers_root_and_frozen_params_never_the_heads()
             )
             .await;
             // A run's shell call first confirms the run is still live.
-            let request = describe_phase(&mut daemon.stream, "pre-bash Live check").await;
-            answer(
-                &mut daemon.stream,
-                &request,
-                subc_protocol::scope::ScopeStatus::Live,
-                true,
-                Some(1),
-            )
-            .await;
+            answer_worker_run_live(&mut daemon.stream).await;
             let reply = read_frame_timeout(&mut daemon.stream, "confined worker run bash").await;
             assert!(
                 !String::from_utf8_lossy(&reply.body).contains("escaped\n"),
@@ -2492,12 +2523,13 @@ fn worker_codemode_run_without_its_workers_identity_is_refused_by_name() {
             let mut under_head = worker_run_stamp();
             under_head.scope_ref = "worker-run-under-head".into();
             under_head.parent = stamp().parent;
-            bind_run(&mut daemon.stream, &daemon.root1, 5, under_head).await;
+            // (Channel 5's bind is the shared dispatch's configure-failure case.)
+            bind_run(&mut daemon.stream, &daemon.root1, 7, under_head).await;
             for (channel, corr, reason) in [
                 (2, 100, "worker_route_not_bound"),
                 (3, 101, "parent_missing"),
                 (4, 102, "parent_pending"),
-                (5, 103, "parent_not_worker"),
+                (7, 103, "parent_not_worker"),
             ] {
                 named_call(&mut daemon.stream, channel, corr, "read", read.clone()).await;
                 let error = expect_refusal(&mut daemon.stream, reason).await;
