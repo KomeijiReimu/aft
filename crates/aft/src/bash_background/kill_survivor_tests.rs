@@ -790,6 +790,114 @@ fn incomplete_listing_note_is_the_approved_sentence() {
     );
 }
 
+/// Stage the race between a kill's post-kill group check and a marker
+/// publisher. The kill is paused before its signal; meanwhile the task's own
+/// exit marker appears and a watchdog-style poll publishes the terminal state,
+/// then pauses before queuing its completion. The kill then signals (the group
+/// SIGKILL reaches nobody, so the TERM-ignoring member survives), clears
+/// `kill_in_flight`, marks sampling as started and pauses before listing the
+/// group. The publisher is released into that window. `hold_sample` is the
+/// longest the group listing stays paused after the publisher is released;
+/// the pause ends early if the publisher finishes.
+fn race_publisher_against_the_post_kill_sample(hold_sample: Duration) -> BgCompletion {
+    let registry = registry();
+    let dir = tempfile::tempdir().unwrap();
+    let task_id = spawn_for_kill(&registry, dir.path(), TERM_IGNORING);
+    wait_for_file(&dir.path().join("ready"), "the command did not start");
+    let task = registry.task_for_test(&task_id).unwrap();
+    let pgid = task_pgid(&registry, &task_id);
+    let _reap = ReapGroup(pgid);
+    test_hooks::deny_sigkill(pgid);
+
+    let (kill_reached, release_kill) = install_kill_signal_gate_for_test(&task_id);
+    let killer = {
+        let registry = registry.clone();
+        let task_id = task_id.clone();
+        std::thread::spawn(move || registry.kill(&task_id, SESSION))
+    };
+    kill_reached.recv_timeout(Duration::from_secs(10)).unwrap();
+
+    let (published_tx, published_rx) = crossbeam_channel::bounded(1);
+    let (release_publisher, release_publisher_rx) = crossbeam_channel::bounded(1);
+    TERMINAL_PUBLICATION_GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(
+            task_id.clone(),
+            KillSignalGate {
+                reached: published_tx,
+                release: release_publisher_rx,
+            },
+        );
+    fs::write(&task.paths.exit, "0").unwrap();
+    let publisher = {
+        let registry = registry.clone();
+        let task = Arc::clone(&task);
+        std::thread::spawn(move || registry.poll_task(&task))
+    };
+    published_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(task.lock_state().unwrap().metadata.status.is_terminal());
+
+    let (sample_reached, release_sample) = install_group_sample_gate_for_test(&task_id);
+    release_kill.send(()).unwrap();
+    sample_reached
+        .recv_timeout(Duration::from_secs(15))
+        .expect("the kill did not reach its post-kill group check");
+    {
+        let state = task.lock_state().unwrap();
+        assert!(!state.kill_in_flight);
+        assert!(state.descendant_sampling_started);
+        assert_eq!(state.metadata.live_descendants, None, "nothing saved yet");
+    }
+
+    release_publisher.send(()).unwrap();
+    let deadline = Instant::now() + hold_sample;
+    while !publisher.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    release_sample.send(()).unwrap();
+    publisher.join().unwrap().unwrap();
+    killer.join().unwrap().unwrap();
+
+    completion_for(&registry, &task_id)
+}
+
+/// The publisher reaches its completion while the kill's first check of the
+/// group is still running. The single completion notice must still name the
+/// process that survived the kill, not describe a group nobody checked.
+#[test]
+fn completion_waits_for_the_post_kill_sample_another_publisher_started() {
+    let completion = race_publisher_against_the_post_kill_sample(Duration::from_millis(500));
+    let members = completion
+        .live_descendants
+        .clone()
+        .unwrap_or_else(|| panic!("the notice omits the survivor: {completion:?}"));
+    assert_eq!(members.len(), 1, "{members:?}");
+    let summary = completion.live_descendants_summary.unwrap_or_default();
+    assert!(
+        summary.starts_with("1 process survived the kill and is still running: pid "),
+        "{summary}"
+    );
+}
+
+/// The same race, but the kill's first check of the group does not finish
+/// within the bounded wait. The notice must say AFT could not read every
+/// process, not describe a clean kill.
+#[test]
+fn completion_reports_an_incomplete_listing_when_the_post_kill_sample_does_not_finish() {
+    let completion = race_publisher_against_the_post_kill_sample(Duration::from_secs(20));
+    assert_eq!(completion.live_descendants, None, "{completion:?}");
+    assert_eq!(
+        completion.live_descendants_unavailable,
+        Some(LiveDescendantsUnavailable::ListingIncomplete)
+    );
+    assert_eq!(
+        completion.live_descendants_summary.as_deref(),
+        Some(INCOMPLETE_LISTING_NOTE)
+    );
+}
+
 /// A pseudoterminal task's group is checked after AFT kills it, which it was
 /// not before: a TERM-ignoring survivor is named, not left unreported.
 #[test]

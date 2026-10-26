@@ -356,6 +356,10 @@ fn terminate_piped_task(
 #[cfg(unix)]
 const KILL_GROUP_SETTLEMENT_GRACE: Duration = Duration::from_secs(2);
 
+/// Longest a completion notice waits for a process-group check another caller
+/// has started. The check is one listing of the group, normally milliseconds.
+const FIRST_GROUP_SAMPLE_WAIT: Duration = Duration::from_secs(2);
+
 #[cfg(all(test, unix))]
 static TERM_ONLY_KILL_TASKS: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
     std::sync::OnceLock::new();
@@ -518,6 +522,47 @@ static TERMINAL_PUBLICATION_GATES: std::sync::OnceLock<Mutex<HashMap<String, Kil
 #[cfg(test)]
 static REHYDRATED_REGISTRATION_GATES: std::sync::OnceLock<Mutex<HashMap<String, KillSignalGate>>> =
     std::sync::OnceLock::new();
+
+// Park a kill's post-kill group check after it has marked sampling as started
+// and before it lists the group, so a test can let another publisher run in
+// that window.
+#[cfg(test)]
+static GROUP_SAMPLE_GATES: std::sync::OnceLock<Mutex<HashMap<String, KillSignalGate>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(all(test, unix))]
+pub(crate) fn install_group_sample_gate_for_test(
+    task_id: &str,
+) -> (
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    GROUP_SAMPLE_GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(
+            task_id.to_string(),
+            KillSignalGate {
+                reached: reached_tx,
+                release: release_rx,
+            },
+        );
+    (reached_rx, release_tx)
+}
+
+#[cfg(test)]
+fn wait_on_group_sample_gate_for_test(task_id: &str) {
+    let gate = GROUP_SAMPLE_GATES
+        .get()
+        .and_then(|gates| gates.lock().unwrap().remove(task_id));
+    if let Some(gate) = gate {
+        let _ = gate.reached.send(());
+        let _ = gate.release.recv_timeout(Duration::from_secs(30));
+    }
+}
 
 #[cfg(test)]
 fn wait_on_rehydrated_registration_gate_for_test(task_id: &str) {
@@ -1480,6 +1525,8 @@ pub(crate) struct BgTask {
     terminal_persist_dirty: AtomicBool,
     pub(crate) timeout_kill_queued: AtomicBool,
     kill_settled: std::sync::Condvar,
+    /// Notified when the first process-group check saves its result.
+    descendant_sample_saved: std::sync::Condvar,
     #[cfg(unix)]
     remote_cancel_notify: tokio::sync::Notify,
     /// Harness namespace the task's aft.db row is keyed under: the harness of
@@ -1751,6 +1798,12 @@ pub(crate) struct BgTaskState {
     /// Prevent duplicate completion delivery while the post-exit process-group
     /// sample is waiting for its grace period.
     pub(crate) descendant_sampling_started: bool,
+    /// The first check of the process group has started but its result is
+    /// not saved yet. Set together with `descendant_sampling_started`, so a
+    /// publisher that skips sampling because it has started waits for this to
+    /// clear (see `finish_terminal_transition`) instead of sending a notice
+    /// built before any check.
+    pub(crate) descendant_sample_pending: bool,
     /// True while a kill has released this lock to signal and reap the
     /// process group. That kill owns the terminal transition until it clears
     /// the flag: the watchdog must not declare the task dead without an exit
@@ -2873,6 +2926,7 @@ impl BgTaskRegistry {
                 false
             } else {
                 state.descendant_sampling_started = true;
+                state.descendant_sample_pending = true;
                 true
             }
         };
@@ -2943,7 +2997,9 @@ impl BgTaskRegistry {
                     task.task_id
                 );
             }
+            state.descendant_sample_pending = false;
         }
+        task.descendant_sample_saved.notify_all();
         sample.ok()
     }
 
@@ -2956,13 +3012,36 @@ impl BgTaskRegistry {
             crate::slog_warn!("failed to clean task scratch for {}: {error}", task.task_id);
         }
         let (metadata, buffer) = {
-            let state = task
+            let mut state = task
                 .lock_state()
                 .map_err(|_| "background task lock poisoned".to_string())?;
             if !state.metadata.status.is_terminal() || state.kill_in_flight {
                 return Ok(());
             }
-            (state.metadata.clone(), state.buffer.clone())
+            // Another caller has started the first check of the process group
+            // but not saved it. A notice built now would describe a group
+            // nobody checked, and the notice is sent only once, so wait for
+            // the check (it normally takes milliseconds).
+            if state.descendant_sample_pending {
+                state = match task.descendant_sample_saved.wait_timeout_while(
+                    state,
+                    FIRST_GROUP_SAMPLE_WAIT,
+                    |state| state.descendant_sample_pending,
+                ) {
+                    Ok((state, _)) => state,
+                    Err(poison) => poison.into_inner().0,
+                };
+            }
+            let mut metadata = state.metadata.clone();
+            if state.descendant_sample_pending {
+                // The check did not finish in time: say AFT could not read
+                // every process rather than describe a clean kill.
+                metadata.live_descendants = None;
+                metadata.live_descendants_omitted = 0;
+                metadata.live_descendants_unavailable =
+                    Some(LiveDescendantsUnavailable::ListingIncomplete);
+            }
+            (metadata, state.buffer.clone())
         };
 
         let cache = self.ensure_terminal_output_cache(task);
@@ -4651,6 +4730,7 @@ impl BgTaskRegistry {
             terminal_persist_dirty: AtomicBool::new(false),
             timeout_kill_queued: AtomicBool::new(false),
             kill_settled: std::sync::Condvar::new(),
+            descendant_sample_saved: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
             remote_launch_ready: AtomicBool::new(false),
@@ -4669,6 +4749,7 @@ impl BgTaskRegistry {
                 detached: false,
                 child_exit_observed: false,
                 descendant_sampling_started: false,
+                descendant_sample_pending: false,
                 kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pipes),
                 terminal_output_cache: None,
@@ -5041,6 +5122,7 @@ impl BgTaskRegistry {
             terminal_persist_dirty: AtomicBool::new(false),
             timeout_kill_queued: AtomicBool::new(false),
             kill_settled: std::sync::Condvar::new(),
+            descendant_sample_saved: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
             remote_launch_ready: AtomicBool::new(false),
@@ -5059,6 +5141,7 @@ impl BgTaskRegistry {
                 detached: false,
                 child_exit_observed: false,
                 descendant_sampling_started: false,
+                descendant_sample_pending: false,
                 kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pty),
                 terminal_output_cache: None,
@@ -5341,6 +5424,7 @@ impl BgTaskRegistry {
             terminal_persist_dirty: AtomicBool::new(false),
             timeout_kill_queued: AtomicBool::new(false),
             kill_settled: std::sync::Condvar::new(),
+            descendant_sample_saved: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
             remote_launch_ready: AtomicBool::new(false),
@@ -5359,6 +5443,7 @@ impl BgTaskRegistry {
                 detached: false,
                 child_exit_observed: false,
                 descendant_sampling_started: false,
+                descendant_sample_pending: false,
                 kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pipes),
                 terminal_output_cache: None,
@@ -11038,6 +11123,7 @@ impl BgTaskRegistry {
             terminal_persist_dirty: AtomicBool::new(false),
             timeout_kill_queued: AtomicBool::new(false),
             kill_settled: std::sync::Condvar::new(),
+            descendant_sample_saved: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
             remote_launch_ready: AtomicBool::new(false),
@@ -11066,6 +11152,7 @@ impl BgTaskRegistry {
                 // failure based on stale evidence.
                 child_exit_observed: false,
                 descendant_sampling_started: false,
+                descendant_sample_pending: false,
                 kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, mode.clone()),
                 terminal_output_cache: None,
@@ -11842,10 +11929,13 @@ impl BgTaskRegistry {
                 && (state.metadata.mode == BgMode::Pipes || state.metadata.group_kill_sent);
             if due {
                 state.descendant_sampling_started = true;
+                state.descendant_sample_pending = true;
             }
             due
         });
         if due {
+            #[cfg(test)]
+            wait_on_group_sample_gate_for_test(&task.task_id);
             let _ = self.sample_task_process_group(task);
         }
     }
