@@ -389,6 +389,9 @@ describe("bash tool adapter", () => {
         "Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs this machine's own operating system or hardware (its sandbox, code signing, service manager, permission prompts or GUI frameworks)",
       );
       expect(bash.description).toContain(
+        '; a build or test that needs only macOS (its sandbox, code signing or file watching) can use runon: "macos" instead',
+      );
+      expect(bash.description).toContain(
         "or runs a binary that already exists on this machine; building and testing still go remote, and a remote build leaves no binaries or target/ output in the local worktree.",
       );
     },

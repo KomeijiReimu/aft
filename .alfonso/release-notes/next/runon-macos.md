@@ -1,1 +1,1 @@
-- `runon: "macos"` sends the command to a macOS machine for builds and tests that need macOS instead of running them on this machine.
+bash can now send build and test commands to a macOS machine with runon: "macos" (fixed size, offline), so macOS-only tests no longer have to run on the local machine.
