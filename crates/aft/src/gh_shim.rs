@@ -153,7 +153,9 @@ const V22_ADMIN_TUPLES: &[&str] = &[
 /// with a text naming the bot-speech route, or run as audited operator
 /// administration under `GH_SHIM_BYPASS=operator`. `checkout` is here because
 /// its interactive conflict resolution can unstack on GitHub; `delete` is the
-/// extension's alias of `unstack`.
+/// extension's alias of `unstack`. `push` makes no API call, but it writes the
+/// stack's branches to GitHub with the operator's git credentials, always as
+/// a `--force-with-lease` push, so it is the operator writing too.
 const V22_STACK_WRITE_TUPLES: &[&str] = &[
     "stack submit",
     "stack sync",
@@ -161,6 +163,7 @@ const V22_STACK_WRITE_TUPLES: &[&str] = &[
     "stack unstack",
     "stack delete",
     "stack checkout",
+    "stack push",
 ];
 /// Refusal for a `gh stack` subcommand that would write as the operator.
 /// `{command}` is replaced with the command, such as `stack submit`.

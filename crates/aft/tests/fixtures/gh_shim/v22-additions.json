@@ -36,14 +36,19 @@
       { "tuple": "stack link", "platform": ["macos", "linux"] },
       { "tuple": "stack unstack", "platform": ["macos", "linux"] },
       { "tuple": "stack delete", "platform": ["macos", "linux"] },
-      { "tuple": "stack checkout", "platform": ["macos", "linux"] }
+      { "tuple": "stack checkout", "platform": ["macos", "linux"] },
+      {
+        "tuple": "stack push",
+        "platform": ["macos", "linux"],
+        "reasoning": "gh stack push writes the stack's branches to GitHub with the operator's git credentials, always as a --force-with-lease push (github/gh-stack cmd/push.go:103-109 calling internal/git/gitops.go:258-305), so it is the operator writing, not the bot: refused with the bot route named, or run as audited operator administration under GH_SHIM_BYPASS=operator."
+      }
     ],
     "mechanical": [
       { "tuple": "extension list", "platform": ["macos", "linux"] },
       {
         "tuple": "stack view",
         "platform": ["macos", "linux"],
-        "reasoning": "gh-stack subcommands whose source makes no GitHub write: reads under the operator's login and local git work only. stack push writes branches over git transport, not the API."
+        "reasoning": "gh-stack subcommands whose source makes no GitHub write: reads under the operator's login and local git work only."
       },
       { "tuple": "stack switch", "platform": ["macos", "linux"] },
       { "tuple": "stack up", "platform": ["macos", "linux"] },
@@ -54,8 +59,7 @@
       { "tuple": "stack rebase", "platform": ["macos", "linux"] },
       { "tuple": "stack modify", "platform": ["macos", "linux"] },
       { "tuple": "stack init", "platform": ["macos", "linux"] },
-      { "tuple": "stack add", "platform": ["macos", "linux"] },
-      { "tuple": "stack push", "platform": ["macos", "linux"] }
+      { "tuple": "stack add", "platform": ["macos", "linux"] }
     ]
   },
   "removed_from_admin": ["pr edit"],

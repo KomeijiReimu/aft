@@ -263,6 +263,7 @@ fn operator_rows() -> Vec<(Vec<&'static str>, &'static str)> {
         (vec!["stack", "unstack"], "stack unstack"),
         (vec!["stack", "delete"], "stack delete"),
         (vec!["stack", "checkout", "7"], "stack checkout"),
+        (vec!["stack", "push"], "stack push"),
     ]
 }
 
@@ -279,7 +280,6 @@ const READ_ROWS: &[&[&str]] = &[
     &["stack", "modify"],
     &["stack", "init", "--base", "main"],
     &["stack", "add", "next-branch"],
-    &["stack", "push"],
 ];
 
 #[test]
