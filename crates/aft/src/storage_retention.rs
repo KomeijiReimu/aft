@@ -3467,7 +3467,7 @@ impl PreparedDue {
         let Self {
             directory,
             key,
-            leases,
+            mut leases,
             deadline: _,
             ..
         } = self;
@@ -3492,6 +3492,9 @@ impl PreparedDue {
         }
         yield_to_bind(&storage.durable)?;
         let phase = Instant::now();
+        for lease in &mut leases {
+            lease.stop_heartbeat_for_removal();
+        }
         retire_directory(&storage.durable, &cache)?;
         *report.timings_ms.entry("due_rename".into()).or_default() +=
             phase.elapsed().as_millis() as u64;
@@ -3980,6 +3983,9 @@ fn candidate_inner(
             }
         }
     } else {
+        for lease in &mut leases {
+            lease.stop_heartbeat_for_removal();
+        }
         retire_directory(&storage.durable, &cache)?;
         report.removed_bytes += before
             .iter()
