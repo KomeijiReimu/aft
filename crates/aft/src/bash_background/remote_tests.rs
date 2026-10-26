@@ -7263,6 +7263,7 @@ enum DrainingClockEvent {
 pub(super) struct DrainingClock {
     ticks: tokio::sync::watch::Sender<u64>,
     events: tokio::sync::mpsc::UnboundedSender<DrainingClockEvent>,
+    retry_jitter_ms: std::sync::atomic::AtomicU64,
 }
 
 impl DrainingClock {
@@ -7321,7 +7322,11 @@ impl PausedDrainingClock {
         let root = test_clock_key(root);
         let (ticks, _) = tokio::sync::watch::channel(1_000_000);
         let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let clock = Arc::new(DrainingClock { ticks, events });
+        let clock = Arc::new(DrainingClock {
+            ticks,
+            events,
+            retry_jitter_ms: std::sync::atomic::AtomicU64::new(0),
+        });
         assert!(draining_clocks()
             .lock()
             .unwrap()
@@ -7340,6 +7345,10 @@ impl PausedDrainingClock {
 
     fn advance(&self, ms: u64) {
         self.clock.ticks.send_modify(|now| *now += ms);
+    }
+
+    fn set_retry_jitter_ms(&self, ms: u64) {
+        self.clock.retry_jitter_ms.store(ms, Ordering::SeqCst);
     }
 
     async fn expect_event(&mut self, expected: DrainingClockEvent) {
@@ -7406,6 +7415,106 @@ fn start_runon_retry(registry: &BgTaskRegistry, dir: &Path, connection: PathBuf)
             Some(dir.into()),
         )
         .unwrap()
+}
+
+fn retry_backoff_script(signer: bool, hint: u64) -> Script {
+    if signer {
+        Script::SignerRefused {
+            refusals: 1,
+            detail: "runner_sign_unavailable",
+            retry_after_ms: Some(hint),
+        }
+    } else {
+        Script::Draining {
+            refusals: 1,
+            retry_after_ms: Some(hint),
+        }
+    }
+}
+
+async fn assert_zero_hint_waits_for_floor(signer: bool) {
+    let daemon = daemon(retry_backoff_script(signer, 0), "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let first = clock.now();
+    tokio::select! {
+        _ = clock.expect_sleep(first, first + if signer { 5000 } else { 1000 }) => {},
+        done = terminal(&registry, &task) => panic!("zero hint resubmitted without waiting: {done:?}"),
+    }
+    clock.advance(4999);
+    if !signer {
+        clock.expect_sleep(first + 4999, first + 5000).await;
+    }
+    assert_eq!(exec_runs(&daemon).len(), 1, "must wait at least five seconds");
+    clock.advance(1);
+    let done = terminal(&registry, &task).await;
+    assert_eq!(done.exit_code, Some(0), "{done:?}");
+    assert_eq!(exec_runs(&daemon).len(), 2);
+}
+
+#[tokio::test]
+async fn runon_retry_backoff_draining_zero_hint_waits_five_seconds() {
+    assert_zero_hint_waits_for_floor(false).await;
+}
+
+#[tokio::test]
+async fn runon_retry_backoff_signer_zero_hint_waits_five_seconds() {
+    assert_zero_hint_waits_for_floor(true).await;
+}
+
+#[tokio::test]
+async fn runon_retry_backoff_large_hints_are_not_shortened() {
+    for signer in [false, true] {
+        let daemon = daemon(retry_backoff_script(signer, 30_000), "exec-remote/v1").await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut clock = PausedDrainingClock::new(dir.path());
+        let registry = registry();
+        let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+        let first = clock.now();
+        clock.expect_sleep(first, first + if signer { 30_000 } else { 1000 }).await;
+        clock.advance(29_999);
+        if !signer {
+            clock.expect_sleep(first + 29_999, first + 30_000).await;
+        }
+        assert_eq!(exec_runs(&daemon).len(), 1, "must honour the runner's hint");
+        clock.advance(1);
+        assert_eq!(terminal(&registry, &task).await.exit_code, Some(0));
+        assert_eq!(exec_runs(&daemon).len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn runon_retry_backoff_simultaneous_refusals_resubmit_at_different_times() {
+    for signer in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut clock = PausedDrainingClock::new(dir.path());
+        let registry = registry();
+        let first = clock.now();
+        let mut tasks = Vec::new();
+        for jitter in [0, 500, 1000] {
+            clock.set_retry_jitter_ms(jitter);
+            let daemon = daemon(retry_backoff_script(signer, 5000), "exec-remote/v1").await;
+            let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+            clock.expect_sleep(first, first + if signer { 5000 + jitter } else { 1000 }).await;
+            if !signer {
+                let saved = read_task(&registry.task(&task).unwrap().paths.json).unwrap();
+                assert_eq!(saved.remote.unwrap().retry.unwrap().next_retry_at_ms, Some(first + 5000 + jitter));
+            }
+            tasks.push((daemon, task));
+        }
+        // All three refusals used the same logical time; only their jitter differs.
+        clock.advance(5000);
+        for (index, (daemon, task)) in tasks.iter().enumerate() {
+            if index > 0 {
+                assert_eq!(exec_runs(daemon).len(), 1, "later retries must still be waiting");
+                clock.advance(500);
+            }
+            assert_eq!(terminal(&registry, task).await.exit_code, Some(0));
+            assert_eq!(exec_runs(daemon).len(), 2);
+        }
+    }
 }
 
 #[tokio::test]
