@@ -1441,6 +1441,9 @@ pub struct CompleteFixture {
 
 fn make_impact_value(count: usize, depth_limited: bool) -> Value {
     let result = StoreImpactResult {
+        callback_dependencies: 0,
+        callback_reference_label: None,
+        test_filter_note: None,
         symbol: "target".to_string(),
         file: "src/app.ts".to_string(),
         signature: None,
@@ -1450,6 +1453,7 @@ fn make_impact_value(count: usize, depth_limited: bool) -> Value {
         affected_files: 1,
         callers: (1..=count)
             .map(|index| StoreImpactCaller {
+                relation: None,
                 caller_symbol: format!("caller{index}"),
                 caller_file: "src/app.ts".to_string(),
                 line: index as u32,
@@ -1472,12 +1476,17 @@ fn make_impact_value(count: usize, depth_limited: bool) -> Value {
 
 fn make_callers_value(count: usize, depth_limited: bool) -> Value {
     let result = StoreCallersResult {
+        callback_dependencies: 0,
+        callback_reference_label: None,
+        test_filter_note: None,
         symbol: "target".to_string(),
         file: "src/app.ts".to_string(),
         callers: vec![StoreCallerGroup {
             file: "src/app.ts".to_string(),
             callers: (1..=count)
                 .map(|index| StoreCallerEntry {
+                    relation: None,
+                    test_status_unknown: false,
                     symbol: format!("caller{index:02}"),
                     line: index as u32,
                     approximate: None,
@@ -1539,6 +1548,7 @@ fn make_tree_value(count: usize, depth_limited: bool) -> Value {
 fn make_capped_impact_value(count: usize) -> Value {
     let callers = (1..=count)
         .map(|i| StoreImpactCaller {
+            relation: None,
             caller_symbol: format!("caller{i}"),
             caller_file: "src/app.ts".to_string(),
             line: i as u32,
@@ -1576,6 +1586,9 @@ fn make_capped_impact_value(count: usize) -> Value {
     let sites_list_envelope = build_callgraph_envelope(Unit::Sites, shown, count, 0);
 
     let result = StoreImpactResult {
+        callback_dependencies: 0,
+        callback_reference_label: None,
+        test_filter_note: None,
         symbol: "target".to_string(),
         file: "src/app.ts".to_string(),
         signature: None,
@@ -1596,6 +1609,8 @@ fn make_capped_impact_value(count: usize) -> Value {
 fn make_capped_callers_value(count: usize) -> Value {
     let entries = (1..=count)
         .map(|i| StoreCallerEntry {
+            relation: None,
+            test_status_unknown: false,
             symbol: format!("caller{i:02}"),
             line: i as u32,
             approximate: None,
@@ -1629,6 +1644,9 @@ fn make_capped_callers_value(count: usize) -> Value {
     let callers_list_envelope = build_callgraph_envelope(Unit::Items, shown, count, 0);
 
     let result = StoreCallersResult {
+        callback_dependencies: 0,
+        callback_reference_label: None,
+        test_filter_note: None,
         symbol: "target".to_string(),
         file: "src/app.ts".to_string(),
         callers: vec![StoreCallerGroup {

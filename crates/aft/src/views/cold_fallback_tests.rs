@@ -749,11 +749,35 @@ fn callgraph_previous_producer_reextracts_callbacks_and_inline_test_status() {
     )
     .unwrap();
     for (op, result, expected) in [
-        ("callers", serde_json::to_value(callers_result(&store, Path::new("src/lib.rs"), "transform", 5, true).unwrap()).unwrap(), "1 caller dependency · 1 file group\nsrc/lib.rs\n  ↳ checks:3 (callback reference)"),
-        ("impact", serde_json::to_value(impact_result(&store, Path::new("src/lib.rs"), "transform", 5, true).unwrap()).unwrap(), "1 affected dependency site · 1 file\nsrc/lib.rs:3\n  ↳ checks (callback reference)\n  fn checks() { spawn(transform); }"),
-        ("callers", serde_json::to_value(callers_result(&store, Path::new("src/lib.rs"), "transform", 5, false).unwrap()).unwrap(), "0 callers · 0 file groups\n1 callers in tests hidden — includeTests: true shows them"),
+        (
+            "callers",
+            serde_json::to_value(
+                callers_result(&store, Path::new("src/lib.rs"), "transform", 5, true).unwrap(),
+            )
+            .unwrap(),
+            "1 caller dependency · 1 file group\nsrc/lib.rs\n  ↳ checks:3 (callback reference)",
+        ),
+        (
+            "impact",
+            serde_json::to_value(
+                impact_result(&store, Path::new("src/lib.rs"), "transform", 5, true).unwrap(),
+            )
+            .unwrap(),
+            "1 affected dependency site · 1 file\nsrc/lib.rs:3\n  ↳ checks (callback reference)",
+        ),
+        (
+            "callers",
+            serde_json::to_value(
+                callers_result(&store, Path::new("src/lib.rs"), "transform", 5, false).unwrap(),
+            )
+            .unwrap(),
+            "0 callers · 0 file groups\n1 callers in tests hidden — includeTests: true shows them",
+        ),
     ] {
-        assert_eq!(crate::subc_format::format_callgraph(op, &result, false), expected);
+        assert_eq!(
+            crate::subc_format::format_callgraph(op, &result, false),
+            expected
+        );
     }
 }
 

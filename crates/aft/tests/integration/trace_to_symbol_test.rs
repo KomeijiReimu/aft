@@ -370,7 +370,10 @@ fn callgraph_public_to_path_guidance_and_retry() {
     request["arguments"]["toPath"] = serde_json::json!(root.join("one.ts"));
     let selected = aft.send(&request.to_string());
     assert_eq!(selected["success"], true, "{selected}");
-    assert_eq!(selected["text"], "run [start.ts:2]\n  ↳ target [one.ts:1]");
+    assert_eq!(
+        selected["text"],
+        "2 hops\n  ↳ run [start.ts:2]\n    ↳ target [one.ts:1]"
+    );
     aft.shutdown();
 }
 
