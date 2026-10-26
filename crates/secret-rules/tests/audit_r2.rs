@@ -59,7 +59,11 @@ fn item8_request_outcome_debug_does_not_dump_the_rewritten_body() {
         &keys("x", MIN_KEY),
     );
     assert_eq!(outcome.refusal, None);
-    assert!(outcome.rewritten_body.is_some(), "the body carries the key");
+    let body = outcome.rewritten_body.as_ref().expect("a rewritten body");
+    assert!(
+        body.windows(MIN_KEY.len()).any(|window| window == MIN_KEY),
+        "the rewritten body carries the key, so Debug has something to leak"
+    );
     let rendered = format!("{outcome:?}");
     assert!(
         !debug_shows_key(&rendered, MIN_KEY),
@@ -79,88 +83,141 @@ fn item8_key_patterns_debug_does_not_dump_the_patterns() {
     assert!(rendered.contains("longest"), "{rendered}");
 }
 
-#[test]
-fn item8_audit_record_debug_does_not_dump_metadata() {
-    let record = AuditRecordV1::new(
+/// A record with `text` in every free-text field: label, request id, origin,
+/// host, matched prefix, location kind and all three scope strings.
+fn record_with_everywhere(text: &str) -> AuditRecordV1 {
+    AuditRecordV1::new(1, text, Decision::Literal, AuditReason::Matched, text, text)
+        .with_scope(Some(ScopeRef {
+            owner: text.to_string(),
+            kind: text.to_string(),
+            reference: text.to_string(),
+        }))
+        .with_rule(text, 443, text, text)
+}
+
+/// A record with `text` in exactly one free-text field, named by `field`.
+fn record_with_one(field: &str, text: &str) -> AuditRecordV1 {
+    let clean = "clean";
+    let scope = |owner: &str, kind: &str, reference: &str| ScopeRef {
+        owner: owner.to_string(),
+        kind: kind.to_string(),
+        reference: reference.to_string(),
+    };
+    let pick = |name: &str| if name == field { text } else { clean };
+    AuditRecordV1::new(
         1,
         "repo_key",
         Decision::Literal,
         AuditReason::Matched,
-        "req-1",
-        String::from_utf8_lossy(MIN_KEY).into_owned(),
+        pick("request_id"),
+        pick("origin"),
+    )
+    .with_scope(Some(scope(pick("owner"), pick("kind"), pick("ref"))))
+    .with_rule(pick("host"), 443, pick("prefix"), pick("location_kind"))
+}
+
+const RECORD_FIELDS: &[&str] = &[
+    "request_id",
+    "origin",
+    "owner",
+    "kind",
+    "ref",
+    "host",
+    "prefix",
+    "location_kind",
+];
+
+#[test]
+fn item1_audit_debug_hides_the_key_in_every_field() {
+    let text = String::from_utf8_lossy(MIN_KEY).into_owned();
+    let record = record_with_everywhere(&text);
+    for rendered in [
+        format!("{record:?}"),
+        format!("{:?}", record.scope),
+        format!("{:?}", record.matched_prefix),
+    ] {
+        assert!(
+            !debug_shows_key(&rendered, MIN_KEY),
+            "Debug printed the key: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn item1_header_edit_debug_hides_a_header_name_that_is_the_key() {
+    let name = String::from_utf8_lossy(MIN_KEY).into_owned();
+    let request = RequestView::new("/v1/x", vec![HeaderField::value(&name, PH.as_bytes())]);
+    let outcome = evaluate_request_with_connect(
+        &request,
+        &connect(),
+        &[rule("x", Location::Header(name.clone()))],
+        &keys("x", MIN_KEY),
     );
-    let rendered = format!("{record:?}");
+    assert_eq!(outcome.refusal, None);
+    assert_eq!(outcome.header_edits.len(), 1, "the header was substituted");
+    let rendered = format!("{outcome:?}");
     assert!(
         !debug_shows_key(&rendered, MIN_KEY),
-        "AuditRecordV1 Debug printed the key: {rendered}"
+        "Debug printed the key: {rendered}"
     );
 }
 
+/// `(key, field text)`: the field spells the key. Every spelling is written
+/// out by hand.
+const RECORD_SPELLINGS: &[(&[u8], &str)] = &[
+    (b"0123456789abcdef", "0123456789abcdef"),
+    // Base64, alone and at a shifted alignment inside a longer token.
+    (b"0123456789abcdef", "MDEyMzQ1Njc4OWFiY2RlZg"),
+    (b"0123456789abcdef", "xMDEyMzQ1Njc4OWFiY2RlZg"),
+    // Hex, shifted by one character, and upper case inside other text.
+    (b"abcdefghijklmnop", "g6162636465666768696a6b6c6d6e6f70"),
+    (b"abcdefghijklmnop", "id-6162636465666768696A6B6C6D6E6F70"),
+    // Percent and form (`+` is a space, `%2B` a plus).
+    (b"0123456789abcdef", "%30%31%32%33%34%35%36%37%38%39%61%62%63%64%65%66"),
+    (b"my key/with+plus", "my+key%2Fwith%2Bplus"),
+    // JSON escapes: `\uXXXX`, a control escape, and surrogate pairs.
+    (
+        b"0123456789abcdef",
+        r"\u0030\u0031\u0032\u0033\u0034\u0035\u0036\u0037\u0038\u0039\u0061\u0062\u0063\u0064\u0065\u0066",
+    ),
+    (b"aaa\tbbbbccccdddd", r"aaa\tbbbbccccdddd"),
+    (
+        "\u{1F600}\u{1F600}\u{1F600}\u{1F600}".as_bytes(),
+        r"\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00",
+    ),
+    // The punctuation-separated key the old keyless shape check let through.
+    (b"ab-cd-ef-gh-ij-kl", "ab-cd-ef-gh-ij-kl"),
+];
+
 #[test]
-fn item8_scope_fields_are_checked_against_the_key() {
-    let record = AuditRecordV1::new(
-        1,
-        "repo_key",
-        Decision::Literal,
-        AuditReason::Matched,
-        "req-1",
-        "task-1",
-    )
-    .with_scope(Some(ScopeRef {
-        owner: String::from_utf8_lossy(MIN_KEY).into_owned(),
-        kind: "head".to_string(),
-        reference: "ref".to_string(),
-    }));
-    assert!(record.to_json_line_with_key(MIN_KEY).is_err());
+fn item1_the_keyed_writer_refuses_every_spelling_in_every_field() {
+    let unrelated: &[u8] = b"zzzzzzzzzzzzzzzz";
+    for (key, text) in RECORD_SPELLINGS {
+        for field in RECORD_FIELDS {
+            let record = record_with_one(field, text);
+            // The spelled key is not the first one passed: every key is checked.
+            assert_eq!(
+                record.to_json_line_with_keys(&[unrelated, *key]),
+                Err(secret_rules::AuditRefusal::KeyMaterialInRecord),
+                "{field} = {text}"
+            );
+            assert_eq!(
+                record.to_json_line_with_key(key),
+                Err(secret_rules::AuditRefusal::KeyMaterialInRecord),
+                "{field} = {text}"
+            );
+        }
+    }
 }
 
 #[test]
-fn item8_encoded_key_forms_in_metadata_are_found() {
-    let hex: String = MIN_KEY.iter().map(|byte| format!("{byte:02x}")).collect();
-    let record = AuditRecordV1::new(
-        1,
-        "repo_key",
-        Decision::Literal,
-        AuditReason::Matched,
-        "req-1",
-        hex,
-    );
-    assert!(record.to_json_line_with_key(MIN_KEY).is_err());
-}
-
-#[test]
-fn item8_punctuation_separated_key_is_refused_without_the_key() {
-    // `ab-cd-ef-...` has no sixteen-byte alphanumeric run, so the shape check
-    // alone would let it through.
-    let separated = "ab-cd-ef-gh-ij-kl";
-    let record = AuditRecordV1::new(
-        1,
-        "repo_key",
-        Decision::Literal,
-        AuditReason::Matched,
-        "req-1",
-        separated,
-    );
-    assert_eq!(
-        record.to_json_line_with_key(separated.as_bytes()),
-        Err(secret_rules::AuditRefusal::KeyMaterialInRecord)
-    );
-}
-
-#[test]
-fn item8_the_record_has_no_unguarded_serialization() {
-    // The type is deliberately not `Serialize`; the only writers check first.
-    // This compiles only because the value goes through `to_json_line`.
-    let record = AuditRecordV1::new(
-        1,
-        "repo_key",
-        Decision::Literal,
-        AuditReason::Matched,
-        "req-1",
-        "task-1",
-    );
-    let json = record.to_json_line().expect("clean record");
-    assert!(json.contains("\"reason\":\"matched\""), "{json}");
+fn item1_the_keyed_writer_accepts_a_record_that_spells_no_key() {
+    let keys: Vec<&[u8]> = RECORD_SPELLINGS.iter().map(|(key, _)| *key).collect();
+    let record = record_with_one("origin", "task-1");
+    let json = record
+        .to_json_line_with_keys(&keys)
+        .expect("a clean record is written");
+    assert!(json.contains("\"origin\":\"task-1\""), "{json}");
 }
 
 // --- item 13: duplicate detection is total and bounded ----------------------

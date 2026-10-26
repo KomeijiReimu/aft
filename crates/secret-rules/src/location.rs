@@ -223,6 +223,9 @@ impl std::fmt::Debug for Edit {
 }
 
 /// One header value to replace, and what it becomes.
+///
+/// `Debug` prints the name's length rather than the name: a header rule's name
+/// is caller-chosen text and is never checked against the keys.
 #[derive(Clone, PartialEq, Eq)]
 pub struct HeaderEdit {
     pub name: String,
@@ -234,7 +237,7 @@ pub struct HeaderEdit {
 impl std::fmt::Debug for HeaderEdit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HeaderEdit")
-            .field("name", &self.name)
+            .field("name_len", &self.name.len())
             .field("start", &self.start)
             .field("end", &self.end)
             .field("replacement_len", &self.replacement.len())

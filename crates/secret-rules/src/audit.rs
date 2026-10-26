@@ -9,10 +9,16 @@
 //! * `reason` is a closed vocabulary ([`AuditReason`]), so a caller cannot pass
 //!   arbitrary text into it. The vocabulary is re-used for refusal codes, which
 //!   already name a rule and never a value.
-//! * every other text field is checked when the record is built and scrubbed
-//!   when it is serialized. A value that still holds the key, or a control
-//!   byte, refuses the record; anything else that happens to look like key
-//!   material is replaced with the label's placeholder before it is written.
+//! * every other text field is checked against the installed keys when the
+//!   record is written: a field that holds a key in any spelling the scrubber
+//!   recognises, or a control byte, refuses the record. There is no writer
+//!   that skips the key check, and the record type does not implement
+//!   `Serialize`. [`AuditRecordV1::scrubbed_with_key`] replaces key material
+//!   with the label's placeholder before writing, for callers that would
+//!   rather keep the record.
+//!
+//! `Debug` on the record and its parts prints decisions and field lengths, never
+//! the text of a field.
 
 use serde::{Deserialize, Serialize};
 
@@ -94,12 +100,25 @@ impl AuditReason {
 
 /// The authorization scope a call runs under (V2). `None` on a record means
 /// the call had no daemon stamp.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+///
+/// `Debug` prints field lengths only: the strings are caller metadata and are
+/// checked against the keys only when a record is written.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct ScopeRef {
     pub owner: String,
     pub kind: String,
     #[serde(rename = "ref")]
     pub reference: String,
+}
+
+impl std::fmt::Debug for ScopeRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopeRef")
+            .field("owner_len", &self.owner.len())
+            .field("kind_len", &self.kind.len())
+            .field("ref_len", &self.reference.len())
+            .finish()
+    }
 }
 
 impl ScopeRef {
@@ -111,10 +130,19 @@ impl ScopeRef {
     }
 }
 
-/// The path prefix that matched, as the rule declares it.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// The path prefix that matched, as the rule declares it. `Debug` prints its
+/// length only.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct MatchedPrefix {
     pub path_prefix: String,
+}
+
+impl std::fmt::Debug for MatchedPrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MatchedPrefix")
+            .field("path_prefix_len", &self.path_prefix.len())
+            .finish()
+    }
 }
 
 /// Why a record could not be written.
@@ -128,11 +156,37 @@ pub enum AuditRefusal {
 
 /// One audit record, version 1.
 ///
-/// The record deliberately does **not** derive `Serialize`: the only way to
-/// write it is [`AuditRecordV1::to_json_line`] or
-/// [`AuditRecordV1::to_json_line_with_key`], both of which check and scrub every
-/// text field first. `Debug` reports the decisions and the field lengths, so a
-/// record printed while debugging cannot carry key material either.
+/// The record deliberately does **not** implement `Serialize`: the only way to
+/// write it is [`AuditRecordV1::to_json_line_with_keys`] (or its one-key form
+/// [`AuditRecordV1::to_json_line_with_key`]), which checks every text field
+/// against the keys first. `Debug` reports the decisions and the field
+/// lengths, so a record printed while debugging cannot carry key material
+/// either.
+///
+/// That the trait is absent is checked at compile time. This compiles, so the
+/// harness itself is sound:
+///
+/// ```
+/// fn requires_serialize<T: serde::Serialize>() {}
+/// requires_serialize::<secret_rules::Decision>();
+/// ```
+///
+/// and each of these fails to compile:
+///
+/// ```compile_fail,E0277
+/// fn requires_serialize<T: serde::Serialize>() {}
+/// requires_serialize::<secret_rules::AuditRecordV1>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// fn requires_serialize<T: serde::Serialize>() {}
+/// requires_serialize::<secret_rules::ScopeRef>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// fn requires_serialize<T: serde::Serialize>() {}
+/// requires_serialize::<secret_rules::MatchedPrefix>();
+/// ```
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct AuditRecordV1 {
     /// Wire tag; readers refuse any other value.
@@ -204,34 +258,34 @@ impl AuditRecordV1 {
         self
     }
 
-    /// Check the record against a key, then serialize it as one JSON line.
+    /// Check the record against one key, then serialize it as one JSON line.
     ///
-    /// A field that still contains the key (or any of its encodings) refuses
-    /// the record: the caller must not rely on output scrubbing to catch a
-    /// mistake in what it put into the record. Fields that pass are written as
-    /// they are.
+    /// The same check as [`AuditRecordV1::to_json_line_with_keys`] with a
+    /// single key.
     pub fn to_json_line_with_key(&self, key: &[u8]) -> Result<String, AuditRefusal> {
-        if !self.metadata_is_valid() {
-            return Err(AuditRefusal::InvalidMetadata);
-        }
-        if self.fields().any(|field| field_holds_key(key, field)) {
-            return Err(AuditRefusal::KeyMaterialInRecord);
-        }
-        Ok(self.render())
+        self.to_json_line_with_keys(&[key])
     }
 
-    /// Serialize the record as one JSON line.
+    /// Check the record against every installed key, then serialize it as one
+    /// JSON line. This (and the one-key form above) is the only way to write a
+    /// record.
     ///
-    /// Every text field is checked for the shape that could carry key material
-    /// first: a value that is not plain printable metadata refuses the record.
-    /// Callers that hold the key should prefer
-    /// [`AuditRecordV1::to_json_line_with_key`], which also refuses a field
-    /// that contains the key itself.
-    pub fn to_json_line(&self) -> Result<String, AuditRefusal> {
+    /// A text field that holds any of `keys`, in any spelling the scrubber
+    /// recognises (raw, `%XX`, form `+`, JSON escapes including surrogate
+    /// pairs, hex at any offset, base64 at any alignment), refuses the record:
+    /// the caller must not rely on output scrubbing to catch a mistake in what
+    /// it put into the record. The guarantee covers exactly the keys passed
+    /// here, so a caller passes every key it holds; with no keys there is
+    /// nothing to check and only the metadata shape is validated. Fields that
+    /// pass are written as they are.
+    pub fn to_json_line_with_keys(&self, keys: &[&[u8]]) -> Result<String, AuditRefusal> {
         if !self.metadata_is_valid() {
             return Err(AuditRefusal::InvalidMetadata);
         }
-        if self.fields().any(looks_like_key_material) {
+        if keys
+            .iter()
+            .any(|key| self.fields().any(|field| field_holds_key(key, field)))
+        {
             return Err(AuditRefusal::KeyMaterialInRecord);
         }
         Ok(self.render())
@@ -384,10 +438,9 @@ impl<'a> From<&'a MatchedPrefix> for PrefixWire<'a> {
     }
 }
 
-/// True when `field` holds `key` or any of its ordinary encodings.
-///
-/// Encodings are compared by decoding the field, so punctuation-separated or
-/// escaped spellings (`%2D`, `ab-cd`, `\u00..`) are found as well.
+/// True when `field` holds `key` raw or in any spelling the scrubber decodes:
+/// `%XX`, form `+`, JSON escapes (surrogate pairs included), hex at any offset
+/// and base64 in either alphabet at any alignment inside a token.
 fn field_holds_key(key: &[u8], field: &str) -> bool {
     if key.is_empty() {
         return false;
@@ -416,28 +469,6 @@ fn scrub_key_material(value: &str, key: &[u8], replacement: &str) -> String {
         out = out.replace(&literal, replacement);
     }
     out
-}
-
-/// True when `value` carries a run that could be key material.
-///
-/// Metadata is a label, a task id, a host or a location token: no field of
-/// those ever holds a run of sixteen or more letters and digits with no
-/// separator, which is the shortest key P3 admits. A field that does is refused
-/// rather than written, because the record is a log line and the key would be
-/// recoverable from it.
-fn looks_like_key_material(value: &str) -> bool {
-    let mut run = 0usize;
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() {
-            run += 1;
-            if run >= crate::material::MIN_KEY_LEN {
-                return true;
-            }
-        } else {
-            run = 0;
-        }
-    }
-    false
 }
 
 /// True when `value` is plain printable text of a reasonable length.

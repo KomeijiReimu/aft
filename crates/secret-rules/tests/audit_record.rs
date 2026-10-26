@@ -20,7 +20,7 @@ fn a_full_record_serializes_with_every_field_and_version_one() {
         reference: "ref-1".to_string(),
     }))
     .with_rule("api.example.com", 443, "/v1", "header:x-api-key");
-    let json = record.to_json_line().expect("clean record serializes");
+    let json = record.to_json_line_with_key(KEY).expect("clean record serializes");
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed["v"], 1);
     assert_eq!(parsed["timestamp_ms"], 1_760_000_000_000u64);
@@ -48,7 +48,7 @@ fn a_launch_refusal_record_has_null_rule_fields_and_null_scope() {
         "req-2",
         "task-9",
     );
-    let json = record.to_json_line().expect("clean record serializes");
+    let json = record.to_json_line_with_key(KEY).expect("clean record serializes");
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     for field in ["scope", "host", "port", "matched_prefix", "location_kind"] {
         assert!(parsed[field].is_null(), "{field} must be null");
@@ -68,10 +68,9 @@ fn decisions_serialize_as_their_snake_case_names() {
 }
 
 #[test]
-fn no_record_field_can_hold_key_bytes() {
-    // Every field is filled with the key text deliberately; the schema has no
-    // place for a query string or a URL, and the only free-text field is a
-    // reason tag the caller chooses from a fixed vocabulary.
+fn a_written_record_has_only_the_schema_fields() {
+    // A clean record, written with the key check: the output carries no key
+    // text, and the schema has no field for a query string, a URL or a body.
     let key_text = std::str::from_utf8(KEY).unwrap();
     let record = AuditRecordV1::new(
         1,
@@ -82,7 +81,7 @@ fn no_record_field_can_hold_key_bytes() {
         "task-9",
     )
     .with_rule("api.example.com", 443, "/v1", "query:key");
-    let json = record.to_json_line().expect("clean record serializes");
+    let json = record.to_json_line_with_key(KEY).expect("clean record serializes");
     assert!(
         !json.contains(key_text),
         "record must not contain the key: {json}"
@@ -130,9 +129,9 @@ fn records_round_trip_through_serde() {
         "req-4",
         "fetch-1#2",
     );
-    // The record has no `Serialize` impl on purpose: the only writer is
-    // `to_json_line`, so nothing can bypass its checks.
-    let json = record.to_json_line().expect("clean record serializes");
+    // The record has no `Serialize` impl on purpose (a compile_fail doc test on
+    // `AuditRecordV1` checks that); the writers check every field first.
+    let json = record.to_json_line_with_key(KEY).expect("clean record serializes");
     let back: AuditRecordV1 = serde_json::from_str(&json).unwrap();
     assert_eq!(back, record);
 }

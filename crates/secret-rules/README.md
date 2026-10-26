@@ -24,4 +24,10 @@ as a silently rewritten test.
 
 `audit::AuditRecordV1` deliberately keeps `origin` as an opaque string the
 caller renders (a task id or `<fetch call id>#<hop>`); the crate never sees a
-URL, a query string or a body, so no record field can hold key bytes.
+URL, a query string or a body. Its text fields are still caller-supplied, so
+the record has no `Serialize` impl and is written only through
+`to_json_line_with_keys` (or the one-key `to_json_line_with_key`), which
+refuses a record whose text fields hold any of the keys passed to it, raw or
+in any spelling the scrubber decodes. The guarantee covers the keys the caller
+passes, so a caller passes every key it holds. `Debug` on the record prints
+field lengths, not field text.

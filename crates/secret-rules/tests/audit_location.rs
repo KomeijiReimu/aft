@@ -461,16 +461,16 @@ fn an_audit_record_refuses_a_metadata_value_that_holds_the_key() {
         "sk-live-0123456789abcdef",
     );
     let result = record.to_json_line_with_key(KEY);
-    assert!(
-        result.is_err(),
+    assert_eq!(
+        result,
+        Err(secret_rules::AuditRefusal::KeyMaterialInRecord),
         "a record whose origin held the key was serialized"
     );
 }
 
 #[test]
-fn an_audit_record_scrubs_metadata_without_a_key_check() {
-    // Without the key the record cannot know which run is key material, so a
-    // field shaped like a key refuses rather than being written out.
+fn an_audit_record_refuses_then_scrubs_a_field_holding_the_key() {
+    // A field that holds the key refuses the keyed writer.
     let record = AuditRecordV1::new(
         1,
         "repo_key",
@@ -480,14 +480,14 @@ fn an_audit_record_scrubs_metadata_without_a_key_check() {
         "task-1",
     );
     assert_eq!(
-        record.to_json_line(),
+        record.to_json_line_with_key(KEY),
         Err(secret_rules::AuditRefusal::KeyMaterialInRecord)
     );
     // With the key the record is written, with the key replaced by the label's
     // placeholder.
     let json = record
         .scrubbed_with_key(b"sk-live-0123456789abcdef")
-        .and_then(|clean| clean.to_json_line())
+        .and_then(|clean| clean.to_json_line_with_key(KEY))
         .expect("a header-shaped field is scrubbed");
     assert!(!json.contains("sk-live-0123456789abcdef"), "{json}");
     assert!(json.contains("{{ck-secret:repo_key}}"), "{json}");
@@ -519,7 +519,7 @@ fn a_clean_record_round_trips_without_scrubbing() {
         "req-1",
         "task-1",
     );
-    let json = record.to_json_line().expect("clean record serializes");
+    let json = record.to_json_line_with_key(KEY).expect("clean record serializes");
     assert!(json.contains("\"reason\":\"matched\""));
     assert!(json.contains("\"label\":\"repo_key\""));
 }
@@ -720,7 +720,7 @@ fn item13_the_audit_record_refuses_key_shaped_metadata() {
         "r",
         "sk-live-0123456789abcdef",
     );
-    assert!(record.to_json_line().is_err());
+    assert!(record.to_json_line_with_key(KEY).is_err());
 }
 
 #[test]
