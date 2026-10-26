@@ -51,10 +51,10 @@ fn callgraph_callback_references_are_labelled_in_ts_js_and_rust() {
         assert_eq!(
             callers(&store, file, "transform", false),
             format!(
-                "1 caller dependency · 1 file group\n{file}\n  ↳ process:2 (callback reference)"
+                "1 caller (1 by callback reference) · 1 file group\n{file}\n  ↳ process:2 (callback reference)"
             )
         );
-        assert_eq!(impact(&store, file, "transform", false), format!("1 affected dependency site · 1 file\n{file}:2\n  ↳ process{entry} (callback reference)\n  {}", source.lines().nth(1).unwrap()));
+        assert_eq!(impact(&store, file, "transform", false), format!("1 affected site (1 by callback reference) · 1 file\n{file}:2\n  ↳ process{entry} (callback reference)\n  {}", source.lines().nth(1).unwrap()));
         let tree = call_tree_result(&store, Path::new(file), "process", 3, false).unwrap();
         let text = crate::subc_format::format_callgraph(
             "call_tree",
@@ -74,14 +74,14 @@ fn callgraph_callback_references_are_labelled_in_ts_js_and_rust() {
 #[test]
 fn callgraph_callback_import_alias_arrow_and_direct_call_stay_distinct() {
     let (_temp, store) = fixture(&[("helper.ts", "export function transform() {}\n"), ("main.ts", "import { transform as callback } from './helper';\nfunction process() { items.map(callback); callback(); }\n")]);
-    assert_eq!(callers(&store, "helper.ts", "transform", false), "2 caller dependencies · 1 file group\nmain.ts\n  ↳ process:2\n  ↳ process:2 (callback reference)");
+    assert_eq!(callers(&store, "helper.ts", "transform", false), "2 callers (1 by callback reference) · 1 file group\nmain.ts\n  ↳ process:2\n  ↳ process:2 (callback reference)");
     let (_temp, store) = fixture(&[(
         "main.ts",
         "const transform = () => 1;\nfunction process() { items.map(transform); }\n",
     )]);
     assert_eq!(
         callers(&store, "main.ts", "transform", false),
-        "1 caller dependency · 1 file group\nmain.ts\n  ↳ process:2 (callback reference)"
+        "1 caller (1 by callback reference) · 1 file group\nmain.ts\n  ↳ process:2 (callback reference)"
     );
     let (_temp, store) = fixture(&[(
         "main.ts",
@@ -131,7 +131,9 @@ fn callgraph_zero_callers_discloses_unresolved_sites_but_clean_zero_stays_clean(
         "main.ts",
         "function onlyB() {}\nconst m = { b: onlyB };\nfunction dynamic() { m['b'](); }\n",
     )]);
-    assert_eq!(callers(&store, "main.ts", "onlyB", false), "Incomplete: 1 unresolved call site in the analyzed TypeScript scope could not be resolved; dynamic or indirect calls may target `onlyB`. Zero statically linked callers is not proof of no callers.\n0 callers · 0 file groups");
+    assert_eq!(callers(&store, "main.ts", "onlyB", false), "Incomplete: 1 call site in the analyzed TypeScript code could not be resolved, so a dynamic or indirect call may still reach `onlyB`.\n0 callers · 0 file groups");
+    let (_temp, store) = fixture(&[("main.ts", "function onlyB() {}\nconst m = { b: onlyB, c: onlyB };\nfunction dynamic() { m['b'](); m['c'](); }\n")]);
+    assert_eq!(callers(&store, "main.ts", "onlyB", false), "Incomplete: 2 call sites in the analyzed TypeScript code could not be resolved, so a dynamic or indirect call may still reach `onlyB`.\n0 callers · 0 file groups");
     let (_temp, store) = fixture(&[("main.ts", "function unused() {}\n")]);
     assert_eq!(
         callers(&store, "main.ts", "unused", false),
@@ -161,8 +163,86 @@ fn callgraph_unknown_rust_test_status_is_disclosed_not_guessed() {
         "lib.rs",
         "fn target() {}\nfn caller() { target(); }\nfn broken(\n",
     )]);
-    assert_eq!(callers(&store, "lib.rs", "target", false), "Test filtering incomplete: test-ness could not be determined for 1 caller site; they remain visible.\n1 caller · 1 file group\nlib.rs\n  ↳ caller:2");
-    assert_eq!(impact(&store, "lib.rs", "target", false), "Test filtering incomplete: test-ness could not be determined for 1 caller site; they remain visible.\n1 affected call site · 1 file\nlib.rs:2\n  ↳ caller\n  fn caller() { target(); }");
+    assert_eq!(callers(&store, "lib.rs", "target", false), "Test filtering incomplete: AFT could not tell whether 1 caller site is test code, so it is still shown.\n1 caller · 1 file group\nlib.rs\n  ↳ caller:2");
+    assert_eq!(impact(&store, "lib.rs", "target", false), "Test filtering incomplete: AFT could not tell whether 1 caller site is test code, so it is still shown.\n1 affected call site · 1 file\nlib.rs:2\n  ↳ caller\n  fn caller() { target(); }");
+}
+
+#[test]
+fn callgraph_approved_callback_count_lines_preserve_plain_counts() {
+    for (total, references, caller_heading, impact_heading) in [
+        (
+            1,
+            0,
+            "1 caller · 1 file group",
+            "1 affected call site · 1 file",
+        ),
+        (
+            2,
+            0,
+            "2 callers · 1 file group",
+            "2 affected call sites · 1 file",
+        ),
+        (
+            1,
+            1,
+            "1 caller (1 by callback reference) · 1 file group",
+            "1 affected site (1 by callback reference) · 1 file",
+        ),
+        (
+            2,
+            1,
+            "2 callers (1 by callback reference) · 1 file group",
+            "2 affected sites (1 by callback reference) · 1 file",
+        ),
+        (
+            2,
+            2,
+            "2 callers (2 by callback reference) · 1 file group",
+            "2 affected sites (2 by callback reference) · 1 file",
+        ),
+    ] {
+        let rows = (0..total)
+            .map(|index| {
+                serde_json::json!({
+                    "symbol": format!("process{index}"), "caller_symbol": format!("process{index}"),
+                    "caller_file": "main.ts", "line": index + 1,
+                    "relation": (index < references).then_some("callback_reference"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let callers = serde_json::json!({"total_callers":total, "callback_dependencies":references,
+            "callers":[{"file":"main.ts", "callers":rows.clone()}]});
+        let impact = serde_json::json!({"total_affected":total, "callback_dependencies":references,
+            "affected_files":1, "callers":rows});
+        for (operation, result, expected) in [
+            ("callers", callers, caller_heading),
+            ("impact", impact, impact_heading),
+        ] {
+            let text = crate::subc_format::format_callgraph(operation, &result, false);
+            assert_eq!(text.lines().next().unwrap(), expected);
+        }
+    }
+}
+
+#[test]
+fn callgraph_approved_test_status_note_uses_singular_and_plural_wording() {
+    assert_eq!(test_filter_note_for_count(1, false).as_deref(), Some("Test filtering incomplete: AFT could not tell whether 1 caller site is test code, so it is still shown."));
+    assert_eq!(test_filter_note_for_count(2, false).as_deref(), Some("Test filtering incomplete: AFT could not tell whether 2 caller sites are test code, so they are still shown."));
+    assert_eq!(test_filter_note_for_count(0, false), None);
+    assert_eq!(test_filter_note_for_count(2, true), None);
+}
+
+#[test]
+fn callgraph_approved_test_status_note_includes_unknown_macro_callers() {
+    for (direct, expected) in [
+        ("", "Test filtering incomplete: AFT could not tell whether 2 caller sites are test code, so they are still shown."),
+        ("fn direct() { target(); }\n", "Test filtering incomplete: AFT could not tell whether 3 caller sites are test code, so they are still shown."),
+    ] {
+        let source = format!("fn target() {{}}\nmacro_rules! invoke_target {{ () => {{ target() }} }}\nfn caller() {{ invoke_target!(); }}\n{direct}fn broken(\n");
+        let (_temp, store) = fixture(&[("lib.rs", &source)]);
+        let result = callers_result(&store, Path::new("lib.rs"), "target", 5, false).unwrap();
+        assert_eq!(result.test_filter_note.as_deref(), Some(expected));
+    }
 }
 
 #[test]

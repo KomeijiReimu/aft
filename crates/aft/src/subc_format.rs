@@ -3631,6 +3631,15 @@ fn unresolved_summary_text(nodes: &[&serde_json::Map<String, Value>]) -> String 
     format!("+ {} unresolved external {noun}: {names}", nodes.len())
 }
 
+fn callback_reference_count_suffix(record: &serde_json::Map<String, Value>) -> String {
+    let count = number_field(record, "callback_dependencies").unwrap_or(0);
+    if count > 0 {
+        format!(" ({count} by callback reference)")
+    } else {
+        String::new()
+    }
+}
+
 fn format_callers_sections(record: &serde_json::Map<String, Value>) -> Vec<String> {
     let envelope = record
         .get("callers_list_envelope")
@@ -3657,20 +3666,11 @@ fn format_callers_sections(record: &serde_json::Map<String, Value>) -> Vec<Strin
         let total = number_field(record, "total_callers").unwrap_or(0);
         format!("{}", total.saturating_sub(hidden_test_callers))
     };
+    let callback_note = callback_reference_count_suffix(record);
     let mut sections = vec![join_non_empty(&[
         Some(format!(
-            "{total_str} {}",
-            if number_field(record, "callback_dependencies").unwrap_or(0) > 0 {
-                if total_str == "1" {
-                    "caller dependency"
-                } else {
-                    "caller dependencies"
-                }
-            } else if total_str == "1" {
-                "caller"
-            } else {
-                "callers"
-            }
+            "{total_str} caller{}{callback_note}",
+            if total_str == "1" { "" } else { "s" }
         )),
         Some(format!(
             "{} file group{}",
@@ -3911,13 +3911,14 @@ fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String
         format!("{}", total_affected.saturating_sub(hidden_test_callers))
     };
     let affected_files = number_field(record, "affected_files").unwrap_or(0);
+    let callback_note = callback_reference_count_suffix(record);
     let mut sections = vec![join_non_empty(&[
         Some(format!(
-            "{total_str} affected {} site{}",
-            if number_field(record, "callback_dependencies").unwrap_or(0) > 0 {
-                "dependency"
+            "{total_str} affected {}{}{callback_note}",
+            if callback_note.is_empty() {
+                "call site"
             } else {
-                "call"
+                "site"
             },
             if total_str == "1" { "" } else { "s" }
         )),

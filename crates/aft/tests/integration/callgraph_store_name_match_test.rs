@@ -922,12 +922,11 @@ fn trait_callers_honest_empty_and_impact_disclose_unresolved_sites() {
     ] {
         assert_eq!(result["complete"], false, "{result:#}");
         assert_eq!(result["unresolved_call_sites"], 1, "{result:#}");
-        assert_eq!(result["incomplete_reason"], "Incomplete: 1 unresolved call site in the analyzed Rust scope could not be resolved; dynamic or indirect calls may target `m`. Zero statically linked callers is not proof of no callers.");
+        assert_eq!(result["incomplete_reason"], "Incomplete: 1 call site in the analyzed Rust code could not be resolved, so a dynamic or indirect call may still reach `m`.");
         for op in ["callers", "impact"] {
             let rendered = aft::subc_format::format_callgraph(op, &result, false);
             assert!(
-                rendered
-                    .starts_with("Incomplete: 1 unresolved call site in the analyzed Rust scope"),
+                rendered.starts_with("Incomplete: 1 call site in the analyzed Rust code"),
                 "{rendered}"
             );
         }

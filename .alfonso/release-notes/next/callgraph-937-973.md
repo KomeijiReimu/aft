@@ -1,1 +1,1 @@
-- Callgraph labels callback dependencies, links construction only to explicit constructors, reports unresolved zero-callers results, and hides Rust inline-test callers by default.
+aft_callgraph now marks functions passed as callbacks, links new Class() only to the class's constructor, says when a zero-caller answer may be missing dynamic calls, and hides Rust inline test callers when tests are excluded.

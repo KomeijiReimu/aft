@@ -209,6 +209,11 @@ function renderCallersGroupLines(
   return lines;
 }
 
+function callbackReferenceCountSuffix(record: Record<string, unknown>): string {
+  const count = asNumber(record.callback_dependencies) ?? 0;
+  return count > 0 ? ` (${count} by callback reference)` : "";
+}
+
 export function formatCallgraphSections(
   op: string,
   response: unknown,
@@ -232,15 +237,10 @@ export function formatCallgraphSections(
     const hubSummary = hubSummaryLine(record, theme);
     const hiddenTests = asNumber(record.hidden_test_callers) ?? 0;
     const total = (asNumber(record.total_callers) ?? 0) - hiddenTests;
-    const dependency = (asNumber(record.callback_dependencies) ?? 0) > 0;
+    const callbackNote = callbackReferenceCountSuffix(record);
     const sections = [
       joinNonEmpty([
-        theme.fg(
-          "success",
-          dependency
-            ? `${total} caller dependenc${total === 1 ? "y" : "ies"}`
-            : `${total} caller${total === 1 ? "" : "s"}`,
-        ),
+        theme.fg("success", `${total} caller${total === 1 ? "" : "s"}${callbackNote}`),
         theme.fg("muted", `${groups.length} file group${groups.length === 1 ? "" : "s"}`),
         warning,
       ]),
@@ -325,13 +325,14 @@ export function formatCallgraphSections(
     const hubSummary = hubSummaryLine(record, theme);
     const hiddenTests = asNumber(record.hidden_test_callers) ?? 0;
     const totalAffected = (asNumber(record.total_affected) ?? callers.length) - hiddenTests;
-    const siteKind = (asNumber(record.callback_dependencies) ?? 0) > 0 ? "dependency" : "call";
+    const callbackNote = callbackReferenceCountSuffix(record);
+    const siteKind = callbackNote ? "site" : "call site";
     const affectedFiles = asNumber(record.affected_files) ?? 0;
     const sections = [
       joinNonEmpty([
         theme.fg(
           "warning",
-          `${totalAffected} affected ${siteKind} site${totalAffected === 1 ? "" : "s"}`,
+          `${totalAffected} affected ${siteKind}${totalAffected === 1 ? "" : "s"}${callbackNote}`,
         ),
         theme.fg("muted", `${affectedFiles} file${affectedFiles === 1 ? "" : "s"}`),
         warning,

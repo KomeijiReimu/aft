@@ -755,7 +755,7 @@ fn callgraph_previous_producer_reextracts_callbacks_and_inline_test_status() {
                 callers_result(&store, Path::new("src/lib.rs"), "transform", 5, true).unwrap(),
             )
             .unwrap(),
-            "1 caller dependency · 1 file group\nsrc/lib.rs\n  ↳ checks:3 (callback reference)",
+            "1 caller (1 by callback reference) · 1 file group\nsrc/lib.rs\n  ↳ checks:3 (callback reference)",
         ),
         (
             "impact",
@@ -763,7 +763,7 @@ fn callgraph_previous_producer_reextracts_callbacks_and_inline_test_status() {
                 impact_result(&store, Path::new("src/lib.rs"), "transform", 5, true).unwrap(),
             )
             .unwrap(),
-            "1 affected dependency site · 1 file\nsrc/lib.rs:3\n  ↳ checks (callback reference)",
+            "1 affected site (1 by callback reference) · 1 file\nsrc/lib.rs:3\n  ↳ checks (callback reference)",
         ),
         (
             "callers",

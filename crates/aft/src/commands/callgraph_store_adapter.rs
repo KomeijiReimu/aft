@@ -55,7 +55,8 @@ fn is_zero(value: &usize) -> bool {
 }
 
 pub(crate) const CALLBACK_REFERENCE_LABEL: &str = " (callback reference)";
-pub(crate) const UNRESOLVED_CALLERS_NOTE: &str = "Incomplete: {count} unresolved call site{plural} in the analyzed {language} scope could not be resolved; dynamic or indirect calls may target `{symbol}`. Zero statically linked callers is not proof of no callers.";
+pub(crate) const UNRESOLVED_CALLERS_NOTE: &str = "Incomplete: {count} call site{plural} in the analyzed {language} code could not be resolved, so a dynamic or indirect call may still reach `{symbol}`.";
+const TEST_FILTER_NOTE: &str = "Test filtering incomplete: AFT could not tell whether {count} caller site{plural} {verb} test code, so {subject} still shown.";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreHubSummary {
@@ -471,15 +472,28 @@ fn callsite_is_from_test(site: &StoreCallSite) -> bool {
 }
 
 fn unknown_test_note(sites: &[StoreCallSite], include_tests: bool) -> Option<String> {
-    let unknown = sites
+    test_filter_note_for_count(unknown_test_caller_count(sites), include_tests)
+}
+
+fn unknown_test_caller_count(sites: &[StoreCallSite]) -> usize {
+    sites
         .iter()
         .filter(|site| {
             site.caller.lang == crate::parser::LangId::Rust
                 && !is_test_file(&site.caller.file)
                 && site.caller_is_test.is_none()
         })
-        .count();
-    (!include_tests && unknown > 0).then(|| format!("Test filtering incomplete: test-ness could not be determined for {unknown} caller site{}; they remain visible.", if unknown == 1 { "" } else { "s" }))
+        .count()
+}
+
+fn test_filter_note_for_count(count: usize, include_tests: bool) -> Option<String> {
+    (!include_tests && count > 0).then(|| {
+        TEST_FILTER_NOTE
+            .replace("{count}", &count.to_string())
+            .replace("{plural}", if count == 1 { "" } else { "s" })
+            .replace("{verb}", if count == 1 { "is" } else { "are" })
+            .replace("{subject}", if count == 1 { "it is" } else { "they are" })
+    })
 }
 
 fn trace_path_starts_in_test(path: &StoreTracePath) -> bool {
@@ -609,7 +623,7 @@ pub fn callers_result(
             .then(left.caller.symbol.cmp(&right.caller.symbol))
     });
     let pre_filter_count = sites.len();
-    let mut test_filter_note = unknown_test_note(&sites, include_tests);
+    let unknown_test_callers = unknown_test_caller_count(&sites);
     let hidden_tests = sites
         .iter()
         .filter(|site| callsite_is_from_test(site))
@@ -687,13 +701,8 @@ pub fn callers_result(
         .iter()
         .filter(|(_, entry)| entry.test_status_unknown)
         .count();
-    if !include_tests && unknown_macro_callers > 0 {
-        let note = format!("Test-ness could not be determined for {unknown_macro_callers} macro caller sites; they remain visible.");
-        test_filter_note = Some(match test_filter_note {
-            Some(existing) => format!("{existing} {note}"),
-            None => note,
-        });
-    }
+    let test_filter_note =
+        test_filter_note_for_count(unknown_test_callers + unknown_macro_callers, include_tests);
     for (file, entry) in via_entries {
         groups.entry(file).or_default().push(entry);
     }
