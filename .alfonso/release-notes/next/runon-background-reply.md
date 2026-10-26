@@ -1,0 +1,1 @@
+- Remote bash calls with `background: true` now return immediately with a task ID instead of waiting for the foreground window.

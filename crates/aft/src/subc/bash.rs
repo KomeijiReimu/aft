@@ -6073,8 +6073,8 @@ mod grant_path_tests {
         }
     }
 
-    /// A background runon reply names the registered task before the runner
-    /// accepts it, and that task later delivers its completion on the same id.
+    /// A background runon reply keeps local background launch wording and names
+    /// the registered task before acceptance, then delivers completion on that id.
     #[cfg(unix)]
     #[tokio::test]
     async fn background_runon_replies_at_registration_before_acceptance() {
@@ -6112,7 +6112,13 @@ mod grant_path_tests {
         assert!(response.success, "{response:?}");
         assert_eq!(response.data["status"], "starting", "{response:?}");
         assert_eq!(response.data["remote_phase"], "submitting", "{response:?}");
-        assert!(text.contains("promoted to background"), "{text}");
+        assert_eq!(
+            response.data["output"].as_str().unwrap(),
+            format!(
+                "Background task started: {task_id}. A completion reminder will be delivered automatically; don't poll bash_status.\n{REMOTE_ADMISSION_PENDING_NOTE}\n{REMOTE_INPUT_CAPTURE_WARNING}"
+            ),
+        );
+        assert!(!text.contains("Foreground bash didn't finish"), "{text}");
         assert!(text.contains(&task_id), "{text}");
         assert!(text.contains(REMOTE_ADMISSION_PENDING_NOTE), "{text}");
         assert!(text.contains(REMOTE_INPUT_CAPTURE_WARNING), "{text}");
@@ -6431,7 +6437,12 @@ mod grant_path_tests {
         let task_id = response.data["task_id"].as_str().unwrap().to_owned();
         assert_eq!(response.data["status"], "starting", "{response:?}");
         assert_eq!(response.data["remote_phase"], "submitting", "{response:?}");
-        assert!(text.contains("promoted to background"), "{text}");
+        assert_eq!(
+            response.data["output"].as_str().unwrap(),
+            format!(
+                "Foreground bash didn't finish within 1s and was promoted to background: {task_id}. A completion reminder will be delivered automatically; use bash_status({{ taskId: \"{task_id}\" }}) to inspect output or bash_kill({{ taskId: \"{task_id}\" }}) to terminate.\n{REMOTE_ADMISSION_PENDING_NOTE}\n{REMOTE_INPUT_CAPTURE_WARNING}"
+            ),
+        );
         assert!(text.contains(&task_id), "{text}");
         assert!(text.contains(REMOTE_ADMISSION_PENDING_NOTE), "{text}");
         assert!(text.contains(REMOTE_INPUT_CAPTURE_WARNING), "{text}");
