@@ -6504,7 +6504,13 @@ async fn drive_back_to_back_binds_beside_held_mutating_job(input: FakeDaemonInpu
     release_tx.send(()).unwrap();
     held.recv_timeout(Duration::from_secs(5)).unwrap();
     let health = health.expect("the frame loop must service health while the writer is held");
-    assert_eq!((health.header.channel, health.header.corr), (0, 40));
+    assert_eq!(
+        (health.header.channel, health.header.corr),
+        (0, 40),
+        "first control frame while Mutating was held: header={:?} body={}",
+        health.header,
+        String::from_utf8_lossy(&health.body)
+    );
     let mut acks = HashSet::new();
     while acks.len() < 2 {
         let ack = read_frame_timeout(&mut stream, "deferred bind ack").await;

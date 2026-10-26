@@ -1784,6 +1784,12 @@ fn codemode_bash_runs_in_a_real_shell_without_rewrites() {
 
 #[test]
 fn codemode_call_runs_with_head_principal_and_run_route_finds_its_ledger_row() {
+    // The call-ledger warning explains why an outcome_unknown result could not
+    // be confirmed as durably recorded.
+    let _ = env_logger::Builder::new()
+        .filter_module("aft::subc::tool_provider", log::LevelFilter::Warn)
+        .is_test(true)
+        .try_init();
     run_subc_bridge_test_with_dispatch(
         "codemode-ledger-carrier",
         Duration::from_secs(30),
