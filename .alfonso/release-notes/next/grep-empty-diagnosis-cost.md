@@ -1,1 +1,1 @@
-Empty `grep` and `glob` scope breakdowns now stop at the request's remaining time instead of walking oversized trees, so huge checkouts quickly report that the breakdown could not be determined instead of stalling the reply.
+Empty `grep` and `glob` scope breakdowns now stop when the request runs out of time, so on very large checkouts they no longer keep using CPU in the background after the reply.
