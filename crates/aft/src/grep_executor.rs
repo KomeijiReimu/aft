@@ -548,12 +548,21 @@ fn bounded_scope_has_files(
 ) -> Option<bool> {
     let filters = filters.clone();
     let filter_root = filter_root.to_path_buf();
+    // The probe stops at the caller's deadline (with a margin to return),
+    // so an oversized scope reports unknown instead of keeping a filesystem
+    // helper occupied after the caller has given up.
+    let deadline = crate::bounded_io::deadline_before_io_timeout(
+        search_root,
+        fallback_walk_budget(),
+        FALLBACK_WALK_RETURN_MARGIN,
+    );
     crate::bounded_io::run(search_root, None, move |search_root| {
         Ok(scope_has_files_unbounded(
             &filter_root,
             &search_root,
             &filters,
             ignored_target,
+            deadline,
         ))
     })
     .ok()
@@ -565,8 +574,8 @@ fn scope_has_files_unbounded(
     search_root: &Path,
     filters: &PathFilters,
     ignored_target: bool,
+    deadline: Instant,
 ) -> Option<bool> {
-    let started = Instant::now();
     let skipped = Arc::new(AtomicUsize::new(0));
     let Some(builder) = fallback_target_walk_builder(
         search_root,
@@ -580,7 +589,7 @@ fn scope_has_files_unbounded(
     let walker = builder.build();
     for (visited, entry) in walker.enumerate() {
         if visited >= MAX_FALLBACK_WALK_FILES.saturating_mul(8)
-            || started.elapsed() >= FALLBACK_WALK_BUDGET
+            || Instant::now() >= deadline
             || crate::executor::current_job_cancelled()
         {
             return None;
@@ -1365,7 +1374,10 @@ fn target_is_ignored_unbounded(path: &Path) -> bool {
 /// The crate hides rejected entries before filter_entry is called. Only an
 /// empty reply needs their count: compare one directory's accepted children
 /// with its immediate on-disk entries, then recurse only through accepted
-/// directories. No ignored directory is opened to count its contents.
+/// directories. No ignored directory is opened to count its contents. The
+/// walk stops at the caller's deadline (with a margin to return), so an
+/// oversized scope reports unknown instead of keeping a filesystem helper
+/// occupied after the caller has given up.
 pub(crate) fn diagnose_scope_counts(
     filter_root: &Path,
     search_root: &Path,
@@ -1374,12 +1386,18 @@ pub(crate) fn diagnose_scope_counts(
 ) -> Option<ScopeFileCounts> {
     let filters = filters.clone();
     let filter_root = filter_root.to_path_buf();
+    let deadline = crate::bounded_io::deadline_before_io_timeout(
+        search_root,
+        fallback_walk_budget(),
+        FALLBACK_WALK_RETURN_MARGIN,
+    );
     crate::bounded_io::run(search_root, None, move |search_root| {
         Ok(diagnose_scope_counts_unbounded(
             &filter_root,
             &search_root,
             &filters,
             ignored_target,
+            deadline,
         ))
     })
     .ok()
@@ -1391,13 +1409,13 @@ fn diagnose_scope_counts_unbounded(
     search_root: &Path,
     filters: &PathFilters,
     ignored_target: bool,
+    deadline: Instant,
 ) -> Option<ScopeFileCounts> {
-    let started = Instant::now();
     let skipped = Arc::new(AtomicUsize::new(0));
     let mut counts = ScopeFileCounts::default();
     let within_budget = |visited: usize| {
         visited < MAX_FALLBACK_WALK_FILES.saturating_mul(8)
-            && started.elapsed() < FALLBACK_WALK_BUDGET
+            && Instant::now() < deadline
             && !crate::executor::current_job_cancelled()
     };
     // A starting path a confined walk may not use has nothing in scope; it is
@@ -3540,6 +3558,57 @@ mod tests {
         assert_eq!(counts.examined, 4);
         // One ignored file and the three fixed-skip directories, not their files.
         assert_eq!(counts.ignored, 4);
+    }
+
+    #[test]
+    fn empty_scope_probes_stop_at_an_expired_call_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::create_dir(dir.path().join("ignored")).unwrap();
+        std::fs::write(dir.path().join("ignored").join("skip.log"), "ignored\n").unwrap();
+        std::fs::write(dir.path().join("a.log"), "visible\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "other\n").unwrap();
+        // A filter matching nothing leaves the scope empty. The probes still
+        // break that empty scope down honestly: the ignored directory counts
+        // once without opening it, and the three visible files count as
+        // filtered. The visit count covers both passes over the root: the
+        // ignore-aware walk (the root plus three accepted children) and the
+        // directory listing it is compared against.
+        let filters = build_path_filters(&["*.nomatch".to_string()], &[]).unwrap();
+        let counts = diagnose_scope_counts(dir.path(), dir.path(), &filters, false)
+            .expect("a tiny scope fits inside the call budget");
+        assert_eq!(counts.examined, 3);
+        assert_eq!(counts.ignored, 1);
+        assert_eq!(counts.filtered, 3);
+        assert_eq!(counts.eligible, 0);
+        assert_eq!(counts.entries_visited, 8);
+        let scope = GrepScope {
+            roots: vec![ResolvedRoot {
+                search_root: dir.path().to_path_buf(),
+                filter_root: dir.path().to_path_buf(),
+                use_index: false,
+                is_external: true,
+                ignored_target: false,
+                authorized_task_artifact: false,
+            }],
+            multi_root: false,
+            per_root_max: 10,
+        };
+        assert_eq!(scope_has_files(&scope, &filters), Some(false));
+        // An expired call budget leaves the breakdown unknown instead of
+        // walking: the deadline check runs before the first entry, so neither
+        // probe visits anything.
+        with_fallback_walk_budget_for_test(Duration::ZERO, || {
+            assert!(
+                diagnose_scope_counts(dir.path(), dir.path(), &filters, false).is_none(),
+                "an expired call budget leaves the breakdown unknown instead of walking"
+            );
+            assert_eq!(
+                scope_has_files(&scope, &filters),
+                None,
+                "an expired call budget leaves scope presence unknown instead of walking"
+            );
+        });
     }
 
     #[test]
