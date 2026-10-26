@@ -26,8 +26,8 @@ async fn server_frames<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     writer: &mut W,
     state: &State,
 ) -> Result<(), ()> {
-    let mut message = Zeroizing::new(Vec::new());
-    let mut opcode = None;
+    let mut active: Option<(u8, secret_rules::scrub::Scrubber, bool)> = None;
+    let mut buffer = Zeroizing::new(vec![0u8; 8192]);
     loop {
         let mut header = [0u8; 2];
         reader.read_exact(&mut header).await.map_err(|_| ())?;
@@ -42,58 +42,75 @@ async fn server_frames<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             127 => reader.read_u64().await.map_err(|_| ())?,
             size => size as u64,
         };
-        // Cap each accumulated message at 16 MiB so a fragmented message
-        // cannot grow without limit.
-        if length > 16 * 1024 * 1024 || message.len() as u64 + length > 16 * 1024 * 1024 {
+        if length > i64::MAX as u64 {
             return Err(());
         }
-        let mut payload = Zeroizing::new(vec![0u8; length as usize]);
-        reader.read_exact(&mut payload).await.map_err(|_| ())?;
+        if kind >= 8 {
+            if !matches!(kind, 8..=10) || !fin || length > 125 {
+                return Err(());
+            }
+            reader
+                .read_exact(&mut buffer[..length as usize])
+                .await
+                .map_err(|_| ())?;
+            let clean = state.scrub(&buffer[..length as usize])?;
+            if clean.len() > 125 {
+                return Err(());
+            }
+            write_frame(writer, kind, true, &clean).await?;
+            if kind == 8 {
+                return Ok(());
+            }
+            continue;
+        }
         match kind {
-            0x8..=0xa => {
-                if !fin || length > 125 {
-                    return Err(());
-                }
-                let clean = state.scrub(&payload)?;
-                if clean.len() > 125 {
-                    return Err(());
-                }
-                write_frame(writer, kind, &clean).await?;
-                if kind == 8 {
-                    return Ok(());
-                }
-            }
-            1 | 2 if opcode.is_none() => {
-                opcode = Some(kind);
-                extend_message(&mut message, &payload);
-            }
-            0 if opcode.is_some() => extend_message(&mut message, &payload),
+            1 | 2 if active.is_none() => active = Some((kind, state.scrubber()?, false)),
+            0 if active.is_some() => {}
             _ => return Err(()),
         }
-        if kind < 8 && fin {
-            let clean = state.scrub(&message)?;
-            write_frame(writer, opcode.take().ok_or(())?, &clean).await?;
-            message = Zeroizing::new(Vec::new());
+        let (opcode, scrubber, started) = active.as_mut().ok_or(())?;
+        let mut remaining = length;
+        // Emit new fragments from one per-message scrubber. Its overlap spans
+        // both transport reads and frame boundaries without buffering a whole
+        // message or ever mixing bytes from separate WebSocket messages.
+        while remaining > 0 {
+            let count = remaining.min(buffer.len() as u64) as usize;
+            reader
+                .read_exact(&mut buffer[..count])
+                .await
+                .map_err(|_| ())?;
+            remaining -= count as u64;
+            state.refresh(scrubber)?;
+            let clean = scrubber.push(&buffer[..count]);
+            if !clean.is_empty() {
+                write_frame(writer, if *started { 0 } else { *opcode }, false, &clean).await?;
+                *started = true;
+            }
+        }
+        if fin {
+            let (opcode, mut scrubber, started) = active.take().ok_or(())?;
+            state.refresh(&mut scrubber)?;
+            write_frame(
+                writer,
+                if started { 0 } else { opcode },
+                true,
+                &scrubber.finish(),
+            )
+            .await?;
         }
     }
-}
-
-fn extend_message(message: &mut Zeroizing<Vec<u8>>, payload: &[u8]) {
-    let needed = message.len() + payload.len();
-    if needed > message.capacity() {
-        let mut grown = Zeroizing::new(Vec::with_capacity(needed.next_power_of_two()));
-        grown.extend_from_slice(message);
-        *message = grown;
-    }
-    message.extend_from_slice(payload);
 }
 
 async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     opcode: u8,
+    fin: bool,
     payload: &[u8],
 ) -> Result<(), ()> {
-    writer.write_u8(0x80 | opcode).await.map_err(|_| ())?;
+    writer
+        .write_u8((if fin { 0x80 } else { 0 }) | opcode)
+        .await
+        .map_err(|_| ())?;
     match payload.len() {
         0..=125 => writer.write_u8(payload.len() as u8).await.map_err(|_| ())?,
         126..=65535 => {

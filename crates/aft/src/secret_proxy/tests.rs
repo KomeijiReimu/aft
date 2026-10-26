@@ -218,8 +218,34 @@ impl Server {
                                 tokio::spawn(async move {
                                     if let Ok(upgraded) = upgrade.await {
                                         let mut io = TokioIo::new(upgraded);
-                                        let frames = if mode == "ws-rsv" {
-                                            [vec![0xc1, K1.len() as u8], K1.to_vec()].concat()
+                                        let frames = if mode == "ws-encodings" {
+                                            let payload = [
+                                                b"prefix|".repeat(2000),
+                                                representations(K1),
+                                                b"|tail".to_vec(),
+                                            ]
+                                            .concat();
+                                            let chunks = payload.chunks(7).collect::<Vec<_>>();
+                                            let mut frames = Vec::new();
+                                            for (index, chunk) in chunks.iter().enumerate() {
+                                                frames.push(
+                                                    (if index + 1 == chunks.len() {
+                                                        0x80
+                                                    } else {
+                                                        0
+                                                    }) | if index == 0 { 1 } else { 0 },
+                                                );
+                                                frames.push(chunk.len() as u8);
+                                                frames.extend_from_slice(chunk);
+                                            }
+                                            frames
+                                        } else if mode.starts_with("ws-rsv") {
+                                            let bit = match mode {
+                                                "ws-rsv2" => 0x20,
+                                                "ws-rsv3" => 0x10,
+                                                _ => 0x40,
+                                            };
+                                            [vec![0x81 | bit, K1.len() as u8], K1.to_vec()].concat()
                                         } else {
                                             [
                                                 vec![0x01, 8],
@@ -473,8 +499,10 @@ fn client_child() {
                     let proxy = url::Url::parse(&std::env::var("AFT_PROXY").unwrap()).unwrap();
                     let authority = value["authority"].as_str().map(str::to_owned).unwrap_or_else(|| std::env::var("AFT_UPSTREAM").unwrap());
                     let mut socket = TcpStream::connect((proxy.host_str().unwrap(), proxy.port().unwrap())).await.map_err(|_| ())?;
-                    let credentials = base64::engine::general_purpose::STANDARD.encode(format!("{}:", proxy.username()));
-                    socket.write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Authorization: Basic {credentials}\r\n\r\n").as_bytes()).await.map_err(|_| ())?;
+                    let token = if value["wrong_token"] == true { "wrong-token" } else { proxy.username() };
+                    let host = value["connect_host"].as_str().unwrap_or(&authority);
+                    let credentials = base64::engine::general_purpose::STANDARD.encode(format!("{token}:"));
+                    socket.write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {host}\r\nProxy-Authorization: Basic {credentials}\r\n\r\n").as_bytes()).await.map_err(|_| ())?;
                     let mut header = Vec::new();
                     while !header.ends_with(b"\r\n\r\n") { header.push(socket.read_u8().await.map_err(|_| ())?); }
                     if !header.starts_with(b"HTTP/1.1 200") { return Err(()); }
@@ -779,7 +807,14 @@ async fn proxy_upstream_tls_refuses_wrong_name_expiry_and_untrusted_root() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_websocket_scrubs_fragments_and_refuses_extensions_and_rsv() {
-    for mode in ["ws", "ws-extension", "ws-rsv"] {
+    for mode in [
+        "ws",
+        "ws-extension",
+        "ws-rsv",
+        "ws-rsv2",
+        "ws-rsv3",
+        "ws-encodings",
+    ] {
         let server = Server::new(mode).await;
         let vault = Vault::new();
         let proxy = SecretProxy::start_with_tls(
@@ -802,7 +837,14 @@ async fn proxy_websocket_scrubs_fragments_and_refuses_extensions_and_rsv() {
             let frames = base64::engine::general_purpose::STANDARD
                 .decode(response["frames"].as_str().unwrap())
                 .unwrap();
-            if mode == "ws-rsv" {
+            if mode == "ws-encodings" {
+                let message = ws_message(&frames);
+                let text = std::str::from_utf8(&message).unwrap();
+                assert!(text.starts_with("prefix|prefix|"));
+                assert!(text.ends_with("|tail"));
+                assert_eq!(text.matches(MARKER).count(), 10);
+                assert!(!text.contains(std::str::from_utf8(K1).unwrap()));
+            } else if mode.starts_with("ws-rsv") {
                 assert!(frames.is_empty());
             } else {
                 assert_eq!(
@@ -1132,4 +1174,101 @@ async fn proxy_http1_upstream_receives_all_locations_and_rewritten_length() {
     assert_eq!(seen["headers"]["x-key"], "test-key-12345678");
     assert_eq!(seen["body"], r#"{"k":"test-key-12345678"}"#);
     assert_eq!(seen["headers"]["content-length"], "25");
+}
+
+fn ws_message(mut bytes: &[u8]) -> Vec<u8> {
+    let mut message = Vec::new();
+    let mut first = true;
+    loop {
+        assert!(bytes.len() >= 2);
+        let flags = bytes[0];
+        let size = bytes[1];
+        bytes = &bytes[2..];
+        assert_eq!(flags & 0x70, 0);
+        assert_eq!(size & 0x80, 0);
+        assert_eq!(flags & 0xf, if first { 1 } else { 0 });
+        first = false;
+        let length = match size {
+            126 => {
+                let length = u16::from_be_bytes(bytes[..2].try_into().unwrap()) as usize;
+                bytes = &bytes[2..];
+                length
+            }
+            127 => {
+                let length = u64::from_be_bytes(bytes[..8].try_into().unwrap()) as usize;
+                bytes = &bytes[8..];
+                length
+            }
+            size => size as usize,
+        };
+        message.extend_from_slice(&bytes[..length]);
+        bytes = &bytes[length..];
+        if flags & 0x80 != 0 {
+            assert!(bytes.is_empty());
+            return message;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_requires_armed_session_token_and_canonical_connect_authority() {
+    let server = Server::new("plain").await;
+    let vault = Vault::new();
+    let proxy = SecretProxy::start_with_tls(
+        config(
+            vault.clone(),
+            server.address.port(),
+            &[("test", Location::Bearer)],
+        ),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    assert_eq!(client.command(json!({"op":"connect"}))["error"], true);
+    proxy.arm_command(client.process.id()).unwrap();
+    assert_eq!(
+        client.command(json!({"op":"connect","wrong_token":true}))["error"],
+        true
+    );
+    assert_eq!(
+        client.command(json!({"op":"connect","connect_host":"other.invalid"}))["error"],
+        true
+    );
+    client.connect(false);
+    assert_eq!(
+        client.request(
+            "/approved",
+            json!({"authorization":format!("Bearer {MARKER}")}),
+            ""
+        )["status"],
+        200
+    );
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn proxy_only_accepts_grants_for_the_exact_launch_scan() {
+    let vault = Vault::new();
+    let make = || config(vault.clone(), 443, &[("test", Location::Bearer)]);
+    let tls = rustls::ClientConfig::builder()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+    let mut cfg = make();
+    cfg.scanned_labels.clear();
+    assert_eq!(
+        SecretProxy::start_with_tls(cfg, tls.clone()).err(),
+        Some(ProxyError::InvalidRules)
+    );
+    let mut cfg = make();
+    cfg.scanned_labels.push("file-label".into());
+    assert_eq!(
+        SecretProxy::start_with_tls(cfg, tls.clone()).err(),
+        Some(ProxyError::InvalidRules)
+    );
+    let mut cfg = make();
+    cfg.grants[0].rule.location = Location::Header("Accept-Encoding".into());
+    assert_eq!(
+        SecretProxy::start_with_tls(cfg, tls).err(),
+        Some(ProxyError::InvalidRules)
+    );
 }
