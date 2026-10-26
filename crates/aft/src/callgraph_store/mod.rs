@@ -5258,6 +5258,14 @@ mod local_symbol_memo_tests {
             Some("other".into())
         );
         assert_eq!(index.local_symbols.borrow().builds, 2);
+        // A later cold-build window can reparse the same caller path.
+        index.local_symbols.borrow_mut().file = None;
+        assert_eq!(index.local_symbol("other.rs", &data, "other"), None);
+        assert_eq!(
+            index.local_symbol("other.rs", &data, "local"),
+            Some("local".into())
+        );
+        assert_eq!(index.local_symbols.borrow().builds, 3);
         eprintln!(
             "local symbol queries={} scan_ns_per_query={} memo_ns_per_query={} builds=1",
             queries.len(),
@@ -7625,6 +7633,10 @@ impl CallGraphStore {
                 missing.into_iter().collect(),
                 &extraction_memo,
             );
+
+            // A caller split across windows may have been reparsed. Its local
+            // name table must use this window's data, not an earlier parse.
+            index_memos.local_symbols.borrow_mut().file = None;
 
             self.verify_writer_lease()?;
             let total_changes_before = conn.total_changes();
