@@ -187,7 +187,7 @@ fn normalized_frame(frame: &Frame, temporary_root: &Path, tool: &str) -> Value {
         let rendered = regex::Regex::new(r"\bWaited \d+ms").unwrap();
         body = rendered.replace_all(&body, "Waited 0ms").into_owned();
     }
-    // Recompute only the byte length affected by replacing the temporary path.
+    // Recompute the body byte length after normalizing volatile values.
     let header = &frame.header;
     let normalized = Frame::build_with_version(
         header.ver,
