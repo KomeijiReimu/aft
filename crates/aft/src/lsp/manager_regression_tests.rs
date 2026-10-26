@@ -78,12 +78,15 @@ fn exiting_server_forgets_only_its_instance_state() {
     for key in [&exited, &live] {
         seed_instance_state(&mut manager, key, &file);
     }
-    manager.handle_event(&LspEvent::ServerExited {
-        server_kind: exited.kind.clone(),
-        root: exited.root.clone(),
-        pid: 4242,
-        reason: ServerExitReason::Eof,
-    });
+    let _ = manager.handle_event(
+        &LspEvent::ServerExited {
+            server_kind: exited.kind.clone(),
+            root: exited.root.clone(),
+            pid: 4242,
+            reason: ServerExitReason::Eof,
+        }
+        .into(),
+    );
     assert!(!manager.watched_file_skip_logged.contains(&exited));
     assert!(manager.watched_file_skip_logged.contains(&live));
     for cache in [
@@ -238,7 +241,7 @@ fn overflow_drift_scan_hashes_each_path_once_across_servers() {
 
 #[cfg(unix)]
 fn sleeping_rust_client(manager: &LspManager, root: &Path) -> LspClient {
-    LspClient::spawn(
+    LspClient::spawn_with_reclaim_root(
         ServerKind::Rust,
         root.to_path_buf(),
         Path::new("sh"),
@@ -246,6 +249,8 @@ fn sleeping_rust_client(manager: &LspManager, root: &Path) -> LspClient {
         &HashMap::new(),
         manager.event_sender_for_test(),
         manager.child_registry.clone(),
+        None,
+        false,
     )
     .unwrap()
 }
