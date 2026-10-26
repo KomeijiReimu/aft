@@ -1095,7 +1095,10 @@ fn v22_preparer_applies_the_additions_to_a_synthetic_v21_baseline() {
         let python = Command::new("python3")
             .args([
                 "-c",
-                "import json,sys; print(json.dumps(json.loads(sys.stdin.read()), indent=2, ensure_ascii=False))",
+                // Written as bytes: text-mode stdout turns "\n" into "\r\n" on
+                // Windows, and the preparer refuses a baseline whose formatting
+                // differs from its own.
+                "import json,sys; sys.stdout.buffer.write((json.dumps(json.loads(sys.stdin.read()), indent=2, ensure_ascii=False) + '\\n').encode('utf-8'))",
             ])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
