@@ -184,7 +184,7 @@ fn normalized_frame(frame: &Frame, temporary_root: &Path, tool: &str) -> Value {
         // A completed task still reports scheduler-dependent time spent observing it.
         let elapsed = regex::Regex::new(r#"("elapsed_ms":)\d+"#).unwrap();
         body = elapsed.replace_all(&body, "${1}0").into_owned();
-        let rendered = regex::Regex::new(r"\bWaited \d+ms").unwrap();
+        let rendered = regex::Regex::new(r"Waited \d+ms").unwrap();
         body = rendered.replace_all(&body, "Waited 0ms").into_owned();
     }
     // Recompute the body byte length after normalizing volatile values.
@@ -240,8 +240,7 @@ async fn run_case(case: &Case) -> Value {
 
 #[test]
 fn carrier_sample_normalization_is_narrow() {
-    let body =
-        r#"{"started_at":17,"duration_ms":12,"waited":{"elapsed_ms":9},"text":"Waited 9ms"}"#;
+    let body = r#"{"started_at":17,"duration_ms":12,"waited":{"elapsed_ms":9},"text":"status\nWaited 9ms\n"}"#;
     let frame = Frame::build(
         FrameType::Response,
         control_flags(),
@@ -254,12 +253,12 @@ fn carrier_sample_normalization_is_narrow() {
     let watch = normalized_frame(&frame, Path::new("/unused-fixture-root"), "bash_watch");
     assert_eq!(
         watch["body_utf8"],
-        r#"{"started_at":0,"duration_ms":12,"waited":{"elapsed_ms":0},"text":"Waited 0ms"}"#
+        r#"{"started_at":0,"duration_ms":12,"waited":{"elapsed_ms":0},"text":"status\nWaited 0ms\n"}"#
     );
     let status = normalized_frame(&frame, Path::new("/unused-fixture-root"), "bash_status");
     assert_eq!(
         status["body_utf8"],
-        r#"{"started_at":0,"duration_ms":12,"waited":{"elapsed_ms":9},"text":"Waited 9ms"}"#
+        r#"{"started_at":0,"duration_ms":12,"waited":{"elapsed_ms":9},"text":"status\nWaited 9ms\n"}"#
     );
 }
 

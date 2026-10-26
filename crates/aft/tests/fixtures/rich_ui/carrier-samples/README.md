@@ -1,4 +1,4 @@
-# Phone carrier read-gate wire samples (CKIOS)
+# Phone carrier read-gate wire samples
 
 Captured from main commit **9782a74b254bdfbeeb0c7e09909b8d888609ffb1**
 using the production handlers and route admission code at that commit. The
