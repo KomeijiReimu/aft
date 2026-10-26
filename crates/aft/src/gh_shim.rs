@@ -163,10 +163,8 @@ const V22_STACK_WRITE_TUPLES: &[&str] = &[
     "stack checkout",
 ];
 /// Refusal for a `gh stack` subcommand that would write as the operator.
-/// `{tuple}` is replaced with the verb.
-/// Placeholder wording, marked PLACEHOLDER in the text itself; replace it with
-/// the approved refusal message before a signed v22 manifest ships.
-const STACK_WRITE_REFUSAL_TEXT: &str = "PLACEHOLDER(stack-write): `{tuple}` would write to GitHub as the operator: the gh-stack extension calls the GitHub API with the operator's gh login, not the bot's. As the bot: push the branch with git, open each pull request with `gh pr create --base <parent branch>`, then build the stack with `gh api -X POST repos/<owner>/<repo>/stacks --input <file with {\"pull_requests\":[...]}>` (append with `.../stacks/<number>/add`, dissolve with `.../stacks/<number>/unstack`). To run it as the operator instead, re-run with GH_SHIM_BYPASS=operator; the shim records an operator-attributed audit line.";
+/// `{command}` is replaced with the command, such as `stack submit`.
+const STACK_WRITE_REFUSAL_TEXT: &str = r#"`{command}` is refused: the gh-stack extension writes to GitHub with the operator's login, not the bot's. To do it as the bot: push the branch with git, open each pull request with `gh pr create --base <parent branch>`, then create the stack with `gh api -X POST repos/<owner>/<repo>/stacks --input <file>`, where the file holds `{"pull_requests": [...]}`. Add to a stack with `.../stacks/<number>/add` and dissolve it with `.../stacks/<number>/unstack`. To run it as the operator instead, re-run with GH_SHIM_BYPASS=operator; the shim records that in its audit log."#;
 /// The stack REST endpoints admitted as bot speech, and the asynchronous merge
 /// endpoint kept as operator administration like `pr merge`.
 const STACK_CREATE_PATH_GLOB: &str = "/repos/*/*/stacks";
@@ -203,13 +201,10 @@ const PULL_PATCH_FIELDS: &[&str] = &["title", "body", "base"];
 /// route refuses them by name rather than as unknown flags.
 const PR_EDIT_LABEL_FLAGS: &[&str] = &["--add-label", "--remove-label"];
 /// Refusal for a governed `pr edit` that also changes labels.
-/// Placeholder wording, marked PLACEHOLDER in the text itself; replace it with
-/// the approved refusal message before a signed v22 manifest ships.
-const PR_EDIT_LABEL_REFUSAL_TEXT: &str = "PLACEHOLDER(pr-edit-labels): a bot `pr edit` changes only the title and body of a pull request the bot opened; label changes run as the operator's label-only row (GH_SHIM_BYPASS=operator, labels and nothing else)";
-/// Refusal for any other `gh pr edit` flag on the governed route.
-/// Placeholder wording, marked PLACEHOLDER in the text itself; replace it with
-/// the approved refusal message before a signed v22 manifest ships.
-const PR_EDIT_FLAG_REFUSAL_TEXT: &str = "PLACEHOLDER(pr-edit-flags): a bot `pr edit` admits only --title/-t, --body/-b, --body-file/-F and --repo";
+const PR_EDIT_LABEL_REFUSAL_TEXT: &str = r#"`pr edit` as the bot changes only the title and body of a pull request the bot opened. Label changes run as the operator: re-run with GH_SHIM_BYPASS=operator (labels only)."#;
+/// Refusal for any other `gh pr edit` flag on the governed route. `{flag}` is
+/// replaced with the refused flag as the caller spelled it.
+const PR_EDIT_FLAG_REFUSAL_TEXT: &str = r#"`{flag}`: `pr edit` as the bot accepts only --title/-t, --body/-b, --body-file/-F and --repo."#;
 /// The body fields the `pr create` reader produces, in the order the manifest
 /// declares them. The reader is purpose-built for this list, so a signed
 /// declaration naming any other list is refused rather than half-honoured.
@@ -1216,7 +1211,7 @@ where
 /// bot and name the route that can; every other verb gets the generic text.
 fn admin_tier_refusal_text(tuple: &str) -> String {
     if V22_STACK_WRITE_TUPLES.contains(&tuple) {
-        return STACK_WRITE_REFUSAL_TEXT.replace("{tuple}", tuple);
+        return STACK_WRITE_REFUSAL_TEXT.replace("{command}", tuple);
     }
     admin_refusal_text(tuple)
 }

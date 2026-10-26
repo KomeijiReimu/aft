@@ -106,7 +106,7 @@ pub(super) fn canonicalize_pr_edit_from<R: Read>(
         if value.starts_with('-') {
             return Err(CanonicalizeError::typed(
                 RefusalCode::UnsupportedFlag,
-                format!("{value}: {PR_EDIT_FLAG_REFUSAL_TEXT}"),
+                PR_EDIT_FLAG_REFUSAL_TEXT.replace("{flag}", value),
             ));
         }
         positional.push(value.to_string());

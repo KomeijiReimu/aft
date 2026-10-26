@@ -116,6 +116,13 @@ impl Drop for EnvGuard {
 const RESOLVE_LITERAL: &str = r#"mutation { resolveReviewThread(input: {threadId: "PRRT_kwDOAbc123"}) { thread { isResolved } } }"#;
 const UNRESOLVE_VARIABLE: &str = r#"mutation($id: ID!) { unresolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }"#;
 
+/// The refusal texts as approved (operator review, 2026-10-26), copied here
+/// from the approval rather than from the production constants, so a change
+/// to either side fails these tests.
+const APPROVED_STACK_WRITE_REFUSAL: &str = r#"`{command}` is refused: the gh-stack extension writes to GitHub with the operator's login, not the bot's. To do it as the bot: push the branch with git, open each pull request with `gh pr create --base <parent branch>`, then create the stack with `gh api -X POST repos/<owner>/<repo>/stacks --input <file>`, where the file holds `{"pull_requests": [...]}`. Add to a stack with `.../stacks/<number>/add` and dissolve it with `.../stacks/<number>/unstack`. To run it as the operator instead, re-run with GH_SHIM_BYPASS=operator; the shim records that in its audit log."#;
+const APPROVED_PR_EDIT_LABEL_REFUSAL: &str = r#"`pr edit` as the bot changes only the title and body of a pull request the bot opened. Label changes run as the operator: re-run with GH_SHIM_BYPASS=operator (labels only)."#;
+const APPROVED_PR_EDIT_FLAG_REFUSAL: &str = r#"`{flag}`: `pr edit` as the bot accepts only --title/-t, --body/-b, --body-file/-F and --repo."#;
+
 fn governed_tuple(classification: Classification) -> Option<String> {
     match classification {
         Classification::Governed { tuple, .. } => Some(tuple),
@@ -540,12 +547,22 @@ fn v22_pr_edit_routes_title_and_body_as_own_pull_request_speech() {
     };
     let label = refused(&["pr", "edit", "7", "--add-label", "bug", "--title", "x"]);
     assert_eq!(label.code, RefusalCode::UnsupportedFlag);
-    assert_eq!(label.text, PR_EDIT_LABEL_REFUSAL_TEXT);
+    assert_eq!(label.text, APPROVED_PR_EDIT_LABEL_REFUSAL);
     for flag in ["--base", "--add-reviewer", "--milestone", "--add-assignee"] {
         let error = refused(&["pr", "edit", "7", "--title", "x", flag, "value"]);
         assert_eq!(error.code, RefusalCode::UnsupportedFlag, "{flag}");
-        assert!(error.text.contains(PR_EDIT_FLAG_REFUSAL_TEXT), "{flag}");
+        assert_eq!(
+            error.text,
+            APPROVED_PR_EDIT_FLAG_REFUSAL.replace("{flag}", flag),
+            "{flag}"
+        );
     }
+    // One rendering spelled out in full, so a substitution bug cannot hide
+    // behind the same template on both sides.
+    assert_eq!(
+        refused(&["pr", "edit", "7", "--title", "x", "--base", "main"]).text,
+        r#"`--base`: `pr edit` as the bot accepts only --title/-t, --body/-b, --body-file/-F and --repo."#
+    );
     // A title-less, body-less edit and an edit naming no pull request are not
     // guessed at.
     assert!(refused(&["pr", "edit", "7"])
@@ -978,9 +995,10 @@ fn v22_operator_rows_refuse_without_the_bypass_and_audit_with_it() {
             assert!(!paths.bypass_audit.exists());
             let text = admin_tier_refusal_text(tuple);
             if tuple.starts_with("stack ") && tuple != "stack merge" {
-                assert!(text.starts_with("PLACEHOLDER(stack-write): "), "{text}");
-                assert!(text.contains(&format!("`{tuple}`")));
-                assert!(text.contains("gh pr create --base"));
+                assert_eq!(
+                    text,
+                    APPROVED_STACK_WRITE_REFUSAL.replace("{command}", tuple)
+                );
             } else {
                 assert_eq!(text, admin_refusal_text(tuple));
             }
@@ -1006,6 +1024,19 @@ fn v22_operator_rows_refuse_without_the_bypass_and_audit_with_it() {
             73
         );
     }
+}
+
+#[test]
+fn v22_stack_write_refusal_renders_the_approved_text() {
+    assert_eq!(
+        admin_tier_refusal_text("stack submit"),
+        r#"`stack submit` is refused: the gh-stack extension writes to GitHub with the operator's login, not the bot's. To do it as the bot: push the branch with git, open each pull request with `gh pr create --base <parent branch>`, then create the stack with `gh api -X POST repos/<owner>/<repo>/stacks --input <file>`, where the file holds `{"pull_requests": [...]}`. Add to a stack with `.../stacks/<number>/add` and dissolve it with `.../stacks/<number>/unstack`. To run it as the operator instead, re-run with GH_SHIM_BYPASS=operator; the shim records that in its audit log."#
+    );
+    // `stack merge` is plain administration and keeps the generic text.
+    assert_eq!(
+        admin_tier_refusal_text("stack merge"),
+        admin_refusal_text("stack merge")
+    );
 }
 
 #[test]
