@@ -394,40 +394,132 @@ fn item6_an_approved_target_for_an_evil_connect_is_not_authorized() {
 
 // --- item 15: known-answer tests for the independent detectors --------------
 
+/// One detector known answer: a name, a key and an output that spells it.
+fn case<'a>(name: &'a str, key: &'a [u8], output: &'a [u8]) -> (&'a str, &'a [u8], &'a [u8]) {
+    (name, key, output)
+}
+
 #[test]
 fn item15_each_decoder_has_known_answers() {
-    // URL-safe base64 of sixteen 0xff bytes uses `_` in its alphabet; the
-    // standard one uses `/` and `+`.
-    let bytes_of_ff = [0xffu8; 16];
-    let standard = secret_rules::scrub::base64_encode(
-        &bytes_of_ff,
-        secret_rules::scrub::base64_standard(),
-        false,
-    );
-    let url_safe = secret_rules::scrub::base64_encode(
-        &bytes_of_ff,
-        secret_rules::scrub::base64_url_safe(),
-        false,
-    );
-    for encoded in [standard, url_safe] {
-        let text = String::from_utf8_lossy(&encoded).into_owned();
+    // Every expected encoding below is written out by hand, never produced by
+    // the crate's own encoders, so a shared encoder bug cannot hide here.
+    let all_ff = [0xffu8; 16];
+    // 0xfb 0xef 0xbe encodes to `++++` (standard) and `----` (URL-safe).
+    let mut all_plus = [0xfb, 0xef, 0xbe].repeat(5);
+    all_plus.push(0xfb);
+    let positives = vec![
+        case("base64 standard /", &all_ff, b"/////////////////////w"),
+        case("base64 url-safe _", &all_ff, b"_____________________w"),
+        case("base64 standard +", &all_plus, b"+++++++++++++++++++++w"),
+        case("base64 url-safe -", &all_plus, b"---------------------w"),
+        case(
+            "json \\uXXXX",
+            b"0123456789abcdef",
+            br"\u0030\u0031\u0032\u0033\u0034\u0035\u0036\u0037\u0038\u0039\u0061\u0062\u0063\u0064\u0065\u0066",
+        ),
+        case("json \\t", b"aaa\tbbbbccccdddd", br"aaa\tbbbbccccdddd"),
+        case(
+            "json control escapes",
+            b"ab\ncd\ref\x08gh\x0cij\tkl",
+            br"ab\ncd\ref\bgh\fij\tkl",
+        ),
+        case(
+            "json surrogate pairs",
+            "\u{1F600}\u{1F600}\u{1F600}\u{1F600}".as_bytes(),
+            br"\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00",
+        ),
+        case(
+            "json surrogate pairs, upper case",
+            "\u{1F600}\u{1F600}\u{1F600}\u{1F600}".as_bytes(),
+            br"\uD83D\uDE00\uD83D\uDE00\uD83D\uDE00\uD83D\uDE00",
+        ),
+        // Form: `+` is a space and `%2B` a plus, decoded in that order.
+        case("form plus and percent", b"my key/with+plus", b"my+key%2Fwith%2Bplus"),
+    ];
+    for (name, key, output) in positives {
+        assert!(support::discloses(key, output), "detector missed {name}");
+    }
+    let negatives = vec![
+        case("other base64 key", &all_plus, b"/////////////////////w"),
+        case("escaped backslash, not a tab", b"aaa\tbbbbccccdddd", br"aaa\\tbbbbccccdddd"),
+        case(
+            "lone high surrogates",
+            "\u{1F600}\u{1F600}\u{1F600}\u{1F600}".as_bytes(),
+            br"\ud83d\ud83d\ud83d\ud83d",
+        ),
+        case(
+            "surrogates in the wrong order",
+            "\u{1F600}\u{1F600}\u{1F600}\u{1F600}".as_bytes(),
+            br"\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d",
+        ),
+        // A literal `+` in the key is `%2B` in a form; a bare `+` is a space.
+        case("form plus is a space", b"my key/with+plus", b"my+key/with+plus"),
+        case("form with a wrong byte", b"my key/with+plus", b"my+key%2Fwith%2Bpluz"),
+    ];
+    for (name, key, output) in negatives {
         assert!(
-            support::discloses(&bytes_of_ff, text.as_bytes()),
-            "detector missed base64 form {text}"
+            !support::discloses(key, output),
+            "detector reported {name} as a leak"
         );
     }
-    // JSON unicode escapes and a form `+` for space.
-    let key: &[u8] = b"a b-cd-ef-gh-ijkl";
-    let escaped: String = key.iter().map(|byte| format!("\\u{:04x}", byte)).collect();
-    assert!(
-        support::discloses(key, escaped.as_bytes()),
-        "unicode escapes"
-    );
-    let plus_form: Vec<u8> = key
-        .iter()
-        .map(|byte| if *byte == b' ' { b'+' } else { *byte })
-        .collect();
-    assert!(support::discloses(key, &plus_form), "form plus");
+}
+
+// --- item 3: JSON surrogate pairs in the production scrubber ---------------
+
+/// Four U+1F600 characters: sixteen UTF-8 bytes, an admissible key.
+const EMOJI_KEY: &str = "\u{1F600}\u{1F600}\u{1F600}\u{1F600}";
+
+/// Scrub `input` in the given chunks with one `x` matcher for `key`.
+fn scrub_chunks(key: &[u8], chunks: &[&[u8]]) -> Vec<u8> {
+    let mut scrubber =
+        secret_rules::Scrubber::new(vec![secret_rules::MatcherSet::new("x", key).unwrap()]);
+    let mut out = Vec::new();
+    for chunk in chunks {
+        out.extend_from_slice(&scrubber.push(chunk));
+    }
+    out.extend_from_slice(&scrubber.finish());
+    out
+}
+
+#[test]
+fn item3_surrogate_pair_escaped_key_is_scrubbed_whole_split_and_byte_at_a_time() {
+    let key = EMOJI_KEY.as_bytes();
+    for spelled in [
+        r"\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00",
+        r"\uD83D\uDE00\uD83D\uDE00\uD83D\uDE00\uD83D\uDE00",
+    ] {
+        let body = format!("{{\"k\":\"{spelled}\"}}");
+        let expected = "{\"k\":\"{{ck-secret:x}}\"}";
+        let whole = scrub_bytes(key, "x", body.as_bytes()).unwrap();
+        assert_eq!(String::from_utf8_lossy(&whole), expected, "whole buffer");
+        let bytes = body.as_bytes();
+        for split in 0..=bytes.len() {
+            let out = scrub_chunks(key, &[&bytes[..split], &bytes[split..]]);
+            assert_eq!(
+                String::from_utf8_lossy(&out),
+                expected,
+                "split at {split}"
+            );
+        }
+        let singles: Vec<&[u8]> = bytes.chunks(1).collect();
+        let out = scrub_chunks(key, &singles);
+        assert_eq!(String::from_utf8_lossy(&out), expected, "byte at a time");
+    }
+}
+
+#[test]
+fn item3_lone_surrogates_are_not_the_key() {
+    // Not valid JSON for the key, so the text passes through unchanged.
+    let body = r"\ud83d\ud83d\ud83d\ud83d\ude00";
+    let out = scrub_bytes(EMOJI_KEY.as_bytes(), "x", body.as_bytes()).unwrap();
+    assert_eq!(out, body.as_bytes());
+}
+
+#[test]
+fn item3_json_control_escapes_in_a_key_are_scrubbed() {
+    let key: &[u8] = b"ab\ncd\ref\x08gh\x0cij\tkl";
+    let out = scrub_bytes(key, "x", br#"["ab\ncd\ref\bgh\fij\tkl"]"#).unwrap();
+    assert_eq!(String::from_utf8_lossy(&out), r#"["{{ck-secret:x}}"]"#);
 }
 
 // --- H2: a replacement may not disclose an installed key -------------------

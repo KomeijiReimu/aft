@@ -114,8 +114,8 @@ pub fn discloses(key: &[u8], output: &[u8]) -> bool {
     if key.is_empty() {
         return false;
     }
-    // JSON \uXXXX escapes and form `+` stand for key bytes as much as the
-    // percent family does, so both are decoded before the comparison.
+    // JSON escapes and form `+` stand for key bytes as much as the percent
+    // family does, so both are decoded before the comparison.
     for variant in [
         json_unescape(&String::from_utf8_lossy(output)),
         form_unescape(&String::from_utf8_lossy(output)),
@@ -161,31 +161,70 @@ pub fn discloses(key: &[u8], output: &[u8]) -> bool {
     false
 }
 
-/// Decode `\uXXXX` escapes so an escaped key compares like a plain one.
+/// Decode JSON string-content escapes so an escaped key compares like a plain
+/// one: `\" \\ \/ \b \f \n \r \t`, `\uXXXX`, and a `\uXXXX\uXXXX`
+/// surrogate pair as the one character it spells. An escape that is not valid
+/// JSON (a lone surrogate, an unknown letter) is kept as written.
 fn json_unescape(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find("\\u") {
-        out.push_str(&rest[..at]);
-        let tail = &rest[at + 2..];
-        match tail
-            .get(..4)
-            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
-        {
-            Some(code) => {
-                if let Some(ch) = char::from_u32(code) {
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] != '\\' || index + 1 >= chars.len() {
+            out.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        let simple = match chars[index + 1] {
+            '"' => Some('"'),
+            '\\' => Some('\\'),
+            '/' => Some('/'),
+            'b' => Some('\u{8}'),
+            'f' => Some('\u{c}'),
+            'n' => Some('\n'),
+            'r' => Some('\r'),
+            't' => Some('\t'),
+            _ => None,
+        };
+        if let Some(ch) = simple {
+            out.push(ch);
+            index += 2;
+            continue;
+        }
+        if chars[index + 1] == 'u' {
+            if let Some(unit) = utf16_unit_at(&chars, index + 2) {
+                if (0xD800..0xDC00).contains(&unit) {
+                    let low = (chars.get(index + 6) == Some(&'\\')
+                        && chars.get(index + 7) == Some(&'u'))
+                    .then(|| utf16_unit_at(&chars, index + 8))
+                    .flatten()
+                    .filter(|low| (0xDC00..0xE000).contains(low));
+                    if let Some(ch) =
+                        low.and_then(|low| char::from_u32(0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00)))
+                    {
+                        out.push(ch);
+                        index += 12;
+                        continue;
+                    }
+                } else if let Some(ch) = char::from_u32(unit) {
                     out.push(ch);
+                    index += 6;
+                    continue;
                 }
-                rest = &tail[4..];
-            }
-            None => {
-                out.push_str("\\u");
-                rest = tail;
             }
         }
+        out.push('\\');
+        index += 1;
     }
-    out.push_str(rest);
     out
+}
+
+/// Four hex digits starting at `at`, as a UTF-16 code unit.
+fn utf16_unit_at(chars: &[char], at: usize) -> Option<u32> {
+    chars
+        .get(at..at + 4)?
+        .iter()
+        .try_fold(0u32, |value, ch| ch.to_digit(16).map(|digit| value * 16 + digit))
 }
 
 /// Decode form `+` to a space, then percent escapes.

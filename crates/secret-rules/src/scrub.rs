@@ -45,7 +45,8 @@ pub(crate) enum Family {
     Percent,
     /// `+`-for-space form encoding around a key that contains a space.
     Form,
-    /// A JSON string body with `\/`, `\"`, `\\` and `\uXXXX` escapes.
+    /// A JSON string body: `\/`, `\"`, `\\`, the control escapes
+    /// (`\b \f \n \r \t`), `\uXXXX`, and `\uXXXX\uXXXX` surrogate pairs.
     Json,
     /// Hex digits in any case.
     Hex,
@@ -307,117 +308,136 @@ impl MatcherSet {
     }
 
     /// Every span of `window` that holds this matcher's key, sorted by start
-    /// and free of overlaps.
-    ///
-    /// The spans index the input only; the replacement text is never part of
-    /// the window, so the caller applies them to a copy of the original bytes
-    /// without ever rescanning generated text. The scan is one pass: base64
-    /// tokens are decoded once each, and every other byte is tried once.
+    /// and free of overlaps. See [`find_key_spans`].
     fn find_spans(&self, window: &[u8]) -> Vec<(usize, usize)> {
-        let tokens = self.find_base64_spans(window);
-        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(tokens.len());
-        let mut next_token = 0;
-        let mut index = 0;
-        while index < window.len() {
-            // A base64 token that decodes to the key is replaced whole, and its
-            // bytes are not tried again one by one.
-            if let Some(&(start, end)) = tokens.get(next_token) {
-                if start <= index {
-                    push_merged(&mut spans, (start, end));
-                    next_token += 1;
-                    index = index.max(end);
-                    continue;
-                }
-            }
-            // Cheap pre-filter: every family's match starts with an escape
-            // introducer (`%`, `\`), a base64 or hex character or the key's
-            // own first byte.
-            if !self.can_start_match(window[index]) {
-                index += 1;
+        find_key_spans(window, self.key(), &self.patterns.patterns)
+    }
+}
+
+/// Every span of `window` that spells `key`, sorted by start and free of
+/// overlaps.
+///
+/// A span is a literal spelling from `literals`, a `%XX`, form, JSON-escaped
+/// or hex run that decodes to the key, or a whole base64 token that decodes to
+/// a text containing the key. The scrubber, the audit record's key check and
+/// the replacement collision check all use this one search, so a spelling one
+/// of them recognises is recognised by all three.
+///
+/// The spans index the input only; a caller applies them to a copy of the
+/// original bytes and never rescans generated text. The scan is one pass:
+/// base64 tokens are decoded once each, and every other byte is tried once.
+pub(crate) fn find_key_spans(
+    window: &[u8],
+    key: &[u8],
+    literals: &[Zeroizing<Vec<u8>>],
+) -> Vec<(usize, usize)> {
+    if key.is_empty() {
+        return Vec::new();
+    }
+    let tokens = find_base64_spans(window, key);
+    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(tokens.len());
+    let mut next_token = 0;
+    let mut index = 0;
+    while index < window.len() {
+        // A base64 token that decodes to the key is replaced whole, and its
+        // bytes are not tried again one by one.
+        if let Some(&(start, end)) = tokens.get(next_token) {
+            if start <= index {
+                push_merged(&mut spans, (start, end));
+                next_token += 1;
+                index = index.max(end);
                 continue;
             }
-            match self.try_match_at(window, index) {
-                Some((end, _family)) => {
-                    push_merged(&mut spans, (index, end));
-                    index = end;
-                }
-                None => index += 1,
+        }
+        // Cheap pre-filter: every family's match starts with an escape
+        // introducer (`%`, `\`), a base64 or hex character (which includes
+        // form's `+`) or the key's own first byte.
+        if !can_start_match(key, window[index]) {
+            index += 1;
+            continue;
+        }
+        match try_match_at(window, index, key, literals) {
+            Some((end, _family)) => {
+                push_merged(&mut spans, (index, end));
+                index = end;
             }
+            None => index += 1,
         }
-        // A match can end past the start of the last tokens; they still count.
-        for &(start, end) in tokens.get(next_token..).unwrap_or_default() {
-            push_merged(&mut spans, (start, end));
-        }
-        spans
     }
+    // A match can end past the start of the last tokens; they still count.
+    for &(start, end) in tokens.get(next_token..).unwrap_or_default() {
+        push_merged(&mut spans, (start, end));
+    }
+    spans
+}
 
-    /// True when one representation of the key can begin with `byte`.
-    fn can_start_match(&self, byte: u8) -> bool {
-        byte == b'%'
-            || byte == b'\\'
-            || is_base64_byte(byte)
-            || self.key().first().is_some_and(|first| *first == byte)
-    }
+/// True when one representation of `key` can begin with `byte`.
+fn can_start_match(key: &[u8], byte: u8) -> bool {
+    byte == b'%'
+        || byte == b'\\'
+        || is_base64_byte(byte)
+        || key.first().is_some_and(|first| *first == byte)
+}
 
-    /// Every base64 token in `window` that decodes to the key, once per token.
-    ///
-    /// A token is the maximal run of base64 characters around the key. Decoding
-    /// it once per alignment and replacing it whole keeps the work linear in the
-    /// window, and covers the token's edge bytes too.
-    fn find_base64_spans(&self, window: &[u8]) -> Vec<(usize, usize)> {
-        let mut spans = Vec::new();
-        let mut index = 0;
-        while index < window.len() {
-            if !is_base64_byte(window[index]) {
-                index += 1;
-                continue;
-            }
-            let start = index;
-            while index < window.len() && is_base64_byte(window[index]) {
-                index += 1;
-            }
-            let run = &window[start..index];
-            // A key may begin inside the token; every offset of the token is a
-            // possible alignment, and `base64_run_contains` tries four of them
-            // per start, so test the whole token once.
-            if base64_run_contains(run, self.key()) {
-                spans.push((start, index));
-            }
+/// Every base64 token in `window` that decodes to text containing `key`, once
+/// per token.
+///
+/// A token is the maximal run of base64 characters around the key. Decoding
+/// it once per alignment and replacing it whole keeps the work linear in the
+/// window, and covers the token's edge bytes too.
+fn find_base64_spans(window: &[u8], key: &[u8]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut index = 0;
+    while index < window.len() {
+        if !is_base64_byte(window[index]) {
+            index += 1;
+            continue;
         }
-        spans
+        let start = index;
+        while index < window.len() && is_base64_byte(window[index]) {
+            index += 1;
+        }
+        if base64_run_contains(&window[start..index], key) {
+            spans.push((start, index));
+        }
     }
+    spans
+}
 
-    /// The end of a key representation starting at `index`, if one starts
-    /// there.
-    fn try_match_at(&self, window: &[u8], index: usize) -> Option<(usize, Family)> {
-        let key = self.key();
-        // Base64 is handled by `find_base64_spans` over whole tokens, before
-        // this per-byte pass: a literal spelling of part of the key is a prefix
-        // of the token that contains the whole key, and replacing the token
-        // covers the key's edge bytes as well.
-        // Literal spellings next: they are exact and cheapest.
-        for pattern in self.patterns() {
-            if window.len() >= index + pattern.len()
-                && &window[index..index + pattern.len()] == pattern
-            {
-                return Some((index + pattern.len(), Family::Raw));
-            }
+/// The end of a representation of `key` starting at `index`, if one starts
+/// there.
+///
+/// Base64 is handled by [`find_base64_spans`] over whole tokens, before this
+/// per-byte pass: a literal spelling of part of the key is a prefix of the
+/// token that contains the whole key, and replacing the token covers the key's
+/// edge bytes as well.
+fn try_match_at(
+    window: &[u8],
+    index: usize,
+    key: &[u8],
+    literals: &[Zeroizing<Vec<u8>>],
+) -> Option<(usize, Family)> {
+    // Literal spellings first: they are exact and cheapest.
+    for pattern in literals {
+        if window.get(index..index + pattern.len()) == Some(pattern.as_slice()) {
+            return Some((index + pattern.len(), Family::Raw));
         }
-        // Then the decoded escape families.
-        if let Some(end) = match_percent(window, index, key) {
-            return Some((end, Family::Percent));
-        }
-        if let Some(end) = match_form(window, index, key) {
-            return Some((end, Family::Form));
-        }
-        if let Some(end) = match_json(window, index, key) {
-            return Some((end, Family::Json));
-        }
-        if let Some(end) = match_hex(window, index, key) {
-            return Some((end, Family::Hex));
-        }
-        None
     }
+    // Then the decoded escape families. Percent decoding with no escape in
+    // the run is a plain byte comparison, so it also finds the raw key.
+    if let Some(end) = match_percent(window, index, key) {
+        return Some((end, Family::Percent));
+    }
+    if let Some(end) = match_form(window, index, key) {
+        return Some((end, Family::Form));
+    }
+    if let Some(end) = match_json(window, index, key) {
+        return Some((end, Family::Json));
+    }
+    if let Some(end) = match_hex(window, index, key) {
+        return Some((end, Family::Hex));
+    }
+    None
 }
 
 /// Append `span` to `spans`, which are sorted by start, merging it with the
@@ -522,7 +542,9 @@ fn match_hex(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
 /// and per alphabet. That keeps a long base64 body linear: four alignments of
 /// one pass each, instead of a fresh decode from every byte.
 fn base64_run_contains(run: &[u8], key: &[u8]) -> bool {
-    if run.len() < key.len() + 4 {
+    // Each character carries six bits; a run too short to hold the key's
+    // bits cannot contain it.
+    if run.len() * 6 / 8 < key.len() {
         return false;
     }
     // The key can start at any character, but always within the first three
@@ -575,6 +597,7 @@ fn is_base64_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'-' | b'_' | b'=')
 }
 
+/// One escaped byte of the percent family at `index`.
 fn decode_percent(window: &[u8], index: usize) -> Option<(u8, usize)> {
     let high = window
         .get(index + 1)
@@ -590,129 +613,50 @@ fn decode_percent(window: &[u8], index: usize) -> Option<(u8, usize)> {
     }
 }
 
-/// One escaped byte of the JSON/percent family at `index`.
-///
-/// The families differ only in which sequences are escapes, so one decoder
-/// serves both the streaming matcher and the audit record's key check.
-fn decode_either(text: &[u8], index: usize) -> Option<(u8, usize)> {
-    let byte = *text.get(index)?;
-    if byte == b'%' {
-        return decode_percent(text, index);
-    }
-    if byte != b'\\' {
-        return None;
-    }
-    match *text.get(index + 1)? {
-        b'u' => {
-            let hex = std::str::from_utf8(text.get(index + 2..index + 6)?).ok()?;
-            let code = u32::from_str_radix(hex, 16).ok()?;
-            let ch = char::from_u32(code)?;
-            let mut buf = [0u8; 4];
-            let encoded = ch.encode_utf8(&mut buf);
-            if encoded.len() == 1 {
-                Some((encoded.as_bytes()[0], 6))
-            } else {
-                // A multi-byte character is not one key byte; refuse so the
-                // caller treats the text as literal.
-                None
-            }
-        }
-        b'"' => Some((b'"', 2)),
-        b'/' => Some((b'/', 2)),
-        b'\\' => Some((b'\\', 2)),
-        b'b' => Some((0x08, 2)),
-        b'f' => Some((0x0c, 2)),
-        b'n' => Some((b'\n', 2)),
-        b'r' => Some((b'\r', 2)),
-        b't' => Some((b'\t', 2)),
-        _ => None,
-    }
-}
-
-/// True when decoding `text` anywhere yields the key.
+/// True when `text` holds `key` in any spelling the scrubber decodes: raw,
+/// `%XX`, form `+`, JSON escapes (including surrogate pairs), hex at any
+/// offset, or base64 in either alphabet at any alignment inside a token.
 pub(crate) fn text_decodes_to_key(text: &str, key: &[u8]) -> bool {
-    if key.is_empty() {
-        return false;
-    }
-    // Hex, in either case, contiguous.
-    let bytes = text.as_bytes();
-    let mut candidate = Zeroizing::new(Vec::with_capacity(key.len()));
-    for (index, byte) in bytes.iter().enumerate() {
-        if let Some(value) = crate::placeholder::hex_value(*byte) {
-            if index % 2 == 0 {
-                candidate.push(value << 4);
-            } else {
-                if let Some(last) = candidate.last_mut() {
-                    *last |= value;
-                }
-                if candidate.len() == key.len() && candidate.as_slice() == key {
-                    return true;
-                }
-                if candidate.len() >= key.len() {
-                    candidate.clear();
-                }
-            }
-        } else {
-            candidate.clear();
-        }
-    }
-    for start in 0..bytes.len() {
-        let mut cursor = start;
-        let mut decoded = Zeroizing::new(Vec::with_capacity(key.len()));
-        while cursor < bytes.len() && decoded.len() < key.len() {
-            match decode_either(bytes, cursor) {
-                Some((value, len)) => {
-                    decoded.push(value);
-                    cursor += len;
-                }
-                None => {
-                    decoded.push(bytes[cursor]);
-                    cursor += 1;
-                }
-            }
-        }
-        if decoded.as_slice() == key {
-            return true;
-        }
-    }
-    false
+    !find_key_spans(text.as_bytes(), key, &[]).is_empty()
 }
 
-/// Replace every decoded spelling of `key` in `text` with `replacement`.
+/// Replace every spelling of `key` that [`text_decodes_to_key`] finds in
+/// `text` with `replacement`.
 pub(crate) fn scrub_encodings(text: &str, key: &[u8], replacement: &str) -> String {
-    if key.is_empty() {
+    let bytes = text.as_bytes();
+    let spans = find_key_spans(bytes, key, &[]);
+    if spans.is_empty() {
         return text.to_string();
     }
-    let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
+    let mut out = Vec::with_capacity(bytes.len());
     let mut cursor = 0;
-    while cursor < bytes.len() {
-        let mut probe = cursor;
-        let mut decoded = Zeroizing::new(Vec::with_capacity(key.len()));
-        while probe < bytes.len() && decoded.len() < key.len() {
-            match decode_either(bytes, probe) {
-                Some((value, len)) => {
-                    decoded.push(value);
-                    probe += len;
-                }
-                None => {
-                    decoded.push(bytes[probe]);
-                    probe += 1;
-                }
-            }
-        }
-        if decoded.as_slice() == key {
-            out.push_str(replacement);
-            cursor = probe;
-            continue;
-        }
-        let ch = text[cursor..].chars().next().unwrap_or_default();
-        out.push(ch);
-        cursor += ch.len_utf8();
+    for (start, end) in spans {
+        out.extend_from_slice(&bytes[cursor..start]);
+        out.extend_from_slice(replacement.as_bytes());
+        cursor = end;
     }
-    out
+    out.extend_from_slice(&bytes[cursor..]);
+    // A key of arbitrary bytes can start inside a multi-byte character; the
+    // cut half is not text and is written as U+FFFD.
+    String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Four hex digits at `at`, as a UTF-16 code unit.
+fn hex4(window: &[u8], at: usize) -> Option<u32> {
+    let digits = window.get(at..at + 4)?;
+    digits.iter().try_fold(0u32, |value, digit| {
+        crate::placeholder::hex_value(*digit).map(|nibble| (value << 4) | u32::from(nibble))
+    })
+}
+
+/// One JSON escape at `index` (which holds `\`): the UTF-8 bytes it stands for
+/// and how many input bytes it spans.
+///
+/// A `\uXXXX` high surrogate followed by a `\uXXXX` low surrogate is one
+/// character outside the Basic Multilingual Plane, spelled in twelve bytes;
+/// that is how JSON writes an emoji or any other four-byte UTF-8 character. A
+/// surrogate without its partner is not valid JSON text and decodes to
+/// nothing.
 fn decode_json_escape(window: &[u8], index: usize) -> Option<(Vec<u8>, usize)> {
     match *window.get(index + 1)? {
         b'"' => Some((vec![b'"'], 2)),
@@ -724,9 +668,21 @@ fn decode_json_escape(window: &[u8], index: usize) -> Option<(Vec<u8>, usize)> {
         b'r' => Some((vec![b'\r'], 2)),
         b't' => Some((vec![b'\t'], 2)),
         b'u' => {
-            let hex = std::str::from_utf8(window.get(index + 2..index + 6)?).ok()?;
-            let code = u32::from_str_radix(hex, 16).ok()?;
-            Some((char::from_u32(code)?.to_string().into_bytes(), 6))
+            let unit = hex4(window, index + 2)?;
+            let (code, len) = if (0xD800..0xDC00).contains(&unit) {
+                if window.get(index + 6..index + 8) != Some(b"\\u".as_slice()) {
+                    return None;
+                }
+                let low = hex4(window, index + 8)?;
+                if !(0xDC00..0xE000).contains(&low) {
+                    return None;
+                }
+                (0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00), 12)
+            } else {
+                (unit, 6)
+            };
+            // A lone low surrogate is rejected here: it is not a `char`.
+            Some((char::from_u32(code)?.to_string().into_bytes(), len))
         }
         _ => None,
     }
@@ -747,9 +703,10 @@ pub fn overlap_for(longest_consumed: usize) -> usize {
 /// bytes.
 ///
 /// JSON can spell every byte as `\u00XX` (six bytes each), percent-encoding
-/// three, hex two and base64 four per three bytes; the escaped JSON form is
-/// always the widest. Streaming keeps space for it plus one byte, so a match
-/// never starts in released bytes.
+/// three, a surrogate pair three (twelve bytes for a four-byte character), hex
+/// two and base64 four per three bytes; the escaped JSON form is always the
+/// widest. Streaming keeps space for it plus one byte, so a match never starts
+/// in released bytes.
 pub fn max_consumed_len(key_len: usize) -> usize {
     key_len.saturating_mul(6).max(key_len).max(1)
 }
