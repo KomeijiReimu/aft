@@ -212,7 +212,7 @@ fn extract_item_name(line: &str) -> Option<String> {
     None
 }
 
-fn find_enclosing_item(lines: &[&str], target_idx: usize) -> String {
+pub(crate) fn find_enclosing_item(lines: &[&str], target_idx: usize) -> String {
     for i in (0..=target_idx).rev() {
         if let Some(name) = extract_item_name(lines[i]) {
             return name;

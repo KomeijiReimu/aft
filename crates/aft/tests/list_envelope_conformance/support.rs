@@ -2361,6 +2361,42 @@ fn enclosing_item(lines: &[&str], target: usize) -> String {
         .unwrap_or_else(|| "<file_root>".to_string())
 }
 
+#[test]
+fn qualified_visibility_cut_fixture_attribution() {
+    let source = r#"
+fn plain() {
+    values.iter().take(1);
+}
+pub(super) fn restricted() {
+    values.iter().take(2);
+}
+pub(in crate::x) fn scoped() {
+    values.iter().take(3);
+}
+"#;
+    let lines = source.lines().collect::<Vec<_>>();
+    let cuts = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains(".take("))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let conformance = cuts
+        .iter()
+        .map(|&index| enclosing_item(&lines, index))
+        .collect::<Vec<_>>();
+    let drift_guard = cuts
+        .iter()
+        .map(|&index| crate::list_envelope_drift_guard::find_enclosing_item(&lines, index))
+        .collect::<Vec<_>>();
+    let expected = vec!["plain", "restricted", "scoped"];
+    assert_eq!(
+        (conformance, drift_guard),
+        (expected.clone(), expected),
+        "both scanners must attribute each cut to its own function"
+    );
+}
+
 pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     let source_dir = aft_src_dir();
     let mut paths = collect_rs_files(&source_dir.join("commands"));
