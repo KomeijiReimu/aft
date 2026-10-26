@@ -342,9 +342,16 @@ fn prepare_provider_project(root: &Path) -> Result<(), HarnessError> {
 }
 
 /// The main-thread stack the provider under test may have in this test, the
-/// size Windows reserves by default. `None` means it cannot be set here.
+/// size Windows reserves by default. `None` means it cannot be set here: macOS
+/// refuses to lower a forked child's stack limit (`setrlimit` fails with
+/// EINVAL), so the case runs on Linux, where the limit is lowered, and on
+/// Windows, where the binary's own reservation is checked.
 fn windows_sized_main_stack() -> Option<u64> {
-    Some(1024 * 1024)
+    if cfg!(target_os = "macos") {
+        None
+    } else {
+        Some(1024 * 1024)
+    }
 }
 
 fn provider_command(root: &Path, connection_path: &Path) -> Result<Command, HarnessError> {
@@ -3116,6 +3123,10 @@ impl ToolProviderSubject for Subject {
 /// and says in its failure why it cannot there.
 #[tokio::test]
 async fn cold_bash_admission_on_one_mib_module_stack() {
+    if windows_sized_main_stack().is_none() {
+        eprintln!("skipped: this platform cannot give the provider a 1 MiB main-thread stack");
+        return;
+    }
     let subject = Subject::head().with_one_mib_main_stack();
     let root = tempfile::tempdir().unwrap();
     let process = subject.spawn(root.path()).await.unwrap();
