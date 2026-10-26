@@ -10,6 +10,8 @@ use super::{
     LabelOutcome, LabelRule, Location, RequestRefusal, RequestView, MAX_SUBSTITUTABLE_BODY,
 };
 use crate::material::encode_for_location;
+use crate::work::Counted;
+use std::collections::BTreeSet;
 use zeroize::Zeroizing;
 
 /// True for `application/json` and any `+json` subtype (P4).
@@ -115,11 +117,6 @@ pub(crate) fn evaluate(
     })
 }
 
-/// True when one object in `body` names the same member twice.
-///
-/// `serde_json` keeps the last value of a repeated member and gives no view of
-/// the earlier one, so the check runs on the raw bytes: every object's member
-/// names are collected as they are scanned.
 /// The deepest object/array nesting the duplicate check will walk.
 ///
 /// The check runs before `serde_json` parses the body, so it bounds itself: a
@@ -131,10 +128,11 @@ pub const MAX_JSON_DEPTH: usize = 64;
 ///
 /// `serde_json` keeps the last value of a repeated member and gives no view of
 /// the earlier one, so this runs on the raw bytes. It is one iterative walk over
-/// the body — a stack of open objects holding their member names — so neither
-/// deep nesting nor a wide object can stall or crash it, and names are compared
-/// after unescaping, because `ke\u0079` and `key` are the same member to a
-/// parser.
+/// the body with a stack of open objects, bounded at [`MAX_JSON_DEPTH`] levels.
+/// Each object keeps its member names in an ordered set, so an object with `n`
+/// members costs `O(n log n)` name comparisons rather than one comparison per
+/// pair of members. Names are compared after unescaping, because `ke\u0079`
+/// and `key` are the same member to a parser.
 fn duplicate_member(body: &[u8]) -> Result<bool, RequestRefusal> {
     let mut stack: Vec<ObjectNames> = Vec::new();
     let mut index = 0usize;
@@ -173,10 +171,9 @@ fn duplicate_member(body: &[u8]) -> Result<bool, RequestRefusal> {
                     let Some(object) = stack.last_mut() else {
                         return Err(RequestRefusal::MalformedJsonBody);
                     };
-                    if object.contains(&decoded) {
+                    if !object.insert(decoded) {
                         return Ok(true);
                     }
-                    object.push(decoded);
                 }
                 index = next;
             }
@@ -198,24 +195,21 @@ fn duplicate_member(body: &[u8]) -> Result<bool, RequestRefusal> {
 /// Member names seen so far in one open object.
 #[derive(Default)]
 struct ObjectNames {
-    names: Vec<Vec<u8>>,
+    names: BTreeSet<Counted<Vec<u8>>>,
     is_array: bool,
 }
 
 impl ObjectNames {
     fn array() -> Self {
         Self {
-            names: Vec::new(),
+            names: BTreeSet::new(),
             is_array: true,
         }
     }
 
-    fn contains(&self, name: &[u8]) -> bool {
-        self.names.iter().any(|seen| seen.as_slice() == name)
-    }
-
-    fn push(&mut self, name: Vec<u8>) {
-        self.names.push(name);
+    /// Record `name`; false when the object already had a member of that name.
+    fn insert(&mut self, name: Vec<u8>) -> bool {
+        self.names.insert(Counted(name))
     }
 }
 
@@ -531,5 +525,48 @@ fn skip_value(bytes: &[u8], start: usize) -> Option<usize> {
             }
             Some(index)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `{"k000000":0,"k000001":0,...}` with `members` distinct names.
+    fn wide_object(members: usize) -> Vec<u8> {
+        let body: Vec<String> = (0..members)
+            .map(|index| format!("\"k{index:06}\":0"))
+            .collect();
+        format!("{{{}}}", body.join(",")).into_bytes()
+    }
+
+    #[test]
+    fn a_wide_object_costs_n_log_n_name_comparisons() {
+        // The closure check's counterexample: 80,000 distinct members, under
+        // the 1 MiB body cap. Comparing every new name with every earlier one
+        // would take 3,199,960,000 comparisons.
+        let members = 80_000usize;
+        let body = wide_object(members);
+        assert!(body.len() < crate::location::MAX_SUBSTITUTABLE_BODY);
+        crate::work::take();
+        assert_eq!(duplicate_member(&body), Ok(false));
+        let comparisons = crate::work::take();
+        let log2 = u64::from(usize::BITS - members.leading_zeros());
+        // A B-tree search scans at most eleven keys per level; twelve per bit
+        // of `log2(n)` per member is a generous `n log n` ceiling.
+        let ceiling = 12 * members as u64 * log2;
+        assert!(comparisons > 0, "the name set was never consulted");
+        assert!(
+            comparisons <= ceiling,
+            "{comparisons} name comparisons for {members} members (ceiling {ceiling})"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_after_many_members_is_still_found() {
+        let mut body = wide_object(10_000);
+        body.pop();
+        body.extend_from_slice(b",\"k000000\":1}");
+        assert_eq!(duplicate_member(&body), Ok(true));
     }
 }

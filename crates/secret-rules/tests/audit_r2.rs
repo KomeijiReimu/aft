@@ -209,8 +209,10 @@ fn item13_deep_nesting_refuses_instead_of_overflowing() {
 }
 
 #[test]
-fn item13_a_wide_object_is_checked_once_per_member() {
-    // Ten thousand distinct members: linear work, and no duplicate.
+fn item13_a_wide_object_without_duplicates_is_accepted() {
+    // Ten thousand distinct members and no duplicate. This checks only the
+    // answer; the comparison count is bounded by the unit test
+    // `a_wide_object_costs_n_log_n_name_comparisons` in `src/location/json.rs`.
     let members: Vec<String> = (0..10_000).map(|index| format!("\"k{index}\":1")).collect();
     let body = format!("{{{}}}", members.join(","));
     assert_eq!(duplicate_case(&body), None);

@@ -23,7 +23,8 @@
 pub use crate::material::json_escape;
 use crate::material::percent_encode_form;
 use crate::placeholder::PLACEHOLDER_PREFIX;
-use std::collections::BTreeSet;
+use crate::work::Counted;
+use std::collections::{BTreeMap, BTreeSet};
 use zeroize::Zeroizing;
 
 /// Why a key cannot be turned into scrub patterns.
@@ -305,46 +306,49 @@ impl MatcherSet {
         &self.key
     }
 
-    /// Test hook: the edits this matcher finds in `window`.
-    /// Every match of the key in `window`, as `(start, end, replacement)`.
+    /// Every span of `window` that holds this matcher's key, sorted by start
+    /// and free of overlaps.
     ///
-    /// Matches never overlap each other, and the replacement text is not part
-    /// of the window, so the caller can apply the edits to a copy of the
-    /// original bytes without ever rescanning generated text.
-    fn find_edits(&self, window: &[u8]) -> Vec<(usize, usize, Vec<u8>)> {
-        let mut edits = self.find_base64_edits(window);
+    /// The spans index the input only; the replacement text is never part of
+    /// the window, so the caller applies them to a copy of the original bytes
+    /// without ever rescanning generated text. The scan is one pass: base64
+    /// tokens are decoded once each, and every other byte is tried once.
+    fn find_spans(&self, window: &[u8]) -> Vec<(usize, usize)> {
+        let tokens = self.find_base64_spans(window);
+        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(tokens.len());
+        let mut next_token = 0;
         let mut index = 0;
         while index < window.len() {
-            // Bytes inside a token that produced an edit are already covered.
-            if let Some((_, end, _)) = edits
-                .last()
-                .filter(|(start, end, _)| *start < index && index < *end)
-            {
-                index = *end;
-                continue;
+            // A base64 token that decodes to the key is replaced whole, and its
+            // bytes are not tried again one by one.
+            if let Some(&(start, end)) = tokens.get(next_token) {
+                if start <= index {
+                    push_merged(&mut spans, (start, end));
+                    next_token += 1;
+                    index = index.max(end);
+                    continue;
+                }
             }
-            // Cheap pre-filter: every family's match starts with a byte that is
-            // in a literal pattern, an escape introducer (`%`, `\`), a hex
-            // digit, a base64 character or the key's own first byte. Inside a
-            // long run of base64 text the run is decoded once (see
-            // `find_base64_edits`), so the per-byte path must not decode it
-            // again.
+            // Cheap pre-filter: every family's match starts with an escape
+            // introducer (`%`, `\`), a base64 or hex character or the key's
+            // own first byte.
             if !self.can_start_match(window[index]) {
                 index += 1;
                 continue;
             }
-            // A repeated byte (the self-overlapping case) is the worst thing
-            // this matcher sees: literal spellings are checked first, then each
-            // decoded family in turn.
             match self.try_match_at(window, index) {
                 Some((end, _family)) => {
-                    edits.push((index, end, self.replacement.clone()));
+                    push_merged(&mut spans, (index, end));
                     index = end;
                 }
                 None => index += 1,
             }
         }
-        edits
+        // A match can end past the start of the last tokens; they still count.
+        for &(start, end) in tokens.get(next_token..).unwrap_or_default() {
+            push_merged(&mut spans, (start, end));
+        }
+        spans
     }
 
     /// True when one representation of the key can begin with `byte`.
@@ -360,8 +364,8 @@ impl MatcherSet {
     /// A token is the maximal run of base64 characters around the key. Decoding
     /// it once per alignment and replacing it whole keeps the work linear in the
     /// window, and covers the token's edge bytes too.
-    fn find_base64_edits(&self, window: &[u8]) -> Vec<(usize, usize, Vec<u8>)> {
-        let mut edits = Vec::new();
+    fn find_base64_spans(&self, window: &[u8]) -> Vec<(usize, usize)> {
+        let mut spans = Vec::new();
         let mut index = 0;
         while index < window.len() {
             if !is_base64_byte(window[index]) {
@@ -377,17 +381,17 @@ impl MatcherSet {
             // possible alignment, and `base64_run_contains` tries four of them
             // per start, so test the whole token once.
             if base64_run_contains(run, self.key()) {
-                edits.push((start, index, self.replacement.clone()));
+                spans.push((start, index));
             }
         }
-        edits
+        spans
     }
 
     /// The end of a key representation starting at `index`, if one starts
     /// there.
     fn try_match_at(&self, window: &[u8], index: usize) -> Option<(usize, Family)> {
         let key = self.key();
-        // Base64 is handled by `find_base64_edits` over whole tokens, before
+        // Base64 is handled by `find_base64_spans` over whole tokens, before
         // this per-byte pass: a literal spelling of part of the key is a prefix
         // of the token that contains the whole key, and replacing the token
         // covers the key's edge bytes as well.
@@ -413,6 +417,18 @@ impl MatcherSet {
             return Some((end, Family::Hex));
         }
         None
+    }
+}
+
+/// Append `span` to `spans`, which are sorted by start, merging it with the
+/// last span when the two overlap.
+///
+/// Two overlapping matches of one key are replaced as one: keeping only the
+/// first would leave the second's leading bytes, which spell part of the key.
+fn push_merged(spans: &mut Vec<(usize, usize)>, span: (usize, usize)) {
+    match spans.last_mut() {
+        Some(last) if span.0 < last.1 => last.1 = last.1.max(span.1),
+        _ => spans.push(span),
     }
 }
 
@@ -832,30 +848,37 @@ impl Scrubber {
         self.scrub_all(&tail)
     }
 
-    /// Run every matcher once over the window.
-    ///
-    /// A matcher sees only the bytes `buffer` holds, never the text another
-    /// matcher wrote: the output is built from the input side while the
-    /// inserted replacements are copied through untouched.
     /// Every replacement the installed matchers make in `buffer`, sorted and
     /// free of overlaps.
     ///
     /// Each matcher sees only `buffer`, never another matcher's generated text,
-    /// so generated placeholders can never be rewritten in the same pass.
+    /// so generated placeholders can never be rewritten in the same pass. When
+    /// two matchers claim overlapping bytes, the matcher installed first keeps
+    /// its span and the later one is dropped.
+    ///
+    /// Accepted spans are kept in an ordered map keyed by start. They never
+    /// overlap, so the only one a new span can collide with is the last one
+    /// that starts before the new span ends: one lookup per candidate, and
+    /// `O(m log m)` work for `m` matches instead of comparing every pair.
     fn find_edits(&self, buffer: &[u8]) -> Vec<(usize, usize, Vec<u8>)> {
-        let mut edits: Vec<(usize, usize, Vec<u8>)> = Vec::new();
-        for matcher in &self.matchers {
-            for edit in matcher.find_edits(buffer) {
-                let overlaps = edits
-                    .iter()
-                    .any(|(start, end, _)| edit.0 < *end && *start < edit.1);
+        let mut accepted: BTreeMap<Counted<usize>, (usize, usize)> = BTreeMap::new();
+        for (which, matcher) in self.matchers.iter().enumerate() {
+            for (start, end) in matcher.find_spans(buffer) {
+                let overlaps = accepted
+                    .range(..Counted(end))
+                    .next_back()
+                    .is_some_and(|(_, (previous_end, _))| *previous_end > start);
                 if !overlaps {
-                    edits.push(edit);
+                    accepted.insert(Counted(start), (end, which));
                 }
             }
         }
-        edits.sort_by_key(|(start, end, _)| (*start, *end));
-        edits
+        accepted
+            .into_iter()
+            .map(|(Counted(start), (end, which))| {
+                (start, end, self.matchers[which].replacement.clone())
+            })
+            .collect()
     }
 
     /// Rewrite `buffer` with `edits`.
@@ -931,4 +954,51 @@ pub fn scrub_bytes(key: &[u8], label: &str, input: &[u8]) -> Result<Vec<u8>, Scr
     let mut out = scrubber.push(input);
     out.extend_from_slice(&scrubber.finish());
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn many_matches_are_aggregated_in_n_log_n_comparisons() {
+        // The closure check's shape: thousands of disjoint key tokens in one
+        // push. Two matchers make the cross-matcher overlap check run on every
+        // candidate. `MDEyMzQ1Njc4OWFiY2RlZg` is the unpadded base64 of
+        // `0123456789abcdef`; the second key appears raw.
+        let tokens = 10_000usize;
+        let unit = "MDEyMzQ1Njc4OWFiY2RlZg!fedcba9876543210!";
+        let input = unit.repeat(tokens);
+        let mut scrubber = Scrubber::new(vec![
+            MatcherSet::new("a", b"0123456789abcdef").unwrap(),
+            MatcherSet::new("b", b"fedcba9876543210").unwrap(),
+        ]);
+        crate::work::take();
+        let mut out = scrubber.push(input.as_bytes());
+        out.extend_from_slice(&scrubber.finish());
+        let comparisons = crate::work::take();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "{{ck-secret:a}}!{{ck-secret:b}}!".repeat(tokens)
+        );
+        let matches = 2 * tokens as u64;
+        let log2 = u64::from(u64::BITS - matches.leading_zeros());
+        // One range lookup and one insert per candidate, each a B-tree search
+        // of at most eleven keys per level.
+        let ceiling = 2 * 12 * matches * log2;
+        assert!(comparisons > 0, "the accepted-span map was never consulted");
+        assert!(
+            comparisons <= ceiling,
+            "{comparisons} comparisons for {matches} matches (ceiling {ceiling})"
+        );
+    }
+
+    #[test]
+    fn overlapping_matches_of_one_key_are_replaced_as_one() {
+        let mut spans = vec![(0, 4)];
+        push_merged(&mut spans, (2, 9));
+        push_merged(&mut spans, (9, 12));
+        assert_eq!(spans, vec![(0, 9), (9, 12)]);
+    }
 }

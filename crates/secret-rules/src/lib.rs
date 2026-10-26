@@ -16,6 +16,7 @@ pub mod placeholder;
 pub mod redirect;
 pub mod scrub;
 pub mod target;
+mod work;
 
 pub use audit::{
     AuditReason, AuditRecordV1, AuditRefusal, Decision, MatchedPrefix, ScopeRef, AUDIT_VERSION_V1,
