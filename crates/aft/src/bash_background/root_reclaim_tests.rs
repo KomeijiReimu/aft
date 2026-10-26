@@ -165,3 +165,150 @@ pub(crate) fn while_task_map_locked<T>(registry: &BgTaskRegistry, call: impl FnO
     let _held = registry.inner.tasks.lock().unwrap();
     call()
 }
+
+#[test]
+fn root_reclaim_identity_is_resolved_before_spawn_admission() {
+    for kind in ["pipes", "pty", "remote"] {
+        let registry = BgTaskRegistry::default();
+        registry
+            .inner
+            .watchdog_started
+            .store(true, Ordering::SeqCst);
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe_calls = Arc::clone(&calls);
+        let probe_registry = registry.clone();
+        ROOT_LOCK_PROBE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                probe_calls.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    probe_registry.inner.background_admission.try_lock().is_ok(),
+                    "root identity I/O held admission lock"
+                );
+                assert!(
+                    probe_registry.inner.tasks.try_lock().is_ok(),
+                    "root identity I/O held registry lock"
+                );
+            }))
+        });
+        // A zero slot limit stops before allocating or spawning a process, but
+        // still takes admission. Root resolution must happen before that lock.
+        let result = match kind {
+            "pipes" => registry.spawn(
+                SpawnPlan::Unsandboxed,
+                "true",
+                "reclaim".into(),
+                root.path().into(),
+                HashMap::new(),
+                super::super::HardKill::After(Duration::from_secs(30)),
+                None,
+                storage.path().into(),
+                0,
+                false,
+                false,
+                Some(root.path().into()),
+            ),
+            "pty" => registry.spawn_pty(
+                SpawnPlan::Unsandboxed,
+                "true",
+                "reclaim".into(),
+                root.path().into(),
+                HashMap::new(),
+                super::super::HardKill::After(Duration::from_secs(30)),
+                None,
+                storage.path().into(),
+                0,
+                false,
+                false,
+                Some(root.path().into()),
+                24,
+                80,
+            ),
+            "remote" => registry
+                .spawn_remote_typed(
+                    super::super::RemoteLaunch {
+                        requested_platform: None,
+                        params: Default::default(),
+                        explicit_runon: true,
+                        connection_file: None,
+                        harness: "reclaim".into(),
+                        session: "reclaim".into(),
+                        requested_vcpus: None,
+                        requested_network: false,
+                    },
+                    SpawnPlan::Unsandboxed,
+                    "true",
+                    "/bin/sh".into(),
+                    "reclaim".into(),
+                    root.path().into(),
+                    HashMap::new(),
+                    super::super::HardKill::After(Duration::from_secs(30)),
+                    None,
+                    storage.path().into(),
+                    super::super::TaskSlot::Background { max: 0 },
+                    false,
+                    false,
+                    Some(root.path().into()),
+                )
+                .map_err(|error| error.to_string()),
+            _ => unreachable!(),
+        };
+        ROOT_LOCK_PROBE.with(|hook| hook.borrow_mut().take());
+        assert!(
+            result.is_err(),
+            "{kind}: slot limit must refuse before spawning"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "{kind}: root lookup was not exercised"
+        );
+    }
+}
+
+#[test]
+fn root_reclaim_registration_reuses_identity_under_admission_and_claim_locks() {
+    let registry = BgTaskRegistry::default();
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let alias = storage.path().join("root-alias");
+    std::os::unix::fs::symlink(root.path(), &alias).unwrap();
+    let canonical_root = canonicalized_path(&alias);
+    let layout = super::super::persistence::create_task_layout(
+        storage.path(),
+        "reclaim",
+        "bash-0000000000000013",
+    )
+    .unwrap();
+    let metadata = PersistedTask::starting(
+        "bash-0000000000000013".into(),
+        "reclaim".into(),
+        "no process".into(),
+        alias.clone(),
+        Some(alias.clone()),
+        None,
+        false,
+        false,
+    );
+    std::fs::remove_file(alias).unwrap();
+    let _admission =
+        registry.background_admission_guard(super::super::TaskSlot::Background { max: 1 });
+    let _claims = saved_remote_task_claims().lock().unwrap();
+    ROOT_LOCK_PROBE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(|| {
+            panic!("registration repeated root identity I/O under locks")
+        }))
+    });
+    registry
+        .insert_rehydrated_task_with_root(metadata, layout.paths, true, canonical_root.clone())
+        .unwrap();
+    ROOT_LOCK_PROBE.with(|hook| hook.borrow_mut().take());
+    assert_eq!(
+        registry
+            .task_for_session("bash-0000000000000013", "reclaim")
+            .unwrap()
+            .project_root,
+        canonical_root
+    );
+}

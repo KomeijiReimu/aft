@@ -2086,6 +2086,7 @@ impl BgTaskRegistry {
         compressed: bool,
         root: Option<PathBuf>,
     ) -> Result<String, RegistryError> {
+        let canonical_project_root = canonicalized_path(root.as_deref().unwrap_or(&workdir));
         let _admission = self.background_admission_guard(slot);
         self.check_background_slot_typed(slot, &session_id)?;
         let layout = match plan.prepared_task() {
@@ -2194,6 +2195,7 @@ impl BgTaskRegistry {
             layout.paths,
             false,
             crate::bash_changed_files::current(),
+            canonical_project_root,
         )?;
         let task = self.task(&task_id).unwrap();
         task.holds_background_slot

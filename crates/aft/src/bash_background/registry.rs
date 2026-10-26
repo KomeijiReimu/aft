@@ -4260,10 +4260,21 @@ impl BgTaskRegistry {
         super::memory_limit::Monitor::prepare(mib, task_id).map(Some)
     }
 
-    fn fail_memory_spawn(&self, metadata: &mut PersistedTask, paths: &TaskPaths, error: &str) {
+    fn fail_memory_spawn(
+        &self,
+        metadata: &mut PersistedTask,
+        paths: &TaskPaths,
+        error: &str,
+        canonical_project_root: PathBuf,
+    ) {
         metadata.mark_terminal(BgTaskStatus::Failed, None, Some(error.into()));
         let _ = self.persist_task(paths, metadata);
-        let _ = self.insert_rehydrated_task(metadata.clone(), paths.clone(), true);
+        let _ = self.insert_rehydrated_task_with_root(
+            metadata.clone(),
+            paths.clone(),
+            true,
+            canonical_project_root,
+        );
         self.record_live_delivery_session(&metadata.session_id);
         self.enqueue_completion_if_needed(metadata, Some(paths), true);
     }
@@ -4547,6 +4558,8 @@ impl BgTaskRegistry {
         compressed: bool,
         project_root: Option<PathBuf>,
     ) -> Result<String, RegistryError> {
+        let canonical_project_root =
+            canonicalized_path(project_root.as_deref().unwrap_or(&workdir));
         self.start_watchdog();
 
         #[cfg(target_os = "linux")]
@@ -4702,7 +4715,12 @@ impl BgTaskRegistry {
                     metadata.notify_on_completion = true;
                     metadata.mark_terminal(BgTaskStatus::Failed, None, Some(error.clone()));
                     let _ = self.persist_task(&paths, &metadata);
-                    let _ = self.insert_rehydrated_task(metadata.clone(), paths.clone(), true);
+                    let _ = self.insert_rehydrated_task_with_root(
+                        metadata.clone(),
+                        paths.clone(),
+                        true,
+                        canonical_project_root,
+                    );
                     self.record_live_delivery_session(&metadata.session_id);
                     self.enqueue_completion_if_needed(&metadata, Some(&paths), true);
                 } else {
@@ -4717,7 +4735,7 @@ impl BgTaskRegistry {
             if let Err(error) = monitor.attach(child_pid) {
                 super::process::terminate_pgid(child_pid as i32, None);
                 let _ = child.wait();
-                self.fail_memory_spawn(&mut metadata, &paths, &error);
+                self.fail_memory_spawn(&mut metadata, &paths, &error, canonical_project_root);
                 return Err(error.into());
             }
             metadata.memory_policy = Some(monitor.policy.clone());
@@ -4742,7 +4760,12 @@ impl BgTaskRegistry {
                 Some("spawn aborted".to_string()),
             );
             let _ = self.persist_task(&paths, &metadata);
-            let _ = self.insert_rehydrated_task(metadata, paths.clone(), true);
+            let _ = self.insert_rehydrated_task_with_root(
+                metadata,
+                paths.clone(),
+                true,
+                canonical_project_root,
+            );
             return Err(format!("failed to persist background task metadata: {error}").into());
         }
         metadata.mark_running(child_pid, child_pid as i32);
@@ -4759,12 +4782,7 @@ impl BgTaskRegistry {
             session_id,
             paths: paths.clone(),
             artifact_root: canonical_artifact_root(&paths),
-            project_root: canonicalized_path(
-                metadata
-                    .project_root
-                    .as_deref()
-                    .unwrap_or(&metadata.workdir),
-            ),
+            project_root: canonical_project_root,
             started: Instant::now(),
             terminal_reader_done: Arc::new(AtomicBool::new(true)),
             holds_background_slot: AtomicBool::new(slot.holds_slot()),
@@ -4983,6 +5001,8 @@ impl BgTaskRegistry {
         rows: u16,
         cols: u16,
     ) -> Result<String, RegistryError> {
+        let canonical_project_root =
+            canonicalized_path(project_root.as_deref().unwrap_or(&workdir));
         self.start_watchdog();
 
         let _admission =
@@ -5115,7 +5135,12 @@ impl BgTaskRegistry {
                     metadata.pgid = spawned_pgid;
                     metadata.mark_terminal(BgTaskStatus::Failed, None, Some(error.clone()));
                     let _ = self.persist_task(&paths, &metadata);
-                    let _ = self.insert_rehydrated_task(metadata.clone(), paths.clone(), true);
+                    let _ = self.insert_rehydrated_task_with_root(
+                        metadata.clone(),
+                        paths.clone(),
+                        true,
+                        canonical_project_root,
+                    );
                     self.record_live_delivery_session(&metadata.session_id);
                     self.enqueue_completion_if_needed(&metadata, Some(&paths), true);
                 } else {
@@ -5156,12 +5181,7 @@ impl BgTaskRegistry {
             session_id,
             paths: paths.clone(),
             artifact_root: canonical_artifact_root(&paths),
-            project_root: canonicalized_path(
-                metadata
-                    .project_root
-                    .as_deref()
-                    .unwrap_or(&metadata.workdir),
-            ),
+            project_root: canonical_project_root,
             started: Instant::now(),
             terminal_reader_done,
             // A PTY always runs in the background.
@@ -5336,6 +5356,8 @@ impl BgTaskRegistry {
         compressed: bool,
         project_root: Option<PathBuf>,
     ) -> Result<String, RegistryError> {
+        let canonical_project_root =
+            canonicalized_path(project_root.as_deref().unwrap_or(&workdir));
         self.start_watchdog();
 
         let _admission = self.background_admission_guard(slot);
@@ -5421,7 +5443,7 @@ impl BgTaskRegistry {
             if let Err(error) = monitor.attach(child_pid) {
                 let _ = child.kill();
                 let _ = child.wait();
-                self.fail_memory_spawn(&mut metadata, &paths, &error);
+                self.fail_memory_spawn(&mut metadata, &paths, &error, canonical_project_root);
                 return Err(error.into());
             }
             use std::io::Write;
@@ -5436,7 +5458,7 @@ impl BgTaskRegistry {
                 monitor.terminate();
                 let _ = child.kill();
                 let _ = child.wait();
-                self.fail_memory_spawn(&mut metadata, &paths, &error);
+                self.fail_memory_spawn(&mut metadata, &paths, &error, canonical_project_root);
                 return Err(error.into());
             }
             metadata.memory_policy = Some(monitor.policy.clone());
@@ -5465,12 +5487,7 @@ impl BgTaskRegistry {
             session_id,
             paths: paths.clone(),
             artifact_root: canonical_artifact_root(&paths),
-            project_root: canonicalized_path(
-                metadata
-                    .project_root
-                    .as_deref()
-                    .unwrap_or(&metadata.workdir),
-            ),
+            project_root: canonical_project_root,
             started: Instant::now(),
             terminal_reader_done: Arc::new(AtomicBool::new(true)),
             holds_background_slot: AtomicBool::new(slot.holds_slot()),
@@ -10982,6 +10999,12 @@ impl BgTaskRegistry {
         paths: TaskPaths,
     ) -> Result<(), String> {
         let task_id = metadata.task_id.clone();
+        let canonical_project_root = canonicalized_path(
+            metadata
+                .project_root
+                .as_deref()
+                .unwrap_or(&metadata.workdir),
+        );
         // Held while the task is built and its worker started, so another
         // registry can neither build a second copy nor start a worker first.
         // Released before this registry publishes the task's pending
@@ -11012,7 +11035,7 @@ impl BgTaskRegistry {
                 return Ok(());
             }
         }
-        self.insert_rehydrated_task(metadata, paths, true)?;
+        self.insert_rehydrated_task_with_root(metadata, paths, true, canonical_project_root)?;
         let task = self
             .task(&task_id)
             .ok_or_else(|| format!("{task_id}: restored remote task missing"))?;
@@ -11378,7 +11401,25 @@ impl BgTaskRegistry {
         paths: TaskPaths,
         detached: bool,
     ) -> Result<(), String> {
-        self.insert_registered_task(metadata, paths, detached, None)
+        let canonical_project_root = canonicalized_path(
+            metadata
+                .project_root
+                .as_deref()
+                .unwrap_or(&metadata.workdir),
+        );
+        self.insert_rehydrated_task_with_root(metadata, paths, detached, canonical_project_root)
+    }
+
+    /// Admission and remote-claim holders pass the root resolved before locking.
+    /// Rehydrating a failed spawn must not repeat root filesystem I/O under them.
+    fn insert_rehydrated_task_with_root(
+        &self,
+        metadata: PersistedTask,
+        paths: TaskPaths,
+        detached: bool,
+        canonical_project_root: PathBuf,
+    ) -> Result<(), String> {
+        self.insert_registered_task(metadata, paths, detached, None, canonical_project_root)
     }
 
     fn insert_registered_task(
@@ -11387,6 +11428,7 @@ impl BgTaskRegistry {
         paths: TaskPaths,
         detached: bool,
         changed_files: Option<Arc<crate::bash_changed_files::Capture>>,
+        canonical_project_root: PathBuf,
     ) -> Result<(), String> {
         let task_id = metadata.task_id.clone();
         let session_id = metadata.session_id.clone();
@@ -11428,12 +11470,7 @@ impl BgTaskRegistry {
             session_id,
             paths: paths.clone(),
             artifact_root: canonical_artifact_root(&paths),
-            project_root: canonicalized_path(
-                metadata
-                    .project_root
-                    .as_deref()
-                    .unwrap_or(&metadata.workdir),
-            ),
+            project_root: canonical_project_root,
             started,
             terminal_reader_done: Arc::new(AtomicBool::new(true)),
             // A task reloaded after a restart has no caller waiting on it any
@@ -17178,9 +17215,10 @@ mod tests {
         });
         registry.kill_running_tasks_for_root(dir.path());
         ROOT_LOCK_PROBE.with(|hook| hook.borrow_mut().take());
-        assert!(
-            calls.load(Ordering::SeqCst) >= 2,
-            "probe never inspected a task's root lookup"
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "root reclaim resolves only its input; task root identities are cached at registration"
         );
     }
 
