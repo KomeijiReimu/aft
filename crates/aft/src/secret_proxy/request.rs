@@ -163,183 +163,156 @@ async fn prepare_and_send(
             }
         }
     }
-    let mut materials = Vec::new();
-    for ((rule, matched), grant) in rules.iter().zip(&matches).zip(&state.config.grants) {
-        if !matched {
-            materials.push(None);
-            continue;
+    for (grant, matched) in state.config.grants.iter().zip(&matches) {
+        if *matched && crate::secret::vault::now_ms() >= grant.expires_at_ms {
+            return Err(grant.rule.label.clone());
         }
+    }
+    // Authenticate the upstream first. Material is the vault's revocation
+    // check, so obtain it only after asynchronous connection work ends.
+    let upstream = connect_upstream(authority, state, ws).await?;
+    let http2 = matches!(&upstream, Upstream::Http2(_));
+    let response = {
         let _gate = state.material_gate.lock();
-        if state.stopped.load(Ordering::Acquire)
-            || crate::secret::vault::now_ms() >= grant.expires_at_ms
-        {
-            return Err(rule.label.clone());
+        let mut materials = Vec::new();
+        for ((rule, matched), grant) in rules.iter().zip(&matches).zip(&state.config.grants) {
+            if !matched {
+                materials.push(None);
+                continue;
+            }
+            if state.stopped.load(Ordering::Acquire)
+                || crate::secret::vault::now_ms() >= grant.expires_at_ms
+            {
+                return Err(rule.label.clone());
+            }
+            let material = state
+                .config
+                .vault
+                .material(
+                    &state.config.authorization_scope,
+                    &rule.label,
+                    &rule.grant_id,
+                )
+                .map_err(|_| rule.label.clone())?;
+            check_admissible(material.expose(), &rule.label, &rule.location)
+                .map_err(|_| rule.label.clone())?;
+            state
+                .install(&rule.label, material.expose())
+                .map_err(|_| rule.label.clone())?;
+            materials.push(Some(material));
         }
-        let material = state
-            .config
-            .vault
-            .material(
-                &state.config.authorization_scope,
-                &rule.label,
-                &rule.grant_id,
-            )
-            .map_err(|_| rule.label.clone())?;
-        check_admissible(material.expose(), &rule.label, &rule.location)
-            .map_err(|_| rule.label.clone())?;
-        state
-            .install(&rule.label, material.expose())
-            .map_err(|_| rule.label.clone())?;
-        materials.push(Some(material));
-    }
-    let mut query_edits = Vec::new();
-    let mut body_edits = Vec::new();
-    let mut header_edits = Vec::new();
-    for ((rule, outcome), material) in rules.iter().zip(&plan.labels).zip(&materials) {
-        if let LabelOutcome::Substituted {
-            byte_start,
-            byte_end,
-            ..
-        } = outcome
-        {
-            let material = material.as_ref().ok_or_else(fail)?;
-            let encoded = Zeroizing::new(
-                encode_for_location(material.expose(), &rule.label, &rule.location)
-                    .map_err(|_| rule.label.clone())?,
-            );
-            match &rule.location {
-                Location::Query(_) => query_edits.push((*byte_start, *byte_end, encoded)),
-                Location::Json(_) => body_edits.push((*byte_start, *byte_end, encoded)),
-                Location::Header(name) => header_edits.push((name.clone(), encoded)),
-                Location::Bearer => header_edits.push(("authorization".to_owned(), encoded)),
+        let mut query_edits = Vec::new();
+        let mut body_edits = Vec::new();
+        let mut header_edits = Vec::new();
+        for ((rule, outcome), material) in rules.iter().zip(&plan.labels).zip(&materials) {
+            if let LabelOutcome::Substituted {
+                byte_start,
+                byte_end,
+                ..
+            } = outcome
+            {
+                let material = material.as_ref().ok_or_else(fail)?;
+                let encoded = Zeroizing::new(
+                    encode_for_location(material.expose(), &rule.label, &rule.location)
+                        .map_err(|_| rule.label.clone())?,
+                );
+                match &rule.location {
+                    Location::Query(_) => query_edits.push((*byte_start, *byte_end, encoded)),
+                    Location::Json(_) => body_edits.push((*byte_start, *byte_end, encoded)),
+                    Location::Header(name) => header_edits.push((name.clone(), encoded)),
+                    Location::Bearer => header_edits.push(("authorization".to_owned(), encoded)),
+                }
             }
         }
-    }
-    drop(view);
-    for (name, bytes) in header_edits {
-        let name = hyper::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| fail())?;
-        let mut value = hyper::header::HeaderValue::from_maybe_shared(super::secret_bytes(bytes))
-            .map_err(|_| fail())?;
-        value.set_sensitive(true);
-        parts.headers.insert(name, value);
-    }
-    let mut wire_target = apply_edits(target.as_bytes(), &mut query_edits)?;
-    if let Ok(normalized) = normalize_request_target(target.split('?').next().unwrap_or(&target)) {
-        let query = wire_target
-            .iter()
-            .position(|c| *c == b'?')
-            .map(|i| Zeroizing::new(wire_target[i..].to_vec()));
-        wire_target = Zeroizing::new(normalized.wire);
-        if let Some(query) = query {
-            wire_target.extend_from_slice(&query);
+        drop(view);
+        for (name, bytes) in header_edits {
+            let name =
+                hyper::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| fail())?;
+            let mut value =
+                hyper::header::HeaderValue::from_maybe_shared(super::secret_bytes(bytes))
+                    .map_err(|_| fail())?;
+            value.set_sensitive(true);
+            parts.headers.insert(name, value);
         }
-    }
-    parts.uri =
-        hyper::Uri::from_maybe_shared(super::secret_bytes(Zeroizing::new(wire_target.to_vec())))
-            .map_err(|_| fail())?;
-    parts.headers.remove("proxy-authorization");
-    parts.headers.insert(
-        "accept-encoding",
-        hyper::header::HeaderValue::from_static("identity"),
-    );
-    parts.headers.remove("sec-websocket-extensions");
-    super::response::strip_hop_headers(&mut parts.headers, ws);
-    // Routing belongs to CONNECT, never to a client-nominated hop header or
-    // the presence of a Host field on the downstream HTTP version.
-    parts.headers.insert(
-        "host",
-        hyper::header::HeaderValue::from_str(&authority.authority()).map_err(|_| fail())?,
-    );
-    let outbound_body: Body = if has_json {
-        let rewritten = apply_edits(&body, &mut body_edits)?;
+        let mut wire_target = apply_edits(target.as_bytes(), &mut query_edits)?;
+        if let Ok(normalized) =
+            normalize_request_target(target.split('?').next().unwrap_or(&target))
+        {
+            let query = wire_target
+                .iter()
+                .position(|c| *c == b'?')
+                .map(|i| Zeroizing::new(wire_target[i..].to_vec()));
+            wire_target = Zeroizing::new(normalized.wire);
+            if let Some(query) = query {
+                wire_target.extend_from_slice(&query);
+            }
+        }
+        parts.uri = hyper::Uri::from_maybe_shared(super::secret_bytes(Zeroizing::new(
+            wire_target.to_vec(),
+        )))
+        .map_err(|_| fail())?;
+        parts.headers.remove("proxy-authorization");
         parts.headers.insert(
-            "content-length",
-            hyper::header::HeaderValue::from_str(&rewritten.len().to_string())
-                .map_err(|_| fail())?,
+            "accept-encoding",
+            hyper::header::HeaderValue::from_static("identity"),
         );
-        full(super::secret_bytes(rewritten))
-    } else {
-        incoming
-            .map_err(|_| super::response::io_error())
-            .boxed_unsync()
-    };
-    // Validate the request and fetch and check material for every matching rule
-    // before opening upstream. TLS uses a direct socket, ignoring proxy env.
-    let socket = tokio::net::TcpStream::connect((authority.host.as_str(), authority.port))
-        .await
-        .map_err(|_| fail())?;
-    let mut tls_config = state.upstream.clone();
-    tls_config.alpn_protocols = if ws {
-        vec![b"http/1.1".to_vec()]
-    } else {
-        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
-    };
-    let server_name =
-        rustls::pki_types::ServerName::try_from(authority.host.clone()).map_err(|_| fail())?;
-    let tls = tokio_rustls::TlsConnector::from(Arc::new(tls_config))
-        .connect(server_name, socket)
-        .await
-        .map_err(|_| fail())?;
-    if state.stopped.load(Ordering::Acquire) {
-        return Err(fail());
-    }
-    let http2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
-    let mut outbound = Request::from_parts(parts, outbound_body);
-    if http2 {
-        let host = authority.authority();
-        let mut uri = Zeroizing::new(Vec::with_capacity(8 + host.len() + wire_target.len()));
-        uri.extend_from_slice(b"https://");
-        uri.extend_from_slice(host.as_bytes());
-        uri.extend_from_slice(&wire_target);
-        *outbound.uri_mut() =
-            hyper::Uri::from_maybe_shared(super::secret_bytes(uri)).map_err(|_| fail())?;
-        *outbound.version_mut() = Version::HTTP_2;
-    } else {
-        *outbound.version_mut() = Version::HTTP_11;
-    }
-    #[cfg(test)]
-    state.headers_sensitive.store(
-        plan.header_edits.iter().all(|edit| {
-            outbound
-                .headers()
-                .get(edit.name.as_str())
-                .is_some_and(|value| value.is_sensitive())
-        }),
-        Ordering::Release,
-    );
-    let response = if http2 {
-        let (mut sender, connection) =
-            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
-                .await
-                .map_err(|_| fail())?;
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        let response = {
-            let _gate = state.material_gate.lock();
-            if state.stopped.load(Ordering::Acquire) {
-                return Err(fail());
-            }
-            sender.send_request(outbound)
+        parts.headers.remove("sec-websocket-extensions");
+        super::response::strip_hop_headers(&mut parts.headers, ws);
+        // Routing belongs to CONNECT, never to a client-nominated hop header or
+        // the presence of a Host field on the downstream HTTP version.
+        parts.headers.insert(
+            "host",
+            hyper::header::HeaderValue::from_str(&authority.authority()).map_err(|_| fail())?,
+        );
+        let outbound_body: Body = if has_json {
+            let rewritten = apply_edits(&body, &mut body_edits)?;
+            parts.headers.insert(
+                "content-length",
+                hyper::header::HeaderValue::from_str(&rewritten.len().to_string())
+                    .map_err(|_| fail())?,
+            );
+            full(super::secret_bytes(rewritten))
+        } else {
+            incoming
+                .map_err(|_| super::response::io_error())
+                .boxed_unsync()
         };
-        drop(materials);
-        response.await.map_err(|_| fail())?
-    } else {
-        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
-            .await
-            .map_err(|_| fail())?;
-        tokio::spawn(async move {
-            let _ = connection.with_upgrades().await;
-        });
-        let response = {
-            let _gate = state.material_gate.lock();
-            if state.stopped.load(Ordering::Acquire) {
-                return Err(fail());
+        let mut outbound = Request::from_parts(parts, outbound_body);
+        if http2 {
+            let host = authority.authority();
+            let mut uri = Zeroizing::new(Vec::with_capacity(8 + host.len() + wire_target.len()));
+            uri.extend_from_slice(b"https://");
+            uri.extend_from_slice(host.as_bytes());
+            uri.extend_from_slice(&wire_target);
+            *outbound.uri_mut() =
+                hyper::Uri::from_maybe_shared(super::secret_bytes(uri)).map_err(|_| fail())?;
+            *outbound.version_mut() = Version::HTTP_2;
+        } else {
+            *outbound.version_mut() = Version::HTTP_11;
+        }
+        #[cfg(test)]
+        state.headers_sensitive.store(
+            plan.header_edits.iter().all(|edit| {
+                outbound
+                    .headers()
+                    .get(edit.name.as_str())
+                    .is_some_and(|value| value.is_sensitive())
+            }),
+            Ordering::Release,
+        );
+        if state.stopped.load(Ordering::Acquire) {
+            return Err(fail());
+        }
+        for (grant, matched) in state.config.grants.iter().zip(&matches) {
+            if *matched && crate::secret::vault::now_ms() >= grant.expires_at_ms {
+                return Err(grant.rule.label.clone());
             }
-            sender.send_request(outbound)
-        };
+        }
+        let response = upstream.send(outbound);
         drop(materials);
-        response.await.map_err(|_| fail())?
+        response
     };
+    let response = response.await.map_err(|_| fail())?;
     let _request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     super::response::forward(response, state.clone(), client_upgrade)
         .await
@@ -368,4 +341,77 @@ fn apply_edits(
     }
     out.extend_from_slice(&input[cursor..]);
     Ok(out)
+}
+
+enum Upstream {
+    Http1(hyper::client::conn::http1::SendRequest<Body>),
+    Http2(hyper::client::conn::http2::SendRequest<Body>),
+}
+
+type Reply = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Response<Incoming>, hyper::Error>> + Send>,
+>;
+
+impl Upstream {
+    fn send(self, request: Request<Body>) -> Reply {
+        match self {
+            Self::Http1(mut sender) => {
+                let response = sender.send_request(request);
+                Box::pin(async move {
+                    let response = response.await;
+                    drop(sender);
+                    response
+                })
+            }
+            Self::Http2(mut sender) => {
+                let response = sender.send_request(request);
+                Box::pin(async move {
+                    let response = response.await;
+                    drop(sender);
+                    response
+                })
+            }
+        }
+    }
+}
+
+async fn connect_upstream(
+    authority: &ConnectAuthority,
+    state: &State,
+    websocket: bool,
+) -> Result<Upstream, String> {
+    let fail = || String::new();
+    let socket = tokio::net::TcpStream::connect((authority.host.as_str(), authority.port))
+        .await
+        .map_err(|_| fail())?;
+    let mut config = state.upstream.clone();
+    config.alpn_protocols = if websocket {
+        vec![b"http/1.1".to_vec()]
+    } else {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    };
+    let name =
+        rustls::pki_types::ServerName::try_from(authority.host.clone()).map_err(|_| fail())?;
+    let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(name, socket)
+        .await
+        .map_err(|_| fail())?;
+    if tls.get_ref().1.alpn_protocol() == Some(b"h2") {
+        let (sender, connection) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+                .await
+                .map_err(|_| fail())?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok(Upstream::Http2(sender))
+    } else {
+        let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+            .await
+            .map_err(|_| fail())?;
+        tokio::spawn(async move {
+            let _ = connection.with_upgrades().await;
+        });
+        Ok(Upstream::Http1(sender))
+    }
 }
