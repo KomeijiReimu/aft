@@ -1,0 +1,1 @@
+- Configure warnings now check each folder for its Biome workspace and configuration once per pass instead of once per file, cutting background disk checks in projects with many files.
