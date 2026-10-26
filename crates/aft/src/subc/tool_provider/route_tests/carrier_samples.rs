@@ -174,6 +174,15 @@ fn sample_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rich_ui/carrier-samples")
 }
 
+fn sample_path(case: &Case) -> PathBuf {
+    let windows = sample_dir().join(format!("{}.windows.json", case.name));
+    if cfg!(windows) && windows.is_file() {
+        windows
+    } else {
+        sample_dir().join(format!("{}.json", case.name))
+    }
+}
+
 fn normalized_frame(frame: &Frame, temporary_root: &Path, tool: &str) -> Value {
     let mut body = String::from_utf8(frame.body.clone())
         .unwrap()
@@ -268,16 +277,31 @@ async fn capture_carrier_samples() {
     std::fs::create_dir_all(sample_dir()).unwrap();
     for case in cases() {
         let sample = run_case(&case).await;
+        let common = sample_dir().join(format!("{}.json", case.name));
+        let path = if cfg!(windows) {
+            let baseline: Value = serde_json::from_slice(&std::fs::read(&common).unwrap()).unwrap();
+            if sample == baseline {
+                println!("CARRIER_SAMPLE_UNCHANGED {}", case.name);
+                continue;
+            }
+            // Preserve genuine platform output without rewriting the common captures.
+            sample_dir().join(format!("{}.windows.json", case.name))
+        } else {
+            common
+        };
         let json = format!("{}\n", serde_json::to_string_pretty(&sample).unwrap());
-        std::fs::write(sample_dir().join(format!("{}.json", case.name)), &json).unwrap();
-        println!("CARRIER_SAMPLE {} {sample}", case.name);
+        std::fs::write(&path, &json).unwrap();
+        println!(
+            "CARRIER_SAMPLE {} {sample}",
+            path.file_stem().unwrap().to_str().unwrap()
+        );
     }
 }
 
 #[tokio::test]
 async fn carrier_samples_match_wire() {
     for case in cases() {
-        let path = sample_dir().join(format!("{}.json", case.name));
+        let path = sample_path(&case);
         let expected: Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap_or_else(|error| {
                 panic!(

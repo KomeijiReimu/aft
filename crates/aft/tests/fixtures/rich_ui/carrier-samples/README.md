@@ -87,6 +87,27 @@ epoch 1, correlation 7, derived request id `subc-41-7` and task id
 `bash-0123456789abcdef` are fixed by the harness, not rewritten. No fields are
 dropped; all other messages, result data and durations are preserved.
 
+## Platform variants
+
+All fourteen cases were captured natively on Windows. Only `bash_status`
+differs from the common samples:
+
+| Windows variant | Preserved platform difference |
+| --- | --- |
+| `bash_status.windows.json` | Task status includes `· live descendant check n/a on Windows (background tasks do not use a Job Object)`. |
+
+`bash_watch` and the other twelve cases match their common samples after the
+existing normalization, so they have no Windows variants.
+
+On Windows, the normal test selects `<case>.windows.json` when that variant
+exists; otherwise it uses the common `<case>.json`. Other platforms always use
+the common sample. Platform-specific reply text is preserved, not normalized.
+
+The native Windows capture reruns all fourteen cases and compares each complete
+normalized frame pair with its common sample. It writes a `.windows.json` file
+only when the pair differs, and prints `CARRIER_SAMPLE_UNCHANGED <case>` for an
+identical pair. It never overwrites the common JSON files on Windows.
+
 ## Reproduce and review updates
 
 Run from the repository root on Linux (the worker guide requires remote Cargo
@@ -98,8 +119,14 @@ cargo test -p agent-file-tools --lib -- carrier_samples::capture_carrier_samples
 cargo test -p agent-file-tools --lib -- carrier_samples::carrier_samples_match_wire
 ```
 
-The ignored capture test explicitly overwrites the fourteen JSON samples and
-prints each one as `CARRIER_SAMPLE <case> <json>` for export from remote jobs.
+Run the same capture and comparison commands natively on Windows using
+`runon: "windows"` to regenerate or verify Windows variants; cross-compilation
+cannot capture platform-specific replies.
+
+On non-Windows platforms, the ignored capture test explicitly overwrites the
+fourteen common JSON samples. On Windows, it writes only differing variants.
+It prints each written sample as `CARRIER_SAMPLE <case>[.windows] <json>` for
+export from remote jobs.
 The normal test never updates fixtures: it reruns all cases, validates successful
 tagged results and admission error codes, and compares normalized frames,
 including the exact serialized body strings, to these reviewed samples.
