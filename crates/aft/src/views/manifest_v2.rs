@@ -744,7 +744,7 @@ impl ViewStore {
         prepared: PreparedV2,
         observer: Option<&dyn DurabilityObserver>,
     ) -> Result<PublishV2> {
-        self.commit_v2_before_sweep(prepared, observer, || Ok(()))
+        self.commit_v2_completion(prepared, observer, || Ok(()), false)
     }
 
     /// Complete publication-time SQLite reads before scheduling retirement.
@@ -755,6 +755,16 @@ impl ViewStore {
         prepared: PreparedV2,
         observer: Option<&dyn DurabilityObserver>,
         after_publish: impl FnOnce() -> Result<()>,
+    ) -> Result<PublishV2> {
+        self.commit_v2_completion(prepared, observer, after_publish, true)
+    }
+
+    fn commit_v2_completion(
+        &self,
+        prepared: PreparedV2,
+        observer: Option<&dyn DurabilityObserver>,
+        after_publish: impl FnOnce() -> Result<()>,
+        coordinate_probe: bool,
     ) -> Result<PublishV2> {
         let name = prepared.generation.to_string();
         // Keep both the private attempt and the resolved pointer generation
@@ -770,7 +780,11 @@ impl ViewStore {
                 super::checkpoint_pointer_after_cas(&self.pointer_path())?;
                 sync_directory(self.view_dir())?;
                 observe(observer, DurabilityStep::PointerSynced);
-                let completion = after_publish();
+                let completion = if coordinate_probe {
+                    super::generation::with_publication_probe(self.view_dir(), after_publish)
+                } else {
+                    after_publish()
+                };
                 super::generation::schedule_generation_sweep(self.clone());
                 completion?;
                 Ok(PublishV2::Published)

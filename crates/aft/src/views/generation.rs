@@ -99,6 +99,97 @@ fn unlink_generation_file(path: &Path) -> Option<u64> {
 static GENERATION_SWEEPS: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
 static GENERATION_SWEEP_SETTLED: std::sync::Condvar = std::sync::Condvar::new();
 
+#[derive(Default)]
+struct ProbeSweepState {
+    sweeps: usize,
+    probe: bool,
+    waiting_probes: usize,
+}
+
+#[derive(Default)]
+struct ProbeSweepGate {
+    state: Mutex<ProbeSweepState>,
+    changed: std::sync::Condvar,
+}
+
+struct ProbeSweepPermit {
+    gate: Arc<ProbeSweepGate>,
+    probe: bool,
+}
+
+impl Drop for ProbeSweepPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.probe {
+            state.probe = false;
+        } else {
+            state.sweeps -= 1;
+        }
+        drop(state);
+        self.gate.changed.notify_all();
+    }
+}
+
+fn probe_sweep_gate(path: &Path) -> Arc<ProbeSweepGate> {
+    type Key = Vec<std::ffi::OsString>;
+    static GATES: OnceLock<Mutex<HashMap<Key, Weak<ProbeSweepGate>>>> = OnceLock::new();
+    let key = crate::production_storage::comparison_key(path, cfg!(windows));
+    let mut gates = GATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    gates.retain(|_, gate| gate.strong_count() != 0);
+    if let Some(gate) = gates.get(&key).and_then(Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(ProbeSweepGate::default());
+    gates.insert(key, Arc::downgrade(&gate));
+    gate
+}
+
+fn enter_probe_or_sweep(path: &Path, probe: bool) -> ProbeSweepPermit {
+    let gate = probe_sweep_gate(path);
+    let mut state = gate
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if probe {
+        state.waiting_probes += 1;
+    }
+    while state.probe
+        || if probe {
+            state.sweeps != 0
+        } else {
+            state.waiting_probes != 0
+        }
+    {
+        state = gate
+            .changed
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    if probe {
+        state.waiting_probes -= 1;
+        state.probe = true;
+    } else {
+        state.sweeps += 1;
+    }
+    drop(state);
+    ProbeSweepPermit { gate, probe }
+}
+
+/// Coordinate only this view's probe and cleanup activity. The coordination
+/// mutex is released before all filesystem/SQLite work. Call after dropping
+/// registry and pointer transactions so an older sweep can finish admission.
+pub(super) fn with_publication_probe<T>(view_dir: &Path, read: impl FnOnce() -> T) -> T {
+    let _permit = enter_probe_or_sweep(view_dir, true);
+    read()
+}
+
 pub(super) fn schedule_generation_sweep(view: ViewStore) {
     let path = view.view_dir().to_path_buf();
     let jobs = GENERATION_SWEEPS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -546,6 +637,9 @@ impl ViewStore {
         &self,
         registry: Option<&super::registry::FamilyRegistry>,
     ) -> Result<GenerationSweep> {
+        let _activity = enter_probe_or_sweep(self.view_dir(), false);
+        #[cfg(test)]
+        crate::storage_retention::test_hook(self.view_dir(), "generation-sweep-admitted");
         let lock = sweep_lock(self.view_dir());
         let _serialized = lock
             .lock()
@@ -1255,8 +1349,8 @@ fn checkpoint_lock(path: &Path) -> Arc<Mutex<()>> {
 
 // Two cleanups of one view in this process would each see the other's claim
 // as a competing writer and yield, possibly leaving both incomplete. Run them
-// one after another instead. This lock is in-process only and never held by a
-// publisher, so it cannot delay publication.
+// one after another instead. Publishers do not take this I/O-held mutex; their
+// read-only probes use the short-held activity coordinator above.
 fn sweep_lock(path: &Path) -> Arc<Mutex<()>> {
     static SWEEP_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
     let mut locks = SWEEP_LOCKS
@@ -1898,6 +1992,113 @@ pub(super) fn copy_all_pages(backup: &rusqlite::backup::Backup<'_, '_>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_live_probe_blocks_only_maintenance_for_its_own_view() {
+        use std::sync::mpsc;
+        let storage = tempfile::tempdir().unwrap();
+        let same = ViewStore::open(storage.path(), "probe-same").unwrap();
+        let other = ViewStore::open(storage.path(), "probe-other").unwrap();
+        let (same_started, same_work) = mpsc::channel();
+        let (other_started, other_work) = mpsc::channel();
+        let _same_hook = crate::storage_retention::observe_test_hook(
+            same.view_dir(),
+            Arc::new(move |step| {
+                if step == "generation-sweep-admitted" {
+                    let _ = same_started.send(());
+                }
+            }),
+        );
+        let _other_hook = crate::storage_retention::observe_test_hook(
+            other.view_dir(),
+            Arc::new(move |step| {
+                if step == "generation-sweep-admitted" {
+                    let _ = other_started.send(());
+                }
+            }),
+        );
+        let (entered, opened) = mpsc::channel();
+        let (resume, finish) = mpsc::channel();
+        let probing = same.clone();
+        let probe = std::thread::spawn(move || {
+            with_publication_probe(probing.view_dir(), || {
+                let connection = crate::db::file_identity::IdentityConnection::open_with_flags(
+                    probing.pointer_path(),
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    "held publication probe",
+                )
+                .unwrap();
+                let _: String = connection
+                    .query_row(
+                        "SELECT generation FROM pointer WHERE singleton=1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                entered.send(()).unwrap();
+                finish.recv_timeout(Duration::from_secs(10)).unwrap();
+                drop(connection);
+            })
+        });
+        opened.recv_timeout(Duration::from_secs(10)).unwrap();
+        schedule_generation_sweep(same.clone());
+        schedule_generation_sweep(other.clone());
+        let other_progressed = other_work.recv_timeout(Duration::from_secs(5)).is_ok();
+        let same_progressed = same_work.recv_timeout(Duration::from_millis(200)).is_ok();
+        resume.send(()).unwrap();
+        probe.join().unwrap();
+        wait_for_generation_sweep_for_test(same.view_dir());
+        wait_for_generation_sweep_for_test(other.view_dir());
+        assert!(
+            other_progressed,
+            "a probe blocked an unrelated view's maintenance"
+        );
+        assert!(
+            !same_progressed,
+            "same-view maintenance ran while the SQLite probe was open"
+        );
+    }
+
+    #[test]
+    fn a_probe_waits_for_an_already_running_same_view_sweep() {
+        use std::sync::mpsc;
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "older-sweep").unwrap();
+        let pause_once = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (entered, running) = mpsc::channel();
+        let (resume, finish) = mpsc::channel();
+        let finish = Arc::new(Mutex::new(finish));
+        let _hook = crate::storage_retention::observe_test_hook(
+            view.view_dir(),
+            Arc::new(move |step| {
+                if step == "generation-sweep-admitted"
+                    && pause_once.swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    entered.send(()).unwrap();
+                    finish
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap();
+                }
+            }),
+        );
+        schedule_generation_sweep(view.clone());
+        running.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (probe_entered, probe_work) = mpsc::channel();
+        let probing = view.clone();
+        let probe = std::thread::spawn(move || {
+            with_publication_probe(probing.view_dir(), || probe_entered.send(()).unwrap())
+        });
+        let started_early = probe_work.recv_timeout(Duration::from_millis(200)).is_ok();
+        resume.send(()).unwrap();
+        probe.join().unwrap();
+        wait_for_generation_sweep_for_test(view.view_dir());
+        assert!(
+            !started_early,
+            "publication probe overlapped an older active sweep"
+        );
+    }
 
     fn assert_file_set_removed(path: &Path) {
         for suffix in ["", "-wal", "-shm", "-journal"] {
