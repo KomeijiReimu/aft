@@ -7789,28 +7789,24 @@ fn log_scope_workdir_comparison(
     stamp: &subc_protocol::scope::ScopeStamp,
     result: io::Result<Option<(PathBuf, PathBuf)>>,
 ) {
-    // Runs on the shared frame-loop runtime, so tag the line with the bind's
-    // own session explicitly.
-    crate::log_ctx::with_session(Some(identity.session.to_string()), || {
-        match result {
-            Ok(Some((project_root, workdir))) => crate::slog_info!(
-                "subc scope workdir differs: project_root={} workdir={} session={} project_id={}",
-                project_root.display(),
-                workdir.display(),
-                identity.session,
-                stamp.project_id.as_deref().unwrap_or("none"),
-            ),
-            Ok(None) => {}
-            Err(error) => crate::slog_info!(
-                "subc scope workdir comparison skipped: project_root={} workdir={} session={} project_id={} reason={}",
-                identity.project_root.display(),
-                stamp.workdir.as_deref().unwrap_or("none"),
-                identity.session,
-                stamp.project_id.as_deref().unwrap_or("none"),
-                error,
-            ),
-        }
-    });
+    match result {
+        Ok(Some((project_root, workdir))) => crate::slog_info!(
+            "subc scope workdir differs: project_root={} workdir={} session={} project_id={}",
+            project_root.display(),
+            workdir.display(),
+            identity.session,
+            stamp.project_id.as_deref().unwrap_or("none"),
+        ),
+        Ok(None) => {}
+        Err(error) => crate::slog_info!(
+            "subc scope workdir comparison skipped: project_root={} workdir={} session={} project_id={} reason={}",
+            identity.project_root.display(),
+            stamp.workdir.as_deref().unwrap_or("none"),
+            identity.session,
+            stamp.project_id.as_deref().unwrap_or("none"),
+            error,
+        ),
+    }
 }
 
 /// Channel-0 control requests: RouteBind plus the cached health probe.
