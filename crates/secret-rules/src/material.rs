@@ -89,7 +89,8 @@ pub fn encode_for_location(
     check_admissible(key, label, location)?;
     Ok(match location {
         Location::Bearer => {
-            let mut out = b"Bearer ".to_vec();
+            let mut out = Vec::with_capacity(7 + key.len());
+            out.extend_from_slice(b"Bearer ");
             out.extend_from_slice(key);
             out
         }
@@ -105,13 +106,14 @@ pub fn encode_for_location(
 /// `keep_spaces_literal` leaves `0x20` alone, which the scrubber needs to
 /// catch the common variant of form encoding.
 pub(crate) fn percent_encode_form(key: &[u8], keep_spaces_literal: bool) -> Vec<u8> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = Vec::with_capacity(key.len() * 3);
     for byte in key {
         let unreserved = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~');
         if unreserved || (keep_spaces_literal && *byte == b' ') {
             out.push(*byte);
         } else {
-            out.extend_from_slice(format!("%{byte:02X}").as_bytes());
+            out.extend_from_slice(&[b'%', HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]]);
         }
     }
     out
@@ -122,7 +124,7 @@ pub(crate) fn percent_encode_form(key: &[u8], keep_spaces_literal: bool) -> Vec<
 /// Valid UTF-8 is kept as characters; invalid bytes are written as `\ufffd`
 /// so the escaped text is always a legal JSON string body.
 pub fn json_escape(key: &[u8]) -> String {
-    let mut out = String::with_capacity(key.len());
+    let mut out = String::with_capacity(key.len() * 6);
     let mut rest = key;
     while !rest.is_empty() {
         match std::str::from_utf8(rest) {
@@ -152,7 +154,12 @@ fn escape_str(text: &str, out: &mut String) {
             '\t' => out.push_str("\\t"),
             '\u{8}' => out.push_str("\\b"),
             '\u{c}' => out.push_str("\\f"),
-            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch if (ch as u32) < 0x20 => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                out.push_str("\\u00");
+                out.push(HEX[(ch as usize >> 4) & 0xf] as char);
+                out.push(HEX[ch as usize & 0xf] as char);
+            }
             ch => out.push(ch),
         }
     }

@@ -487,7 +487,7 @@ fn push_merged(spans: &mut Vec<(usize, usize)>, span: (usize, usize)) {
 /// selection of escapes.
 fn match_percent(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
     let mut cursor = index;
-    let mut decoded = Zeroizing::new(Vec::new());
+    let mut decoded = Zeroizing::new(Vec::with_capacity(key.len()));
     while cursor < window.len() && decoded.len() < key.len() {
         let byte = window[cursor];
         if byte == b'%' {
@@ -516,7 +516,7 @@ fn match_form(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
         return None;
     }
     let mut cursor = index;
-    let mut decoded = Zeroizing::new(Vec::new());
+    let mut decoded = Zeroizing::new(Vec::with_capacity(key.len()));
     while cursor < window.len() && decoded.len() < key.len() {
         let byte = window[cursor];
         if byte == b'%' {
@@ -537,7 +537,7 @@ fn match_form(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
 /// A JSON string body starting at `index` that unescapes to the key.
 fn match_json(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
     let mut cursor = index;
-    let mut decoded = Zeroizing::new(Vec::new());
+    let mut decoded = Zeroizing::new(Vec::with_capacity(key.len() + 4));
     while cursor < window.len() && decoded.len() < key.len() {
         let byte = window[cursor];
         if byte == b'\\' {
