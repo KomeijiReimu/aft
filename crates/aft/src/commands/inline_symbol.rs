@@ -180,7 +180,11 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     // complete candidate set below because a receiver cannot be type-resolved
     // safely from its final property name alone.
     let matches = if let Some(hints) = lsp_hints::parse_lsp_hints(req) {
-        lsp_hints::apply_lsp_disambiguation(resolved_matches.clone(), &hints)
+        lsp_hints::apply_lsp_disambiguation(
+            resolved_matches.clone(),
+            &hints,
+            &ctx.resolve_relative_path(Path::new(".")),
+        )
     } else {
         resolved_matches.clone()
     };

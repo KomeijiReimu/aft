@@ -177,7 +177,11 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // LSP-enhanced disambiguation (S03)
     let filtered = if let Some(hints) = lsp_hints::parse_lsp_hints(req) {
-        lsp_hints::apply_lsp_disambiguation(filtered, &hints)
+        lsp_hints::apply_lsp_disambiguation(
+            filtered,
+            &hints,
+            &ctx.resolve_relative_path(Path::new(".")),
+        )
     } else {
         filtered
     };

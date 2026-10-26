@@ -691,6 +691,8 @@ fn stderr_tail_for_log(stderr_tail: &str) -> String {
 /// - `workspace_diagnostics` → use `workspace/diagnostic` for directory mode
 ///
 /// Defaults are conservative: `false` means "fall back to push semantics".
+/// Workspace diagnostic `refreshSupport` is advertised by the client, not the
+/// server. Initialize responses therefore cannot populate refresh support here.
 #[derive(Debug, Clone, Default)]
 pub struct ServerDiagnosticCapabilities {
     /// Server supports `textDocument/diagnostic` (LSP 3.17 per-file pull).
@@ -700,10 +702,6 @@ pub struct ServerDiagnosticCapabilities {
     /// `identifier` field from server's diagnosticProvider, if any.
     /// Used to scope previousResultId tracking when multiple servers share a file.
     pub identifier: Option<String>,
-    /// Whether the server requested workspace diagnostic refresh notifications.
-    /// We declare `refreshSupport: false` in our client capabilities so this
-    /// should always be false in practice — kept for completeness.
-    pub refresh_support: bool,
 }
 
 /// rust-analyzer analysis state saved when AFT requests a workspace reload,
@@ -2928,17 +2926,6 @@ fn parse_diagnostic_capabilities(value: &Value) -> ServerDiagnosticCapabilities 
         }
     }
 
-    // Workspace diagnostic refresh (rare — most servers don't request this,
-    // and we declared refreshSupport=false in our client capabilities anyway).
-    if let Some(refresh) = value
-        .get("workspace")
-        .and_then(|w| w.get("diagnostic"))
-        .and_then(|d| d.get("refreshSupport"))
-        .and_then(|r| r.as_bool())
-    {
-        caps.refresh_support = refresh;
-    }
-
     caps
 }
 
@@ -3195,7 +3182,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_caps_workspace_refresh_support() {
+    fn server_capability_state_excludes_client_refresh_support() {
         let value = json!({
             "workspace": {
                 "diagnostic": {
@@ -3204,7 +3191,8 @@ mod tests {
             }
         });
         let caps = parse_diagnostic_capabilities(&value);
-        assert!(caps.refresh_support);
+        // refreshSupport belongs to the client, not to server capability state.
+        assert!(!format!("{caps:?}").contains("refresh_support"));
         // No diagnosticProvider → pull still false
         assert!(!caps.pull_diagnostics);
     }
