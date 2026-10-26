@@ -6,6 +6,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
+/// How long a finished command waits for the watcher to acknowledge its flush marker.
+///
+/// Native Windows file notifications are slower and less prompt than inotify or
+/// FSEvents: on a busy machine building the marker file itself can take most of a
+/// second, so a 300 ms cap reports changes as incomplete even though every file was
+/// seen. The wait still ends as soon as the acknowledgement arrives; the larger
+/// Windows cap only bounds the worst case where it never does.
+#[cfg(windows)]
+pub(crate) const BASH_FLUSH_LIMIT: Duration = Duration::from_millis(1500);
+#[cfg(not(windows))]
 pub(crate) const BASH_FLUSH_LIMIT: Duration = Duration::from_millis(300);
 const MIN_MARKER_BUDGET: Duration = Duration::from_millis(100);
 const MARKER_PREFIX: &str = ".aft-flush-";
@@ -265,6 +275,97 @@ pub(crate) fn is_marker_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    /// A flush control whose first marker acknowledgement arrives only after a
+    /// delay, standing in for a watcher that acknowledges once the file system
+    /// has caught up rather than immediately.
+    fn control_with_ack_delay(root: &Path, delay: Duration) -> Arc<FlushControl> {
+        let control = Arc::new(FlushControl::default());
+        let acknowledged = control.clone();
+        std::thread::spawn(move || {
+            // Only the first wait is held back; a later wait in the same test
+            // would otherwise pay the delay again.
+            let mut delay = Some(delay);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let acks = {
+                    let pending = acknowledged.pending.lock().unwrap();
+                    if pending.is_empty() {
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        drop(pending);
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    drop(pending);
+                    if let Some(delay) = delay.take() {
+                        std::thread::sleep(delay);
+                    }
+                    std::mem::take(&mut *acknowledged.pending.lock().unwrap())
+                };
+                for (_, wait) in acks {
+                    let _ = wait.ack.send(true);
+                }
+            }
+        });
+        control.set_marker_directory(root.to_path_buf());
+        control
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bash_changed_files_flush_limit_is_1_5s_on_windows() {
+        // Native Windows notification delivery can take most of a second on a
+        // loaded runner, so the Windows cap leaves room for it.
+        assert_eq!(BASH_FLUSH_LIMIT, Duration::from_millis(1500));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn bash_changed_files_flush_limit_stays_300ms_off_windows() {
+        assert_eq!(BASH_FLUSH_LIMIT, Duration::from_millis(300));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bash_changed_files_flush_waits_for_late_acknowledgement() {
+        // Both delays are past the 300 ms the other platforms allow but inside
+        // the Windows cap, so only Windows has to keep waiting for them. The
+        // control acknowledges without a real watcher, which keeps this test's
+        // own timer off the shared machine load, but the kernel still needs
+        // room to schedule its threads, so give the runs a cap with headroom.
+        for delay in [Duration::from_millis(400), Duration::from_millis(900)] {
+            let root = tempfile::tempdir().unwrap();
+            let control = control_with_ack_delay(root.path(), delay);
+            let budget = delay + Duration::from_secs(5);
+            assert!(
+                control.wait(root.path(), Instant::now() + budget),
+                "a {delay:?} acknowledgement arrives well inside {budget:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bash_changed_files_flush_limit_leaves_room_for_a_late_acknowledgement() {
+        // The Windows cap has to outlast the waits measured on a busy machine:
+        // about 900 ms for the marker file to be created and its event delivered.
+        assert!(BASH_FLUSH_LIMIT > Duration::from_millis(900));
+    }
+
+    #[test]
+    fn bash_changed_files_flush_reports_incomplete_past_the_limit() {
+        // The delay outlasts the cap, so the pending wait must give up and the
+        // late acknowledgement must not turn that into a complete report.
+        let delay = BASH_FLUSH_LIMIT + Duration::from_millis(600);
+        let root = tempfile::tempdir().unwrap();
+        let control = control_with_ack_delay(root.path(), delay);
+        let started = Instant::now();
+        assert!(!control.wait(root.path(), started + BASH_FLUSH_LIMIT));
+        assert!(started.elapsed() < delay);
+    }
+
     #[test]
     fn bash_changed_files_flush_acknowledges_only_observed_marker() {
         let control = FlushControl::default();
