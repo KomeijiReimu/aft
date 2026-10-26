@@ -4216,3 +4216,7 @@ mod trace_to_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "callgraph_regression_tests.rs"]
+mod callgraph_regression_tests;
