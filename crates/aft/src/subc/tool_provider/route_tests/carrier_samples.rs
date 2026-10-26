@@ -130,7 +130,7 @@ fn fixture() -> (tempfile::TempDir, ProjectRootId, Arc<AppContext>) {
     }
 
     // A completed task avoids a live process and makes its duration reproducible.
-    let storage = dir.path().join("tasks");
+    let storage = crate::bash_background::task_storage_dir(&ctx);
     let paths = task_paths(&storage, "session-s", TASK_ID).unwrap();
     let mut task = PersistedTask::starting(
         TASK_ID.into(),
@@ -174,10 +174,19 @@ fn sample_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rich_ui/carrier-samples")
 }
 
-fn normalized_frame(frame: &Frame, temporary_root: &Path) -> Value {
-    let body = String::from_utf8(frame.body.clone())
+fn normalized_frame(frame: &Frame, temporary_root: &Path, tool: &str) -> Value {
+    let mut body = String::from_utf8(frame.body.clone())
         .unwrap()
         .replace(temporary_root.to_str().unwrap(), "${FIXTURE_ROOT}");
+    let timestamps = regex::Regex::new(r#"("(?:started_at|finished_at)":)\d+"#).unwrap();
+    body = timestamps.replace_all(&body, "${1}0").into_owned();
+    if tool == "bash_watch" {
+        // A completed task still reports scheduler-dependent time spent observing it.
+        let elapsed = regex::Regex::new(r#"("elapsed_ms":)\d+"#).unwrap();
+        body = elapsed.replace_all(&body, "${1}0").into_owned();
+        let rendered = regex::Regex::new(r"\bWaited \d+ms").unwrap();
+        body = rendered.replace_all(&body, "Waited 0ms").into_owned();
+    }
     // Recompute only the byte length affected by replacing the temporary path.
     let header = &frame.header;
     let normalized = Frame::build_with_version(
@@ -226,7 +235,32 @@ async fn run_case(case: &Case) -> Value {
         cortexkit_role_tool_provider::result::validate(&result).unwrap();
         assert!(result.error_code.is_none(), "{}: {result:?}", case.name);
     }
-    json!({"request_frame":normalized_frame(&request, dir.path()),"reply_frame":normalized_frame(reply.frame(), dir.path())})
+    json!({"request_frame":normalized_frame(&request, dir.path(), case.tool),"reply_frame":normalized_frame(reply.frame(), dir.path(), case.tool)})
+}
+
+#[test]
+fn carrier_sample_normalization_is_narrow() {
+    let body =
+        r#"{"started_at":17,"duration_ms":12,"waited":{"elapsed_ms":9},"text":"Waited 9ms"}"#;
+    let frame = Frame::build(
+        FrameType::Response,
+        control_flags(),
+        41,
+        1,
+        7,
+        body.as_bytes().to_vec(),
+    )
+    .unwrap();
+    let watch = normalized_frame(&frame, Path::new("/unused-fixture-root"), "bash_watch");
+    assert_eq!(
+        watch["body_utf8"],
+        r#"{"started_at":0,"duration_ms":12,"waited":{"elapsed_ms":0},"text":"Waited 0ms"}"#
+    );
+    let status = normalized_frame(&frame, Path::new("/unused-fixture-root"), "bash_status");
+    assert_eq!(
+        status["body_utf8"],
+        r#"{"started_at":0,"duration_ms":12,"waited":{"elapsed_ms":9},"text":"Waited 9ms"}"#
+    );
 }
 
 #[tokio::test]

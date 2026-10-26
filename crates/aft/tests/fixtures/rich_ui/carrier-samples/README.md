@@ -74,12 +74,18 @@ To recover frame bytes, hex-decode `header_hex` and append the UTF-8 bytes of
 `body_utf8`. JSON escaping in the outer sample file is only the storage wrapper;
 the inner body's key order, whitespace, text and envelope fields are preserved.
 
-The only normalization is replacement of the temporary fixture directory with
-`${FIXTURE_ROOT}` wherever it occurs in body text. The header's body length is
-recomputed for that replacement. Frame channel 41, epoch 1, correlation 7,
-derived request id `subc-41-7` and task id `bash-0123456789abcdef` are fixed by
-the harness, not rewritten. No fields are dropped and no messages, result data,
-durations or timestamps are normalized.
+Normalization is limited to:
+
+- The temporary fixture directory becomes `${FIXTURE_ROOT}` in body text.
+- Task `started_at`/`finished_at` timestamps, when present, become numeric `0`.
+- Only for `bash_watch`, measured `waited.elapsed_ms` becomes numeric `0`, and
+  the corresponding rendered `Waited Nms` becomes `Waited 0ms`. This is measured
+  observation time, not the fixture task's fixed `duration_ms` of 12.
+
+The header's body length is recomputed after normalization. Frame channel 41,
+epoch 1, correlation 7, derived request id `subc-41-7` and task id
+`bash-0123456789abcdef` are fixed by the harness, not rewritten. No fields are
+dropped; all other messages, result data and durations are preserved.
 
 ## Reproduce and review updates
 
