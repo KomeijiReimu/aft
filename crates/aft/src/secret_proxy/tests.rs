@@ -628,7 +628,7 @@ fn client_child() {
                 let path = value["path"].as_str().unwrap_or("/approved");
                 let uri = if matches!(sender, Sender::H2(_)) { format!("https://{authority}{path}") } else { path.to_owned() };
                 let mut request = Request::builder().uri(uri).method("POST").header("te", "trailers");
-                if value["omit_host"] != true { request = request.header("host", &authority); }
+                if value["omit_host"] != true { request = request.header("host", value["host_override"].as_str().unwrap_or(&authority)); }
                 if let Some(headers) = value["headers"].as_object() {
                     for (key, val) in headers { request = request.header(key, val.as_str().unwrap()); }
                 }

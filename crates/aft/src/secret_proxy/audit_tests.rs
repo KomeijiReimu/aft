@@ -238,13 +238,20 @@ async fn audit_raw_parser_cases() {
     let (_proxy, mut client) = launch(&server, Vault::new());
     let authority = format!("localhost:{}", server.address.port());
     let cases = [
-        "Content-Length: 0\r\nContent-Length: 4\r\n",
-        "Content-Length: 0\r\nTransfer-Encoding: chunked\r\nConnection: host\r\n",
-        "Host: other.invalid\r\n",
-        "X-Note: one\r\n folded\r\n",
-        "X-Note : value\r\n",
+        (
+            "Content-Length: 0\r\nContent-Length: 4\r\n".to_owned(),
+            true,
+        ),
+        (
+            "Content-Length: 0\r\nTransfer-Encoding: chunked\r\nConnection: host\r\n".to_owned(),
+            false,
+        ),
+        ("Host: other.invalid\r\n".to_owned(), true),
+        (format!("Host: {authority}\r\n"), true),
+        ("X-Note: one\r\n folded\r\n".to_owned(), false),
+        ("X-Note : value\r\n".to_owned(), false),
     ];
-    for fields in cases {
+    for (fields, must_refuse) in cases {
         assert_eq!(
             client.command(json!({"op":"connect","raw":true}))["ok"],
             true
@@ -255,7 +262,15 @@ async fn audit_raw_parser_cases() {
             ""
         };
         let wire=format!("POST /approved HTTP/1.1\r\nHost: {authority}\r\n{fields}Authorization: Bearer {MARKER}\r\nConnection: close\r\n\r\n{body}");
+        let before = server.seen.lock().len();
         client.command(json!({"op":"raw","wire":wire}));
+        if must_refuse {
+            assert_eq!(
+                server.seen.lock().len(),
+                before,
+                "ambiguous raw headers reached upstream"
+            );
+        }
         for seen in server.seen.lock().iter() {
             assert_eq!(
                 seen["headers"]["host"], authority,
@@ -267,6 +282,27 @@ async fn audit_raw_parser_cases() {
             );
             assert_eq!(seen["body"], "");
         }
+    }
+    assert_eq!(
+        client.command(json!({"op":"connect","raw":true}))["ok"],
+        true
+    );
+    let before = server.seen.lock().len();
+    client.command(json!({"op":"raw","wire":format!("POST /approved HTTP/1.1\r\nHost: {authority}\r\nAuthorization: Bearer {MARKER}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")}));
+    assert_eq!(
+        server.seen.lock().len(),
+        before + 1,
+        "positive raw control did not reach the fixture"
+    );
+    client.connect(true);
+    let before = server.seen.lock().len();
+    for (uri, host) in [
+        ("other.invalid", authority.as_str()),
+        (authority.as_str(), "other.invalid"),
+    ] {
+        let reply=client.command(json!({"op":"request","authority":uri,"host_override":host,"path":"/approved","headers":{"authorization":format!("Bearer {MARKER}")}}));
+        assert_eq!(reply["status"], 403);
+        assert_eq!(server.seen.lock().len(), before);
     }
 }
 
