@@ -135,7 +135,12 @@ pub trait PublicationBinding {
     /// Hold the ownership PublishFence across final marker verification and
     /// pointer CAS, and return only after the pointer is synced. Keeping both
     /// operations in one callback prevents a validation-to-CAS ownership race.
-    fn publish_verified(&mut self) -> Result<super::manifest_v2::PublishV2, PlaneError> {
+    /// Mark `MayHaveLanded` immediately before CAS, before any error can hide a
+    /// committed transaction. Leave it `NotAttempted` if verification refuses.
+    fn publish_verified(
+        &mut self,
+        _progress: &mut PublicationProgress,
+    ) -> Result<super::manifest_v2::PublishV2, PlaneError> {
         Err(binding_unavailable())
     }
     fn referrer_published(&mut self) -> Result<(), PlaneError> {
@@ -147,12 +152,28 @@ pub trait PublicationBinding {
     fn schedule_revalidated(&mut self) -> Result<(), PlaneError> {
         Err(binding_unavailable())
     }
-    /// Under the registry barrier, remove any unfinished reference intent and
-    /// release the temporary base marker acquired by `acquire`. After a
-    /// successful install, the bundle retains separate query-residency markers.
+    /// Preserve intent and temporary protection for a publication that landed or
+    /// whose CAS outcome is uncertain. Recovery must reconcile the pointer and
+    /// finish its referrer/install; it must not abort the published reference.
+    fn recover_published(&mut self) -> Result<(), PlaneError> {
+        Err(binding_unavailable())
+    }
+    /// Remove the temporary insertion intent and acquisition marker after a
+    /// known unpublished attempt, or after InstalledBundle.readers retains
+    /// independent ComposedGeneration residency markers. Never called to abort
+    /// a landed or uncertain CAS after a later step failed.
     fn terminal_cleanup(&mut self) -> Result<(), PlaneError> {
         Err(binding_unavailable())
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PublicationProgress {
+    #[default]
+    NotAttempted,
+    /// Set before invoking CAS: a storage error may hide a committed transaction.
+    MayHaveLanded,
+    Published,
 }
 
 fn binding_unavailable() -> PlaneError {
@@ -174,15 +195,19 @@ pub enum BindingOutcome {
 pub fn publish_and_install(
     binding: &mut dyn PublicationBinding,
 ) -> Result<BindingOutcome, PlaneError> {
+    let mut progress = PublicationProgress::NotAttempted;
     let result: Result<BindingOutcome, PlaneError> = (|| {
         binding.cut()?;
         binding.acquire()?;
         binding.build_and_flush()?;
         binding.open_readers()?;
-        match binding.publish_verified()? {
-            super::manifest_v2::PublishV2::Published => {}
+        match binding.publish_verified(&mut progress)? {
+            super::manifest_v2::PublishV2::Published => {
+                progress = PublicationProgress::Published;
+            }
             super::manifest_v2::PublishV2::Conflict { .. }
             | super::manifest_v2::PublishV2::EquivalentWinner { .. } => {
+                progress = PublicationProgress::NotAttempted;
                 return Ok(BindingOutcome::Revalidate);
             }
         }
@@ -190,11 +215,22 @@ pub fn publish_and_install(
         binding.install_replayed()?;
         Ok(BindingOutcome::Installed)
     })();
-    let cleanup = binding.terminal_cleanup();
+    let recovering = result.is_err() && progress != PublicationProgress::NotAttempted;
+    let cleanup = if recovering {
+        binding.recover_published()
+    } else {
+        binding.terminal_cleanup()
+    };
     match (result, cleanup) {
         (Err(error), Err(cleanup)) => Err(SiblingLoader::error(format!(
-            "publication failed: {}; terminal cleanup failed: {}",
-            error.reason, cleanup.reason
+            "publication failed: {}; {} failed: {}",
+            error.reason,
+            if recovering {
+                "published recovery"
+            } else {
+                "terminal cleanup"
+            },
+            cleanup.reason
         ))),
         (Err(error), Ok(())) => Err(error),
         (Ok(_), Err(error)) => Err(error),
@@ -224,10 +260,13 @@ mod publication_binding_tests {
         assert!(binding.open_readers().is_err());
         assert!(binding.verify_held().is_err());
         assert!(binding.publish().is_err());
-        assert!(binding.publish_verified().is_err());
+        let mut progress = PublicationProgress::NotAttempted;
+        assert!(binding.publish_verified(&mut progress).is_err());
+        assert_eq!(progress, PublicationProgress::NotAttempted);
         assert!(binding.referrer_published().is_err());
         assert!(binding.install_replayed().is_err());
         assert!(binding.schedule_revalidated().is_err());
+        assert!(binding.recover_published().is_err());
         assert!(binding.terminal_cleanup().is_err());
         let error = publish_and_install(&mut binding).unwrap_err();
         assert!(error.reason.contains("terminal cleanup failed"));
@@ -237,6 +276,7 @@ mod publication_binding_tests {
         steps: Vec<&'static str>,
         fail: Option<&'static str>,
         outcome: PublishV2,
+        intent: Option<std::path::PathBuf>,
     }
     impl Binding {
         fn step(&mut self, name: &'static str) -> Result<(), PlaneError> {
@@ -253,7 +293,11 @@ mod publication_binding_tests {
             self.step("cut")
         }
         fn acquire(&mut self) -> Result<(), PlaneError> {
-            self.step("acquire")
+            self.step("acquire")?;
+            if let Some(path) = &self.intent {
+                std::fs::write(path, b"pending reference").unwrap();
+            }
+            Ok(())
         }
         fn build_and_flush(&mut self) -> Result<(), PlaneError> {
             self.step("closure-flushed")
@@ -268,8 +312,12 @@ mod publication_binding_tests {
             self.step("pointer-synced")?;
             Ok(self.outcome.clone())
         }
-        fn publish_verified(&mut self) -> Result<PublishV2, PlaneError> {
+        fn publish_verified(
+            &mut self,
+            progress: &mut PublicationProgress,
+        ) -> Result<PublishV2, PlaneError> {
             self.verify_held()?;
+            *progress = PublicationProgress::MayHaveLanded;
             self.publish()
         }
         fn referrer_published(&mut self) -> Result<(), PlaneError> {
@@ -282,12 +330,21 @@ mod publication_binding_tests {
             self.step("revalidated-job")
         }
         fn terminal_cleanup(&mut self) -> Result<(), PlaneError> {
-            self.step("terminal-cleanup")
+            self.step("terminal-cleanup")?;
+            if let Some(path) = &self.intent {
+                if path.exists() {
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+            Ok(())
+        }
+        fn recover_published(&mut self) -> Result<(), PlaneError> {
+            self.step("published-recovery")
         }
     }
 
     #[test]
-    fn publication_binding_nine_steps_and_cleanup_on_each_failure() {
+    fn publication_binding_nine_steps_and_phase_appropriate_failure_recovery() {
         let expected = [
             "cut",
             "acquire",
@@ -303,6 +360,7 @@ mod publication_binding_tests {
             steps: Vec::new(),
             fail: None,
             outcome: PublishV2::Published,
+            intent: None,
         };
         assert_eq!(
             publish_and_install(&mut binding).unwrap(),
@@ -314,11 +372,16 @@ mod publication_binding_tests {
                 steps: Vec::new(),
                 fail: Some(step),
                 outcome: PublishV2::Published,
+                intent: None,
             };
             assert!(publish_and_install(&mut binding).is_err(), "{step}");
             let mut prefix = expected[..=index].to_vec();
             if *step != "terminal-cleanup" {
-                prefix.push("terminal-cleanup");
+                prefix.push(if index >= 5 {
+                    "published-recovery"
+                } else {
+                    "terminal-cleanup"
+                });
             }
             assert_eq!(binding.steps, prefix, "{step}");
         }
@@ -338,6 +401,7 @@ mod publication_binding_tests {
                 steps: Vec::new(),
                 fail: None,
                 outcome,
+                intent: None,
             };
             assert_eq!(
                 publish_and_install(&mut binding).unwrap(),
@@ -357,6 +421,40 @@ mod publication_binding_tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn landed_or_ambiguous_cas_failure_preserves_insertion_protection() {
+        for failed in ["pointer-synced", "referrer-published", "installed"] {
+            let directory = tempfile::tempdir().unwrap();
+            let intent = directory.path().join("insertion-intent");
+            let mut binding = Binding {
+                steps: Vec::new(),
+                fail: Some(failed),
+                outcome: PublishV2::Published,
+                intent: Some(intent.clone()),
+            };
+            assert!(publish_and_install(&mut binding).is_err());
+            assert!(
+                intent.is_file(),
+                "{failed}: recovery discarded the published reference's protection"
+            );
+            assert!(!binding.steps.contains(&"terminal-cleanup"));
+            assert_eq!(binding.steps.last(), Some(&"published-recovery"));
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let intent = directory.path().join("insertion-intent");
+        let mut binding = Binding {
+            steps: Vec::new(),
+            fail: Some("verify-held"),
+            outcome: PublishV2::Published,
+            intent: Some(intent.clone()),
+        };
+        assert!(publish_and_install(&mut binding).is_err());
+        assert!(
+            !intent.exists(),
+            "a known pre-CAS refusal should release its temporary protection"
+        );
     }
 }
 
