@@ -37,11 +37,6 @@ pub(crate) struct FlushControl {
     native: Mutex<Option<mpsc::Sender<FlushRequest>>>,
     #[cfg(test)]
     pub(crate) force_timeout: std::sync::atomic::AtomicBool,
-    /// Test-only: how long the watcher stands in for before it acknowledges a
-    /// marker, so tests can exercise the waiter's deadline without a real slow
-    /// file system.
-    #[cfg(test)]
-    pub(crate) ack_delay: Mutex<Duration>,
 }
 
 #[cfg(target_os = "macos")]
@@ -210,30 +205,10 @@ impl FlushControl {
         let wait_deadline = event_deadline;
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         let wait_deadline = deadline;
-        // The acknowledgement must arrive before wait_deadline. In tests the
-        // acknowledgement can be held back for a while first, to stand in for a
-        // slow watcher without depending on machine load.
-        #[cfg(test)]
-        let ack_delay = *self
-            .ack_delay
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        #[cfg(not(test))]
-        let ack_delay = Duration::ZERO;
-        let acknowledged = |rx: mpsc::Receiver<bool>| {
-            let deadline = wait_deadline.saturating_duration_since(Instant::now());
-            if ack_delay.is_zero() {
-                return rx.recv_timeout(deadline).unwrap_or(false);
-            }
-            match rx.recv_timeout(deadline.min(ack_delay)) {
-                Err(mpsc::RecvTimeoutError::Timeout) => rx
-                    .recv_timeout(wait_deadline.saturating_duration_since(Instant::now()))
-                    .unwrap_or(false),
-                Ok(ack) => ack,
-                Err(mpsc::RecvTimeoutError::Disconnected) => false,
-            }
-        };
-        let caught_up = started && acknowledged(rx);
+        let caught_up = started
+            && rx
+                .recv_timeout(wait_deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(false);
         self.pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -301,21 +276,20 @@ pub(crate) fn is_marker_path(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    /// A flush control whose marker acknowledgements arrive only after a delay,
-    /// standing in for a watcher that acknowledges once the file system has
-    /// caught up rather than immediately.
+    /// A flush control whose first marker acknowledgement arrives only after a
+    /// delay, standing in for a watcher that acknowledges once the file system
+    /// has caught up rather than immediately.
     fn control_with_ack_delay(root: &Path, delay: Duration) -> Arc<FlushControl> {
         let control = Arc::new(FlushControl::default());
-        *control.ack_delay.lock().unwrap() = delay;
         let acknowledged = control.clone();
         std::thread::spawn(move || {
+            // Only the first wait is held back; a later wait in the same test
+            // would otherwise pay the delay again.
+            let mut delay = Some(delay);
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
-                // Acknowledges whatever wait is currently pending, switching the
-                // delay off first so a later wait in the same test is immediate.
                 let acks = {
                     let pending = acknowledged.pending.lock().unwrap();
-                    let delay = *acknowledged.ack_delay.lock().unwrap();
                     if pending.is_empty() {
                         if Instant::now() >= deadline {
                             return;
@@ -324,12 +298,10 @@ mod tests {
                         std::thread::sleep(Duration::from_millis(1));
                         continue;
                     }
-                    *acknowledged
-                        .ack_delay
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Duration::ZERO;
                     drop(pending);
-                    std::thread::sleep(delay);
+                    if let Some(delay) = delay.take() {
+                        std::thread::sleep(delay);
+                    }
                     std::mem::take(&mut *acknowledged.pending.lock().unwrap())
                 };
                 for (_, wait) in acks {

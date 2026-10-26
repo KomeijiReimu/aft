@@ -1,1 +1,1 @@
-- On Windows, a finished command waits up to 1.5 seconds for its changed-files report to catch up, so busy machines no longer mark it incomplete while listing every file.
+On Windows, a finished command now waits up to 1.5 seconds for the file watcher before reporting which files it changed, so busy machines no longer mark a complete list as incomplete.
