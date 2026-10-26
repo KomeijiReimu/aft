@@ -2324,6 +2324,16 @@ fn worker_codemode_run_uses_the_workers_root_and_frozen_params_never_the_heads()
                 json!({"command":"echo escaped", "timeout": 5000}),
             )
             .await;
+            // A run's shell call first confirms the run is still live.
+            let request = describe_phase(&mut daemon.stream, "pre-bash Live check").await;
+            answer(
+                &mut daemon.stream,
+                &request,
+                subc_protocol::scope::ScopeStatus::Live,
+                true,
+                Some(1),
+            )
+            .await;
             let reply = read_frame_timeout(&mut daemon.stream, "confined worker run bash").await;
             assert!(
                 !String::from_utf8_lossy(&reply.body).contains("escaped\n"),
