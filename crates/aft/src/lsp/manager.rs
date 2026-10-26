@@ -2178,7 +2178,7 @@ impl LspManager {
                     client.child_pid(),
                 ))
             });
-        let (writer, save, pid) = match sender {
+        let ((writer, begins_read), save, pid) = match sender {
             Ok(sender) => sender,
             Err(error) => {
                 self.complete_startup_outcome(
@@ -2226,7 +2226,14 @@ impl LspManager {
             .name("lsp-startup-sync".into())
             .spawn(move || {
                 let guard = StartupWorkerGuard(Arc::clone(&worker_signal));
-                let result = replay_startup_notifications(writer, save, pid, &worker_signal, jobs);
+                let result = replay_startup_notifications(
+                    writer,
+                    save,
+                    begins_read,
+                    pid,
+                    &worker_signal,
+                    jobs,
+                );
                 *worker_signal.replay_completion.lock() = Some(result);
                 worker_signal.finish();
                 drop(guard);
@@ -2266,8 +2273,7 @@ impl LspManager {
                 .sync_at_version(document.path.clone(), document.version, &document.disk);
             if let Ok(uri) = uri_for_path(&document.path) {
                 if let Some(client) = self.clients.get_mut(key) {
-                    let saved = client.save_notification().is_some();
-                    client.record_startup_sync(&uri, document.opened, saved);
+                    client.record_startup_sync(&uri, document.opened, document.saved);
                 }
             }
             self.queue_background_document_pull(key, &document.path);
@@ -5953,11 +5959,12 @@ impl LspManager {
             kind: server_kind.clone(),
             root: root.clone(),
         };
-        if !self.clients.contains_key(&event_key) {
-            if let Some(reservation) = self.starting.get_mut(&event_key) {
-                reservation.deferred_events.push(event.clone());
-                return None;
-            }
+        // Replay sends run on a worker outside the manager lock. Defer LSP
+        // events until replay commits document versions, save write times,
+        // and rust-analyzer check-begin counts.
+        if let Some(reservation) = self.starting.get_mut(&event_key) {
+            reservation.deferred_events.push(event.clone());
+            return None;
         }
         let published_file = match event {
             LspEvent::DocumentDiagnosticsPulled {
@@ -7743,6 +7750,8 @@ struct StartupReplayDocument {
     version: i32,
     opened: bool,
     disk: DiskSnapshot,
+    /// Save-notification write time and rust-analyzer check-begin count.
+    saved: Option<(Instant, u64)>,
 }
 
 struct StartupReplayResult {
@@ -7757,6 +7766,7 @@ struct StartupReplayResult {
 fn replay_startup_notifications(
     writer: super::writer::LspWriter,
     save: Option<SaveNotification>,
+    begins_read: Arc<std::sync::atomic::AtomicU64>,
     pid: u32,
     signal: &StartSignal,
     jobs: Vec<(PathBuf, i32, bool)>,
@@ -7767,7 +7777,7 @@ fn replay_startup_notifications(
         error: None,
     };
     for (path, version, opened) in jobs {
-        let sent = (|| -> Result<DiskSnapshot, LspError> {
+        let sent = (|| -> Result<(DiskSnapshot, Option<(Instant, u64)>), LspError> {
             let disk = DiskSnapshot::read(&path);
             let content = std::fs::read_to_string(&path)?;
             let uri = uri_for_path(&path)?;
@@ -7792,20 +7802,27 @@ fn replay_startup_notifications(
                 super::client::full_did_change_message(&uri, version, &content)?
             };
             writer.send(payload)?;
-            if let Some(save) = save {
+            let saved = if let Some(save) = save {
                 writer.send(super::client::did_save_message(
                     &uri,
                     (save == SaveNotification::IncludeText).then_some(content.as_str()),
                 )?)?;
-            }
-            Ok(disk)
+                Some((
+                    Instant::now(),
+                    begins_read.load(std::sync::atomic::Ordering::SeqCst),
+                ))
+            } else {
+                None
+            };
+            Ok((disk, saved))
         })();
         match sent {
-            Ok(disk) => result.documents.push(StartupReplayDocument {
+            Ok((disk, saved)) => result.documents.push(StartupReplayDocument {
                 path,
                 version,
                 opened,
                 disk,
+                saved,
             }),
             Err(error) => {
                 result.error = Some(error);

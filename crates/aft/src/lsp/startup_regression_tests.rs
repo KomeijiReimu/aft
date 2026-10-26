@@ -504,7 +504,7 @@ fn file_change_during_cancelled_startup_is_not_replayed() {
     assert_eq!(queued, vec![(f.key.clone(), 0)]);
     assert!(f.manager.lock().starting[&f.key]
         .pending_notifications
-        .contains(&f.file));
+        .contains(&canonicalize_for_lsp(&f.file).unwrap()));
     f.manager.lock().quiesce();
     pause.resume.send(()).unwrap();
     done_rx.recv_timeout(WAIT).unwrap();
@@ -550,11 +550,29 @@ fn unlocked_request_waits_until_startup_notification_replay_finishes() {
         });
         pause.resume.send(()).unwrap();
         entered_rx.recv_timeout(WAIT).unwrap();
-        let lock_available = f.manager.try_lock_for(Duration::from_secs(5)).is_some();
+        let mut lock_available = false;
+        let mut event_deferred = false;
+        if let Some(mut manager) = f.manager.try_lock_for(Duration::from_secs(5)) {
+            lock_available = true;
+            let before = manager.starting[&f.key].deferred_events.len();
+            let event = LspEvent::Notification {
+                server_kind: f.key.kind.clone(),
+                root: f.key.root.clone(),
+                method: "custom/producerProgress".into(),
+                params: None,
+            };
+            manager.handle_event(&event);
+            event_deferred = manager.clients.contains_key(&f.key)
+                && manager.starting[&f.key].deferred_events.len() == before + 1;
+        }
         let returned_early = done_rx.try_recv().is_ok();
         resume_tx.send(()).unwrap();
         assert_eq!(waiting.join().unwrap().successful, vec![f.key.clone()]);
         assert!(lock_available, "replay held the manager mutex");
+        assert!(
+            event_deferred,
+            "producer event passed uncommitted replay state"
+        );
         assert!(!returned_early, "request returned before replay completed");
     });
     let messages = recorded_notifications(&f);
