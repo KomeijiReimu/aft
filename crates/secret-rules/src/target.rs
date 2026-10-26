@@ -104,6 +104,10 @@ pub fn canonical_host(host: &str) -> Result<String, TargetRefusal> {
         }
         return Ok(format!("[{}]", inner.to_ascii_lowercase()));
     }
+    // A bare IPv6 literal is not a domain name; only the bracketed form is.
+    if host.contains(':') {
+        return Err(TargetRefusal::MalformedAuthority);
+    }
     let (domain, trailing_dot) = match host.strip_suffix('.') {
         Some(stripped) => (stripped, true),
         None => (host, false),
@@ -240,8 +244,15 @@ pub fn canonicalize_path(path: &str) -> Result<CanonicalPath, TargetRefusal> {
         }
     }
 
-    let mut value = String::new();
-    let mut wire = Vec::new();
+    // An absolute path starts with its separator; every later segment is
+    // separated by one too. The empty segment left by a trailing dot segment is
+    // the path's own end rather than another segment, so it is dropped here and
+    // re-appended as the trailing separator.
+    while output.last().is_some_and(|segment| segment.is_empty()) {
+        output.pop();
+    }
+    let mut value = String::from("/");
+    let mut wire = vec![b'/'];
     for (position, segment) in output.iter().enumerate() {
         if position > 0 {
             value.push('/');
@@ -252,7 +263,8 @@ pub fn canonicalize_path(path: &str) -> Result<CanonicalPath, TargetRefusal> {
             if crate::material::is_unreserved(*byte) {
                 wire.push(*byte);
             } else {
-                wire.extend_from_slice(format!("%{byte:02X}").as_bytes());
+                wire.push(b'%');
+                wire.extend_from_slice(hex_pair(*byte).as_bytes());
             }
         }
     }
@@ -270,6 +282,14 @@ pub fn normalize_path_prefix(prefix: &str) -> Result<String, TargetRefusal> {
         return Err(TargetRefusal::MalformedPath);
     };
     canonicalize_path(root).map(|path| path.value)
+}
+
+/// Uppercase hex of one byte, without the format machinery's locale and
+/// width rules.
+pub(crate) fn hex_pair(byte: u8) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    let pair = [DIGITS[(byte >> 4) as usize], DIGITS[(byte & 0x0f) as usize]];
+    String::from_utf8_lossy(&pair).into_owned()
 }
 
 /// Decode one `%XX` escape whose two hex digits start at `start`.

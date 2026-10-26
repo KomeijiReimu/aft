@@ -33,11 +33,14 @@ pub fn check_admissible(
     if key.is_empty() {
         return Err(MaterialRefusal::Empty);
     }
-    if key.len() < MIN_KEY_LEN {
-        return Err(MaterialRefusal::TooShort);
-    }
+    // The placeholder check runs before the length floor: a key that is part
+    // of its own placeholder is refused for that reason, whatever its length,
+    // because the length floor alone would describe it wrongly.
     if key_is_substring_of_placeholder(key, label) {
         return Err(MaterialRefusal::SubstringOfPlaceholder);
+    }
+    if key.len() < MIN_KEY_LEN {
+        return Err(MaterialRefusal::TooShort);
     }
     match location {
         // A header value is a byte string on the wire; anything outside the
@@ -53,15 +56,16 @@ pub fn check_admissible(
     Ok(())
 }
 
-/// True when any non-empty run of key bytes appears in the label's
-/// placeholder text.
+/// True when the key text appears inside the label's own placeholder text, or
+/// the placeholder appears inside the key.
 ///
-/// This is the strict reading of P3's "occurring as a substring of its own
-/// label's placeholder text": a key made of digits inside a digit-bearing label
-/// would otherwise appear in the request even after substitution.
+/// Either direction exposes the key: a key that is a fragment of its label's
+/// placeholder would appear in every substituted request, and a key that
+/// contains the whole placeholder would be rewritten by the scrubber.
 pub fn key_is_substring_of_placeholder(key: &[u8], label: &str) -> bool {
-    let placeholder = format!("{{{{ck-secret:{label}}}}}");
-    bytes_contain(&placeholder.into_bytes(), key)
+    let placeholder = crate::placeholder::placeholder_text(label);
+    let placeholder = placeholder.as_bytes();
+    bytes_contain(placeholder, key) || bytes_contain(key, placeholder)
 }
 
 fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
@@ -117,7 +121,7 @@ pub(crate) fn percent_encode_form(key: &[u8], keep_spaces_literal: bool) -> Vec<
 ///
 /// Valid UTF-8 is kept as characters; invalid bytes are written as `\ufffd`
 /// so the escaped text is always a legal JSON string body.
-pub(crate) fn json_escape(key: &[u8]) -> String {
+pub fn json_escape(key: &[u8]) -> String {
     let mut out = String::with_capacity(key.len());
     let mut rest = key;
     while !rest.is_empty() {

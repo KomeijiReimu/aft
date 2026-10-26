@@ -105,7 +105,7 @@ fn evaluate_pointer(
     let Some(target) = resolve_pointer(value, &tokens) else {
         return Ok(LabelOutcome::OutOfScope);
     };
-    let placeholder = format!("{}{}}}", crate::placeholder::PLACEHOLDER_PREFIX, rule.label);
+    let placeholder = format!("{}{}", crate::placeholder::PLACEHOLDER_PREFIX, rule.label) + "}}";
     let serde_json::Value::String(text) = target else {
         // A pointer that lands on a number, boolean, null, object or array is
         // a rule the request cannot satisfy. It is only ambiguous when the

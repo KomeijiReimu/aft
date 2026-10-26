@@ -213,11 +213,10 @@ impl<'a> HeaderField<'a> {
     }
 
     fn bytes<'b>(&'b self, buffer: &'b [u8]) -> &'b [u8] {
-        match (self.borrowed, self.value_range) {
-            (Some(borrowed), _) => borrowed,
-            (None, Some((start, end))) => buffer.get(start..end).unwrap_or_default(),
-            (None, None) => &[],
+        if let Some((start, end)) = self.value_range {
+            return buffer.get(start..end).unwrap_or_default();
         }
+        self.borrowed.unwrap_or_default()
     }
 }
 
@@ -287,11 +286,13 @@ pub fn header_name_is_reserved(name: &str) -> bool {
 /// Validate a rule's header name for P2.
 pub fn validate_header_name(name: &str) -> Result<(), RequestRefusal> {
     let bytes = name.as_bytes();
-    if bytes.is_empty() || !bytes.iter().all(|byte| is_token_byte(*byte)) {
-        return Err(RequestRefusal::InvalidHeaderName);
-    }
+    // A reserved name is reported as reserved even when it is also a
+    // pseudo-header (`:authority`), because the rule that matters is P2's.
     if header_name_is_reserved(name) {
         return Err(RequestRefusal::ReservedHeaderName);
+    }
+    if bytes.is_empty() || !bytes.iter().all(|byte| is_token_byte(*byte)) {
+        return Err(RequestRefusal::InvalidHeaderName);
     }
     Ok(())
 }
@@ -341,19 +342,10 @@ pub fn evaluate_request(
     let mut outcomes: Vec<LabelOutcome> = Vec::with_capacity(rules.len());
     let mut refusal: Option<RequestRefusal> = None;
 
-    // M1 and M2 hold for the whole request, so they are checked once.
-    let normalized = rules.iter().find_map(|rule| {
-        let rule_target = RuleTarget {
-            host: &rule.host,
-            port: rule.port,
-            path_prefix: &rule.path_prefix,
-        };
-        target.matches(&rule_target).ok()
-    });
-    let headers_present = !request.headers.is_empty();
-
     let mut query = QueryIndex::parse(request.target);
-    let mut json_rules: Vec<&LabelRule> = Vec::new();
+    // JSON locations are evaluated as one pass over the body, so their slots
+    // are recorded as (rule index, outcome) and merged after that pass.
+    let mut json_rules: Vec<(usize, &LabelRule)> = Vec::new();
 
     for rule in rules {
         let rule_target = RuleTarget {
@@ -370,7 +362,7 @@ pub fn evaluate_request(
             continue;
         }
         if let Location::Json(_) = rule.location {
-            json_rules.push(rule);
+            json_rules.push((outcomes.len(), rule));
             outcomes.push(LabelOutcome::OutOfScope);
             continue;
         }
@@ -392,33 +384,14 @@ pub fn evaluate_request(
             }
         }
     }
-    let _ = headers_present;
-
     let mut rewritten_body = None;
     if !json_rules.is_empty() {
-        match json::evaluate(request, &json_rules, key) {
+        let rules_only: Vec<&LabelRule> = json_rules.iter().map(|(_, rule)| *rule).collect();
+        match json::evaluate(request, &rules_only, key) {
             Ok(result) => {
-                let mut slots: Vec<Option<LabelOutcome>> = vec![None; rules.len()];
-                let mut refusals: Vec<(usize, LabelOutcome)> = Vec::new();
-                for (rule, outcome) in json_rules.iter().zip(result.outcomes) {
-                    let slot = rules
-                        .iter()
-                        .position(|candidate| std::ptr::eq(candidate, *rule))
-                        .expect("json rule came from this rule list");
-                    refusals.push((slot, outcome));
+                for ((slot, _), outcome) in json_rules.iter().zip(result.outcomes) {
+                    outcomes[*slot] = outcome;
                 }
-                for (slot, outcome) in refusals {
-                    slots[slot] = Some(outcome);
-                }
-                let mut merged = Vec::with_capacity(rules.len());
-                let mut plain = outcomes.into_iter();
-                for slot in slots {
-                    merged.push(match slot {
-                        Some(outcome) => outcome,
-                        None => plain.next().unwrap_or(LabelOutcome::OutOfScope),
-                    });
-                }
-                outcomes = merged;
                 rewritten_body = result.rewritten_body;
             }
             Err(err) => {
@@ -461,7 +434,6 @@ pub fn evaluate_request(
     if refusal.is_some() {
         rewritten_body = None;
     }
-    let _ = normalized;
 
     RequestOutcome {
         labels: outcomes,
@@ -477,7 +449,9 @@ fn decide_location<'q>(
     query: &mut QueryIndex<'q>,
     key: &[u8],
 ) -> Result<Decision, RequestRefusal> {
-    let placeholder = format!("{PLACEHOLDER_PREFIX}{}}}", rule.label);
+    // Two literal closing braces; write them without format braces so the
+    // target is unambiguous.
+    let placeholder = format!("{}{}", PLACEHOLDER_PREFIX, rule.label) + "}}";
     match &rule.location {
         Location::Bearer => {
             let values = request.header_values("authorization");
@@ -490,8 +464,7 @@ fn decide_location<'q>(
             match bearer_form(value, &rule.label) {
                 WholeValue::Whole => {
                     check_admissible(key, &rule.label, &rule.location)?;
-                    let (start, end) = value_range(request, "authorization")
-                        .ok_or(RequestRefusal::MalformedJsonBody)?;
+                    let (start, end) = value_range(request, "authorization")?;
                     // The credential starts after the `Bearer ` scheme, which
                     // is six bytes plus one space.
                     Ok(Decision::Substituted {
@@ -515,8 +488,7 @@ fn decide_location<'q>(
             };
             if *value == placeholder.as_bytes() {
                 check_admissible(key, &rule.label, &rule.location)?;
-                let (start, end) =
-                    value_range(request, name).ok_or(RequestRefusal::MalformedJsonBody)?;
+                let (start, end) = value_range(request, name)?;
                 Ok(Decision::Substituted {
                     start,
                     end,
@@ -558,12 +530,18 @@ fn decide_location<'q>(
     }
 }
 
-fn value_range(request: &RequestView<'_>, name: &str) -> Option<(usize, usize)> {
-    request
+/// The byte range of a header value inside the request buffer.
+///
+/// A caller that only asks for a decision (fetch) passes no buffer, and then
+/// the decision is still made: the caller rewrites its own header block and
+/// does not need offsets.
+fn value_range(request: &RequestView<'_>, name: &str) -> Result<(usize, usize), RequestRefusal> {
+    Ok(request
         .headers
         .iter()
         .find(|field| field.name.eq_ignore_ascii_case(name))
         .and_then(|field| field.value_range)
+        .unwrap_or((0, 0)))
 }
 
 enum WholeValue {
@@ -591,6 +569,9 @@ fn bearer_form(value: &[u8], label: &str) -> WholeValue {
             }
         }
     };
+    // The label is part of the placeholder grammar. Where a credential is not a
+    // well-formed placeholder at all, there is nothing here for the label to
+    // substitute, so the rule does not apply to it.
     match std::str::from_utf8(credential).ok().and_then(parse_exact) {
         Some(parsed) if parsed.label == label => WholeValue::Whole,
         Some(_) => WholeValue::NotWhole,

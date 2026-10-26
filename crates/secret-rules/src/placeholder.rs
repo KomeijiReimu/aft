@@ -12,6 +12,12 @@ pub const PLACEHOLDER_PREFIX: &str = "{{ck-secret:";
 /// Longest accepted label, in bytes.
 pub const MAX_LABEL_LEN: usize = 63;
 
+/// The placeholder text for `label`, built from the prefix so every caller
+/// spells it the same way.
+pub fn placeholder_text(label: &str) -> String {
+    format!("{}{label}", PLACEHOLDER_PREFIX) + "}}"
+}
+
 /// True when `label` satisfies the P1 grammar.
 ///
 /// The label is matched byte-wise on purpose: a multi-byte UTF-8 character must
@@ -104,7 +110,7 @@ pub fn contains_placeholder_prefix(text: &str) -> bool {
 
 /// True when `text` mentions `label`'s placeholder.
 pub fn mentions_label(text: &str, label: &str) -> bool {
-    let needle = format!("{PLACEHOLDER_PREFIX}{label}}}");
+    let needle = format!("{}{label}", PLACEHOLDER_PREFIX) + "}}";
     text.contains(&needle)
 }
 

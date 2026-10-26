@@ -5,7 +5,8 @@
 //! are plain byte strings, so scrubbing is a byte scan with a bounded overlap
 //! window rather than a regular expression.
 
-use crate::material::{json_escape, percent_encode_form};
+pub use crate::material::json_escape;
+use crate::material::percent_encode_form;
 use crate::placeholder::PLACEHOLDER_PREFIX;
 use std::collections::BTreeSet;
 use zeroize::Zeroizing;
@@ -140,6 +141,17 @@ pub fn base64_patterns(key: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
+/// The RFC 4648 standard alphabet, exposed for tests and callers that build
+/// padded forms themselves.
+pub fn base64_standard() -> &'static [u8; 64] {
+    BASE64_STANDARD
+}
+
+/// The RFC 4648 URL-safe alphabet.
+pub fn base64_url_safe() -> &'static [u8; 64] {
+    BASE64_URL_SAFE
+}
+
 const BASE64_STANDARD: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const BASE64_URL_SAFE: &[u8; 64] =
@@ -187,11 +199,15 @@ pub fn percent_patterns(key: &[u8]) -> Vec<Vec<u8>> {
 /// Hex forms: the whole key lower- and upper-case. Mixed case is covered by
 /// case-insensitive matching of these patterns.
 pub fn hex_patterns(key: &[u8]) -> Vec<Vec<u8>> {
+    const LOWER: &[u8; 16] = b"0123456789abcdef";
+    const UPPER: &[u8; 16] = b"0123456789ABCDEF";
     let mut lower = Vec::with_capacity(key.len() * 2);
     let mut upper = Vec::with_capacity(key.len() * 2);
-    for byte in key {
-        lower.extend_from_slice(format!("{byte:02x}").as_bytes());
-        upper.extend_from_slice(format!("{byte:02X}").as_bytes());
+    for b in key {
+        lower.push(LOWER[(b >> 4) as usize]);
+        lower.push(LOWER[(b & 0x0f) as usize]);
+        upper.push(UPPER[(b >> 4) as usize]);
+        upper.push(UPPER[(b & 0x0f) as usize]);
     }
     vec![lower, upper]
 }
@@ -201,7 +217,7 @@ pub fn hex_patterns(key: &[u8]) -> Vec<Vec<u8>> {
 /// The placeholder is pure ASCII by grammar, so it can stand in for a
 /// truncated encoding inside a response body without breaking quoting.
 pub fn placeholder_for(label: &str) -> Vec<u8> {
-    format!("{PLACEHOLDER_PREFIX}{label}}}").into_bytes()
+    (format!("{}{label}", PLACEHOLDER_PREFIX) + "}}").into_bytes()
 }
 
 /// One installed matcher set with the text it is replaced by.
@@ -302,18 +318,24 @@ impl Scrubber {
     /// Release the retained tail at end of stream.
     pub fn finish(&mut self) -> Vec<u8> {
         let tail = std::mem::take(&mut self.pending).to_vec();
-        let (out, _) = self.scrub_buffer(&tail);
-        out
+        if self.matchers.is_empty() {
+            return tail;
+        }
+        // End of stream: the held tail can no longer complete a match, so it
+        // is released whole instead of being held back again.
+        self.scrub_all(&tail)
     }
 
     /// Run the whole buffer through every matcher, then hold back the longest
     /// possible partial match suffix.
     fn scrub_buffer(&self, buffer: &[u8]) -> (Vec<u8>, Vec<u8>) {
-        let scrubbed = self.scrub_all(buffer);
-        let hold = self.partial_suffix_len(&scrubbed);
-        let split = scrubbed.len() - hold;
-        let (out, held) = scrubbed.split_at(split);
-        (out.to_vec(), held.to_vec())
+        let hold = self.partial_suffix_len(buffer);
+        let split = buffer.len() - hold;
+        let (out, tail) = buffer.split_at(split);
+        // Only the released part is scrubbed: holding the tail verbatim and
+        // scrubbing it again on the next call is what catches a match that
+        // spans the split.
+        (self.scrub_all(out), tail.to_vec())
     }
 
     fn scrub_all(&self, buffer: &[u8]) -> Vec<u8> {
@@ -363,7 +385,13 @@ fn eq_prefix(candidate: &[u8], pattern: &[u8], insensitive: bool) -> bool {
 }
 
 fn byte_eq(left: u8, right: u8, insensitive: bool) -> bool {
-    left == right || (insensitive && left.eq_ignore_ascii_case(&right))
+    if left == right {
+        return true;
+    }
+    if !insensitive {
+        return false;
+    }
+    left.to_ascii_lowercase() == right.to_ascii_lowercase()
 }
 
 /// Replace every pattern occurrence in `input` (longest first).
@@ -394,13 +422,17 @@ fn replace_patterns(input: &[u8], matcher: &MatcherSet) -> (Vec<u8>, bool) {
 
 /// End offset of a pattern occurrence starting at `start`, if any.
 fn match_at(haystack: &[u8], start: usize, pattern: &[u8], insensitive: bool) -> Option<usize> {
-    let end = start.checked_add(pattern.len())?;
-    let window = haystack.get(start..end)?;
-    if window
+    let total = start + pattern.len();
+    if total > haystack.len() {
+        return None;
+    }
+    let window = &haystack[start..total];
+    let end = total;
+    let matched = window
         .iter()
         .zip(pattern)
-        .all(|(left, right)| byte_eq(*left, *right, insensitive))
-    {
+        .all(|(left, right)| byte_eq(*left, *right, insensitive));
+    if matched {
         Some(end)
     } else {
         None
