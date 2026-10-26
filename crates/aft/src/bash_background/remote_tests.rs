@@ -7627,7 +7627,7 @@ async fn runon_draining_kill_stops_retries() {
     )
     .await;
     let dir = tempfile::tempdir().unwrap();
-    shorten_draining_budget(dir.path(), 1000);
+    shorten_draining_budget(dir.path(), 60_000);
     let mut clock = PausedDrainingClock::new(dir.path());
     let registry = registry();
     let task_id = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
@@ -7647,7 +7647,7 @@ async fn runon_draining_kill_stops_retries() {
     .unwrap();
     assert_eq!(killed.info.status, BgTaskStatus::Killed);
     assert_eq!(clock.now(), first);
-    clock.advance(550);
+    clock.advance(6000);
     assert_eq!(
         exec_runs(&daemon).len(),
         1,
@@ -7705,7 +7705,7 @@ async fn runon_draining_restart_preserves_remaining_budget_and_request() {
             .unwrap(),
         request
     );
-    clock.advance(5000);
+    clock.advance(200);
     let done = terminal(&restarted, &task_id).await;
     assert_eq!(done.info.status, BgTaskStatus::Failed);
     assert_eq!(exec_runs(&daemon).len(), 1);
@@ -7733,6 +7733,7 @@ async fn runon_draining_restart_resubmits_and_accepts() {
     .await;
     let dir = tempfile::tempdir().unwrap();
     let mut clock = PausedDrainingClock::new(dir.path());
+    clock.set_retry_jitter_ms(1000);
     stopped_draining_roots()
         .lock()
         .unwrap()
@@ -7740,11 +7741,25 @@ async fn runon_draining_restart_resubmits_and_accepts() {
     let original = registry();
     let task = start_runon_retry(&original, dir.path(), daemon.connection.clone());
     clock.expect_event(DrainingClockEvent::Stopped).await;
+    let first = clock.now();
+    let saved = read_task(&original.task(&task).unwrap().paths.json).unwrap();
+    assert_eq!(
+        saved.remote.unwrap().retry.unwrap().next_retry_at_ms,
+        Some(first + 6000)
+    );
+    // Replaying must keep the sampled deadline, not choose jitter again.
+    clock.set_retry_jitter_ms(0);
     let restarted = registry();
     restarted.replay_session(dir.path(), "session").unwrap();
-    let first = clock.now();
     clock.expect_sleep(first, first + 1000).await;
-    clock.advance(5000);
+    clock.advance(5999);
+    clock.expect_sleep(first + 5999, first + 6000).await;
+    assert_eq!(
+        exec_runs(&daemon).len(),
+        1,
+        "persisted jitter must survive restart"
+    );
+    clock.advance(1);
     let done = terminal(&restarted, &task).await;
     assert_eq!(done.exit_code, Some(0), "{done:?}");
     let requests = exec_runs(&daemon);
