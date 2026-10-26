@@ -185,7 +185,7 @@ pub(crate) fn ledger_spawn_for_test() -> Option<crate::db::call_ledger::Key> {
 /// How far past the last written hard-kill limit a renewal must reach before
 /// it is written to the task's record (see `BgTaskRegistry::renew_hard_kill`).
 pub(crate) const RENEWAL_PERSIST_STEP_MS: u64 = 60_000;
-const PERSISTED_GC_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+pub(super) const PERSISTED_GC_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 const QUARANTINE_GC_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// Bounded retries keep transient file locks from losing task history forever.
 const FINISHED_DELETE_MAX_ATTEMPTS: usize = 5;
@@ -234,6 +234,24 @@ fn with_memory_prepare_gate_for_test<R>(
     }
     let _restore =
         Restore(MEMORY_PREPARE_GATE_FOR_TEST.with(|slot| slot.replace(Some(Box::new(gate)))));
+    run()
+}
+
+#[cfg(test)]
+thread_local! {
+    static GC_AFTER_START_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn with_gc_after_start_for_test<R>(hook: impl FnOnce() + 'static, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Box<dyn FnOnce()>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            GC_AFTER_START_FOR_TEST.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(GC_AFTER_START_FOR_TEST.with(|slot| slot.replace(Some(Box::new(hook)))));
     run()
 }
 
@@ -5668,7 +5686,9 @@ impl BgTaskRegistry {
             .name("aft-bash-task-gc".to_string())
             .spawn(move || {
                 let mut finish = FinishSlot(Some(slot_key));
-                if let Err(error) = registry.maybe_gc_persisted(&storage_dir) {
+                if let Err(error) =
+                    registry.scheduled_gc_persisted(&storage_dir, Instant::now(), SystemTime::now)
+                {
                     crate::slog_warn!("failed to GC persisted background bash tasks: {error}");
                 }
                 finish.finish();
@@ -8280,7 +8300,41 @@ impl BgTaskRegistry {
         }
     }
 
+    /// Run one explicit bounded validation slice and any due deadline work.
+    /// Recurring/replay requests additionally rate-limit validation slices.
     pub fn maybe_gc_persisted(&self, storage_dir: &Path) -> Result<usize, String> {
+        self.gc_persisted_with_clock(storage_dir, SystemTime::now, true)
+    }
+
+    fn scheduled_gc_persisted(
+        &self,
+        storage_dir: &Path,
+        now: Instant,
+        clock: impl FnMut() -> SystemTime,
+    ) -> Result<usize, String> {
+        let memo = super::gc_memo::GcMemo::new(canonicalized_path(&storage_dir.join("bash-tasks")));
+        self.gc_persisted_with_clock(storage_dir, clock, memo.validation_due(now))
+    }
+
+    fn gc_persisted_with_clock(
+        &self,
+        storage_dir: &Path,
+        mut clock: impl FnMut() -> SystemTime,
+        validate: bool,
+    ) -> Result<usize, String> {
+        let now = clock();
+        #[cfg(test)]
+        {
+            let hook = GC_AFTER_START_FOR_TEST.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let now_ms = now
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
         #[cfg(test)]
         self.inner.persisted_gc_runs.fetch_add(1, Ordering::SeqCst);
         // Recorded when the run ENDS (on every exit path, via the guard), so an
@@ -8315,7 +8369,11 @@ impl BgTaskRegistry {
         );
         let root_key = canonicalized_path(&root);
         let memo = super::gc_memo::GcMemo::new(root_key.clone());
-        let walk = gc_batches(&root, root_key);
+        let walk = if validate {
+            gc_batches(&root, root_key)
+        } else {
+            GcWalk::default()
+        };
         for session_dir in &walk.unreadable_session_paths {
             memo.session_unreadable(session_dir);
         }
@@ -8324,6 +8382,7 @@ impl BgTaskRegistry {
         }
         let mut pass = super::gc_memo::PassReport {
             walk_finished: walk.finished,
+            validation_skipped: !validate,
             root_missing: walk.missing,
             error: walk.error,
             unreadable_sessions: walk.unreadable_sessions,
@@ -8331,8 +8390,18 @@ impl BgTaskRegistry {
             ..super::gc_memo::PassReport::default()
         };
         let mut retired = 0;
+        let due = memo.due_batches(now);
+        let mut examined = HashSet::new();
         {
-            for batch in walk.batches {
+            // Validate before deleting due bundles: deletion changes a session's
+            // stamp and would otherwise invalidate unchanged sibling verdicts
+            // that the validation slice is about to visit.
+            for (discovery, batch) in walk
+                .batches
+                .into_iter()
+                .map(|batch| (true, batch))
+                .chain(due.into_iter().map(|batch| (false, batch)))
+            {
                 let session_dir = batch.session;
                 pass.tasks += batch.ids.len();
                 // Replay recovery rewrites the metadata of every task it
@@ -8382,6 +8451,13 @@ impl BgTaskRegistry {
                 // invalidates what this batch remembers about them.
                 let session_stamp = super::gc_memo::Stamp::of(&session_dir).ok();
                 for task_id in &task_ids {
+                    if !examined.insert((session_dir.clone(), task_id.clone())) {
+                        continue;
+                    }
+                    // Deadline selection uses the pass clock, but a task may
+                    // have been acknowledged after that clock was sampled.
+                    let examined_at = clock();
+                    let write_generation = memo.write_generation(&session_dir);
                     // A task judged not deletable on an earlier lap, whose
                     // folders and metadata are unchanged since, is skipped
                     // without opening anything (see `gc_memo`).
@@ -8390,7 +8466,7 @@ impl BgTaskRegistry {
                         session_stamp.as_ref(),
                         task_id,
                         PERSISTED_GC_GRACE,
-                        unix_millis(),
+                        examined_at,
                     ) {
                         pass.unchanged += 1;
                         continue;
@@ -8464,9 +8540,22 @@ impl BgTaskRegistry {
                             session,
                             task_dir,
                             metadata: super::gc_memo::Stamp::of(&resolved.paths.json).ok()?,
+                            write_generation,
                         })
                     });
-                    if modified_within(&resolved.paths.json, PERSISTED_GC_GRACE) {
+                    #[cfg(test)]
+                    super::persistence::work_counts::record_stat();
+                    if fs::metadata(&resolved.paths.json)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .is_some_and(|modified| {
+                            super::gc_memo::within_grace_at(
+                                modified,
+                                PERSISTED_GC_GRACE,
+                                examined_at,
+                            )
+                        })
+                    {
                         if let Some(evidence) = evidence.take() {
                             memo.remember_grace(&session_dir, task_id, evidence);
                         }
@@ -8542,7 +8631,7 @@ impl BgTaskRegistry {
                             }
                         }
                     }
-                    let abandoned = abandoned_completion(&metadata, unix_millis());
+                    let abandoned = abandoned_completion(&metadata, now_ms);
                     if !metadata.status.is_terminal()
                         || (!metadata.completion_delivered && !abandoned)
                     {
@@ -8638,8 +8727,14 @@ impl BgTaskRegistry {
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     self.forget_task_read_record(&resolved.paths.dir);
-                    match delete_task_bundle(&resolved.paths) {
+                    #[cfg(test)]
+                    let before_teardown = super::persistence::work_counts::get();
+                    let removal = delete_task_bundle(&resolved.paths);
+                    #[cfg(test)]
+                    super::persistence::work_counts::record_gc_teardown_since(before_teardown);
+                    match removal {
                         Ok(()) => {
+                            memo.forget(&session_dir, task_id);
                             self.forget_finished_delete_attempts(&metadata.task_id);
                             self.delete_gc_task_from_db(&metadata);
                             self.evaluate_erased_watch_targets();
@@ -8657,7 +8752,9 @@ impl BgTaskRegistry {
                         }
                     }
                 }
-                memo.session_read(&session_dir);
+                if discovery {
+                    memo.session_read(&session_dir);
+                }
                 let related_task_sessions = [session_dir.clone()];
                 if let Err(error) = self
                     .remove_empty_session_directory_if_unused(&session_dir, &related_task_sessions)
@@ -8669,7 +8766,7 @@ impl BgTaskRegistry {
                 }
             }
         }
-        // The collector runs every few seconds; a zero count is the normal
+        // Minute housekeeping normally finds nothing to retire; a zero count is the normal
         // case and logging it would flood the daemon log.
         if retired > 0 {
             crate::slog_info!("retired {retired} undelivered completions of deleted worktrees");
@@ -14676,6 +14773,7 @@ fn task_session_directories_for_quarantine(
 }
 
 /// One pass's share of a resumable walk over a GC root.
+#[derive(Default)]
 struct GcWalk {
     batches: Vec<super::gc_cursor::Batch>,
     /// The walk reached the end of the root in this pass (or the root does

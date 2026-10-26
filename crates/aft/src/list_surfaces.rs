@@ -559,6 +559,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal persisted-task and quarantine retention scans resume the same iterator next pass; the cap bounds inspection work, not returned records",
     },
     ExclusionEntry {
+        file: "bash_background/gc_memo.rs",
+        enclosing_item: "due_batches",
+        location_or_primitive: "GC_ENTRY_BUDGET ordered deadline iterator advancement",
+        reason: "internal retention candidates beyond the budget remain indexed for the next maintenance request; no agent-visible records are truncated",
+    },
+    ExclusionEntry {
         file: "bash_background/remote.rs",
         enclosing_item: "append_executor_environment_disclosure",
         location_or_primitive: "executor environment name preview min(10)",

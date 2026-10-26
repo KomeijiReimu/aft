@@ -2800,7 +2800,10 @@ fn write_task_in_dir(
     let mut upgraded = task.clone();
     upgraded.schema_version = SCHEMA_VERSION;
     let content = serde_json::to_vec_pretty(&upgraded).map_err(io::Error::other)?;
-    atomic_replace(dir, name, &content, sync)
+    super::gc_memo::metadata_written(&dir.path().join(name));
+    let result = atomic_replace(dir, name, &content, sync);
+    super::gc_memo::metadata_written(&dir.path().join(name));
+    result
 }
 
 #[cfg(test)]
@@ -4246,6 +4249,10 @@ pub(crate) mod work_counts {
         pub marker_reads: usize,
         pub stats: usize,
         pub gc_entries: usize,
+        pub gc_deadlines: usize,
+        pub gc_teardown_opens: usize,
+        pub gc_teardown_metadata_reads: usize,
+        pub gc_teardown_stats: usize,
         pub artifact_bytes: usize,
         pub artifact_opens: usize,
         pub syncs: usize,
@@ -4290,6 +4297,16 @@ pub(crate) mod work_counts {
     }
     pub(crate) fn record_gc_entry() {
         record(|counts| counts.gc_entries += 1);
+    }
+    pub(crate) fn record_gc_deadline() {
+        record(|counts| counts.gc_deadlines += 1);
+    }
+    pub(crate) fn record_gc_teardown_since(before: Counts) {
+        record(|counts| {
+            counts.gc_teardown_opens += counts.opens - before.opens;
+            counts.gc_teardown_metadata_reads += counts.metadata_reads - before.metadata_reads;
+            counts.gc_teardown_stats += counts.stats - before.stats;
+        });
     }
     pub(crate) fn record_parse() {
         record(|counts| counts.parses += 1);
