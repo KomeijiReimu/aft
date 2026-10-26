@@ -73,7 +73,7 @@ pub(crate) fn evaluate(
 
     // Duplicate member names make the pointer's meaning depend on the parser
     // that reads the body, so they refuse before any value is chosen.
-    if duplicate_member(request.body) {
+    if duplicate_member(request.body)? {
         return Err(RequestRefusal::DuplicateField);
     }
 
@@ -120,88 +120,103 @@ pub(crate) fn evaluate(
 /// `serde_json` keeps the last value of a repeated member and gives no view of
 /// the earlier one, so the check runs on the raw bytes: every object's member
 /// names are collected as they are scanned.
-fn duplicate_member(body: &[u8]) -> bool {
-    let mut found = false;
-    walk_duplicates(body, &mut found);
-    found
-}
+/// The deepest object/array nesting the duplicate check will walk.
+///
+/// The check runs before `serde_json` parses the body, so it bounds itself: a
+/// body nested deeper than this refuses instead of recursing until the stack
+/// overflows. Real JSON requests nest a handful of levels.
+pub const MAX_JSON_DEPTH: usize = 64;
 
-/// Walk the whole body structurally and set `found` when any object names a
-/// member twice. Returns the position after the consumed value.
-fn walk_duplicates(bytes: &[u8], found: &mut bool) -> usize {
-    let mut position = 0;
-    while position < bytes.len() {
-        match bytes[position] {
-            b'"' => match scan_json_string(bytes, position) {
-                Some((_, next)) => position = next,
-                None => return position,
-            },
+/// True when one object in `body` names the same member twice.
+///
+/// `serde_json` keeps the last value of a repeated member and gives no view of
+/// the earlier one, so this runs on the raw bytes. It is one iterative walk over
+/// the body — a stack of open objects holding their member names — so neither
+/// deep nesting nor a wide object can stall or crash it, and names are compared
+/// after unescaping, because `ke\u0079` and `key` are the same member to a
+/// parser.
+fn duplicate_member(body: &[u8]) -> Result<bool, RequestRefusal> {
+    let mut stack: Vec<ObjectNames> = Vec::new();
+    let mut index = 0usize;
+    while index < body.len() {
+        match body[index] {
             b'{' => {
-                position += 1;
-                let mut names: Vec<Vec<u8>> = Vec::new();
-                loop {
-                    position = skip_ws(bytes, position);
-                    match bytes.get(position) {
-                        Some(b'}') => {
-                            position += 1;
-                            break;
-                        }
-                        Some(b',') => {
-                            position += 1;
-                            continue;
-                        }
-                        Some(b'"') => {}
-                        _ => return position,
-                    }
-                    let Some((name, next)) = scan_json_string(bytes, position) else {
-                        return position;
-                    };
-                    position = skip_ws(bytes, next);
-                    if bytes.get(position) != Some(&b':') {
-                        return position;
-                    }
-                    position += 1;
-                    if names.contains(&name) {
-                        *found = true;
-                    }
-                    names.push(name);
-                    position = walk_duplicates(&bytes[position..], found) + position;
+                if stack.len() >= MAX_JSON_DEPTH {
+                    return Err(RequestRefusal::BodyTooDeep);
                 }
+                stack.push(ObjectNames::default());
+                index += 1;
             }
             b'[' => {
-                position += 1;
-                loop {
-                    position = skip_ws(bytes, position);
-                    match bytes.get(position) {
-                        Some(b']') => {
-                            position += 1;
-                            break;
-                        }
-                        Some(b',') => {
-                            position += 1;
-                            continue;
-                        }
-                        _ => {}
-                    }
-                    let before = position;
-                    position = walk_duplicates(&bytes[position..], found) + position;
-                    if position == before {
-                        return position;
-                    }
+                if stack.len() >= MAX_JSON_DEPTH {
+                    return Err(RequestRefusal::BodyTooDeep);
                 }
+                // Arrays hold values, not names; an empty marker keeps the
+                // depth count honest without tracking names.
+                stack.push(ObjectNames::array());
+                index += 1;
             }
-            b'}' | b']' | b',' => return position,
-            _ => {
-                while position < bytes.len()
-                    && !matches!(bytes[position], b',' | b'}' | b']' | b'[' | b'{' | b'"')
-                {
-                    position += 1;
+            b'}' | b']' => {
+                stack.pop();
+                index += 1;
+            }
+            b'"' => {
+                let Some((decoded, next)) = scan_json_string(body, index) else {
+                    return Err(RequestRefusal::MalformedJsonBody);
+                };
+                // A string at member position is a name; every other string is
+                // a value and is skipped.
+                let after = skip_ws(body, next);
+                let is_name =
+                    body.get(after) == Some(&b':') && stack.last().is_some_and(|o| !o.is_array);
+                if is_name {
+                    let Some(object) = stack.last_mut() else {
+                        return Err(RequestRefusal::MalformedJsonBody);
+                    };
+                    if object.contains(&decoded) {
+                        return Ok(true);
+                    }
+                    object.push(decoded);
                 }
-                return position;
+                index = next;
+            }
+            b',' | b':' => index += 1,
+            byte if byte.is_ascii_whitespace() => index += 1,
+            _ => {
+                // A scalar value: skip to the next structural byte.
+                while index < body.len()
+                    && !matches!(body[index], b',' | b'}' | b']' | b'[' | b'{' | b'"')
+                {
+                    index += 1;
+                }
             }
         }
     }
-    position
+    Ok(false)
+}
+
+/// Member names seen so far in one open object.
+#[derive(Default)]
+struct ObjectNames {
+    names: Vec<Vec<u8>>,
+    is_array: bool,
+}
+
+impl ObjectNames {
+    fn array() -> Self {
+        Self {
+            names: Vec::new(),
+            is_array: true,
+        }
+    }
+
+    fn contains(&self, name: &[u8]) -> bool {
+        self.names.iter().any(|seen| seen.as_slice() == name)
+    }
+
+    fn push(&mut self, name: Vec<u8>) {
+        self.names.push(name);
+    }
 }
 
 fn skip_ws(bytes: &[u8], mut index: usize) -> usize {

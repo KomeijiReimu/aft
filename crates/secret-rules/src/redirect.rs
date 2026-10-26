@@ -138,6 +138,15 @@ pub fn evaluate_redirect(rules: &[LabelRule], hop: &RequestTarget<'_>) -> Vec<Re
     rules
         .iter()
         .map(|rule| {
+            // A rule that is not valid authorizes nothing: the redirect path
+            // gets the same check as the request path.
+            if let Some(err) = crate::location::validate_rule(rule) {
+                return RedirectDecision {
+                    label: rule.label.clone(),
+                    outcome: RedirectOutcome::NotAuthorized,
+                    refusal: Some(err),
+                };
+            }
             let target = RuleTarget {
                 host: &rule.host,
                 port: rule.port,

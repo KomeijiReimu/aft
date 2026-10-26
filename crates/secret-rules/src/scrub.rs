@@ -53,13 +53,30 @@ pub(crate) enum Family {
 }
 
 /// Every literal a response may use for one key (S1).
-#[derive(Debug)]
+///
+/// `Debug` reports only the shape: the patterns themselves are the key in
+/// several encodings, so printing them would print the secret.
+#[derive(Clone, PartialEq, Eq)]
 pub struct KeyPatterns {
     /// Sorted longest first, so a longer spelling is tried before a shorter
     /// one that sits inside it.
     patterns: Vec<Zeroizing<Vec<u8>>>,
     /// Length of the key itself; decoded matches never shrink below it.
     key_len: usize,
+    /// Longest representation a match can consume. An escape family can spell
+    /// one key byte with six source bytes (`\u00e9` in JSON), so this is larger
+    /// than the longest literal pattern.
+    longest_consumed: usize,
+}
+
+impl std::fmt::Debug for KeyPatterns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyPatterns")
+            .field("count", &self.patterns.len())
+            .field("key_len", &self.key_len)
+            .field("longest", &self.longest())
+            .finish()
+    }
 }
 
 impl KeyPatterns {
@@ -85,6 +102,8 @@ impl KeyPatterns {
         Ok(Self {
             patterns,
             key_len: key.len(),
+            // The widest source span any family can produce for this key.
+            longest_consumed: max_consumed_len(key.len()),
         })
     }
 
@@ -111,6 +130,11 @@ impl KeyPatterns {
     /// The key length the decoded families must reproduce.
     pub fn key_len(&self) -> usize {
         self.key_len
+    }
+
+    /// Longest source span a completed match can consume.
+    pub fn longest_consumed(&self) -> usize {
+        self.longest_consumed
     }
 }
 
@@ -268,6 +292,11 @@ impl MatcherSet {
         self.patterns.longest()
     }
 
+    /// Longest representation this matcher can consume.
+    pub fn longest_consumed(&self) -> usize {
+        self.patterns.longest_consumed()
+    }
+
     /// The key length a decoded family must reproduce.
     pub fn key_len(&self) -> usize {
         self.patterns.key_len()
@@ -285,9 +314,27 @@ impl MatcherSet {
     /// of the window, so the caller can apply the edits to a copy of the
     /// original bytes without ever rescanning generated text.
     fn find_edits(&self, window: &[u8]) -> Vec<(usize, usize, Vec<u8>)> {
-        let mut edits = Vec::new();
+        let mut edits = self.find_base64_edits(window);
         let mut index = 0;
         while index < window.len() {
+            // Bytes inside a token that produced an edit are already covered.
+            if let Some((_, end, _)) = edits
+                .last()
+                .filter(|(start, end, _)| *start < index && index < *end)
+            {
+                index = *end;
+                continue;
+            }
+            // Cheap pre-filter: every family's match starts with a byte that is
+            // in a literal pattern, an escape introducer (`%`, `\`), a hex
+            // digit, a base64 character or the key's own first byte. Inside a
+            // long run of base64 text the run is decoded once (see
+            // `find_base64_edits`), so the per-byte path must not decode it
+            // again.
+            if !self.can_start_match(window[index]) {
+                index += 1;
+                continue;
+            }
             // A repeated byte (the self-overlapping case) is the worst thing
             // this matcher sees: literal spellings are checked first, then each
             // decoded family in turn.
@@ -302,11 +349,51 @@ impl MatcherSet {
         edits
     }
 
+    /// True when one representation of the key can begin with `byte`.
+    fn can_start_match(&self, byte: u8) -> bool {
+        byte == b'%'
+            || byte == b'\\'
+            || is_base64_byte(byte)
+            || self.key().first().is_some_and(|first| *first == byte)
+    }
+
+    /// Every base64 token in `window` that decodes to the key, once per token.
+    ///
+    /// A token is the maximal run of base64 characters around the key. Decoding
+    /// it once per alignment and replacing it whole keeps the work linear in the
+    /// window, and covers the token's edge bytes too.
+    fn find_base64_edits(&self, window: &[u8]) -> Vec<(usize, usize, Vec<u8>)> {
+        let mut edits = Vec::new();
+        let mut index = 0;
+        while index < window.len() {
+            if !is_base64_byte(window[index]) {
+                index += 1;
+                continue;
+            }
+            let start = index;
+            while index < window.len() && is_base64_byte(window[index]) {
+                index += 1;
+            }
+            let run = &window[start..index];
+            // A key may begin inside the token; every offset of the token is a
+            // possible alignment, and `base64_run_contains` tries four of them
+            // per start, so test the whole token once.
+            if base64_run_contains(run, self.key()) {
+                edits.push((start, index, self.replacement.clone()));
+            }
+        }
+        edits
+    }
+
     /// The end of a key representation starting at `index`, if one starts
     /// there.
     fn try_match_at(&self, window: &[u8], index: usize) -> Option<(usize, Family)> {
         let key = self.key();
-        // Literal spellings first: they are exact and cheapest.
+        // Base64 is handled by `find_base64_edits` over whole tokens, before
+        // this per-byte pass: a literal spelling of part of the key is a prefix
+        // of the token that contains the whole key, and replacing the token
+        // covers the key's edge bytes as well.
+        // Literal spellings next: they are exact and cheapest.
         for pattern in self.patterns() {
             if window.len() >= index + pattern.len()
                 && &window[index..index + pattern.len()] == pattern
@@ -314,8 +401,7 @@ impl MatcherSet {
                 return Some((index + pattern.len(), Family::Raw));
             }
         }
-        // Then the decoded families, each of which may be longer than the key
-        // or the same length.
+        // Then the decoded escape families.
         if let Some(end) = match_percent(window, index, key) {
             return Some((end, Family::Percent));
         }
@@ -327,9 +413,6 @@ impl MatcherSet {
         }
         if let Some(end) = match_hex(window, index, key) {
             return Some((end, Family::Hex));
-        }
-        if let Some(end) = match_base64(window, index, key) {
-            return Some((end, Family::Base64));
         }
         None
     }
@@ -425,59 +508,65 @@ fn match_hex(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
 /// the whole encoded token that overlaps the key rather than only its aligned
 /// middle. Bytes outside the key are replaced with it as well: leaving them
 /// would let a reader decode the edge key bytes from the surviving groups.
-fn match_base64(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
-    let mut end = index;
-    while end < window.len() && is_base64_byte(window[end]) {
-        end += 1;
-    }
-    if end == index {
-        return None;
-    }
-    let run = &window[index..end];
-    // A token with a single trailing character decodes to complete groups only
-    // once that character is padding; try it with and without.
-    for trim in 0..=1.min(run.len().saturating_sub(1)) {
-        let run = &run[..run.len() - trim];
-        if base64_matches(run, key) {
-            return Some(end);
-        }
-    }
-    None
-}
 
-fn base64_matches(run: &[u8], key: &[u8]) -> bool {
-    for alphabet in [BASE64_STANDARD, BASE64_URL_SAFE] {
-        let Some(decoded) = base64_decode(run, alphabet) else {
+/// True when decoding the whole `run` (with either alphabet, `+`/`/` and
+/// `-`/`_` mixed) yields the key anywhere inside.
+///
+/// The run is decoded **once per starting offset** rather than per position
+/// and per alphabet. That keeps a long base64 body linear: four alignments of
+/// one pass each, instead of a fresh decode from every byte.
+fn base64_run_contains(run: &[u8], key: &[u8]) -> bool {
+    if run.len() < key.len() + 4 {
+        return false;
+    }
+    // The key can start at any character, but always within the first three
+    // characters of a group; four alignments cover every possible group phase.
+    for offset in 0..4 {
+        let Some(slice) = run.get(offset..) else {
             continue;
         };
-        if decoded.windows(key.len()).any(|candidate| candidate == key) {
+        let mut decoded = Vec::with_capacity(slice.len());
+        let mut buffer = 0u32;
+        let mut bits = 0u32;
+        for byte in slice {
+            let Some(value) = base64_value(*byte) else {
+                // A byte outside the alphabet ends the token: reset and keep
+                // scanning, so the run's cells past padding still decode.
+                buffer = 0;
+                bits = 0;
+                continue;
+            };
+            buffer = (buffer << 6) | value as u32;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                decoded.push((buffer >> bits) as u8);
+                buffer &= (1 << bits) - 1;
+            }
+        }
+        if decoded.len() >= key.len() && decoded.windows(key.len()).any(|c| c == key) {
             return true;
         }
     }
     false
 }
 
-fn is_base64_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'-' | b'_' | b'=')
+/// Index of one base64 character in the RFC 4648 alphabet, accepting both the
+/// standard `+`/`/` pair and its URL-safe `-`/`_` spelling.
+fn base64_value(byte: u8) -> Option<u32> {
+    match byte {
+        b'=' => None,
+        b'+' | b'-' => Some(62),
+        b'/' | b'_' => Some(63),
+        _ => BASE64_STANDARD
+            .iter()
+            .position(|candidate| *candidate == byte)
+            .map(|index| index as u32),
+    }
 }
 
-fn base64_decode(input: &[u8], alphabet: &[u8; 64]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(input.len() * 3 / 4 + 3);
-    let mut buffer = 0u32;
-    let mut bits = 0u32;
-    for byte in input {
-        if *byte == b'=' {
-            continue;
-        }
-        let value = alphabet.iter().position(|candidate| candidate == byte)? as u32;
-        buffer = (buffer << 6) | value;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buffer >> bits) as u8);
-        }
-    }
-    Some(out)
+fn is_base64_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'-' | b'_' | b'=')
 }
 
 fn decode_percent(window: &[u8], index: usize) -> Option<(u8, usize)> {
@@ -493,6 +582,129 @@ fn decode_percent(window: &[u8], index: usize) -> Option<(u8, usize)> {
         (Some(high), Some(low)) => Some(((high << 4) | low, 3)),
         _ => None,
     }
+}
+
+/// One escaped byte of the JSON/percent family at `index`.
+///
+/// The families differ only in which sequences are escapes, so one decoder
+/// serves both the streaming matcher and the audit record's key check.
+fn decode_either(text: &[u8], index: usize) -> Option<(u8, usize)> {
+    let byte = *text.get(index)?;
+    if byte == b'%' {
+        return decode_percent(text, index);
+    }
+    if byte != b'\\' {
+        return None;
+    }
+    match *text.get(index + 1)? {
+        b'u' => {
+            let hex = std::str::from_utf8(text.get(index + 2..index + 6)?).ok()?;
+            let code = u32::from_str_radix(hex, 16).ok()?;
+            let ch = char::from_u32(code)?;
+            let mut buf = [0u8; 4];
+            let encoded = ch.encode_utf8(&mut buf);
+            if encoded.len() == 1 {
+                Some((encoded.as_bytes()[0], 6))
+            } else {
+                // A multi-byte character is not one key byte; refuse so the
+                // caller treats the text as literal.
+                None
+            }
+        }
+        b'"' => Some((b'"', 2)),
+        b'/' => Some((b'/', 2)),
+        b'\\' => Some((b'\\', 2)),
+        b'b' => Some((0x08, 2)),
+        b'f' => Some((0x0c, 2)),
+        b'n' => Some((b'\n', 2)),
+        b'r' => Some((b'\r', 2)),
+        b't' => Some((b'\t', 2)),
+        _ => None,
+    }
+}
+
+/// True when decoding `text` anywhere yields the key.
+pub(crate) fn text_decodes_to_key(text: &str, key: &[u8]) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+    // Hex, in either case, contiguous.
+    let bytes = text.as_bytes();
+    let mut candidate = Zeroizing::new(Vec::with_capacity(key.len()));
+    for (index, byte) in bytes.iter().enumerate() {
+        if let Some(value) = crate::placeholder::hex_value(*byte) {
+            if index % 2 == 0 {
+                candidate.push(value << 4);
+            } else {
+                if let Some(last) = candidate.last_mut() {
+                    *last |= value;
+                }
+                if candidate.len() == key.len() && candidate.as_slice() == key {
+                    return true;
+                }
+                if candidate.len() >= key.len() {
+                    candidate.clear();
+                }
+            }
+        } else {
+            candidate.clear();
+        }
+    }
+    for start in 0..bytes.len() {
+        let mut cursor = start;
+        let mut decoded = Zeroizing::new(Vec::with_capacity(key.len()));
+        while cursor < bytes.len() && decoded.len() < key.len() {
+            match decode_either(bytes, cursor) {
+                Some((value, len)) => {
+                    decoded.push(value);
+                    cursor += len;
+                }
+                None => {
+                    decoded.push(bytes[cursor]);
+                    cursor += 1;
+                }
+            }
+        }
+        if decoded.as_slice() == key {
+            return true;
+        }
+    }
+    false
+}
+
+/// Replace every decoded spelling of `key` in `text` with `replacement`.
+pub(crate) fn scrub_encodings(text: &str, key: &[u8], replacement: &str) -> String {
+    if key.is_empty() {
+        return text.to_string();
+    }
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let mut probe = cursor;
+        let mut decoded = Zeroizing::new(Vec::with_capacity(key.len()));
+        while probe < bytes.len() && decoded.len() < key.len() {
+            match decode_either(bytes, probe) {
+                Some((value, len)) => {
+                    decoded.push(value);
+                    probe += len;
+                }
+                None => {
+                    decoded.push(bytes[probe]);
+                    probe += 1;
+                }
+            }
+        }
+        if decoded.as_slice() == key {
+            out.push_str(replacement);
+            cursor = probe;
+            continue;
+        }
+        let ch = text[cursor..].chars().next().unwrap_or_default();
+        out.push(ch);
+        cursor += ch.len_utf8();
+    }
+    out
 }
 
 fn decode_json_escape(window: &[u8], index: usize) -> Option<(Vec<u8>, usize)> {
@@ -521,8 +733,19 @@ fn decode_json_escape(window: &[u8], index: usize) -> Option<(Vec<u8>, usize)> {
 /// content, which is what keeps the release pattern from revealing whether a
 /// chunk continued the secret. It never splits a complete match, because
 /// matching runs on the whole buffered window before anything is released.
-pub fn overlap_for(longest_pattern: usize) -> usize {
-    longest_pattern.saturating_sub(1)
+pub fn overlap_for(longest_consumed: usize) -> usize {
+    longest_consumed.saturating_sub(1)
+}
+
+/// The widest source span the match families produce for a key of `key_len`
+/// bytes.
+///
+/// JSON can spell every byte as `\u00XX` (six bytes each), percent-encoding
+/// three, hex two and base64 four per three bytes; the escaped JSON form is
+/// always the widest. Streaming keeps space for it plus one byte, so a match
+/// never starts in released bytes.
+pub fn max_consumed_len(key_len: usize) -> usize {
+    key_len.saturating_mul(6).max(key_len).max(1)
 }
 
 /// A streaming scrubber state (S2).
@@ -551,7 +774,11 @@ impl std::fmt::Debug for Scrubber {
 impl Scrubber {
     /// Build a scrubber over every installed matcher.
     pub fn new(matchers: Vec<MatcherSet>) -> Self {
-        let longest = matchers.iter().map(MatcherSet::longest).max().unwrap_or(0);
+        let longest = matchers
+            .iter()
+            .map(MatcherSet::longest_consumed)
+            .max()
+            .unwrap_or(0);
         Self {
             matchers,
             pending: Zeroizing::new(Vec::new()),
@@ -563,7 +790,7 @@ impl Scrubber {
     /// already released cannot be rechecked, so the caller installs matchers
     /// before forwarding the response they must cover.
     pub fn install(&mut self, matcher: MatcherSet) {
-        self.longest = self.longest.max(matcher.longest());
+        self.longest = self.longest.max(matcher.longest_consumed());
         self.matchers.push(matcher);
     }
 

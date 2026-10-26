@@ -2,6 +2,11 @@
 
 use serde_json::Value;
 
+/// The audit's key: sixteen bytes, the shortest a rule admits.
+pub const MIN_KEY: &[u8] = b"0123456789abcdef";
+/// Lowercase hex of [`MIN_KEY`].
+pub const MIN_KEY_HEX: &str = "30313233343536373839616263646566";
+
 /// Groups every vector file must carry.
 pub const REQUIRED_GROUPS: &[&str] = &[
     "P1", "P2", "P3", "P4", "M1", "M2", "M3", "M4", "S1", "S2", "A1",

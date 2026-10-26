@@ -25,7 +25,10 @@ pub use location::{
     Edit, HeaderEdit, HeaderField, LabelOutcome, LabelRule, Location, RequestOutcome,
     RequestRefusal, RequestView,
 };
-pub use material::{check_admissible, encode_for_location, MaterialRefusal, MIN_KEY_LEN};
+pub use material::{
+    check_admissible, encode_for_location, key_is_substring_of_placeholder, MaterialRefusal,
+    MIN_KEY_LEN,
+};
 pub use placeholder::{
     contains_placeholder_prefix, contains_placeholder_prefix_loose, is_label, mentions_label,
     mentions_label_loose, parse_at, parse_exact, scan, Placeholder, PLACEHOLDER_PREFIX,

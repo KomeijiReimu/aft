@@ -32,6 +32,8 @@ pub enum TargetRefusal {
     AuthorityMismatch,
     /// An authority cannot be parsed.
     MalformedAuthority,
+    /// The path carries a fragment, which no server receives.
+    FragmentInTarget,
 }
 
 /// A normalized path: the value used for matching, and the bytes sent
@@ -186,6 +188,11 @@ pub fn canonicalize_path(path: &str) -> Result<CanonicalPath, TargetRefusal> {
     if !path.starts_with('/') {
         return Err(TargetRefusal::NotOriginForm);
     }
+    // A fragment is not part of the path a server receives; treating `#` as a
+    // path byte would match one location and forward another.
+    if path.contains('#') {
+        return Err(TargetRefusal::FragmentInTarget);
+    }
     let bytes = path.as_bytes();
     if bytes.len() == 1 {
         return Ok(CanonicalPath {
@@ -283,16 +290,25 @@ pub fn canonicalize_path(path: &str) -> Result<CanonicalPath, TargetRefusal> {
 }
 
 /// Normalize a declared path prefix.
+/// Normalize a declared path prefix.
+///
+/// Only a single trailing separator is dropped (it adds no segment). Every
+/// other spelling goes through the same normalizer as a request path, so a
+/// prefix that would broaden to a different location — `//`, `/.`, `/v1/..`, a
+/// prefix that is not absolute — refuses instead of silently matching `/`.
 pub fn normalize_path_prefix(prefix: &str) -> Result<String, TargetRefusal> {
-    let trimmed = prefix.trim_end_matches('/');
-    let root = if trimmed.is_empty() {
-        "/"
-    } else if trimmed.starts_with('/') {
-        trimmed
-    } else {
+    if !prefix.starts_with('/') {
         return Err(TargetRefusal::MalformedPath);
-    };
-    canonicalize_path(root).map(|path| path.value)
+    }
+    let path = canonicalize_path(prefix)?;
+    // Dot segments and empty segments are refused by the normalizer; a trailing
+    // separator adds no segment and is dropped here, nothing else is.
+    let value = path.value.trim_end_matches('/');
+    Ok(if value.is_empty() {
+        "/".to_string()
+    } else {
+        value.to_string()
+    })
 }
 
 /// Uppercase hex of one byte, without the format machinery's locale and

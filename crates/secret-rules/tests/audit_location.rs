@@ -57,8 +57,7 @@ fn every_label_receives_its_own_key() {
         ("repo_key".to_string(), KEY.to_vec()),
         ("other_key".to_string(), OTHER_KEY.to_vec()),
     ];
-    let outcome =
-        evaluate_request_with_connect(&request, &target("/v1/things"), &connect(), &rules, &keys);
+    let outcome = evaluate_request_with_connect(&request, &connect(), &rules, &keys);
     assert_eq!(outcome.refusal, None);
     match (&outcome.labels[0], &outcome.labels[1]) {
         (
@@ -88,8 +87,7 @@ fn a_key_for_another_label_is_never_substituted() {
         vec![HeaderField::value("X-Repo", PLACEHOLDER.as_bytes())],
     );
     let keys = [("other_key".to_string(), OTHER_KEY.to_vec())];
-    let outcome =
-        evaluate_request_with_connect(&request, &target("/v1/things"), &connect(), &rules, &keys);
+    let outcome = evaluate_request_with_connect(&request, &connect(), &rules, &keys);
     assert_eq!(outcome.refusal, Some(RequestRefusal::MissingMaterial));
     assert!(!outcome.substituted());
 }
@@ -133,7 +131,6 @@ fn an_absolute_form_target_to_another_host_is_refused() {
     );
     let outcome = evaluate_request_with_connect(
         &request,
-        &target("https://evil.example/v1/x"),
         &connect(),
         &rules,
         &[("repo_key".to_string(), KEY.to_vec())],
@@ -160,7 +157,6 @@ fn a_host_header_for_another_host_is_refused() {
     );
     let outcome = evaluate_request_with_connect(
         &request,
-        &target("/v1/x"),
         &connect(),
         &rules,
         &[("repo_key".to_string(), KEY.to_vec())],
@@ -199,7 +195,6 @@ fn a_refusal_clears_every_key_bearing_outcome() {
     );
     let outcome = evaluate_request_with_connect(
         &request,
-        &target("/v1/things"),
         &connect(),
         &rules,
         &[("repo_key".to_string(), KEY.to_vec())],
@@ -221,17 +216,14 @@ fn substituted_counts_a_bearer_or_header_edit() {
     // header line before it, exactly as a proxy parses an incoming request.
     let buffer = format!("Authorization: Bearer {PLACEHOLDER}");
     let start = "Authorization: Bearer ".len();
-    let request = {
-        let mut request = RequestView::new(
-            "/v1/things",
-            vec![HeaderField::ranged("Authorization", start, buffer.len())],
-        );
-        request.body = Box::leak(buffer.clone().into_bytes().into_boxed_slice());
-        request
-    };
+    let header_block = Box::leak(buffer.clone().into_bytes().into_boxed_slice());
+    let request = RequestView::from_header_block(
+        "/v1/things",
+        vec![HeaderField::ranged("Authorization", start, buffer.len())],
+        header_block,
+    );
     let outcome = evaluate_request_with_connect(
         &request,
-        &target("/v1/things"),
         &connect(),
         &rules,
         &[("repo_key".to_string(), KEY.to_vec())],
@@ -299,7 +291,6 @@ fn a_double_encoded_dot_segment_is_refused() {
     );
     let outcome = evaluate_request_with_connect(
         &request,
-        &target("/v1/%252e%252e/echo"),
         &connect(),
         &rules,
         &[("repo_key".to_string(), KEY.to_vec())],
@@ -324,7 +315,6 @@ fn single_encoded_dot_segments_still_normalize() {
     );
     let outcome = evaluate_request_with_connect(
         &request,
-        &target("/v1/a/%2E%2E/b"),
         &connect(),
         &rules,
         &[("repo_key".to_string(), KEY.to_vec())],
@@ -341,7 +331,6 @@ fn a_percent_encoded_query_alias_is_a_duplicate() {
     let request = RequestView::new(&request_target, Vec::new());
     let outcome = evaluate_request_with_connect(
         &request,
-        &target(&request_target),
         &connect(),
         &rules,
         &[("repo_key".to_string(), KEY.to_vec())],
@@ -360,7 +349,6 @@ fn duplicate_json_object_names_refuse() {
     .with_body(body.as_bytes());
     let outcome = evaluate_request_with_connect(
         &request,
-        &target("/v1/x"),
         &connect(),
         &rules,
         &[("repo_key".to_string(), KEY.to_vec())],
@@ -376,7 +364,6 @@ fn a_fragment_is_not_a_query_string() {
     let request = RequestView::new("/v1/x#?k={{ck-secret:repo_key}}", Vec::new());
     let outcome = evaluate_request_with_connect(
         &request,
-        &target("/v1/x#?k={{ck-secret:repo_key}}"),
         &connect(),
         &rules,
         &[("repo_key".to_string(), KEY.to_vec())],
@@ -400,7 +387,6 @@ fn a_rule_prefix_that_is_not_absolute_is_refused() {
     );
     let outcome = evaluate_request_with_connect(
         &request,
-        &target("/v1/x"),
         &connect(),
         &rules,
         &[("repo_key".to_string(), KEY.to_vec())],
@@ -423,7 +409,6 @@ fn header_rules_validate_the_label_grammar() {
     );
     let outcome = evaluate_request_with_connect(
         &request,
-        &target("/v1/x"),
         &connect(),
         &rules,
         &[("Repo Key".to_string(), KEY.to_vec())],
@@ -446,7 +431,6 @@ fn debug_output_never_prints_key_bytes() {
     };
     let outcome = evaluate_request_with_connect(
         &request,
-        &target("/v1/x"),
         &connect(),
         &rules,
         &[("repo_key".to_string(), KEY.to_vec())],
@@ -561,7 +545,6 @@ fn request_outcome_is_not_partial_after_a_refusal() {
     );
     let outcome: RequestOutcome = evaluate_request_with_connect(
         &request,
-        &target("/v1/x"),
         &connect(),
         &rules,
         &[("repo_key".to_string(), KEY.to_vec())],
@@ -597,7 +580,6 @@ fn item4_a_request_for_label_b_never_receives_label_a_key() {
     let connect = ConnectAuthority::parse("beta.example.com:443").unwrap();
     let outcome = evaluate_request_with_connect(
         &request,
-        &target,
         &connect,
         &rules,
         &[("alpha".to_string(), KEY.to_vec())],
@@ -625,7 +607,6 @@ fn item6_absolute_form_target_on_another_host_refuses() {
     };
     let outcome = evaluate_request_with_connect(
         &request,
-        &target,
         &connect(),
         &rules,
         &[("repo_key".to_string(), KEY.to_vec())],
@@ -655,7 +636,6 @@ fn item7_header_substitution_before_a_refusal_leaves_no_key() {
     );
     let outcome = evaluate_request_with_connect(
         &request,
-        &target("/v1/x"),
         &connect(),
         &rules,
         &[("repo_key".to_string(), KEY.to_vec())],
@@ -693,7 +673,6 @@ fn item11_encoded_query_alias_is_a_duplicate() {
     let request = RequestView::new(&target_text, Vec::new());
     let outcome = evaluate_request_with_connect(
         &request,
-        &target(&target_text),
         &connect(),
         &rules,
         &[("repo_key".to_string(), KEY.to_vec())],
@@ -713,7 +692,6 @@ fn item11_duplicate_json_members_refuse() {
     .with_body(body.as_bytes());
     let outcome = evaluate_request_with_connect(
         &request,
-        &target("/v1/x"),
         &connect(),
         &rules,
         &[("repo_key".to_string(), KEY.to_vec())],
@@ -728,7 +706,6 @@ fn item12_a_fragment_is_not_a_query() {
     let request = RequestView::new(&target_text, Vec::new());
     let outcome = evaluate_request_with_connect(
         &request,
-        &target(&target_text),
         &connect(),
         &rules,
         &[("repo_key".to_string(), KEY.to_vec())],
@@ -745,7 +722,6 @@ fn item12_debug_output_does_not_print_key_bytes() {
     );
     let outcome = evaluate_request_with_connect(
         &request,
-        &target("/v1/x"),
         &connect(),
         &rules,
         &[("repo_key".to_string(), KEY.to_vec())],

@@ -18,9 +18,7 @@ pub use json::is_json_content_type;
 
 use crate::material::{check_admissible, encode_for_location, MaterialRefusal};
 use crate::placeholder::{is_label, parse_exact, PLACEHOLDER_PREFIX};
-use crate::target::{
-    authority_matches_connect, ConnectAuthority, RequestTarget, RuleTarget, TargetRefusal,
-};
+use crate::target::{authority_matches_connect, ConnectAuthority, RuleTarget, TargetRefusal};
 use zeroize::Zeroizing;
 
 /// Where a key is substituted (P2).
@@ -78,6 +76,8 @@ pub enum RequestRefusal {
     MalformedJsonBody,
     /// The body is over the 1 MiB cap (P4).
     BodyTooLarge,
+    /// The body nests deeper than the duplicate check will walk (P4).
+    BodyTooDeep,
     /// The request body carries a Content-Encoding (P4).
     ContentEncodingPresent,
     /// A JSON body's Content-Type is not `application/json` or `+json` (P4).
@@ -96,6 +96,8 @@ pub enum RequestRefusal {
     InvalidLabel,
     /// The request target carries a fragment, which a server never sees.
     FragmentInTarget,
+    /// The label's placeholder would disclose an installed key.
+    ReplacementDisclosesKey,
 }
 
 impl From<MaterialRefusal> for RequestRefusal {
@@ -115,6 +117,7 @@ impl RequestRefusal {
             RequestRefusal::NonStringJsonTarget => "non_string_json_target",
             RequestRefusal::MalformedJsonBody => "malformed_json_body",
             RequestRefusal::BodyTooLarge => "body_too_large",
+            RequestRefusal::BodyTooDeep => "body_too_deep",
             RequestRefusal::ContentEncodingPresent => "content_encoding",
             RequestRefusal::JsonContentTypeMissing => "not_json",
             RequestRefusal::TargetMismatch(TargetRefusal::SchemeNotHttps) => "scheme_not_https",
@@ -132,6 +135,7 @@ impl RequestRefusal {
             RequestRefusal::TargetMismatch(TargetRefusal::MalformedAuthority) => {
                 "malformed_authority"
             }
+            RequestRefusal::TargetMismatch(TargetRefusal::FragmentInTarget) => "fragment_in_target",
             RequestRefusal::AuthorityMismatch => "authority_mismatch",
             RequestRefusal::Material(MaterialRefusal::Empty) => "material_empty",
             RequestRefusal::Material(MaterialRefusal::TooShort) => "material_too_short",
@@ -147,6 +151,7 @@ impl RequestRefusal {
             RequestRefusal::MissingMaterial => "missing_material",
             RequestRefusal::InvalidLabel => "invalid_label",
             RequestRefusal::FragmentInTarget => "fragment_in_target",
+            RequestRefusal::ReplacementDisclosesKey => "replacement_discloses_key",
         }
     }
 }
@@ -238,7 +243,10 @@ impl std::fmt::Debug for HeaderEdit {
 }
 
 /// The result of evaluating every rule against one request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` reports sizes and decisions only: `rewritten_body` holds the key for
+/// a JSON substitution, and the label and header edits hold it too.
+#[derive(Clone, PartialEq, Eq)]
 pub struct RequestOutcome {
     /// One entry per rule, in the caller's rule order.
     pub labels: Vec<LabelOutcome>,
@@ -252,6 +260,21 @@ pub struct RequestOutcome {
     /// key-bearing edit is dropped, and any material fetched for the request is
     /// zeroized.
     pub refusal: Option<RequestRefusal>,
+}
+
+impl std::fmt::Debug for RequestOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestOutcome")
+            .field("labels", &self.labels)
+            .field("target_edits", &self.target_edits)
+            .field("header_edits", &self.header_edits)
+            .field(
+                "rewritten_body_len",
+                &self.rewritten_body.as_ref().map(|body| body.len()),
+            )
+            .field("refusal", &self.refusal)
+            .finish()
+    }
 }
 
 impl RequestOutcome {
@@ -298,28 +321,56 @@ impl<'a> HeaderField<'a> {
 }
 
 /// A request to evaluate.
+///
+/// Header values and the body are separate inputs on purpose: a ranged header
+/// value is read from `header_bytes` (the header block), never from the body.
+/// Handing the body to a header read would let a request body decide the
+/// `Host` the CONNECT check sees, or a header decide what a JSON location reads.
 #[derive(Debug, Clone)]
 pub struct RequestView<'a> {
     /// The request target, exactly as received.
     pub target: &'a str,
     pub headers: Vec<HeaderField<'a>>,
+    /// The buffer ranged header values index into.
+    pub header_bytes: &'a [u8],
+    /// The request body, and only the body.
     pub body: &'a [u8],
 }
 
 impl<'a> RequestView<'a> {
-    /// A bodyless request.
+    /// A request whose header values are carried borrowed, not ranged.
     pub fn new(target: &'a str, headers: Vec<HeaderField<'a>>) -> Self {
         Self {
             target,
             headers,
+            header_bytes: &[],
             body: &[],
         }
     }
 
-    /// Attach a request body.
+    /// A request whose header values are ranges inside `header_bytes`.
+    pub fn from_header_block(
+        target: &'a str,
+        headers: Vec<HeaderField<'a>>,
+        header_bytes: &'a [u8],
+    ) -> Self {
+        Self {
+            target,
+            headers,
+            header_bytes,
+            body: &[],
+        }
+    }
+
+    /// Attach a request body (never used to read header values).
     pub fn with_body(mut self, body: &'a [u8]) -> Self {
         self.body = body;
         self
+    }
+
+    /// The header block this request was built with.
+    pub fn header_bytes(&self) -> &'a [u8] {
+        self.header_bytes
     }
 
     /// The values of every header called `name`, in wire order.
@@ -333,7 +384,7 @@ impl<'a> RequestView<'a> {
             .iter()
             .filter(|field| field.name.eq_ignore_ascii_case(name))
             .map(|field| match field.value_range {
-                Some((start, end)) => self.body.get(start..end).unwrap_or_default(),
+                Some((start, end)) => self.header_bytes.get(start..end).unwrap_or_default(),
                 None => field.borrowed.unwrap_or_default(),
             })
             .collect()
@@ -405,6 +456,38 @@ fn is_token_byte(byte: u8) -> bool {
         )
 }
 
+/// True when the placeholder this rule writes would disclose another installed
+/// key.
+///
+/// The replacement is generated text, so it is never rescanned; but the label
+/// itself is caller-supplied, and a label that spells a key (for example the
+/// key's hex) would write that key into every response it appears in. Such a
+/// pair refuses instead of being written.
+fn replacement_collides(rule: &LabelRule, keys: &[(String, Vec<u8>)]) -> Option<RequestRefusal> {
+    let placeholder = crate::placeholder::placeholder_text(&rule.label);
+    for (label, key) in keys {
+        // The rule's own key is admitted by P3, which refuses it when it
+        // appears in its own placeholder. The question here is whether this
+        // rule's replacement would disclose a key installed for *any* label,
+        // including its own when P3 let it through.
+        let _ = label;
+        if key.is_empty() {
+            continue;
+        }
+        let in_label = placeholder
+            .as_bytes()
+            .windows(key.len())
+            .any(|window| window == key.as_slice());
+        if in_label
+            || crate::material::key_is_substring_of_placeholder(key, &rule.label)
+            || crate::scrub::text_decodes_to_key(&placeholder, key)
+        {
+            return Some(RequestRefusal::ReplacementDisclosesKey);
+        }
+    }
+    None
+}
+
 /// What `evaluate_location` decided for one non-JSON rule.
 enum Decision {
     /// A substitute decision with the value span inside the request buffer
@@ -437,11 +520,11 @@ fn decide_location<'q>(
             let Some(value) = values.first() else {
                 return Ok(Decision::OutOfScope);
             };
-            // A ranged field holds the whole value, `Bearer <credential>`; a
-            // borrowed one may hold only the credential.
+            // Where the credential sits says nothing about where the edit is:
+            // a caller that passes only the credential (no scheme, no value
+            // range) gets an edit that covers nothing and must rewrite by name,
+            // never by offset.
             let range = value_range(request, "authorization")?;
-            // The range covers the whole field value; the credential may sit
-            // after the scheme inside it.
             let whole_value = value
                 .get(..6)
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"Bearer"));
@@ -449,13 +532,19 @@ fn decide_location<'q>(
                 WholeValue::Whole => {
                     check_admissible(key, &rule.label, &rule.location)?;
                     let start = if whole_value {
-                        range.0 + b"Bearer ".len()
+                        match range {
+                            Some((start, _)) => start + b"Bearer ".len(),
+                            None => 0,
+                        }
                     } else {
-                        range.0
+                        range.map(|(start, _)| start).unwrap_or(0)
                     };
+                    let end = range
+                        .map(|(_, end)| end)
+                        .unwrap_or(whole_value as usize * start);
                     Ok(Decision::Substituted {
                         start,
-                        end: range.1,
+                        end,
                         replacement: key.to_vec(),
                         location: "bearer".to_string(),
                     })
@@ -475,7 +564,9 @@ fn decide_location<'q>(
             };
             if *value == placeholder.as_bytes() {
                 check_admissible(key, &rule.label, &rule.location)?;
-                let (start, end) = value_range(request, name)?;
+                // A borrowed value has no offsets: the edit covers nothing and
+                // the caller rewrites the header by name.
+                let (start, end) = value_range(request, name)?.unwrap_or((0, 0));
                 Ok(Decision::Substituted {
                     start,
                     end,
@@ -527,12 +618,23 @@ fn decide_location<'q>(
 /// it is refused before any location is considered (M4).
 pub fn evaluate_request_with_connect(
     request: &RequestView<'_>,
-    target: &RequestTarget<'_>,
     connect: &ConnectAuthority,
     rules: &[LabelRule],
     keys: &[(String, Vec<u8>)],
 ) -> RequestOutcome {
     let mut refusal = check_authority(request, connect);
+    if refusal.is_none() && request.target.contains('#') {
+        refusal = Some(RequestRefusal::FragmentInTarget);
+    }
+    // The destination comes from the CONNECT authority and the request target,
+    // never from the caller: a rule is matched against where the connection
+    // actually goes.
+    let bound = bound_target(request, connect);
+    if refusal.is_none() {
+        if let Err(err) = &bound {
+            refusal = Some(*err);
+        }
+    }
     let mut outcomes: Vec<LabelOutcome> = Vec::with_capacity(rules.len());
 
     let mut query = QueryIndex::parse(request.target);
@@ -549,12 +651,21 @@ pub fn evaluate_request_with_connect(
             outcomes.push(LabelOutcome::Refused(err));
             continue;
         }
+        if let Some(collision) = replacement_collides(rule, keys) {
+            refusal = Some(collision);
+            outcomes.push(LabelOutcome::Refused(collision));
+            continue;
+        }
         let rule_target = RuleTarget {
             host: &rule.host,
             port: rule.port,
             path_prefix: &rule.path_prefix,
         };
-        if target.matches(&rule_target).is_err() {
+        let matched = bound
+            .as_ref()
+            .ok()
+            .is_some_and(|target| target.matches(&rule_target).is_ok());
+        if !matched {
             // A target miss is the label's own business; it never refuses the
             // request, because the placeholder then goes upstream literally.
             outcomes.push(LabelOutcome::OutOfScope);
@@ -711,37 +822,78 @@ fn key_for<'k>(keys: &'k [(String, Vec<u8>)], label: &str) -> Option<&'k [u8]> {
 }
 
 /// M4: the request's own authority must match the connection's.
+///
+/// Every `Host` and `:authority` field is checked, not just the first: a
+/// request carrying two of them leaves it to the server which one to trust, and
+/// AFT must not authorize one value while forwarding another.
 fn check_authority(
     request: &RequestView<'_>,
     connect: &ConnectAuthority,
 ) -> Option<RequestRefusal> {
-    // A header value may be borrowed, or a range inside the request buffer.
-    let header = |name: &str| -> Option<String> {
-        request.headers.iter().find_map(|field| {
-            if !field.name.eq_ignore_ascii_case(name) {
-                return None;
-            }
-            let bytes = match field.value_range {
-                Some((start, end)) => request.body.get(start..end).unwrap_or_default(),
-                None => field.borrowed.unwrap_or_default(),
-            };
-            Some(String::from_utf8_lossy(bytes).into_owned())
-        })
+    let header = |name: &str| -> Vec<String> {
+        request
+            .headers
+            .iter()
+            .filter(|field| field.name.eq_ignore_ascii_case(name))
+            .map(|field| {
+                let bytes = match field.value_range {
+                    Some((start, end)) => request.header_bytes.get(start..end).unwrap_or_default(),
+                    None => field.borrowed.unwrap_or_default(),
+                };
+                String::from_utf8_lossy(bytes).into_owned()
+            })
+            .collect()
     };
-    let host = header("host");
-    let authority = header(":authority");
+    let hosts = header("host");
+    let authorities = header(":authority");
+    if hosts.len() > 1 || authorities.len() > 1 {
+        return Some(RequestRefusal::DuplicateField);
+    }
+    // A range that does not fit the header block means the caller's header and
+    // body inputs disagree; refuse rather than compare a truncated value.
+    let ranged_outside = request.headers.iter().any(|field| match field.value_range {
+        Some((start, end)) => end > request.header_bytes.len() || start > end,
+        None => false,
+    });
+    if ranged_outside {
+        return Some(RequestRefusal::TargetMismatch(
+            crate::target::TargetRefusal::AuthorityMismatch,
+        ));
+    }
     authority_matches_connect(
         connect,
-        host.as_deref(),
-        authority.as_deref(),
+        hosts.first().map(String::as_str),
+        authorities.first().map(String::as_str),
         request.target,
     )
     .err()
     .map(RequestRefusal::TargetMismatch)
 }
 
+/// The target a rule is matched against, derived from the connection and the
+/// request rather than trusted from the caller.
+///
+/// The host and port come from the CONNECT authority, because that is where the
+/// connection actually goes; the path comes from the request target, and a
+/// fragment in it is refused (a server never receives one, and a target that
+/// carries one could match a prefix while being forwarded byte for byte).
+fn bound_target<'a>(
+    request: &RequestView<'a>,
+    connect: &ConnectAuthority,
+) -> Result<crate::target::RequestTarget<'a>, RequestRefusal> {
+    if request.target.contains('#') {
+        return Err(RequestRefusal::FragmentInTarget);
+    }
+    Ok(crate::target::RequestTarget {
+        host: connect.host.clone(),
+        port: connect.port,
+        scheme: "https",
+        target: request.target,
+    })
+}
+
 /// Rules whose fields the vault must never be able to smuggle past the grammar.
-fn validate_rule(rule: &LabelRule) -> Option<RequestRefusal> {
+pub(crate) fn validate_rule(rule: &LabelRule) -> Option<RequestRefusal> {
     if !is_label(&rule.label) {
         return Some(RequestRefusal::InvalidLabel);
     }
@@ -761,13 +913,17 @@ fn validate_rule(rule: &LabelRule) -> Option<RequestRefusal> {
 /// A caller that only asks for a decision (fetch) passes no buffer, and then
 /// the decision is still made: the caller rewrites its own header block and
 /// does not need offsets.
-fn value_range(request: &RequestView<'_>, name: &str) -> Result<(usize, usize), RequestRefusal> {
+/// The byte range of a header value in the header block, when the caller
+/// supplied one.
+fn value_range(
+    request: &RequestView<'_>,
+    name: &str,
+) -> Result<Option<(usize, usize)>, RequestRefusal> {
     Ok(request
         .headers
         .iter()
         .find(|field| field.name.eq_ignore_ascii_case(name))
-        .and_then(|field| field.value_range)
-        .unwrap_or((0, 0)))
+        .and_then(|field| field.value_range))
 }
 
 #[derive(Debug)]

@@ -208,6 +208,7 @@ fn run_request(case: &Value) -> Result<Value, String> {
     let request = RequestView {
         target: target.target,
         headers,
+        header_bytes: &[],
         body: Box::leak(body.into_boxed_slice()),
     };
     let connect = ConnectAuthority::parse(&format!("{}:{}", target.host, target.port))
@@ -226,7 +227,7 @@ fn run_request(case: &Value) -> Result<Value, String> {
             .map(|entry| (support::string(&entry["label"]), support::key_bytes(entry)))
             .collect()
     };
-    let outcome = evaluate_request_with_connect(&request, &target, &connect, &rules, &keys);
+    let outcome = evaluate_request_with_connect(&request, &connect, &rules, &keys);
     let mut arms = Vec::new();
     for label in outcome.labels.iter() {
         arms.push(match label {
@@ -324,6 +325,7 @@ fn target_reason(err: &TargetRefusal) -> String {
         TargetRefusal::MalformedPath => "malformed_path",
         TargetRefusal::AuthorityMismatch => "authority_mismatch",
         TargetRefusal::MalformedAuthority => "malformed_authority",
+        TargetRefusal::FragmentInTarget => "fragment_in_target",
     }
     .to_string()
 }

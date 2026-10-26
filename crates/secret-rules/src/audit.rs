@@ -94,7 +94,7 @@ impl AuditReason {
 
 /// The authorization scope a call runs under (V2). `None` on a record means
 /// the call had no daemon stamp.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ScopeRef {
     pub owner: String,
     pub kind: String,
@@ -112,7 +112,7 @@ impl ScopeRef {
 }
 
 /// The path prefix that matched, as the rule declares it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct MatchedPrefix {
     pub path_prefix: String,
 }
@@ -127,7 +127,13 @@ pub enum AuditRefusal {
 }
 
 /// One audit record, version 1.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The record deliberately does **not** derive `Serialize`: the only way to
+/// write it is [`AuditRecordV1::to_json_line`] or
+/// [`AuditRecordV1::to_json_line_with_key`], both of which check and scrub every
+/// text field first. `Debug` reports the decisions and the field lengths, so a
+/// record printed while debugging cannot carry key material either.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct AuditRecordV1 {
     /// Wire tag; readers refuse any other value.
     pub v: u32,
@@ -208,7 +214,7 @@ impl AuditRecordV1 {
         if !self.metadata_is_valid() {
             return Err(AuditRefusal::InvalidMetadata);
         }
-        if self.mentions_key(key) {
+        if self.fields().any(|field| field_holds_key(key, field)) {
             return Err(AuditRefusal::KeyMaterialInRecord);
         }
         Ok(self.render())
@@ -237,7 +243,12 @@ impl AuditRecordV1 {
             return Err(AuditRefusal::InvalidMetadata);
         }
         let placeholder = format!("{{{{ck-secret:{}}}}}", self.label);
-        let scrub = |value: &str| replace_all(value, key, &placeholder);
+        let scrub = |value: &str| scrub_key_material(value, key, &placeholder);
+        // The label itself names the placeholder, so it is checked but not
+        // rewritten: a label holding the key makes the whole record invalid.
+        if field_holds_key(key, &self.label) && !key_is_inside_label(key, &self.label) {
+            return Err(AuditRefusal::KeyMaterialInRecord);
+        }
         let mut record = self.clone();
         record.request_id = scrub(&self.request_id);
         record.origin = scrub(&self.origin);
@@ -274,57 +285,137 @@ impl AuditRecordV1 {
 
     /// True when no text field could carry key material.
     fn metadata_is_valid(&self) -> bool {
-        let fields = [
-            Some(self.label.as_str()),
-            Some(self.request_id.as_str()),
-            Some(self.origin.as_str()),
-            self.host.as_deref(),
-            self.location_kind.as_deref(),
-            self.matched_prefix
-                .as_ref()
-                .map(|prefix| prefix.path_prefix.as_str()),
-        ];
-        if !fields.into_iter().flatten().all(metadata_is_valid) {
-            return false;
-        }
-        self.scope.as_ref().is_none_or(ScopeRef::is_valid)
-    }
-
-    /// True when any text field contains the key in its raw form.
-    fn mentions_key(&self, key: &[u8]) -> bool {
-        if key.is_empty() {
-            return false;
-        }
-        let fields = [
-            Some(self.label.as_str()),
-            Some(self.request_id.as_str()),
-            Some(self.origin.as_str()),
-            self.host.as_deref(),
-            self.location_kind.as_deref(),
-            self.matched_prefix
-                .as_ref()
-                .map(|prefix| prefix.path_prefix.as_str()),
-        ];
-        fields.into_iter().flatten().any(|field| {
-            field
-                .as_bytes()
-                .windows(key.len())
-                .any(|window| window == key)
-        })
+        self.fields().all(metadata_is_valid)
     }
 
     fn render(&self) -> String {
-        serde_json::to_string(self).expect("audit record v1 always serializes")
+        serde_json::to_string(&RecordWire {
+            v: self.v,
+            timestamp_ms: self.timestamp_ms,
+            label: &self.label,
+            scope: self.scope.as_ref().map(ScopeWire::from),
+            host: self.host.as_deref(),
+            port: self.port,
+            matched_prefix: self.matched_prefix.as_ref().map(PrefixWire::from),
+            location_kind: self.location_kind.as_deref(),
+            decision: self.decision,
+            reason: self.reason,
+            request_id: &self.request_id,
+            origin: &self.origin,
+        })
+        .expect("audit record v1 always serializes")
     }
 }
 
-/// Replace every occurrence of `needle` in `value` with `replacement`.
-fn replace_all(value: &str, needle: &[u8], replacement: &str) -> String {
-    if needle.is_empty() {
-        return value.to_string();
+impl std::fmt::Debug for AuditRecordV1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditRecordV1")
+            .field("v", &self.v)
+            .field("timestamp_ms", &self.timestamp_ms)
+            .field("label_len", &self.label.len())
+            .field("scope", &self.scope)
+            .field("host_len", &self.host.as_ref().map(|host| host.len()))
+            .field("port", &self.port)
+            .field(
+                "matched_prefix_len",
+                &self
+                    .matched_prefix
+                    .as_ref()
+                    .map(|prefix| prefix.path_prefix.len()),
+            )
+            .field(
+                "location_kind_len",
+                &self.location_kind.as_ref().map(|kind| kind.len()),
+            )
+            .field("decision", &self.decision)
+            .field("reason", &self.reason)
+            .field("request_id_len", &self.request_id.len())
+            .field("origin_len", &self.origin.len())
+            .finish()
     }
-    let needle = String::from_utf8_lossy(needle).into_owned();
-    value.replace(&needle, replacement)
+}
+
+/// The serialized shape of a record, built field by field so the type itself
+/// cannot be serialized without the checks.
+#[derive(Serialize)]
+struct RecordWire<'a> {
+    v: u32,
+    timestamp_ms: u64,
+    label: &'a str,
+    scope: Option<ScopeWire<'a>>,
+    host: Option<&'a str>,
+    port: Option<u16>,
+    matched_prefix: Option<PrefixWire<'a>>,
+    location_kind: Option<&'a str>,
+    decision: Decision,
+    reason: AuditReason,
+    request_id: &'a str,
+    origin: &'a str,
+}
+
+#[derive(Serialize)]
+struct ScopeWire<'a> {
+    owner: &'a str,
+    kind: &'a str,
+    #[serde(rename = "ref")]
+    reference: &'a str,
+}
+
+#[derive(Serialize)]
+struct PrefixWire<'a> {
+    path_prefix: &'a str,
+}
+
+impl<'a> From<&'a ScopeRef> for ScopeWire<'a> {
+    fn from(scope: &'a ScopeRef) -> Self {
+        Self {
+            owner: &scope.owner,
+            kind: &scope.kind,
+            reference: &scope.reference,
+        }
+    }
+}
+
+impl<'a> From<&'a MatchedPrefix> for PrefixWire<'a> {
+    fn from(prefix: &'a MatchedPrefix) -> Self {
+        Self {
+            path_prefix: &prefix.path_prefix,
+        }
+    }
+}
+
+/// True when `field` holds `key` or any of its ordinary encodings.
+///
+/// Encodings are compared by decoding the field, so punctuation-separated or
+/// escaped spellings (`%2D`, `ab-cd`, `\u00..`) are found as well.
+fn field_holds_key(key: &[u8], field: &str) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+    let bytes = field.as_bytes();
+    if bytes.windows(key.len()).any(|window| window == key) {
+        return true;
+    }
+    crate::scrub::text_decodes_to_key(field, key)
+}
+
+/// True when the key is only present because it spells part of the label.
+fn key_is_inside_label(key: &[u8], label: &str) -> bool {
+    label
+        .as_bytes()
+        .windows(key.len())
+        .any(|window| window == key)
+        || (key.len() <= label.len() && label.as_bytes().windows(key.len()).count() > 0)
+}
+
+/// Replace `key` and its encodings in `value` with `replacement`.
+fn scrub_key_material(value: &str, key: &[u8], replacement: &str) -> String {
+    let mut out = crate::scrub::scrub_encodings(value, key, replacement);
+    let literal = String::from_utf8_lossy(key).into_owned();
+    if !literal.is_empty() {
+        out = out.replace(&literal, replacement);
+    }
+    out
 }
 
 /// True when `value` carries a run that could be key material.

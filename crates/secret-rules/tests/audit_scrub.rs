@@ -105,9 +105,13 @@ fn output_does_not_depend_on_a_matching_prefix() {
 }
 
 #[test]
-fn the_fixed_holdback_is_always_longest_minus_one() {
+fn the_fixed_holdback_is_always_longest_consumed_minus_one() {
     let key: &[u8] = b"sk-live-0123456789abcdef";
-    let longest = KeyPatterns::derive(key).unwrap().longest();
+    // The holdback covers the widest representation a match can consume, which
+    // is the fully JSON-escaped form (`\u00XX` per byte), not the longest
+    // literal pattern.
+    let longest = KeyPatterns::derive(key).unwrap().longest_consumed();
+    assert!(longest > KeyPatterns::derive(key).unwrap().longest());
     let mut scrubber = Scrubber::new(vec![MatcherSet::new(LABEL, key).unwrap()]);
     let mut seen = 0usize;
     for (position, byte) in b"some ordinary response text ".iter().enumerate() {

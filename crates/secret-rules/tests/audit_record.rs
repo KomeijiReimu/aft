@@ -130,7 +130,9 @@ fn records_round_trip_through_serde() {
         "req-4",
         "fetch-1#2",
     );
-    let json = serde_json::to_string(&record).unwrap();
+    // The record has no `Serialize` impl on purpose: the only writer is
+    // `to_json_line`, so nothing can bypass its checks.
+    let json = record.to_json_line().expect("clean record serializes");
     let back: AuditRecordV1 = serde_json::from_str(&json).unwrap();
     assert_eq!(back, record);
 }

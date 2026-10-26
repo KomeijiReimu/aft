@@ -50,18 +50,9 @@ fn bearer_substitutes_only_the_credential_of_an_exact_bearer_value() {
     let text = format!("Host: x\r\nAuthorization: Bearer {}\r\n", placeholder());
     let start = text.find("Bearer ").unwrap();
     let value = HeaderField::ranged("Authorization", start, text.len() - 2);
-    let request = {
-        let mut request = RequestView::new("/v1/things", vec![value]);
-        request.body = Box::leak(text.clone().into_bytes().into_boxed_slice());
-        request
-    };
-    let outcome = evaluate_request_with_connect(
-        &request,
-        &target_t("/v1/things"),
-        &connect(),
-        &rules,
-        &keys(KEY),
-    );
+    let header_block = Box::leak(text.clone().into_bytes().into_boxed_slice());
+    let request = RequestView::from_header_block("/v1/things", vec![value], header_block);
+    let outcome = evaluate_request_with_connect(&request, &connect(), &rules, &keys(KEY));
     assert_eq!(outcome.refusal, None);
     assert_eq!(outcome.labels.len(), 1);
     match &outcome.labels[0] {
@@ -81,13 +72,7 @@ fn bearer_substitutes_only_the_credential_of_an_exact_bearer_value() {
     let lower_text = format!("bearer {}", placeholder());
     let value = HeaderField::value("Authorization", lower_text.as_bytes());
     let request = RequestView::new("/v1/things", vec![value]);
-    let outcome = evaluate_request_with_connect(
-        &request,
-        &target_t("/v1/things"),
-        &connect(),
-        &rules,
-        &keys(KEY),
-    );
+    let outcome = evaluate_request_with_connect(&request, &connect(), &rules, &keys(KEY));
     assert!(matches!(
         outcome.labels[0],
         LabelOutcome::Substituted { .. }
@@ -100,13 +85,7 @@ fn bearer_value_that_is_not_the_whole_credential_is_literal() {
     let value_bytes = format!("Bearer x{}", placeholder());
     let value = HeaderField::value("Authorization", value_bytes.as_bytes());
     let request = RequestView::new("/v1/things", vec![value]);
-    let outcome = evaluate_request_with_connect(
-        &request,
-        &target_t("/v1/things"),
-        &connect(),
-        &rules,
-        &keys(KEY),
-    );
+    let outcome = evaluate_request_with_connect(&request, &connect(), &rules, &keys(KEY));
     assert_eq!(outcome.labels, vec![LabelOutcome::NotWholeValue]);
     assert!(!outcome.substituted());
 }
@@ -120,13 +99,7 @@ fn a_placeholder_elsewhere_in_the_request_is_literal() {
         vec![HeaderField::value("Authorization", value_bytes)],
     )
     .with_body(placeholder().as_bytes());
-    let outcome = evaluate_request_with_connect(
-        &request,
-        &target_t("/v1/things"),
-        &connect(),
-        &rules,
-        &keys(KEY),
-    );
+    let outcome = evaluate_request_with_connect(&request, &connect(), &rules, &keys(KEY));
     assert_eq!(outcome.labels, vec![LabelOutcome::OutOfScope]);
 }
 
@@ -135,8 +108,7 @@ fn query_substitutes_only_after_percent_decoding_the_whole_value() {
     let rules = [rule(Location::Query("key".to_string()))];
     let encoded = "/v1/things?key=%7B%7Bck-secret%3Arepo_key%7D%7D&other=1";
     let request = RequestView::new(encoded, Vec::new());
-    let outcome =
-        evaluate_request_with_connect(&request, &target_t(encoded), &connect(), &rules, &keys(KEY));
+    let outcome = evaluate_request_with_connect(&request, &connect(), &rules, &keys(KEY));
     assert_eq!(outcome.refusal, None);
     let rewritten = apply_target_edits(encoded, &outcome.target_edits);
     assert_eq!(
@@ -146,8 +118,7 @@ fn query_substitutes_only_after_percent_decoding_the_whole_value() {
 
     let partial = "/v1/things?key=prefix%7B%7Bck-secret%3Arepo_key%7D%7D";
     let request = RequestView::new(partial, Vec::new());
-    let outcome =
-        evaluate_request_with_connect(&request, &target_t(partial), &connect(), &rules, &keys(KEY));
+    let outcome = evaluate_request_with_connect(&request, &connect(), &rules, &keys(KEY));
     assert_eq!(outcome.labels, vec![LabelOutcome::NotWholeValue]);
 }
 
@@ -158,18 +129,9 @@ fn header_substitution_targets_the_whole_value() {
     let start = buffer.find("X-Api-Key: ").unwrap() + "X-Api-Key: ".len();
     let end = buffer.len() - 2;
     let value = HeaderField::ranged("X-Api-Key", start, end);
-    let request = {
-        let mut request = RequestView::new("/v1/things", vec![value]);
-        request.body = Box::leak(buffer.clone().into_bytes().into_boxed_slice());
-        request
-    };
-    let outcome = evaluate_request_with_connect(
-        &request,
-        &target_t("/v1/things"),
-        &connect(),
-        &rules,
-        &keys(KEY),
-    );
+    let header_block = Box::leak(buffer.clone().into_bytes().into_boxed_slice());
+    let request = RequestView::from_header_block("/v1/things", vec![value], header_block);
+    let outcome = evaluate_request_with_connect(&request, &connect(), &rules, &keys(KEY));
     match outcome.labels.first() {
         Some(LabelOutcome::Substituted {
             byte_start,
@@ -199,13 +161,7 @@ fn json_pointer_substitutes_a_string_and_keeps_the_rest_of_the_body() {
         ],
     )
     .with_body(body.as_bytes());
-    let outcome = evaluate_request_with_connect(
-        &request,
-        &target_t("/v1/things"),
-        &connect(),
-        &rules,
-        &keys(KEY),
-    );
+    let outcome = evaluate_request_with_connect(&request, &connect(), &rules, &keys(KEY));
     assert_eq!(outcome.refusal, None);
     let rewritten =
         String::from_utf8(outcome.rewritten_body.expect("body rewritten").to_vec()).unwrap();
@@ -227,13 +183,7 @@ fn json_pointer_escapes_tilde_and_slash_tokens() {
         vec![HeaderField::value("Content-Type", b"application/json")],
     )
     .with_body(body.as_bytes());
-    let outcome = evaluate_request_with_connect(
-        &request,
-        &target_t("/v1/things"),
-        &connect(),
-        &rules,
-        &keys(KEY),
-    );
+    let outcome = evaluate_request_with_connect(&request, &connect(), &rules, &keys(KEY));
     assert_eq!(outcome.refusal, None);
     assert!(outcome.rewritten_body.is_some());
 }
@@ -248,13 +198,7 @@ fn json_refusals_cover_every_p4_case() {
         vec![HeaderField::value("Content-Type", b"application/json")],
     )
     .with_body(b"{\"key\": \"{{ck-secret:repo_key}}\", \"other\": 1}");
-    let outcome = evaluate_request_with_connect(
-        &non_string,
-        &target_t("/v1/things"),
-        &connect(),
-        &rules,
-        &keys(KEY),
-    );
+    let outcome = evaluate_request_with_connect(&non_string, &connect(), &rules, &keys(KEY));
     assert_eq!(outcome.refusal, None, "a string target substitutes");
 
     let number_target = RequestView::new(
@@ -262,13 +206,7 @@ fn json_refusals_cover_every_p4_case() {
         vec![HeaderField::value("Content-Type", b"application/json")],
     )
     .with_body(b"{\"key\": 12}");
-    let outcome = evaluate_request_with_connect(
-        &number_target,
-        &target_t("/v1/things"),
-        &connect(),
-        &rules,
-        &keys(KEY),
-    );
+    let outcome = evaluate_request_with_connect(&number_target, &connect(), &rules, &keys(KEY));
     assert_eq!(outcome.labels, vec![LabelOutcome::OutOfScope]);
 
     let wrong_type = RequestView::new(
@@ -276,13 +214,7 @@ fn json_refusals_cover_every_p4_case() {
         vec![HeaderField::value("Content-Type", b"text/plain")],
     )
     .with_body(body.as_bytes());
-    let outcome = evaluate_request_with_connect(
-        &wrong_type,
-        &target_t("/v1/things"),
-        &connect(),
-        &rules,
-        &keys(KEY),
-    );
+    let outcome = evaluate_request_with_connect(&wrong_type, &connect(), &rules, &keys(KEY));
     assert_eq!(
         outcome.refusal,
         Some(RequestRefusal::JsonContentTypeMissing)
@@ -296,26 +228,14 @@ fn json_refusals_cover_every_p4_case() {
         ],
     )
     .with_body(body.as_bytes());
-    let outcome = evaluate_request_with_connect(
-        &encoded,
-        &target_t("/v1/things"),
-        &connect(),
-        &rules,
-        &keys(KEY),
-    );
+    let outcome = evaluate_request_with_connect(&encoded, &connect(), &rules, &keys(KEY));
     assert_eq!(
         outcome.refusal,
         Some(RequestRefusal::ContentEncodingPresent)
     );
 
     let missing_type = RequestView::new("/v1/things", Vec::new()).with_body(body.as_bytes());
-    let outcome = evaluate_request_with_connect(
-        &missing_type,
-        &target_t("/v1/things"),
-        &connect(),
-        &rules,
-        &keys(KEY),
-    );
+    let outcome = evaluate_request_with_connect(&missing_type, &connect(), &rules, &keys(KEY));
     assert_eq!(
         outcome.refusal,
         Some(RequestRefusal::JsonContentTypeMissing)
@@ -326,13 +246,7 @@ fn json_refusals_cover_every_p4_case() {
         vec![HeaderField::value("Content-Type", b"application/json")],
     )
     .with_body(b"{\"key\": ");
-    let outcome = evaluate_request_with_connect(
-        &malformed,
-        &target_t("/v1/things"),
-        &connect(),
-        &rules,
-        &keys(KEY),
-    );
+    let outcome = evaluate_request_with_connect(&malformed, &connect(), &rules, &keys(KEY));
     assert_eq!(outcome.refusal, Some(RequestRefusal::MalformedJsonBody));
 
     let oversized = vec![b' '; secret_rules::location::MAX_SUBSTITUTABLE_BODY + 1];
@@ -341,13 +255,7 @@ fn json_refusals_cover_every_p4_case() {
         vec![HeaderField::value("Content-Type", b"application/json")],
     )
     .with_body(&oversized);
-    let outcome = evaluate_request_with_connect(
-        &big,
-        &target_t("/v1/things"),
-        &connect(),
-        &rules,
-        &keys(KEY),
-    );
+    let outcome = evaluate_request_with_connect(&big, &connect(), &rules, &keys(KEY));
     assert_eq!(outcome.refusal, Some(RequestRefusal::BodyTooLarge));
 
     let bad_pointer = [rule(Location::Json("auth/key".to_string()))];
@@ -356,13 +264,7 @@ fn json_refusals_cover_every_p4_case() {
         vec![HeaderField::value("Content-Type", b"application/json")],
     )
     .with_body(body.as_bytes());
-    let outcome = evaluate_request_with_connect(
-        &request,
-        &target_t("/v1/things"),
-        &connect(),
-        &bad_pointer,
-        &keys(KEY),
-    );
+    let outcome = evaluate_request_with_connect(&request, &connect(), &bad_pointer, &keys(KEY));
     assert_eq!(outcome.refusal, Some(RequestRefusal::InvalidJsonPointer));
 }
 
@@ -376,25 +278,13 @@ fn duplicate_declared_fields_refuse() {
             HeaderField::value("x-api-key", placeholder().as_bytes()),
         ],
     );
-    let outcome = evaluate_request_with_connect(
-        &request,
-        &target_t("/v1/things"),
-        &connect(),
-        &rules,
-        &keys(KEY),
-    );
+    let outcome = evaluate_request_with_connect(&request, &connect(), &rules, &keys(KEY));
     assert_eq!(outcome.refusal, Some(RequestRefusal::DuplicateField));
 
     let query_rules = [rule(Location::Query("key".to_string()))];
     let query = format!("/v1/things?key={}&key=other", placeholder());
     let request = RequestView::new(&query, Vec::new());
-    let outcome = evaluate_request_with_connect(
-        &request,
-        &target_t(&query),
-        &connect(),
-        &query_rules,
-        &keys(KEY),
-    );
+    let outcome = evaluate_request_with_connect(&request, &connect(), &query_rules, &keys(KEY));
     assert_eq!(outcome.refusal, Some(RequestRefusal::DuplicateField));
 }
 
@@ -423,13 +313,7 @@ fn every_invalid_header_name_refuses_and_names_the_reason() {
     for name in reserved {
         let rules = [rule(Location::Header(name.to_string()))];
         let request = RequestView::new("/v1/things", Vec::new());
-        let outcome = evaluate_request_with_connect(
-            &request,
-            &target_t("/v1/things"),
-            &connect(),
-            &rules,
-            &keys(KEY),
-        );
+        let outcome = evaluate_request_with_connect(&request, &connect(), &rules, &keys(KEY));
         assert_eq!(
             outcome.refusal,
             Some(RequestRefusal::ReservedHeaderName),
@@ -440,13 +324,7 @@ fn every_invalid_header_name_refuses_and_names_the_reason() {
     for name in ["Bad Name", "Bad:Name", "", "Bad\nName"] {
         let rules = [rule(Location::Header(name.to_string()))];
         let request = RequestView::new("/v1/things", Vec::new());
-        let outcome = evaluate_request_with_connect(
-            &request,
-            &target_t("/v1/things"),
-            &connect(),
-            &rules,
-            &keys(KEY),
-        );
+        let outcome = evaluate_request_with_connect(&request, &connect(), &rules, &keys(KEY));
         assert_eq!(
             outcome.refusal,
             Some(RequestRefusal::InvalidHeaderName),
@@ -462,13 +340,7 @@ fn an_admissible_rule_far_from_the_path_does_not_refuse_the_request() {
         "/elsewhere",
         vec![HeaderField::value("X-Api-Key", placeholder().as_bytes())],
     );
-    let outcome = evaluate_request_with_connect(
-        &request,
-        &target_t("/elsewhere"),
-        &connect(),
-        &rules,
-        &keys(KEY),
-    );
+    let outcome = evaluate_request_with_connect(&request, &connect(), &rules, &keys(KEY));
     assert_eq!(outcome.refusal, None);
     assert_eq!(outcome.labels, vec![LabelOutcome::OutOfScope]);
 }

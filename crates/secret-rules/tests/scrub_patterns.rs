@@ -196,11 +196,15 @@ fn a_match_split_across_three_reads_is_caught() {
 }
 
 #[test]
-fn the_overlap_window_is_one_less_than_the_longest_pattern() {
+fn the_overlap_window_is_one_less_than_the_longest_consumed_form() {
     let key: &[u8] = b"0123456789abcdef";
     let scrubber = Scrubber::new(vec![MatcherSet::new(LABEL, key).unwrap()]);
-    let longest = KeyPatterns::derive(key).unwrap().longest();
-    assert_eq!(scrubber.overlap(), longest - 1);
+    // The window covers the widest representation a match consumes, which is
+    // the fully JSON-escaped form (six bytes per key byte), not the longest
+    // literal pattern.
+    let consumed = KeyPatterns::derive(key).unwrap().longest_consumed();
+    assert!(consumed > KeyPatterns::derive(key).unwrap().longest());
+    assert_eq!(scrubber.overlap(), consumed - 1);
     assert!(scrubber.overlap() >= 2, "a 16-byte key keeps a real window");
 }
 
