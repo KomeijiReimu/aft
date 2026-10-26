@@ -243,6 +243,12 @@ async fn prepare_and_send(
     );
     parts.headers.remove("sec-websocket-extensions");
     super::response::strip_hop_headers(&mut parts.headers, ws);
+    // Routing belongs to CONNECT, never to a client-nominated hop header or
+    // the presence of a Host field on the downstream HTTP version.
+    parts.headers.insert(
+        "host",
+        hyper::header::HeaderValue::from_str(&authority.authority()).map_err(|_| fail())?,
+    );
     let outbound_body: Body = if has_json {
         let rewritten = apply_edits(&body, &mut body_edits)?;
         parts.headers.insert(
