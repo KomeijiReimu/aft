@@ -98,6 +98,100 @@ pub(crate) fn capture_spawn(metadata: &crate::bash_background::persistence::Pers
     capture_record(&speech, &metadata.session_id, &metadata.task_id);
 }
 
+pub(crate) fn pty_seal_required() -> bool {
+    let raw = SPAWN_TICKET.with(|slot| *slot.borrow());
+    let Some(raw) = raw else { return false };
+    registry()
+        .iter()
+        .find(|entry| constant_time_eq(&entry.ticket, &raw))
+        .and_then(|entry| entry.speech.as_ref())
+        .is_some_and(|speech| {
+            speech.stored.load(Ordering::SeqCst)
+                && speech.prepared.denial.is_none()
+                && speech.prepared.policy.is_some()
+        })
+}
+
+pub(crate) fn finish_pty_seal_or_revoke(
+    task_id: &str,
+) -> Result<(), crate::gh_shim_speech::Refusal> {
+    use crate::gh_shim_speech::{Code, Refusal, ScopeRole};
+    let Some((speech, _)) = spawn_speech(task_id) else {
+        return Err(Refusal::new(
+            Code::AuthorityUnavailable,
+            "task_unverifiable",
+        ));
+    };
+    let stored = speech
+        .prepared
+        .context
+        .service
+        .store
+        .get(&speech.incarnation);
+    let stored_error = stored.as_ref().err().cloned();
+    let failure = if stored_error
+        .as_ref()
+        .is_some_and(|error| error.reason == "revoked" || error.code == Code::ScopeEnded)
+    {
+        stored_error
+    } else {
+        speech
+            .failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .or(stored_error)
+    };
+    if let Some(error) = &failure {
+        // A speech-bookkeeping failure may downgrade a launch. A task cancel or
+        // a definitive end of its work scope must still stop the command itself.
+        let lifecycle_ended = error.code == Code::ScopeEnded
+            && speech
+                .prepared
+                .context
+                .seed
+                .launch
+                .as_ref()
+                .is_ok_and(|launch| {
+                    let ended = if error.role == Some(ScopeRole::Run) {
+                        launch.run.as_ref()
+                    } else {
+                        Some(&launch.authority)
+                    };
+                    ended
+                        .zip(speech.prepared.context.seed.lifecycle.as_ref())
+                        .is_some_and(|(ended, lifecycle)| {
+                            crate::db::access_grants::ScopeKey::from_stamp(ended)
+                                == crate::db::access_grants::ScopeKey::from_stamp(lifecycle)
+                        })
+                });
+        if error.reason == "revoked" || lifecycle_ended {
+            return Err(error.clone());
+        }
+    }
+    if failure.is_none()
+        && speech.active.load(Ordering::SeqCst)
+        && stored.is_ok_and(|stored| stored.record.seal.is_some())
+    {
+        return Ok(());
+    }
+    speech
+        .prepared
+        .context
+        .service
+        .revoke(&speech.incarnation, "execution_unsealed")?;
+    speech.active.store(false, Ordering::SeqCst);
+    *speech
+        .failure
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(
+        failure
+            .filter(|error| error.code == Code::ScopeEnded)
+            .unwrap_or_else(|| Refusal::new(Code::AuthorityUnavailable, "revoked")),
+    );
+    Ok(())
+}
+
 fn capture_record(speech: &SpeechTicket, session: &str, task: &str) {
     if !speech.prepared.provisioned {
         return;
@@ -149,6 +243,14 @@ pub(crate) fn seal_spawn(metadata: &crate::bash_background::persistence::Persist
         return;
     };
     if !speech.stored.load(Ordering::SeqCst) {
+        return;
+    }
+    #[cfg(test)]
+    if let Some(error) = speech.prepared.context.service.test_seal_failure() {
+        *speech
+            .failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(error);
         return;
     }
     #[cfg(unix)]

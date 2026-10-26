@@ -10,6 +10,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp, ScopeStatus};
 
+#[path = "crash_dispatch_tests.rs"]
+mod crash;
+#[path = "pty_dispatch_tests.rs"]
+mod pty;
+
 struct Env(&'static str, Option<OsString>);
 impl Env {
     fn set(key: &'static str, value: &OsStr) -> Self {
@@ -43,6 +48,7 @@ struct PlexState {
     ended: HashSet<ScopeKey>,
     describes: usize,
     route_open_ended: bool,
+    post_log: Option<PathBuf>,
     posts: Vec<Value>,
     sends: usize,
     fingerprints: HashMap<String, Value>,
@@ -192,6 +198,9 @@ impl FakePlex {
                 }
             }
         }
+        if let Some(path) = &state.post_log {
+            fs::write(path, nonce.as_bytes()).unwrap();
+        }
         state.posts.push(args["request"].clone());
         let reply = json!({"status":"completed","result":{"posted":true}});
         state.nonces.insert(nonce, (fingerprint, reply.clone()));
@@ -255,10 +264,34 @@ struct Fixture {
     task: String,
     session: String,
     params: Value,
+    incarnation: String,
+    startup_error: Option<String>,
+}
+
+#[derive(Default)]
+struct LaunchOptions {
+    pty: bool,
+    command: Option<String>,
+    seal_failure: Option<Refusal>,
+    fail_revocation: bool,
+    pause: Option<(
+        std::sync::mpsc::Sender<String>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
 }
 
 impl Fixture {
     async fn new(codemode: bool) -> Self {
+        let fixture = Self::new_with_options(codemode, LaunchOptions::default()).await;
+        assert!(
+            fixture.startup_error.is_none(),
+            "{:?}",
+            fixture.startup_error
+        );
+        fixture
+    }
+
+    async fn new_with_options(codemode: bool, mut options: LaunchOptions) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("store");
         let state_dir = dir.path().join("shim");
@@ -324,6 +357,7 @@ impl Fixture {
                 ended: HashSet::new(),
                 describes: 0,
                 route_open_ended: false,
+                post_log: None,
                 posts: Vec::new(),
                 sends: 0,
                 fingerprints: HashMap::new(),
@@ -345,6 +379,7 @@ impl Fixture {
         let read = plex.clone();
         let reserve = plex.clone();
         service.install_test_partners(Arc::new(TestPartners {
+            seal_failure: options.seal_failure.clone(),
             expect_placed: Some("fake-atomic-expect"),
             run_placed: Some("fake-atomic-run"),
             reserved_send_placed: true,
@@ -366,6 +401,13 @@ impl Fixture {
         ctx.bash_background().set_db_pool(pool);
         ctx.bash_background()
             .set_harness(crate::harness::Harness::Opencode);
+        if let Some((arrived, release)) = options.pause.take() {
+            ctx.bash_background()
+                .install_pty_seal_pause_for_test(arrived, release);
+        }
+        if options.fail_revocation {
+            service.store.connect().unwrap().execute_batch("CREATE TRIGGER reject_pty_revocation BEFORE INSERT ON gh_speech_task_revocations BEGIN SELECT RAISE(ABORT,'simulated revocation failure'); END;").unwrap();
+        }
         let origin = crate::gh_shim_speech::model::RouteOrigin {
             run_nonce: crate::gh_shim_speech::service::run_nonce().unwrap().into(),
             connection_generation: "fixture-control".into(),
@@ -398,7 +440,9 @@ impl Fixture {
         let spawn_root = root.clone();
         let spawn_session = session.clone();
         let lifecycle = seed.lifecycle.clone();
-        let (ticket, task) = tokio::task::spawn_blocking(move || {
+        let pty = options.pty;
+        let command = options.command.take().unwrap_or_else(|| "sleep 120".into());
+        let (ticket, started, incarnation) = tokio::task::spawn_blocking(move || {
             std::thread::spawn(move || {
                 crate::gh_shim_speech::service::with_launch(Some(seed), &spawn_root, || {
                     let ticket = crate::bash_background::registry::with_scope_spawn(
@@ -411,6 +455,10 @@ impl Fixture {
                         },
                     );
                     let raw = ticket.value().unwrap().to_string();
+                    let incarnation = crate::gh_shim_ticket::speech_for_ticket(&raw)
+                        .unwrap()
+                        .incarnation
+                        .clone();
                     let _guard = crate::gh_shim_ticket::spawn_ticket_guard(Some(&raw));
                     crate::gh_shim_ticket::mark_spawn_background(true);
                     let mut environment = HashMap::new();
@@ -420,26 +468,55 @@ impl Fixture {
                     );
                     let task =
                         crate::bash_background::registry::with_scope_spawn(lifecycle, || {
-                            spawn_ctx.bash_background().spawn_with_shell_in_slot(
-                                crate::sandbox_spawn::SpawnPlan::Unsandboxed,
-                                "sleep 120",
-                                crate::bash_background::BashShell::Bash,
-                                crate::bash_background::registry::resolve_posix_shell(),
-                                spawn_session,
-                                project.clone(),
-                                environment,
-                                crate::bash_background::HardKill::After(Duration::from_secs(120)),
-                                None,
-                                spawn_root.join("opencode"),
-                                crate::bash_background::TaskSlot::Background { max: 10 },
-                                true,
-                                false,
-                                Some(project),
-                            )
-                        })
-                        .unwrap();
-                    ticket.bind_task(&task);
-                    (raw, task)
+                            if pty {
+                                spawn_ctx.bash_background().spawn_pty_with_shell(
+                                    crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+                                    &command,
+                                    crate::bash_background::BashShell::Bash,
+                                    crate::bash_background::registry::resolve_posix_shell(),
+                                    spawn_session,
+                                    project.clone(),
+                                    environment,
+                                    crate::bash_background::HardKill::After(Duration::from_secs(
+                                        120,
+                                    )),
+                                    None,
+                                    spawn_root.join("opencode"),
+                                    10,
+                                    true,
+                                    false,
+                                    Some(project),
+                                    24,
+                                    80,
+                                )
+                            } else {
+                                spawn_ctx
+                                    .bash_background()
+                                    .spawn_with_shell_in_slot(
+                                        crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+                                        &command,
+                                        crate::bash_background::BashShell::Bash,
+                                        crate::bash_background::registry::resolve_posix_shell(),
+                                        spawn_session,
+                                        project.clone(),
+                                        environment,
+                                        crate::bash_background::HardKill::After(
+                                            Duration::from_secs(120),
+                                        ),
+                                        None,
+                                        spawn_root.join("opencode"),
+                                        crate::bash_background::TaskSlot::Background { max: 10 },
+                                        true,
+                                        false,
+                                        Some(project),
+                                    )
+                                    .map_err(|error| error.to_string())
+                            }
+                        });
+                    if let Ok(task) = &task {
+                        ticket.bind_task(task);
+                    }
+                    (raw, task, incarnation)
                 })
             })
             .join()
@@ -447,12 +524,28 @@ impl Fixture {
         })
         .await
         .unwrap();
-        let warm = crate::gh_shim_ticket::speech_for_ticket(&ticket).unwrap();
-        assert!(
-            warm.active.load(std::sync::atomic::Ordering::SeqCst),
-            "fixture must acquire genuine durable authority: {:?}",
-            warm.failure.lock().unwrap()
-        );
+        let (task, startup_error) = match started {
+            Ok(task) => (task, None),
+            Err(error) => {
+                let conn = service.store.connect().unwrap();
+                let task: String = conn
+                    .query_row(
+                        "SELECT task_id FROM gh_speech_authorities WHERE incarnation=?1",
+                        [&incarnation],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                (task, Some(error))
+            }
+        };
+        if startup_error.is_none() && options.seal_failure.is_none() {
+            let warm = crate::gh_shim_ticket::speech_for_ticket(&ticket).unwrap();
+            assert!(
+                warm.active.load(std::sync::atomic::Ordering::SeqCst),
+                "fixture must acquire genuine durable authority: {:?}",
+                warm.failure.lock().unwrap()
+            );
+        }
         let args: Vec<OsString> = [
             "issue",
             "comment",
@@ -496,6 +589,8 @@ impl Fixture {
             task,
             session,
             params,
+            incarnation,
+            startup_error,
         }
     }
 

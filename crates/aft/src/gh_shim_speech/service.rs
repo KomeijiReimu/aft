@@ -31,6 +31,7 @@ type EndNotice = Arc<dyn Fn(ScopeStamp) + Send + Sync>;
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct TestPartners {
+    pub(crate) seal_failure: Option<Refusal>,
     pub(crate) expect_placed: Option<&'static str>,
     pub(crate) run_placed: Option<&'static str>,
     pub(crate) reserved_send_placed: bool,
@@ -1014,6 +1015,12 @@ impl Service {
             };
         }
         super::partner::require_plex_guards(codemode)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_seal_failure(&self) -> Option<Refusal> {
+        self.test_partners()
+            .and_then(|partners| partners.seal_failure.clone())
     }
 
     #[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
