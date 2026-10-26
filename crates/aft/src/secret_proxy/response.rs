@@ -91,22 +91,7 @@ pub(super) async fn forward(
         parts.extensions.clear();
         return Ok(Response::from_parts(parts, super::full(Bytes::new())));
     }
-    let encodings: Vec<_> = response
-        .headers()
-        .get_all("content-encoding")
-        .iter()
-        .map(|v| v.to_str().map_err(|_| ()))
-        .collect::<Result<Vec<_>, _>>()?
-        .iter()
-        .flat_map(|v| v.split(','))
-        .map(|s| s.trim().to_ascii_lowercase())
-        .collect();
-    if encodings
-        .iter()
-        .any(|s| !matches!(s.as_str(), "identity" | "gzip" | "deflate" | "br"))
-    {
-        return Err(());
-    }
+    let encodings = content_codings(response.headers())?;
     scrub_headers(response.headers_mut(), &state, false)?;
     response.headers_mut().remove("content-encoding");
     let (mut parts, incoming) = response.into_parts();
@@ -210,4 +195,23 @@ pub(super) async fn forward(
         parts,
         StreamBody::new(stream).boxed_unsync(),
     ))
+}
+
+pub(super) fn content_codings(headers: &HeaderMap) -> Result<Vec<String>, ()> {
+    let encodings: Vec<_> = headers
+        .get_all("content-encoding")
+        .iter()
+        .map(|v| v.to_str().map_err(|_| ()))
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .flat_map(|v| v.split(','))
+        .map(|s| s.trim().to_ascii_lowercase())
+        .collect();
+    if encodings
+        .iter()
+        .any(|s| !matches!(s.as_str(), "identity" | "gzip" | "deflate" | "br"))
+    {
+        return Err(());
+    }
+    Ok(encodings)
 }

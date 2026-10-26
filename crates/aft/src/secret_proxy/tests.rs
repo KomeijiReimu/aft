@@ -23,6 +23,7 @@ struct Vault {
     rotate: AtomicBool,
     refused_label: Mutex<Option<String>>,
     special: AtomicBool,
+    audits: Mutex<Vec<secret_rules::audit::AuditRecordV1>>,
 }
 
 impl Vault {
@@ -33,6 +34,7 @@ impl Vault {
             rotate: AtomicBool::new(false),
             refused_label: Mutex::new(None),
             special: AtomicBool::new(false),
+            audits: Mutex::new(Vec::new()),
         })
     }
 }
@@ -65,7 +67,8 @@ impl SecretVault for Vault {
             .to_vec(),
         ))
     }
-    fn audit(&self, _: &secret_rules::audit::AuditRecordV1) -> Result<(), AuditError> {
+    fn audit(&self, record: &secret_rules::audit::AuditRecordV1) -> Result<(), AuditError> {
+        self.audits.lock().push(record.clone());
         Ok(())
     }
 }
@@ -110,6 +113,8 @@ struct Server {
     client_tls: rustls::ClientConfig,
     seen: Arc<Mutex<Vec<Value>>>,
     task: tokio::task::JoinHandle<()>,
+    handshake_seen: Arc<tokio::sync::Notify>,
+    tls_release: Arc<tokio::sync::Notify>,
 }
 
 impl Drop for Server {
@@ -129,7 +134,7 @@ impl Server {
         let names = if mode == "wrong-name" {
             vec!["wrong.invalid".into()]
         } else {
-            vec!["localhost".into(), "127.0.0.1".into()]
+            vec!["localhost".into(), "127.0.0.1".into(), "::1".into()]
         };
         let mut params = CertificateParams::new(names).unwrap();
         if mode == "expired" {
@@ -156,11 +161,25 @@ impl Server {
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         };
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let listener = if mode == "ipv6-h1" {
+            TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0))
+                .await
+                .unwrap()
+        } else {
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap()
+        };
         let address = listener.local_addr().unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let recorded = seen.clone();
-        let overlap = Arc::new(tokio::sync::Barrier::new(2));
+        let overlap = Arc::new(tokio::sync::Barrier::new(if mode == "hold" {
+            32
+        } else {
+            2
+        }));
+        let handshake_seen = Arc::new(tokio::sync::Notify::new());
+        let tls_release = Arc::new(tokio::sync::Notify::new());
+        let seen_tls = handshake_seen.clone();
+        let release_tls = tls_release.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else {
@@ -169,10 +188,37 @@ impl Server {
                 let acceptor = acceptor.clone();
                 let recorded = recorded.clone();
                 let overlap = overlap.clone();
+                let seen_tls = seen_tls.clone();
+                let release_tls = release_tls.clone();
                 tokio::spawn(async move {
+                    if mode == "delay-h1" {
+                        seen_tls.notify_one();
+                        release_tls.notified().await;
+                    }
                     let Ok(tls) = acceptor.accept(socket).await else {
                         return;
                     };
+                    if mode == "raw-transfer-h1" {
+                        let mut tls = tls;
+                        let mut request = Vec::new();
+                        while !request.ends_with(b"\r\n\r\n") {
+                            let Ok(byte) = tls.read_u8().await else {
+                                return;
+                            };
+                            request.push(byte);
+                        }
+                        recorded
+                            .lock()
+                            .push(json!({"raw":String::from_utf8_lossy(&request)}));
+                        let mut encoder = async_compression::tokio::bufread::GzipEncoder::new(K1);
+                        let mut gzip = Vec::new();
+                        encoder.read_to_end(&mut gzip).await.unwrap();
+                        let wire = [b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\nConnection: close\r\n\r\n".to_vec(),
+                            format!("{:x}\r\n",gzip.len()).into_bytes(),gzip,b"\r\n0\r\n\r\n".to_vec()].concat();
+                        let _ = tls.write_all(&wire).await;
+                        let _ = tls.shutdown().await;
+                        return;
+                    }
                     let service = service_fn(move |mut request: Request<Incoming>| {
                         let recorded = recorded.clone();
                         let overlap = overlap.clone();
@@ -263,7 +309,7 @@ impl Server {
                                 });
                                 return Ok::<_, std::convert::Infallible>(response);
                             }
-                            if mode == "overlap" {
+                            if mode == "overlap" || mode == "hold" {
                                 overlap.wait().await;
                             }
                             let mut payload = if mode.starts_with("echo-request") {
@@ -354,6 +400,8 @@ impl Server {
             client_tls,
             seen,
             task,
+            handshake_seen,
+            tls_release,
         }
     }
 }
@@ -483,9 +531,35 @@ fn client_child() {
             H2(hyper::client::conn::http2::SendRequest<http_body_util::Full<Bytes>>),
         }
         let mut senders: Vec<Sender> = Vec::new();
+        let mut raw_sockets = Vec::new();
         for line in std::io::stdin().lock().lines() {
             let value: Value = serde_json::from_str(&line.unwrap()).unwrap();
             let result = tokio::time::timeout(Duration::from_secs(10), async {
+                if value["op"] == "raw" {
+                    let socket: &mut tokio_rustls::client::TlsStream<TcpStream> = raw_sockets.last_mut().ok_or(())?;
+                    socket.write_all(value["wire"].as_str().ok_or(())?.as_bytes()).await.map_err(|_| ())?;
+                    let mut response = Vec::new(); socket.read_to_end(&mut response).await.map_err(|_| ())?;
+                    return Ok(json!({"wire":String::from_utf8_lossy(&response)}));
+                }
+                if value["op"] == "idle" {
+                    let socket = raw_sockets.last_mut().ok_or(())?;
+                    let closed = matches!(tokio::time::timeout(Duration::from_millis(250), socket.read_u8()).await, Ok(Err(_)));
+                    return Ok(json!({"closed":closed}));
+                }
+                if value["op"] == "cap_connections" {
+                    let proxy = url::Url::parse(&std::env::var("AFT_PROXY").unwrap()).unwrap();
+                    let authority = std::env::var("AFT_UPSTREAM").unwrap();
+                    let credentials = base64::engine::general_purpose::STANDARD.encode(format!("{}:",proxy.username()));
+                    let mut held = Vec::new();
+                    for _ in 0..18 {
+                        let mut socket = TcpStream::connect((proxy.host_str().unwrap(),proxy.port().unwrap())).await.map_err(|_| ())?;
+                        if socket.write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Authorization: Basic {credentials}\r\n\r\n").as_bytes()).await.is_err() { continue; }
+                        let mut header = Vec::new();
+                        while !header.ends_with(b"\r\n\r\n") { match socket.read_u8().await {Ok(b)=>header.push(b),Err(_)=>break} }
+                        if header.starts_with(b"HTTP/1.1 200") { held.push(socket); }
+                    }
+                    return Ok(json!({"accepted":held.len()}));
+                }
                 if value["op"] == "escaped" {
                     use std::os::unix::process::CommandExt;
                     let mut command = Command::new(std::env::current_exe().unwrap());
@@ -516,8 +590,9 @@ fn client_child() {
                     let mut config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
                     let h2 = value["h2"] == true;
                     config.alpn_protocols = vec![if h2 { b"h2".to_vec() } else { b"http/1.1".to_vec() }];
-                    let host = authority.rsplit_once(':').unwrap().0.to_owned();
+                    let host = authority.rsplit_once(':').unwrap().0.trim_start_matches('[').trim_end_matches(']').to_owned();
                     let tls = tokio_rustls::TlsConnector::from(Arc::new(config)).connect(rustls::pki_types::ServerName::try_from(host).unwrap(), socket).await.map_err(|_| ())?;
+                    if value["raw"] == true { raw_sockets.push(tls); return Ok(json!({"ok":true})); }
                     if h2 {
                         let (sender, connection) = hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls)).await.map_err(|_| ())?;
                         tokio::spawn(async move { let _ = connection.await; }); senders.push(Sender::H2(sender));
@@ -529,6 +604,16 @@ fn client_child() {
                 }
                 let index = value["connection"].as_u64().map(|v| v as usize).unwrap_or(senders.len().saturating_sub(1));
                 let sender = senders.get_mut(index).ok_or(())?;
+                if value["op"] == "many" {
+                    let Sender::H2(sender) = sender else { return Err(()); };
+                    let uri = format!("https://{}/approved",std::env::var("AFT_UPSTREAM").unwrap());
+                    let futures = (0..36).map(|_| {
+                        let mut sender = sender.clone(); let uri = uri.clone();
+                        async move { let request = Request::builder().uri(uri).header("authorization",format!("Bearer {MARKER}")).body(Full::new(Bytes::new())).unwrap();
+                            let response = sender.send_request(request).await.map_err(|_| ())?; let status = response.status().as_u16(); response.into_body().collect().await.map_err(|_| ())?; Ok::<_,()>(status) }
+                    });
+                    return Ok(json!({"statuses":futures_util::future::join_all(futures).await.into_iter().collect::<Result<Vec<_>,_>>()?}));
+                }
                 if value["op"] == "overlap" {
                     let Sender::H2(sender) = sender else { return Err(()); };
                     let mut second = sender.clone();
@@ -542,7 +627,8 @@ fn client_child() {
                 let authority = value["authority"].as_str().map(str::to_owned).unwrap_or_else(|| std::env::var("AFT_UPSTREAM").unwrap());
                 let path = value["path"].as_str().unwrap_or("/approved");
                 let uri = if matches!(sender, Sender::H2(_)) { format!("https://{authority}{path}") } else { path.to_owned() };
-                let mut request = Request::builder().uri(uri).method("POST").header("host", &authority).header("te", "trailers");
+                let mut request = Request::builder().uri(uri).method("POST").header("te", "trailers");
+                if value["omit_host"] != true { request = request.header("host", &authority); }
                 if let Some(headers) = value["headers"].as_object() {
                     for (key, val) in headers { request = request.header(key, val.as_str().unwrap()); }
                 }
@@ -561,13 +647,17 @@ fn client_child() {
                 }
                 let collected = response.into_body().collect().await.map_err(|_| ())?;
                 let trailers: HashMap<_,_> = collected.trailers().map(|h| h.iter().map(|(n,v)| (n.to_string(), String::from_utf8_lossy(v.as_bytes()).to_string())).collect()).unwrap_or_default();
-                Ok(json!({"status":status,"headers":headers,"body":String::from_utf8_lossy(&collected.to_bytes()),"trailers":trailers}))
+                let bytes = collected.to_bytes();
+                Ok(json!({"status":status,"headers":headers,"body":String::from_utf8_lossy(&bytes),"bytes":base64::engine::general_purpose::STANDARD.encode(&bytes),"trailers":trailers}))
             }).await;
             println!("{}", result.ok().and_then(Result::ok).unwrap_or(json!({"error":true})));
             std::io::stdout().flush().unwrap();
         }
     });
 }
+
+#[path = "audit_tests.rs"]
+mod audit_tests;
 
 fn child_reply(line: &str) -> Option<Value> {
     // With a single test thread, libtest prefixes uncaptured output with the

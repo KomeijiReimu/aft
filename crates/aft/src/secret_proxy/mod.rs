@@ -95,6 +95,10 @@ pub(crate) struct State {
     patterns: Mutex<Vec<(String, Zeroizing<Vec<u8>>)>>,
     #[cfg(test)]
     headers_sensitive: AtomicBool,
+    #[cfg(test)]
+    test_identity_generation: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    test_idle_timeout_ms: std::sync::atomic::AtomicU64,
 }
 
 impl State {
@@ -234,6 +238,10 @@ impl SecretProxy {
             patterns: Mutex::new(Vec::new()),
             #[cfg(test)]
             headers_sensitive: AtomicBool::new(false),
+            #[cfg(test)]
+            test_identity_generation: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            test_idle_timeout_ms: std::sync::atomic::AtomicU64::new(0),
         });
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .map_err(|_| ProxyError::Initialization)?;

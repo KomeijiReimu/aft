@@ -122,7 +122,7 @@ async fn prepare_and_send(
         .any(|(r, m)| *m && matches!(r.location, Location::Json(_)));
     // Only JSON substitution needs a buffered body. Other uploads remain
     // streaming; they are never searched for placeholders outside their rule.
-    let mut body = Zeroizing::new(Vec::with_capacity(if has_json { 1024 * 1024 } else { 0 }));
+    let mut body = body_buffer(has_json);
     if has_json {
         while let Some(frame) = incoming.frame().await {
             let frame = frame.map_err(|_| fail())?;
@@ -338,6 +338,10 @@ async fn prepare_and_send(
     super::response::forward(response, state.clone(), client_upgrade)
         .await
         .map_err(|_| fail())
+}
+
+pub(super) fn body_buffer(has_json: bool) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(Vec::with_capacity(if has_json { 1024 * 1024 } else { 0 }))
 }
 
 fn apply_edits(
