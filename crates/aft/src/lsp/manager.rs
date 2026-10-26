@@ -2133,9 +2133,16 @@ impl LspManager {
     }
 
     fn wait_for_file_startups(&mut self, file: &Path, config: &Config, deadline: Instant) -> bool {
-        let signals = expected_server_keys_for_file(file, config)
-            .into_iter()
-            .filter_map(|key| self.starting.get(&key).map(|r| Arc::clone(&r.signal)))
+        // Accepted notifications identify their owner even if a later root or
+        // definition lookup no longer finds the same reservation.
+        let expected = expected_server_keys_for_file(file, config);
+        let signals = self
+            .starting
+            .iter()
+            .filter(|(key, reservation)| {
+                expected.contains(key) || reservation.notification_versions.contains_key(file)
+            })
+            .map(|(_, reservation)| Arc::clone(&reservation.signal))
             .collect();
         self.wait_for_startup_signals(signals, deadline)
     }
@@ -4569,7 +4576,19 @@ impl LspManager {
         // explicit diagnostics wait must drive both startup and replay phases.
         self.wait_for_file_startups(&lookup_path, config, deadline);
 
-        if self.server_key_for_file(&lookup_path, config).is_none() {
+        if self.server_key_for_file(&lookup_path, config).is_none()
+            && !servers_for_file(&lookup_path, config)
+                .iter()
+                .any(|definition| {
+                    self.clients.keys().any(|key| {
+                        key.kind == definition.kind
+                            && self
+                                .documents
+                                .get(key)
+                                .is_some_and(|store| store.is_open(&lookup_path))
+                    })
+                })
+        {
             return Vec::new();
         }
 
@@ -6958,7 +6977,10 @@ impl LspManager {
 
     fn server_key_for_file(&self, file_path: &Path, config: &Config) -> Option<ServerKey> {
         for def in servers_for_file(file_path, config) {
-            let key = server_key_for_definition(&def, file_path, config)?;
+            // One inapplicable definition must not hide another live server.
+            let Some(key) = server_key_for_definition(&def, file_path, config) else {
+                continue;
+            };
             if self.clients.contains_key(&key) {
                 return Some(key);
             }
@@ -8086,7 +8108,7 @@ where
     }
 }
 
-/// Join existing startups for a cache/workspace diagnostics request without
+/// Join existing startups for a workspace diagnostics request without
 /// starting servers for files the request has not opened.
 pub(crate) fn wait_for_pending_startups_unlocked<G>(
     lock: impl Fn() -> G,
@@ -8131,32 +8153,60 @@ pub fn start_applicable_server_unlocked(
     let Some(candidate) = snapshot.candidates.iter().find(|c| c.key == *server) else {
         return outcomes;
     };
-    if Instant::now() >= deadline {
-        outcomes.deadline_exceeded = Some(server.clone());
-        return outcomes;
-    }
-    let (initial, signal) = {
-        let mut lsp = manager.lock();
-        lsp.startup_owner = Arc::downgrade(manager);
-        let result = lsp.start_server(
-            &candidate.definition,
-            server,
-            &candidate.source_file,
-            config,
-        );
-        let signal = lsp.starting.get(server).map(|r| Arc::clone(&r.signal));
-        (result, signal)
-    };
-    let result = if let (ServerAttemptResult::InProgress { .. }, Some(signal)) = (&initial, signal)
-    {
-        wait_for_startup_outcome(|| manager.lock(), &signal, deadline).unwrap_or_else(|| {
+    let mut retried_abandoned = false;
+    let result = loop {
+        if Instant::now() >= deadline {
+            outcomes.deadline_exceeded = Some(server.clone());
+            return outcomes;
+        }
+        let (initial, signal) = {
+            let mut lsp = manager.lock();
+            lsp.startup_owner = Arc::downgrade(manager);
+            let result = lsp.start_server(
+                &candidate.definition,
+                server,
+                &candidate.source_file,
+                config,
+            );
+            let signal = lsp.starting.get(server).map(|r| Arc::clone(&r.signal));
+            (result, signal)
+        };
+        let abandoned_before_join = signal.as_ref().is_some_and(|signal| {
             signal
                 .request_deadline_exceeded
-                .store(true, std::sync::atomic::Ordering::Release);
+                .load(std::sync::atomic::Ordering::Acquire)
+        });
+        let result = if let (ServerAttemptResult::InProgress { .. }, Some(signal)) =
+            (&initial, signal)
+        {
+            wait_for_startup_outcome(|| manager.lock(), &signal, deadline).unwrap_or_else(|| {
+                signal
+                    .request_deadline_exceeded
+                    .store(true, std::sync::atomic::Ordering::Release);
+                initial
+            })
+        } else {
             initial
-        })
-    } else {
-        initial
+        };
+        // A new request can overlap cleanup of an earlier timed-out request.
+        // Observe its result, then retry once with the new request's budget and
+        // configuration instead of returning that abandoned attempt's failure.
+        if abandoned_before_join
+            && !retried_abandoned
+            && matches!(
+                result,
+                ServerAttemptResult::SpawnFailed { .. }
+                    | ServerAttemptResult::BinaryNotInstalled { .. }
+            )
+            && Instant::now() < deadline
+        {
+            let lsp = manager.lock();
+            if !lsp.is_quiesced() && lsp.failure_to_replay(server).is_none() {
+                retried_abandoned = true;
+                continue;
+            }
+        }
+        break result;
     };
     match result {
         ServerAttemptResult::Ok { server_key } => outcomes.successful.push(server_key),

@@ -430,7 +430,6 @@ fn handle_global_mode(
     severity_filter: SeverityFilter,
     _wait_ms: u64,
 ) -> Response {
-    crate::lsp::manager::wait_for_pending_startups_unlocked(|| ctx.lsp(), None);
     let diagnostics: Vec<StoredDiagnostic> = {
         let lsp = ctx.lsp();
         lsp.get_all_diagnostics()

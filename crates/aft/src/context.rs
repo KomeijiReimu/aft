@@ -5553,38 +5553,24 @@ impl AppContext {
         context
     }
 
-    /// Current omission-preserving status values. Generation identities are
-    /// checked before project scoping or tsconfig-membership work, so a cache hit
-    /// faithfully reuses each category's presence or absence.
+    /// Explicit status reads wait for a coherent diagnostic snapshot. Publishers
+    /// use the nonblocking accessor so a busy manager never clears their bar.
     pub fn status_bar_count_values(&self) -> StatusBarCountValues {
-        self.try_status_bar_count_values()
-            .unwrap_or_else(|| {
-                // Explicit status reads may still report independent Tier-2
-                // categories. Publishers use the try accessor and skip contention.
-                let tier2 = self
-                    .status_bar_tier2
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                StatusBarCountValues {
-                    errors: None,
-                    warnings: None,
-                    dead_code: tier2.dead_code,
-                    unused_exports: tier2.unused_exports,
-                    duplicates: tier2.duplicates,
-                    todos: tier2.todos,
-                    tier2_stale: tier2.stale,
-                    disabled_categories: Vec::new(),
-                    diagnostics: None,
-                    diagnostics_reason: None,
-                    diagnostics_gaps: Vec::new(),
-                }
-            })
+        self.status_bar_count_values_inner(true)
+            .expect("a blocking status read obtains the language-server manager")
             .mask_disabled(&self.config().inspect)
     }
 
     /// A busy manager is not a missing diagnostic producer. Publishers must
     /// leave their previous bar untouched and retry on a later signal.
     pub(crate) fn try_status_bar_count_values(&self) -> Option<StatusBarCountValues> {
+        self.status_bar_count_values_inner(false)
+    }
+
+    fn status_bar_count_values_inner(
+        &self,
+        wait_for_manager: bool,
+    ) -> Option<StatusBarCountValues> {
         #[cfg(test)]
         STATUS_COUNT_PROBES.with(|count| count.set(count.get() + 1));
         let tier2 = self
@@ -5593,7 +5579,11 @@ impl AppContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let tsconfig_generation = self.tsconfig_membership.lock().generation();
-        let lsp = self.lsp_manager.try_lock()?;
+        let lsp = if wait_for_manager {
+            self.lsp_manager.lock()
+        } else {
+            self.lsp_manager.try_lock()?
+        };
         let diagnostics_generation = lsp.diagnostics_generation();
         let (authoritative, producer_gaps) = lsp.project_diagnostics_authority();
         let pending_reason = if lsp.has_project_applicability() {
