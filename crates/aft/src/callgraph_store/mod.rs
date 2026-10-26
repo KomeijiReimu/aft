@@ -10497,6 +10497,8 @@ fn outgoing_calls_for_symbol_tuples(
             Ok((
                 source_node_id,
                 StoreCallSite {
+                    kind: "call".to_string(),
+                    caller_is_test: None,
                     caller,
                     target_file: row.get(1)?,
                     target_symbol: row.get(2)?,
@@ -15777,8 +15779,21 @@ fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> 
     dependencies.insert(target_file.clone());
     let mut construction_without_constructor = false;
     if raw.kind == "construction" {
+        let Some(node) = index.node_for_symbol(&target_file, &target_symbol) else {
+            return Ok(ResolvedRef {
+                raw,
+                status: "unresolved".to_string(),
+                target_node: None,
+                target_file: None,
+                target_symbol: None,
+                dependencies,
+                edge: None,
+            });
+        };
         let constructor = format!("{target_symbol}::constructor");
-        if index.node_for_symbol(&target_file, &constructor).is_some() {
+        if index.node_is_callable(&target_file, &node) {
+            // JavaScript functions can also be constructed; they remain callable targets.
+        } else if index.node_for_symbol(&target_file, &constructor).is_some() {
             target_symbol = constructor;
         } else {
             // Keep the class reference for liveness without inventing an executable method call.
@@ -18487,7 +18502,7 @@ fn insert_file_dependencies(
 }
 
 fn ref_provenance(raw: &RawRef) -> &'static str {
-    if raw.kind == "value_ref" {
+    if matches!(raw.kind.as_str(), "value_ref" | "callback_ref") {
         PROVENANCE_VALUE_REF
     } else {
         PROVENANCE_TREESITTER

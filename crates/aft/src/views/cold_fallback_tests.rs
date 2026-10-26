@@ -576,6 +576,51 @@ fn stale_build_output_republishes_an_unchanged_manifest() {
 }
 
 #[test]
+fn callgraph_previous_store_version_rebuilds_existing_view() {
+    let project = repository(4);
+    let storage = tempfile::tempdir().unwrap();
+    let (view, owner) = publish_marked_base(project.path(), storage.path());
+    let previous = blake3::hash(
+        b"callgraph_store:v2:positional:raw-ref:v19-position-independent-node-identities",
+    )
+    .to_hex()
+    .to_string();
+    let connection = Connection::open(&owner).unwrap();
+    connection
+        .execute(
+            "UPDATE meta SET v = ?1 WHERE k = 'fingerprint'",
+            [&previous],
+        )
+        .unwrap();
+    connection
+        .execute("UPDATE meta SET v = '2' WHERE k = 'schema_version'", [])
+        .unwrap();
+    drop(connection);
+    assert!(!crate::callgraph_store::manifest_view_database_ready(
+        view.view_dir(),
+        view.current_generation().unwrap().as_deref().unwrap(),
+        Instant::now() + crate::db::STEADY_BUSY_TIMEOUT
+    )
+    .unwrap());
+
+    let report = publish_checkout(&request(project.path(), storage.path(), "head-1", &[])).unwrap();
+    assert!(
+        report.published,
+        "an unchanged manifest must rebuild incompatible graph data"
+    );
+    let derived = view
+        .derived_path(report.generation.as_deref().unwrap())
+        .unwrap();
+    assert!(!has_marker(&derived), "old derived rows must not be reused");
+    assert!(crate::callgraph_store::manifest_view_database_ready(
+        view.view_dir(),
+        report.generation.as_deref().unwrap(),
+        Instant::now() + crate::db::STEADY_BUSY_TIMEOUT
+    )
+    .unwrap());
+}
+
+#[test]
 fn stale_build_output_does_not_seed_an_incremental_diff() {
     let project = repository(4);
     let storage = tempfile::tempdir().unwrap();

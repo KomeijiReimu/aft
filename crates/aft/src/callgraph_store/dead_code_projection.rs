@@ -785,7 +785,7 @@ const OUTBOUND_CALLS_SQL: &str = "SELECT r.caller_file,
             COALESCE(r.target_file, e.target_file),
             COALESCE(tn.name, r.target_symbol, e.target_symbol),
             r.line,
-            CASE WHEN r.kind = 'value_ref' THEN 'value_ref'
+            CASE WHEN r.kind IN ('value_ref', 'callback_ref') THEN 'value_ref'
                  ELSE COALESCE(e.provenance, r.provenance) END,
             r.byte_start,
             r.byte_end,
@@ -794,7 +794,7 @@ const OUTBOUND_CALLS_SQL: &str = "SELECT r.caller_file,
      LEFT JOIN nodes n ON n.id = r.caller_node
      LEFT JOIN edges e ON e.ref_id = r.ref_id AND e.kind = r.kind
      LEFT JOIN nodes tn ON tn.id = e.target_node
-     WHERE r.kind IN ('call', 'value_ref', 'macro_body_call')";
+     WHERE r.kind IN ('call', 'construction', 'callback_ref', 'value_ref', 'macro_body_call')";
 
 fn outbound_calls_from_store(
     conn: &Connection,
