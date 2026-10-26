@@ -75,7 +75,10 @@ fn fresh_git_worktree_produces_typescript_diagnostics_without_installing() {
         ..Config::default()
     };
     let mut manager = LspManager::new();
-    manager.ensure_file_open(&file, &config).unwrap();
+    crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_file_open(&file, &config)
+    })
+    .unwrap();
     manager.wait_for_diagnostics(&file, &config, Duration::from_secs(15));
     let diagnostics = manager.get_diagnostics_for_file(&file);
     assert!(

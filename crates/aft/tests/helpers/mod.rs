@@ -1828,3 +1828,18 @@ pub fn canonicalize_like_product(path: &std::path::Path) -> std::path::PathBuf {
 }
 
 pub(crate) mod aft_binary;
+/// Cold locked starts now return pending. Fixtures that need a ready server
+/// wait through the same public completion path as an owned manager.
+pub fn settled_lsp<R>(
+    manager: &mut aft::lsp::manager::LspManager,
+    operation: impl Fn(&mut aft::lsp::manager::LspManager) -> R,
+) -> R {
+    let initial = operation(manager);
+    if !manager.has_pending_startups() {
+        return initial;
+    }
+    assert!(
+        manager.wait_for_startups(std::time::Instant::now() + std::time::Duration::from_secs(30))
+    );
+    operation(manager)
+}
