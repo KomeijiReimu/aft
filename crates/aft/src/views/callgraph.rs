@@ -228,7 +228,8 @@ impl PlaneAdapter for CallgraphPlane {
             generation.name(),
         )
         .map_err(error)?;
-        self.readers
+        let retired = self
+            .readers
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(
@@ -238,13 +239,16 @@ impl PlaneAdapter for CallgraphPlane {
                     generation: generation.clone(),
                 }),
             );
+        drop(retired);
         Ok(())
     }
     fn release_generation(&self, access: &ViewAccess, generation: &str) {
-        self.readers
+        let retired = self
+            .readers
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&(access.scope().into(), generation.into()));
+        drop(retired);
     }
     fn readiness(&self, access: &ViewAccess, snapshot: &Snapshot) -> PlaneReadiness {
         if !self

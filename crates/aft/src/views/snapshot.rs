@@ -851,6 +851,7 @@ impl LiveEntries for LiveDelta {
 #[cfg(test)]
 mod mutation_tests {
     use super::*;
+    use crate::views::contracts::{PlaneAdapter, PlaneError, ViewAccess};
     use crate::views::manifest_v2::{ManifestHeader, Producers};
 
     fn delta() -> LiveDelta {
@@ -874,6 +875,211 @@ mod mutation_tests {
         resident: std::sync::atomic::AtomicBool,
         releases: std::sync::atomic::AtomicUsize,
     }
+
+    struct ReaderPause {
+        entered: std::sync::mpsc::Sender<()>,
+        resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl ReaderPause {
+        fn wait(&self) {
+            self.entered.send(()).unwrap();
+            self.resume
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        }
+    }
+
+    struct PausedLeaseAdapter {
+        inner: LeaseAdapter,
+        open: Option<ReaderPause>,
+        retire: Option<ReaderPause>,
+    }
+
+    impl PlaneAdapter for PausedLeaseAdapter {
+        fn plane(&self) -> FamilyPlane {
+            FamilyPlane::Trigram
+        }
+        fn producer(&self) -> String {
+            "test".into()
+        }
+        fn applies_to(&self, _: &RelPath) -> bool {
+            true
+        }
+        fn open_generation(
+            &self,
+            access: &ViewAccess,
+            generation: &Arc<ComposedGeneration>,
+        ) -> Result<(), PlaneError> {
+            if let Some(pause) = &self.open {
+                pause.wait();
+            }
+            self.inner.open_generation(access, generation)
+        }
+        fn release_generation(&self, access: &ViewAccess, generation: &str) {
+            if let Some(pause) = &self.retire {
+                pause.wait();
+            }
+            self.inner.release_generation(access, generation);
+        }
+        fn readiness(
+            &self,
+            access: &ViewAccess,
+            snapshot: &Snapshot,
+        ) -> super::super::readiness::PlaneReadiness {
+            self.inner.readiness(access, snapshot)
+        }
+    }
+
+    #[test]
+    fn reader_open_io_releases_the_global_cache_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let registry =
+            super::super::registry::FamilyRegistry::open(storage.path(), "reader-io").unwrap();
+        let owner = registry
+            .register_view_with_storage(storage.path(), "worker", root.path())
+            .unwrap();
+        let access = ViewAccess::Owner(owner);
+        let (entered, arrived) = std::sync::mpsc::channel();
+        let (resume, released) = std::sync::mpsc::channel();
+        let pause = ReaderPause {
+            entered,
+            resume: std::sync::Mutex::new(released),
+        };
+        let blocked: Arc<dyn PlaneAdapter> = Arc::new(PausedLeaseAdapter {
+            inner: LeaseAdapter {
+                resident: false.into(),
+                releases: 0.into(),
+            },
+            open: Some(pause),
+            retire: None,
+        });
+        let generation = delta().base().clone();
+        let first_access = access.clone();
+        let first = std::thread::spawn(move || {
+            PlaneReaders::open(&first_access, generation, &[blocked]).unwrap()
+        });
+        arrived
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let fast: Arc<dyn PlaneAdapter> = Arc::new(LeaseAdapter {
+            resident: false.into(),
+            releases: 0.into(),
+        });
+        let (done, completed) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            done.send(PlaneReaders::open(&access, delta().base().clone(), &[fast]).unwrap())
+                .unwrap()
+        });
+        let progressed = completed.recv_timeout(std::time::Duration::from_secs(2));
+        resume.send(()).unwrap();
+        let held = first.join().unwrap();
+        second.join().unwrap();
+        assert!(
+            progressed.is_ok(),
+            "an unrelated reader waited for adapter open I/O"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn reader_retirement_io_releases_the_global_cache_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let registry =
+            super::super::registry::FamilyRegistry::open(storage.path(), "reader-retire").unwrap();
+        let owner = registry
+            .register_view_with_storage(storage.path(), "worker", root.path())
+            .unwrap();
+        let access = ViewAccess::Owner(owner);
+        let (entered, arrived) = std::sync::mpsc::channel();
+        let (resume, released) = std::sync::mpsc::channel();
+        let blocked: Arc<dyn PlaneAdapter> = Arc::new(PausedLeaseAdapter {
+            inner: LeaseAdapter {
+                resident: false.into(),
+                releases: 0.into(),
+            },
+            open: None,
+            retire: Some(ReaderPause {
+                entered,
+                resume: std::sync::Mutex::new(released),
+            }),
+        });
+        let held = PlaneReaders::open(&access, delta().base().clone(), &[blocked]).unwrap();
+        let first = std::thread::spawn(move || drop(held));
+        arrived
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let fast: Arc<dyn PlaneAdapter> = Arc::new(LeaseAdapter {
+            resident: false.into(),
+            releases: 0.into(),
+        });
+        let (done, completed) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            done.send(PlaneReaders::open(&access, delta().base().clone(), &[fast]).unwrap())
+                .unwrap()
+        });
+        let progressed = completed.recv_timeout(std::time::Duration::from_secs(2));
+        resume.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        assert!(
+            progressed.is_ok(),
+            "an unrelated reader waited for adapter retirement I/O"
+        );
+    }
+
+    #[test]
+    fn concurrent_reader_opens_share_one_per_key_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let registry =
+            super::super::registry::FamilyRegistry::open(storage.path(), "single-reader").unwrap();
+        let owner = registry
+            .register_view_with_storage(storage.path(), "worker", root.path())
+            .unwrap();
+        let access = ViewAccess::Owner(owner);
+        let (entered, arrived) = std::sync::mpsc::channel();
+        let (resume, released) = std::sync::mpsc::channel();
+        let adapter: Arc<dyn PlaneAdapter> = Arc::new(PausedLeaseAdapter {
+            inner: LeaseAdapter {
+                resident: false.into(),
+                releases: 0.into(),
+            },
+            open: Some(ReaderPause {
+                entered,
+                resume: std::sync::Mutex::new(released),
+            }),
+            retire: None,
+        });
+        let first_access = access.clone();
+        let first_adapter = adapter.clone();
+        let first = std::thread::spawn(move || {
+            PlaneReaders::open(&first_access, delta().base().clone(), &[first_adapter]).unwrap()
+        });
+        arrived
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let (done, completed) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            done.send(PlaneReaders::open(&access, delta().base().clone(), &[adapter]).unwrap())
+                .unwrap()
+        });
+        assert!(completed
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        resume.send(()).unwrap();
+        let first = first.join().unwrap();
+        let second_lease = completed
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        second.join().unwrap();
+        assert!(Arc::ptr_eq(&first.adapters[0], &second_lease.adapters[0]));
+    }
+
     impl super::super::contracts::PlaneAdapter for LeaseAdapter {
         fn plane(&self) -> FamilyPlane {
             FamilyPlane::Trigram
@@ -932,7 +1138,8 @@ mod mutation_tests {
             .unwrap();
         let key = old.adapters[0].key.clone();
         let weak = Arc::downgrade(&old.adapters[0]);
-        let mut cache = reader_cache().lock().unwrap();
+        let slot = old.adapters[0].slot.clone();
+        let mut state = slot.state.lock().unwrap();
         let (done, completed) = std::sync::mpsc::channel();
         let retiring = std::thread::spawn(move || {
             drop(old);
@@ -945,18 +1152,23 @@ mod mutation_tests {
         assert_eq!(
             weak.strong_count(),
             0,
-            "the old destructor must be waiting for the cache lock"
+            "the old destructor must be waiting for its slot lock"
         );
         adapter.open_generation(&access, &generation).unwrap();
         let replacement = Arc::new(AdapterLease {
             key: key.clone(),
+            slot: slot.clone(),
+            token: next_reader_token(),
             adapter,
             access,
             resource: None,
             generation,
         });
-        cache.insert(key, Arc::downgrade(&replacement));
-        drop(cache);
+        *state = ReaderSlotState::Live {
+            token: replacement.token,
+            lease: Arc::downgrade(&replacement),
+        };
+        drop(state);
         completed
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
@@ -1303,6 +1515,8 @@ pub struct PlaneReaders {
 
 struct AdapterLease {
     key: ReaderCacheKey,
+    slot: Arc<ReaderSlot>,
+    token: u64,
     adapter: Arc<dyn super::contracts::PlaneAdapter>,
     access: super::contracts::ViewAccess,
     resource: Option<PlaneAttachment>,
@@ -1311,27 +1525,93 @@ struct AdapterLease {
 
 impl Drop for AdapterLease {
     fn drop(&mut self) {
-        // Release the owned handle before adapter cleanup trims its arena.
-        // The generation Arc retains residency pins until the lease is dropped.
-        drop(self.resource.take());
-        let mut cache = reader_cache()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // A new lease can replace a zero-strong-count weak entry while this
-        // destructor waits for the lock. Never remove that new resident.
-        if !cache
-            .get(&self.key)
-            .is_some_and(|lease| lease.strong_count() != 0)
-        {
-            cache.remove(&self.key);
+        let owns_slot = {
+            let mut state = self
+                .slot
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let owns = matches!(&*state,
+                ReaderSlotState::Live { token, .. } | ReaderSlotState::Opening(token)
+                if *token == self.token);
+            if owns {
+                *state = ReaderSlotState::Retiring(self.token);
+            }
+            owns
+        };
+        // Neither the global map nor the per-key slot is locked during teardown.
+        // The generation Arc retains residency pins until the lease fields drop.
+        if owns_slot {
+            let _retiring = ReaderTransition {
+                slot: self.slot.clone(),
+                token: self.token,
+                armed: true,
+            };
+            drop(self.resource.take());
             self.adapter
                 .release_generation(&self.access, &self.generation.resident_key());
+        } else {
+            drop(self.resource.take());
         }
     }
 }
 
 type ReaderCacheKey = (usize, String, String, String);
-type ReaderCache = std::sync::Mutex<BTreeMap<ReaderCacheKey, std::sync::Weak<AdapterLease>>>;
+type ReaderCache = std::sync::Mutex<BTreeMap<ReaderCacheKey, std::sync::Weak<ReaderSlot>>>;
+
+enum ReaderSlotState {
+    Vacant,
+    Opening(u64),
+    Live {
+        token: u64,
+        lease: std::sync::Weak<AdapterLease>,
+    },
+    Retiring(u64),
+}
+
+struct ReaderSlot {
+    state: std::sync::Mutex<ReaderSlotState>,
+    changed: std::sync::Condvar,
+}
+
+impl ReaderSlot {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(ReaderSlotState::Vacant),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+}
+
+struct ReaderTransition {
+    slot: Arc<ReaderSlot>,
+    token: u64,
+    armed: bool,
+}
+
+impl Drop for ReaderTransition {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = self
+            .slot
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(&*state, ReaderSlotState::Opening(token) | ReaderSlotState::Retiring(token) if *token == self.token)
+        {
+            *state = ReaderSlotState::Vacant;
+        }
+        drop(state);
+        self.slot.changed.notify_all();
+    }
+}
+
+fn next_reader_token() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 fn reader_cache() -> &'static ReaderCache {
     static CACHE: std::sync::OnceLock<ReaderCache> = std::sync::OnceLock::new();
@@ -1406,26 +1686,72 @@ impl PlaneReaders {
                 access.scope().to_owned(),
                 readers.generation.resident_key(),
             );
-            let mut cache = reader_cache()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            cache.retain(|_, lease| lease.strong_count() != 0);
-            let lease = match cache.get(&key).and_then(std::sync::Weak::upgrade) {
-                Some(lease) => lease,
-                None => {
-                    let resource = adapter.open_reader(access, &readers.generation)?;
-                    let lease = Arc::new(AdapterLease {
-                        key: key.clone(),
-                        adapter: adapter.clone(),
-                        access: access.clone(),
-                        resource,
-                        generation: readers.generation.clone(),
-                    });
-                    cache.insert(key, Arc::downgrade(&lease));
-                    lease
+            let slot = {
+                let mut cache = reader_cache()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                cache.retain(|_, slot| slot.strong_count() != 0);
+                match cache.get(&key).and_then(std::sync::Weak::upgrade) {
+                    Some(slot) => slot,
+                    None => {
+                        let slot = Arc::new(ReaderSlot::new());
+                        cache.insert(key.clone(), Arc::downgrade(&slot));
+                        slot
+                    }
                 }
             };
-            drop(cache);
+            let lease = loop {
+                let mut state = slot
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match &*state {
+                    ReaderSlotState::Live { lease, .. } if lease.strong_count() != 0 => {
+                        if let Some(lease) = lease.upgrade() {
+                            break lease;
+                        }
+                    }
+                    ReaderSlotState::Vacant => {
+                        let token = next_reader_token();
+                        *state = ReaderSlotState::Opening(token);
+                        drop(state);
+                        let mut opening = ReaderTransition {
+                            slot: slot.clone(),
+                            token,
+                            armed: true,
+                        };
+                        let resource = adapter.open_reader(access, &readers.generation)?;
+                        let lease = Arc::new(AdapterLease {
+                            key: key.clone(),
+                            slot: slot.clone(),
+                            token,
+                            adapter: adapter.clone(),
+                            access: access.clone(),
+                            resource,
+                            generation: readers.generation.clone(),
+                        });
+                        *slot
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            ReaderSlotState::Live {
+                                token,
+                                lease: Arc::downgrade(&lease),
+                            };
+                        opening.armed = false;
+                        slot.changed.notify_all();
+                        break lease;
+                    }
+                    _ => {}
+                }
+                // An expired live weak reference still owns retirement. Wait for
+                // its destructor, rather than opening over a half-closed reader.
+                state = slot
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                drop(state);
+            };
             let resource =
                 adapter.bind_reader(access, &readers.generation, lease.resource.clone())?;
             readers.adapters.push(lease);

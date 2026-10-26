@@ -1667,38 +1667,34 @@ impl FirstLoadDriver for CheckoutDriver {
             .installed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let installed = Arc::make_mut(&mut installed);
         if cut.seq != installed.seq || !Arc::ptr_eq(&cut.resident, &installed.composed) {
             return Err(SiblingLoader::error(
                 "BaseChanged: installed bundle superseded",
             ));
         }
-        installed.seq += 1;
+        let seq = installed.seq + 1;
         successor.set_watcher(super::snapshot::WatcherState::Healthy);
-        installed.composed = snapshot.generation().clone();
-        installed.published = snapshot
+        let published = snapshot
             .generation()
             .published()
             .cloned()
             .unwrap_or_default();
-        installed.readers = readers.clone();
-        installed.snapshot =
-            successor
-                .snapshot()
-                .with_readers(readers)
-                .with_install_cut(InstallCut {
-                    seq: installed.seq,
-                    resident: installed.composed.clone(),
-                    epoch: successor.epoch(),
-                    version: successor.version(),
-                    intent_version: successor.snapshot().intent_version(),
-                });
-        installed.coverage = FamilyPlane::ALL
+        let installed_snapshot = successor
+            .snapshot()
+            .with_readers(readers.clone())
+            .with_install_cut(InstallCut {
+                seq,
+                resident: snapshot.generation().clone(),
+                epoch: successor.epoch(),
+                version: successor.version(),
+                intent_version: successor.snapshot().intent_version(),
+            });
+        let coverage = FamilyPlane::ALL
             .into_iter()
             .map(|plane| {
                 (
                     plane,
-                    if installed.snapshot.pending_intent().any(|path| {
+                    if installed_snapshot.pending_intent().any(|path| {
                         self.planes
                             .iter()
                             .any(|driver| driver.plane() == plane && driver.applies_to(path))
@@ -1707,8 +1703,8 @@ impl FirstLoadDriver for CheckoutDriver {
                     } else {
                         super::readiness::plane_readiness(
                             plane,
-                            Some(&installed.composed),
-                            &installed.snapshot,
+                            Some(snapshot.generation()),
+                            &installed_snapshot,
                             &Default::default(),
                             &|_| true,
                         )
@@ -1716,9 +1712,25 @@ impl FirstLoadDriver for CheckoutDriver {
                 )
             })
             .collect();
-        installed.uncertain_paths.clear();
-        installed.own_installed = own_installed;
-        *live = successor;
+        let replacement = Arc::new(InstalledBundle {
+            seq,
+            composed: snapshot.generation().clone(),
+            coverage,
+            readers,
+            published,
+            revision: installed.revision,
+            snapshot: installed_snapshot,
+            uncertain_paths: Default::default(),
+            own_installed,
+        });
+        let retired_bundle = std::mem::replace(&mut *installed, replacement);
+        let retired_delta = std::mem::replace(&mut *live, successor);
+        drop(installed);
+        drop(live);
+        // Last-drop reader close and residency-pin cleanup can perform I/O.
+        // Keep displaced owners alive until both root locks are released.
+        drop(retired_bundle);
+        drop(retired_delta);
         Ok(())
     }
     fn build_own_generation(
@@ -1956,7 +1968,7 @@ impl QueryState for CheckoutDriver {
 
 #[cfg(test)]
 mod composite_tests {
-    use super::super::contracts::{PlaneLoader, QueryWait, WaitOutcome};
+    use super::super::contracts::{PlaneAdapter, PlaneLoader, QueryWait, WaitOutcome};
     use super::super::manifest_v2::{EntryPlanes, EntryV2, ManifestV2};
     use super::super::snapshot::{DiskState, PlaneAttachment};
     use super::*;
@@ -2090,6 +2102,105 @@ mod composite_tests {
             vec![plane.clone()],
         ));
         (driver, walker, plane, ViewAccess::Owner(owner))
+    }
+
+    struct RetirePauseAdapter {
+        armed: AtomicBool,
+        entered: std::sync::mpsc::Sender<()>,
+        resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl PlaneAdapter for RetirePauseAdapter {
+        fn plane(&self) -> FamilyPlane {
+            FamilyPlane::Trigram
+        }
+        fn producer(&self) -> String {
+            "test".into()
+        }
+        fn applies_to(&self, _: &RelPath) -> bool {
+            true
+        }
+        fn open_generation(
+            &self,
+            _: &ViewAccess,
+            _: &Arc<ComposedGeneration>,
+        ) -> Result<(), PlaneError> {
+            Ok(())
+        }
+        fn release_generation(&self, _: &ViewAccess, _: &str) {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.entered.send(()).unwrap();
+                self.resume
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            }
+        }
+        fn readiness(
+            &self,
+            _: &ViewAccess,
+            _: &Snapshot,
+        ) -> super::super::readiness::PlaneReadiness {
+            super::super::readiness::PlaneReadiness::Ready {
+                pending: 0,
+                failed: 0,
+            }
+        }
+    }
+
+    #[test]
+    fn installed_bundle_retirement_releases_live_and_installed_locks() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        let (entered, arrived) = std::sync::mpsc::channel();
+        let (resume, released) = std::sync::mpsc::channel();
+        let adapter = Arc::new(RetirePauseAdapter {
+            armed: false.into(),
+            entered,
+            resume: std::sync::Mutex::new(released),
+        });
+        let driver = Arc::new(
+            Arc::try_unwrap(driver)
+                .ok()
+                .unwrap()
+                .with_adapters(vec![adapter.clone()]),
+        );
+        drop(
+            SiblingLoader::new(driver.clone(), vec![])
+                .load(&access)
+                .unwrap(),
+        );
+        let (previous, revision) = driver.installed_cut();
+        let cut = previous.install_cut().unwrap().clone();
+        let generation = Arc::new(ComposedGeneration::new(
+            "replacement",
+            previous.generation().flatten().unwrap(),
+            None,
+        ));
+        let successor = super::super::snapshot::LiveDelta::new(generation)
+            .snapshot()
+            .with_install_cut(cut);
+        drop(previous);
+        adapter.armed.store(true, Ordering::SeqCst);
+        let installing = driver.clone();
+        let worker = std::thread::spawn(move || installing.install(&access, &successor, revision));
+        arrived
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let live_unlocked = driver.live.try_lock().is_ok();
+        let installed_unlocked = driver.installed.try_lock().is_ok();
+        resume.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        assert!(
+            live_unlocked,
+            "reader retirement ran while the live lock was held"
+        );
+        assert!(
+            installed_unlocked,
+            "reader retirement ran while the installed lock was held"
+        );
     }
     #[test]
     fn composite_reconcile_omits_file_deleted_after_listing() {
@@ -2813,10 +2924,12 @@ pub struct InstalledDriver(Arc<std::sync::RwLock<Option<Arc<CheckoutDriver>>>>);
 impl InstalledDriver {
     pub fn install(&self, driver: Arc<CheckoutDriver>) {
         driver.register_write_intent();
-        *self
+        let retired = self
             .0
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(driver);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(driver);
+        drop(retired);
     }
 
     /// Removes `driver` unless another one replaced it meanwhile.
@@ -2825,19 +2938,25 @@ impl InstalledDriver {
             .0
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if installed
+        let retired = if installed
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, driver))
         {
-            *installed = None;
-        }
+            installed.take()
+        } else {
+            None
+        };
+        drop(installed);
+        drop(retired);
     }
 
     pub fn clear(&self) {
-        *self
+        let retired = self
             .0
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(retired);
     }
 
     pub fn get(&self) -> Option<Arc<CheckoutDriver>> {
