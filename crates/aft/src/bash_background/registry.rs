@@ -9056,7 +9056,9 @@ impl BgTaskRegistry {
         let tasks = self.task_arcs();
         let targets: Vec<_> = tasks
             .into_iter()
-            .filter(|task| task.project_root == canonical_root)
+            .filter(|task| {
+                reclaim_root_paths_match(&task.project_root, &canonical_root, cfg!(windows))
+            })
             .filter_map(|task| {
                 let sample_missing = {
                     let state = task.lock_state().ok()?;
@@ -11369,10 +11371,9 @@ impl BgTaskRegistry {
         project_root: &crate::path_identity::ProjectRootId,
     ) -> Option<bool> {
         let tasks = self.inner.tasks.try_lock().ok()?;
-        for task in tasks
-            .values()
-            .filter(|task| task.project_root == project_root.as_path())
-        {
+        for task in tasks.values().filter(|task| {
+            reclaim_root_paths_match(&task.project_root, project_root.as_path(), cfg!(windows))
+        }) {
             let state = task.state.try_lock().ok()?;
             if BgTask::state_needs_root_reclaim(&state) {
                 return Some(true);
@@ -14743,6 +14744,18 @@ fn modified_within(path: &Path, grace: Duration) -> bool {
         .unwrap_or(false)
 }
 
+/// Windows canonicalization adds a verbatim prefix, but a deleted root can
+/// only supply its plain routing path. Normalize the comparison, not the
+/// stored identity, without probing a directory that may no longer exist.
+fn reclaim_root_paths_match(stored: &Path, requested: &Path, windows: bool) -> bool {
+    if windows {
+        crate::windows_path::normalize_windows_path(stored)
+            == crate::windows_path::normalize_windows_path(requested)
+    } else {
+        stored == requested
+    }
+}
+
 fn canonicalized_path(path: &Path) -> PathBuf {
     #[cfg(test)]
     ROOT_LOCK_PROBE.with(|hook| {
@@ -17220,6 +17233,38 @@ mod tests {
             1,
             "root reclaim resolves only its input; task root identities are cached at registration"
         );
+    }
+
+    #[test]
+    fn root_reclaim_compares_windows_verbatim_spellings() {
+        for (verbatim, plain) in [
+            (r"\\?\C:\work\gone", r"C:\work\gone"),
+            (r"\\?\UNC\server\share\gone", r"\\server\share\gone"),
+            (r"\\?\c:\work\gone", "C:/work/gone"),
+        ] {
+            assert!(
+                reclaim_root_paths_match(Path::new(verbatim), Path::new(plain), true),
+                "{verbatim} must match {plain}"
+            );
+            assert!(
+                reclaim_root_paths_match(Path::new(plain), Path::new(verbatim), true),
+                "{plain} must match {verbatim}"
+            );
+            assert!(
+                !reclaim_root_paths_match(Path::new(verbatim), Path::new(plain), false),
+                "non-Windows comparisons must keep literal path identity"
+            );
+        }
+        assert!(!reclaim_root_paths_match(
+            Path::new(r"\\?\C:\work\gone"),
+            Path::new(r"C:\work\other"),
+            true
+        ));
+        assert!(!reclaim_root_paths_match(
+            Path::new(r"\\?\Volume{1234}\gone"),
+            Path::new(r"Volume{1234}\gone"),
+            true
+        ));
     }
 
     #[test]
