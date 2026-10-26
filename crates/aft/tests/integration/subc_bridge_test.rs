@@ -3860,7 +3860,7 @@ static S1_ATTACKER_CONFIG_REACHED_DISPATCH: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 const S1_ATTACKER_MARKER: &str = "S1_ATTACKER_SECRET_ENV";
 
-fn s1_guard_dispatch(req: RawRequest, _ctx: &AppContext) -> Response {
+fn s1_guard_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     // The RouteBind reconcile dispatches a clean `configure` (no marker); only a
     // forwarded tool-call `configure` would carry the marker. If the marker ever
     // arrives here, the fail-closed gate failed and the cap was bypassed.
@@ -3869,6 +3869,7 @@ fn s1_guard_dispatch(req: RawRequest, _ctx: &AppContext) -> Response {
         if raw.contains(S1_ATTACKER_MARKER) {
             S1_ATTACKER_CONFIG_REACHED_DISPATCH.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+        return aft::commands::configure::handle_configure(&req, ctx);
     }
     Response::success(req.id, json!({}))
 }
@@ -3953,7 +3954,8 @@ fn subc_rejects_forwarded_configure_tool_call_in_production() {
         heavy_permits: 1,
         drr_quantum: 1,
     }));
-    let user_config_path = storage.path().join("nonexistent-user-aft.jsonc");
+    let user_config_path = storage.path().join("user-aft.jsonc");
+    std::fs::write(&user_config_path, r#"{"indexes":{"trigram":false,"semantic":false,"callgraph":false},"views":{"enabled":false}}"#).unwrap();
 
     // PRODUCTION entry — passthrough is OFF.
     run_subc_mode(
@@ -7424,6 +7426,28 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
     .await;
     expect_priority_event(&mut events, SubcLifecycleEvent::ReliablePushTurnHeld).await;
 
+    // The independent ACK lane can overtake proxied flood frames. Confirm actual
+    // flood pressure while configure is still held, not by requiring that race
+    // to resolve the same way after its ACK becomes eligible.
+    let mut flood_seen = 0_u64;
+    let mut flood_response_seen = false;
+    while flood_seen == 0 {
+        let frame =
+            read_any_frame_timeout(&mut stream, "flood pressure before bind completion").await;
+        match frame.header.ty {
+            FrameType::Push => {
+                let body: Value = serde_json::from_slice(&frame.body).unwrap();
+                if push_type(&body) == Some("bash_completed")
+                    && push_task_id(&body).is_some_and(|task| task.starts_with(flood_prefix))
+                {
+                    flood_seen += 1;
+                }
+            }
+            FrameType::Response if frame.header.corr == 901 => flood_response_seen = true,
+            other => panic!("unexpected frame before bind completion: {other:?}"),
+        }
+    }
+
     // Hold the loop at a turn boundary, not the configure worker: completion
     // handoff must actually reach the loop's channel before the next turn runs.
     state.release_slow_configures();
@@ -7474,8 +7498,6 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
         &ctx,
         bash_completed_push(after_ack_task, "session-1")
     ));
-    let mut flood_seen = 0_u64;
-    let mut flood_response_seen = false;
     let mut ack_seen = false;
     let mut ready_seen = false;
     let mut after_ack_seen = false;
@@ -14843,7 +14865,13 @@ fn extract_bash_task_id(text: &str) -> String {
 
 async fn expect_route_bind_ack(stream: &mut tokio::net::TcpStream, corr: u64) {
     let frame = read_frame_timeout(stream, "RouteBindAck").await;
-    assert_eq!(frame.header.ty, FrameType::Response);
+    assert_eq!(
+        frame.header.ty,
+        FrameType::Response,
+        "bind corr={corr}: header={:?} body={}",
+        frame.header,
+        String::from_utf8_lossy(&frame.body)
+    );
     assert_eq!(frame.header.channel, 0);
     assert_eq!(frame.header.corr, corr);
     let ack: ModuleControlResponse = serde_json::from_slice(&frame.body).expect("ack body");

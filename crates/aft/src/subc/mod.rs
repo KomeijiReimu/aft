@@ -318,6 +318,7 @@ pub enum SubcLifecycleEvent {
 pub struct SubcTestLifecycleProbe {
     events_tx: mpsc::UnboundedSender<SubcLifecycleEvent>,
     bind_priority: Arc<StdMutex<Option<RouteBindPriorityProbe>>>,
+    ack_queue_corr: Option<u64>,
     health_rollup: Option<SubcTestHealthRollupProbe>,
 }
 
@@ -334,8 +335,16 @@ impl SubcTestLifecycleProbe {
         Self {
             events_tx,
             bind_priority: Arc::new(StdMutex::new(None)),
+            ack_queue_corr: None,
             health_rollup: None,
         }
+    }
+
+    /// Observe one bind's queued ACK without changing other lifecycle observers.
+    #[doc(hidden)]
+    pub fn with_bind_ack_queue_for_test(mut self, corr: u64) -> Self {
+        self.ack_queue_corr = Some(corr);
+        self
     }
 
     /// Hold the next turn that drains reliable pushes at its end. Releasing the
@@ -400,8 +409,10 @@ impl SubcTestLifecycleProbe {
                     .batches_at_arrival
                     .expect("bind completion arrival observed");
                 priority.reliable_push_batches - batches_at_arrival
-            } else {
+            } else if self.ack_queue_corr == Some(corr) {
                 0
+            } else {
+                return;
             };
         let _ = self.events_tx.send(SubcLifecycleEvent::RouteBindAckQueued {
             corr,
@@ -4144,25 +4155,27 @@ fn run_subc_mode_inner(
             connection_file_path.display()
         );
         let (read_half, write_half) = tokio::io::split(stream);
-        run_module_loop(
-            read_half,
-            write_half,
-            connection_file_path,
-            shared_app,
-            executor_for_loop,
-            dispatch,
-            user_config_path,
-            allow_native_passthrough,
-            tool_response_body_limit,
-            lifecycle_probe,
-            &storage_dir,
-            // The exit phase below takes and shuts down every root's servers.
-            QuiescedLsp::LeaveForExitSweep,
-            #[cfg(test)]
-            None,
-            #[cfg(test)]
-            None,
-        )
+        heap_module_future(|| {
+            run_module_loop(
+                read_half,
+                write_half,
+                connection_file_path,
+                shared_app,
+                executor_for_loop,
+                dispatch,
+                user_config_path,
+                allow_native_passthrough,
+                tool_response_body_limit,
+                lifecycle_probe,
+                &storage_dir,
+                // The exit phase below takes and shuts down every root's servers.
+                QuiescedLsp::LeaveForExitSweep,
+                #[cfg(test)]
+                None,
+                #[cfg(test)]
+                None,
+            )
+        })
         .await
     });
 
@@ -4864,6 +4877,14 @@ async fn drain_pending_route_bind_completions(
     Ok(drained)
 }
 
+// Construct the large protocol future in a separate stack frame, then keep its
+// state on the heap while polling. Native Windows main threads have a smaller
+// default stack than Rust worker threads, and must still handle ordinary calls.
+#[inline(never)]
+fn heap_module_future<F: std::future::Future>(build: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
+    Box::pin(build())
+}
+
 /// ModuleHello → HelloAck → control/route loop. Runs until the daemon closes
 /// the connection (EOF), sends channel-0 Goodbye, or a fatal mutating executor
 /// response requests whole-connection teardown.
@@ -5233,6 +5254,12 @@ where
         {
             break Err(error);
         }
+        status_pushes.awaiting_binds(
+            pending_binds
+                .values()
+                .filter(|pending| !pending.cancelled && !pending.deadline_reported)
+                .map(|pending| pending.bind_root_id.clone()),
+        );
         if tokio::time::Instant::now() >= next_drain_at {
             dispatch_path_metrics.mark_frame_loop_step("push::emit_bg_event_wakes", "", 0);
             push::emit_bg_event_wakes(

@@ -93,7 +93,7 @@ async fn retracted_bind(tool: bool, trigger: &str, expected_code: &str) {
     let frames = Arc::new(AtomicUsize::new(0));
     let metrics = Arc::new(DispatchPathMetrics::new());
     let (events, mut observed) = mpsc::unbounded_channel();
-    let probe = SubcTestLifecycleProbe::new(events);
+    let probe = SubcTestLifecycleProbe::new(events).with_bind_ack_queue_for_test(891);
     let before = frames.clone();
     let hooks = stall_watchdog::FrameLoopTestHooks {
         metrics: metrics.clone(),
