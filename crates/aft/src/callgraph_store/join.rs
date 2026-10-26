@@ -2859,6 +2859,10 @@ impl<I: super::ResolverIndex> super::ResolverIndex for ViewSurfaceIndex<'_, I> {
         // surface answers, so the immutable blob itself guards this input.
         self.inner.caller_data(file)
     }
+    fn local_symbol(&self, file: &str, data: &FileCallData, query: &str) -> Option<String> {
+        // Local symbols come from the caller blob, not a consulted file surface.
+        self.inner.local_symbol(file, data, query)
+    }
     fn lang_for(&self, file: &str) -> Option<LangId> {
         let value = self.inner.lang_for(file);
         self.record(
