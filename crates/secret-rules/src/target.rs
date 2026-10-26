@@ -132,7 +132,14 @@ pub fn canonical_host(host: &str) -> Result<String, TargetRefusal> {
 /// An absolute-form target (`https://host/path`) is accepted only when its
 /// scheme is HTTPS; its authority is compared separately by
 /// [`authority_matches_connect`].
+///
+/// A `#` anywhere in the target refuses it, in the query as much as in the
+/// path: a server never receives a fragment, so a target that carries one is
+/// not the target that would be forwarded.
 pub fn normalize_request_target(target: &str) -> Result<NormalizedPath, TargetRefusal> {
+    if target.contains('#') {
+        return Err(TargetRefusal::FragmentInTarget);
+    }
     let origin_form = match strip_https(target) {
         Some(rest) => {
             let path_start = rest.find(['/', '?']).unwrap_or(rest.len());
@@ -329,9 +336,17 @@ fn decode_escape(bytes: &[u8], start: usize) -> Result<(u8, usize), TargetRefusa
 }
 
 /// True when `path` is `prefix` or lies under it on whole segments.
+///
+/// `prefix` must be a declared prefix in its normalized spelling (see
+/// [`normalize_path_prefix`]); `/` covers every absolute path. Any other
+/// spelling (`//`, `/v1/`, `/v1/..`, an empty or relative prefix) covers
+/// nothing, so a caller that skips validation cannot widen a prefix to the
+/// root by accident.
 pub fn path_covers(path: &str, prefix: &str) -> bool {
-    let prefix = prefix.trim_end_matches('/');
-    if prefix.is_empty() {
+    let Ok(prefix) = normalize_path_prefix(prefix) else {
+        return false;
+    };
+    if prefix == "/" {
         return path.starts_with('/');
     }
     path == prefix || path.starts_with(&format!("{prefix}/"))

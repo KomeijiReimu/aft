@@ -20,7 +20,9 @@ fn a_full_record_serializes_with_every_field_and_version_one() {
         reference: "ref-1".to_string(),
     }))
     .with_rule("api.example.com", 443, "/v1", "header:x-api-key");
-    let json = record.to_json_line_with_key(KEY).expect("clean record serializes");
+    let json = record
+        .to_json_line_with_key(KEY)
+        .expect("clean record serializes");
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed["v"], 1);
     assert_eq!(parsed["timestamp_ms"], 1_760_000_000_000u64);
@@ -48,7 +50,9 @@ fn a_launch_refusal_record_has_null_rule_fields_and_null_scope() {
         "req-2",
         "task-9",
     );
-    let json = record.to_json_line_with_key(KEY).expect("clean record serializes");
+    let json = record
+        .to_json_line_with_key(KEY)
+        .expect("clean record serializes");
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     for field in ["scope", "host", "port", "matched_prefix", "location_kind"] {
         assert!(parsed[field].is_null(), "{field} must be null");
@@ -81,7 +85,9 @@ fn a_written_record_has_only_the_schema_fields() {
         "task-9",
     )
     .with_rule("api.example.com", 443, "/v1", "query:key");
-    let json = record.to_json_line_with_key(KEY).expect("clean record serializes");
+    let json = record
+        .to_json_line_with_key(KEY)
+        .expect("clean record serializes");
     assert!(
         !json.contains(key_text),
         "record must not contain the key: {json}"
@@ -131,7 +137,9 @@ fn records_round_trip_through_serde() {
     );
     // The record has no `Serialize` impl on purpose (a compile_fail doc test on
     // `AuditRecordV1` checks that); the writers check every field first.
-    let json = record.to_json_line_with_key(KEY).expect("clean record serializes");
+    let json = record
+        .to_json_line_with_key(KEY)
+        .expect("clean record serializes");
     let back: AuditRecordV1 = serde_json::from_str(&json).unwrap();
     assert_eq!(back, record);
 }

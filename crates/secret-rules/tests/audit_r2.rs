@@ -173,7 +173,10 @@ const RECORD_SPELLINGS: &[(&[u8], &str)] = &[
     (b"abcdefghijklmnop", "g6162636465666768696a6b6c6d6e6f70"),
     (b"abcdefghijklmnop", "id-6162636465666768696A6B6C6D6E6F70"),
     // Percent and form (`+` is a space, `%2B` a plus).
-    (b"0123456789abcdef", "%30%31%32%33%34%35%36%37%38%39%61%62%63%64%65%66"),
+    (
+        b"0123456789abcdef",
+        "%30%31%32%33%34%35%36%37%38%39%61%62%63%64%65%66",
+    ),
     (b"my key/with+plus", "my+key%2Fwith%2Bplus"),
     // JSON escapes: `\uXXXX`, a control escape, and surrogate pairs.
     (
@@ -348,9 +351,12 @@ fn item16_dot_segment_or_doubled_prefixes_do_not_become_root() {
         let request = RequestView::new("/admin", vec![HeaderField::value("X-A", PH.as_bytes())]);
         let outcome =
             evaluate_request_with_connect(&request, &connect(), &[rule], &keys("x", MIN_KEY));
-        assert!(
-            outcome.refusal.is_some(),
-            "prefix {prefix:?} authorized /admin"
+        assert_eq!(
+            outcome.refusal,
+            Some(RequestRefusal::TargetMismatch(
+                secret_rules::TargetRefusal::MalformedPath
+            )),
+            "prefix {prefix:?}"
         );
     }
 }
@@ -373,28 +379,131 @@ fn item16_a_fragment_in_the_target_refuses() {
 }
 
 #[test]
-fn item16_the_redirect_path_validates_rules() {
-    use secret_rules::{evaluate_redirect, RedirectOutcome, RequestTarget};
-    let invalid = vec![
-        LabelRule {
-            path_prefix: "//".to_string(),
-            ..rule("x", Location::Query("k".to_string()))
-        },
-        LabelRule {
-            label: "Bad Label".to_string(),
-            ..rule("x", Location::Query("k".to_string()))
-        },
-    ];
+fn item6_the_redirect_path_validates_rules_against_a_matching_hop() {
+    use secret_rules::{evaluate_redirect, RedirectOutcome, RequestTarget, TargetRefusal};
+    // The hop matches every rule's host, port and prefix, so each refusal
+    // below can only come from rule validation.
     let hop = RequestTarget {
         host: "api.example.com".to_string(),
         port: 443,
         scheme: "https",
-        target: "/anything",
+        target: "/v1/x",
     };
-    for decision in evaluate_redirect(&invalid, &hop) {
-        assert_eq!(decision.outcome, RedirectOutcome::NotAuthorized);
-        assert!(decision.refusal.is_some());
+    let rules = vec![
+        rule("x", Location::Query("k".to_string())),
+        LabelRule {
+            path_prefix: "//".to_string(),
+            ..rule("x", Location::Query("k".to_string()))
+        },
+        rule("Bad Label", Location::Query("k".to_string())),
+        rule("x", Location::Header("bad name".to_string())),
+    ];
+    let decisions = evaluate_redirect(&rules, &hop);
+    let got: Vec<(RedirectOutcome, Option<RequestRefusal>)> = decisions
+        .iter()
+        .map(|decision| (decision.outcome, decision.refusal))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (RedirectOutcome::Authorized, None),
+            (
+                RedirectOutcome::NotAuthorized,
+                Some(RequestRefusal::TargetMismatch(TargetRefusal::MalformedPath))
+            ),
+            (
+                RedirectOutcome::NotAuthorized,
+                Some(RequestRefusal::InvalidLabel)
+            ),
+            (
+                RedirectOutcome::NotAuthorized,
+                Some(RequestRefusal::InvalidHeaderName)
+            ),
+        ]
+    );
+}
+
+#[test]
+fn item6_a_fragment_anywhere_in_a_redirect_target_refuses() {
+    use secret_rules::{evaluate_redirect, RedirectOutcome, RequestTarget, TargetRefusal};
+    // The closure check's hop: a fragment after the query of an otherwise
+    // matching target.
+    for target in [
+        "/v1/x?q=#fragment",
+        "/v1/x#fragment",
+        "https://api.example.com/v1/x?q=#f",
+    ] {
+        assert_eq!(
+            secret_rules::normalize_request_target(target),
+            Err(TargetRefusal::FragmentInTarget),
+            "{target}"
+        );
+        let hop = RequestTarget {
+            host: "api.example.com".to_string(),
+            port: 443,
+            scheme: "https",
+            target,
+        };
+        let decisions = evaluate_redirect(&[rule("x", Location::Query("q".to_string()))], &hop);
+        assert_eq!(decisions.len(), 1, "{target}");
+        assert_eq!(
+            decisions[0].outcome,
+            RedirectOutcome::NotAuthorized,
+            "{target}"
+        );
+        assert_eq!(
+            decisions[0].refusal,
+            Some(RequestRefusal::TargetMismatch(
+                TargetRefusal::FragmentInTarget
+            )),
+            "{target}"
+        );
     }
+    // The same hop without the fragment is authorized, so the refusal above
+    // is the fragment's.
+    let hop = RequestTarget {
+        host: "api.example.com".to_string(),
+        port: 443,
+        scheme: "https",
+        target: "/v1/x?q=",
+    };
+    let decisions = evaluate_redirect(&[rule("x", Location::Query("q".to_string()))], &hop);
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].outcome, RedirectOutcome::Authorized);
+}
+
+#[test]
+fn item6_a_query_fragment_refuses_in_the_request_evaluator() {
+    let request = RequestView::new(
+        "/v1/x?k=#frag",
+        vec![HeaderField::value("X-A", PH.as_bytes())],
+    );
+    let outcome = evaluate_request_with_connect(
+        &request,
+        &connect(),
+        &[rule("x", Location::Header("X-A".to_string()))],
+        &keys("x", MIN_KEY),
+    );
+    assert_eq!(outcome.refusal, Some(RequestRefusal::FragmentInTarget));
+    assert!(outcome.header_edits.is_empty());
+}
+
+#[test]
+fn item6_the_standalone_prefix_helpers_never_widen_to_the_root() {
+    use secret_rules::path_covers;
+    use secret_rules::redirect::path_is_covered;
+    for prefix in ["//", "///", "/v1/", "/v1/..", "/.", "", "v1"] {
+        assert!(
+            !path_is_covered("/admin", prefix),
+            "path_is_covered {prefix:?}"
+        );
+        assert!(!path_covers("/admin", prefix), "path_covers {prefix:?}");
+    }
+    // The valid spellings still work, the root included.
+    assert!(path_is_covered("/admin", "/"));
+    assert!(path_covers("/admin", "/"));
+    assert!(path_is_covered("/v1/x", "/v1"));
+    assert!(!path_is_covered("/v10", "/v1"));
 }
 
 // --- item 6: duplicate authority fields and a bound destination -------------
@@ -498,7 +607,11 @@ fn item15_each_decoder_has_known_answers() {
     }
     let negatives = vec![
         case("other base64 key", &all_plus, b"/////////////////////w"),
-        case("escaped backslash, not a tab", b"aaa\tbbbbccccdddd", br"aaa\\tbbbbccccdddd"),
+        case(
+            "escaped backslash, not a tab",
+            b"aaa\tbbbbccccdddd",
+            br"aaa\\tbbbbccccdddd",
+        ),
         case(
             "lone high surrogates",
             "\u{1F600}\u{1F600}\u{1F600}\u{1F600}".as_bytes(),
@@ -510,8 +623,16 @@ fn item15_each_decoder_has_known_answers() {
             br"\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d",
         ),
         // A literal `+` in the key is `%2B` in a form; a bare `+` is a space.
-        case("form plus is a space", b"my key/with+plus", b"my+key/with+plus"),
-        case("form with a wrong byte", b"my key/with+plus", b"my+key%2Fwith%2Bpluz"),
+        case(
+            "form plus is a space",
+            b"my key/with+plus",
+            b"my+key/with+plus",
+        ),
+        case(
+            "form with a wrong byte",
+            b"my key/with+plus",
+            b"my+key%2Fwith%2Bpluz",
+        ),
     ];
     for (name, key, output) in negatives {
         assert!(
@@ -529,7 +650,8 @@ const EMOJI_KEY: &str = "\u{1F600}\u{1F600}\u{1F600}\u{1F600}";
 /// Scrub `input` in the given chunks with one `x` matcher for `key`.
 fn scrub_chunks(key: &[u8], chunks: &[&[u8]]) -> Vec<u8> {
     let mut scrubber =
-        secret_rules::Scrubber::new(vec![secret_rules::MatcherSet::new("x", key).unwrap()]).unwrap();
+        secret_rules::Scrubber::new(vec![secret_rules::MatcherSet::new("x", key).unwrap()])
+            .unwrap();
     let mut out = Vec::new();
     for chunk in chunks {
         out.extend_from_slice(&scrubber.push(chunk));
@@ -552,11 +674,7 @@ fn item3_surrogate_pair_escaped_key_is_scrubbed_whole_split_and_byte_at_a_time()
         let bytes = body.as_bytes();
         for split in 0..=bytes.len() {
             let out = scrub_chunks(key, &[&bytes[..split], &bytes[split..]]);
-            assert_eq!(
-                String::from_utf8_lossy(&out),
-                expected,
-                "split at {split}"
-            );
+            assert_eq!(String::from_utf8_lossy(&out), expected, "split at {split}");
         }
         let singles: Vec<&[u8]> = bytes.chunks(1).collect();
         let out = scrub_chunks(key, &singles);
@@ -684,8 +802,12 @@ fn item4_the_request_evaluator_refuses_every_disclosing_label() {
                 ("plain".to_string(), key.to_vec()),
             ],
         ] {
-            let outcome =
-                evaluate_request_with_connect(&request, &connect(), &[header_rule.clone()], &keys);
+            let outcome = evaluate_request_with_connect(
+                &request,
+                &connect(),
+                std::slice::from_ref(&header_rule),
+                &keys,
+            );
             assert_eq!(
                 outcome.refusal,
                 Some(RequestRefusal::ReplacementDisclosesKey),
@@ -703,7 +825,11 @@ fn item4_every_scrubber_entry_point_refuses_a_disclosing_replacement() {
     for (label, key) in DISCLOSING_PAIRS {
         // A matcher whose own placeholder spells its own key.
         assert_eq!(MatcherSet::new(label, key).err(), refused, "label {label}");
-        assert_eq!(scrub_bytes(key, label, b"x").err(), refused, "label {label}");
+        assert_eq!(
+            scrub_bytes(key, label, b"x").err(),
+            refused,
+            "label {label}"
+        );
         // The label belongs to another key; the spelled key is installed
         // under a plain label, before or after it.
         let spelling = || MatcherSet::new(label, OTHER_KEY).unwrap();
@@ -720,10 +846,18 @@ fn item4_every_scrubber_entry_point_refuses_a_disclosing_replacement() {
         );
         let mut rotated = Scrubber::new(vec![spelled()]).unwrap();
         assert_eq!(rotated.install(spelling()).err(), refused, "label {label}");
-        assert_eq!(rotated.matcher_count(), 1, "a refused install changed state");
+        assert_eq!(
+            rotated.matcher_count(),
+            1,
+            "a refused install changed state"
+        );
         let mut rotated = Scrubber::new(vec![spelling()]).unwrap();
         assert_eq!(rotated.install(spelled()).err(), refused, "label {label}");
-        assert_eq!(rotated.matcher_count(), 1, "a refused install changed state");
+        assert_eq!(
+            rotated.matcher_count(),
+            1,
+            "a refused install changed state"
+        );
     }
 }
 
@@ -778,7 +912,8 @@ fn h1_unicode_escaped_key_survives_every_split() {
     );
     for split in 0..=body.len() {
         let mut scrubber =
-            secret_rules::Scrubber::new(vec![secret_rules::MatcherSet::new("x", MIN_KEY).unwrap()]).unwrap();
+            secret_rules::Scrubber::new(vec![secret_rules::MatcherSet::new("x", MIN_KEY).unwrap()])
+                .unwrap();
         let mut out = scrubber.push(body.as_bytes().get(..split).unwrap_or_default());
         out.extend_from_slice(&scrubber.push(body.as_bytes().get(split..).unwrap_or_default()));
         out.extend_from_slice(&scrubber.finish());
@@ -919,7 +1054,11 @@ fn item5_a_borrowed_whole_bearer_value_is_rewritten_with_its_scheme() {
         assert_eq!(outcome.refusal, None);
         let edit = outcome.header_edits.first().expect("a header edit");
         assert_eq!(edit.kind, secret_rules::HeaderEditKind::WholeValue);
-        assert_eq!((edit.start, edit.end), (0, 0), "a borrowed value has no offsets");
+        assert_eq!(
+            (edit.start, edit.end),
+            (0, 0),
+            "a borrowed value has no offsets"
+        );
         let expected = format!("{scheme}0123456789abcdef");
         assert_eq!(edit.replacement.as_slice(), expected.as_bytes());
     }

@@ -176,8 +176,11 @@ pub fn location_mentions(location: &str, label: &str) -> bool {
 }
 
 /// True when `path` stays under `prefix` after normalization.
+///
+/// `prefix` is used only in its normalized spelling; any other spelling
+/// (including `//`) covers nothing.
 pub fn path_is_covered(path: &str, prefix: &str) -> bool {
     normalize_request_target(path)
-        .map(|normalized| path_covers(&normalized.value, prefix.trim_end_matches('/')))
+        .map(|normalized| path_covers(&normalized.value, prefix))
         .unwrap_or(false)
 }

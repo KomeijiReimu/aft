@@ -199,9 +199,9 @@ fn json_unescape(text: &str) -> String {
                     .then(|| utf16_unit_at(&chars, index + 8))
                     .flatten()
                     .filter(|low| (0xDC00..0xE000).contains(low));
-                    if let Some(ch) =
-                        low.and_then(|low| char::from_u32(0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00)))
-                    {
+                    if let Some(ch) = low.and_then(|low| {
+                        char::from_u32(0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00))
+                    }) {
                         out.push(ch);
                         index += 12;
                         continue;
@@ -221,10 +221,9 @@ fn json_unescape(text: &str) -> String {
 
 /// Four hex digits starting at `at`, as a UTF-16 code unit.
 fn utf16_unit_at(chars: &[char], at: usize) -> Option<u32> {
-    chars
-        .get(at..at + 4)?
-        .iter()
-        .try_fold(0u32, |value, ch| ch.to_digit(16).map(|digit| value * 16 + digit))
+    chars.get(at..at + 4)?.iter().try_fold(0u32, |value, ch| {
+        ch.to_digit(16).map(|digit| value * 16 + digit)
+    })
 }
 
 /// Decode form `+` to a space, then percent escapes.

@@ -992,7 +992,9 @@ enum BearerForm {
     /// The credential is exactly this label's placeholder. `scheme_len` bytes
     /// of the value (`Bearer ` for a whole value, none for a parsed
     /// credential) come before it and are kept in the replacement.
-    Whole { scheme_len: usize },
+    Whole {
+        scheme_len: usize,
+    },
     /// A whole wire value that is exactly this label's placeholder, with no
     /// `Bearer` scheme at all.
     SchemeMissing,
@@ -1017,9 +1019,9 @@ fn bearer_form(value: &[u8], label: &str, form: HeaderValueForm) -> BearerForm {
     let (scheme_len, credential) = match form {
         HeaderValueForm::BearerCredential => (0, value),
         HeaderValueForm::WholeValue => {
-            let has_scheme = value
-                .get(..7)
-                .is_some_and(|scheme| scheme[..6].eq_ignore_ascii_case(b"Bearer") && scheme[6] == b' ');
+            let has_scheme = value.get(..7).is_some_and(|scheme| {
+                scheme[..6].eq_ignore_ascii_case(b"Bearer") && scheme[6] == b' '
+            });
             if !has_scheme {
                 return if is_this_placeholder(value) {
                     BearerForm::SchemeMissing

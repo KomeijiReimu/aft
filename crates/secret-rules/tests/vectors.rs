@@ -341,7 +341,7 @@ fn run_path(case: &Value) -> Result<Value, String> {
         Ok(path) => Ok(json!({
             "normalized": path.value,
             "wire": support::lossy(&path.wire),
-            "matches": secret_rules::path_covers(&path.value, prefix.trim_end_matches('/')),
+            "matches": secret_rules::path_covers(&path.value, &prefix),
         })),
         Err(err) => Ok(json!({ "error": target_reason(&err) })),
     }
@@ -423,11 +423,11 @@ fn run_scrub_stream(case: &Value) -> Result<Value, String> {
     let label = support::string(&case["label"]);
     let input = support::string(&case["input"]);
     let chunk = case["chunk"].as_u64().unwrap_or(4) as usize;
-    let mut scrubber = secret_rules::Scrubber::new(vec![secret_rules::MatcherSet::new(
-        &label, &key,
-    )
-    .map_err(|err| format!("{err:?}"))?])
-    .map_err(|err| format!("{err:?}"))?;
+    let mut scrubber =
+        secret_rules::Scrubber::new(vec![
+            secret_rules::MatcherSet::new(&label, &key).map_err(|err| format!("{err:?}"))?
+        ])
+        .map_err(|err| format!("{err:?}"))?;
     let mut out = Vec::new();
     for piece in input.as_bytes().chunks(chunk.max(1)) {
         out.extend_from_slice(&scrubber.push(piece));

@@ -523,7 +523,9 @@ fn a_clean_record_round_trips_without_scrubbing() {
         "req-1",
         "task-1",
     );
-    let json = record.to_json_line_with_key(KEY).expect("clean record serializes");
+    let json = record
+        .to_json_line_with_key(KEY)
+        .expect("clean record serializes");
     assert!(json.contains("\"reason\":\"matched\""));
     assert!(json.contains("\"label\":\"repo_key\""));
 }

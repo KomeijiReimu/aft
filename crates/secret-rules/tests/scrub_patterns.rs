@@ -225,7 +225,8 @@ fn two_keys_in_one_stream_are_both_scrubbed() {
     let mut scrubber = Scrubber::new(vec![
         MatcherSet::new("one", first).unwrap(),
         MatcherSet::new("two", second).unwrap(),
-    ]).unwrap();
+    ])
+    .unwrap();
     let mut out = scrubber.push(text);
     out.extend_from_slice(&scrubber.finish());
     let out_text = String::from_utf8_lossy(&out);
