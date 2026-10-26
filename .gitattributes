@@ -39,3 +39,6 @@ crates/aft/src/exec_remote/fixtures/reports/** -text
 # rewrite them into CRLF. The whole directory is covered so that template
 # files added beside the vectors are byte-pinned without another rule.
 crates/aft/tests/fixtures/rich_ui/** -text
+# Published agent-data project/session vectors are pinned by SHA-256 of their
+# exact bytes; Windows checkout conversion must not rewrite their line endings.
+crates/aft/tests/fixtures/agent_data/** -text

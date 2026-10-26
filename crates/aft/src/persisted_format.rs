@@ -115,12 +115,14 @@ impl PersistedStore {
         }
     }
 
-    /// Format version of this store that this build writes. Every store
-    /// currently writes the highest version it reads; the two are kept apart
-    /// so a build that learns to read a format before it starts writing it
-    /// raises the floor only when it actually writes.
+    /// The default version this build writes when preparing a store. Guarded
+    /// backup stacks opt into their newer format at the imported write boundary;
+    /// ordinary history must not raise that reader floor merely on startup.
     pub fn written(self) -> u32 {
-        self.supported()
+        match self {
+            Self::BackupMeta => crate::backup::ORDINARY_SCHEMA_VERSION,
+            _ => self.supported(),
+        }
     }
 }
 
