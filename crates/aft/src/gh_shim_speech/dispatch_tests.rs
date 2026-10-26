@@ -3,7 +3,8 @@ use crate::db::access_grants::ScopeKey;
 use crate::gh_shim_relay::{
     RelayCall, RelayReply, RelayTransport, RouteScopes, TransportError, BOT_REQUEST_OPERATION,
 };
-use crate::gh_shim_speech::partner::{Binding, QueuedBotResponse, ReservedBotRequest};
+use crate::gh_shim_speech::model::Binding;
+use crate::gh_shim_speech::partner::{QueuedBotResponse, ReservedBotRequest};
 use crate::gh_shim_speech::service::{LaunchSeed, Service, TestPartners};
 use crate::gh_shim_speech::{Code, Refusal};
 use std::collections::{HashMap, HashSet};

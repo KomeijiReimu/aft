@@ -1007,6 +1007,7 @@ fn lifecycle_pty_setup_failure_terminates_and_reaps_child() {
         &mut spawned_pgid,
         &mut None,
         &mut |_| Ok(()),
+        false,
     );
     let pid = pid.load(Ordering::SeqCst);
     assert_ne!(pid, 0);
@@ -1048,6 +1049,7 @@ fn approved_pty_worker_admission_failure(worker: super::worker_thread::Worker) {
                 &mut spawned_pgid,
                 &mut None,
                 &mut |_| Ok(()),
+                false,
             )
         })
     }));
