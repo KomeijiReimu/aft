@@ -569,3 +569,208 @@ fn request_outcome_is_not_partial_after_a_refusal() {
     assert!(outcome.refusal.is_some());
     assert_eq!(outcome.header_edits.len(), 0);
 }
+
+// --- minimal counterexamples, one per audit item ---------------------------
+
+#[test]
+fn item4_a_request_for_label_b_never_receives_label_a_key() {
+    // Audit: rules A and B, the request names only B, and the caller supplies
+    // A's key. B must not be substituted with A's key.
+    let rules = [
+        rule("alpha", Location::Header("X-Alpha".to_string())),
+        LabelRule {
+            label: "beta".to_string(),
+            host: "beta.example.com".to_string(),
+            ..rule("beta", Location::Header("X-Beta".to_string()))
+        },
+    ];
+    let request = RequestView::new(
+        "/v1/x",
+        vec![HeaderField::value("X-Beta", b"{{ck-secret:beta}}")],
+    );
+    let target = RequestTarget {
+        host: "beta.example.com".to_string(),
+        port: 443,
+        scheme: "https",
+        target: "/v1/x",
+    };
+    let connect = ConnectAuthority::parse("beta.example.com:443").unwrap();
+    let outcome = evaluate_request_with_connect(
+        &request,
+        &target,
+        &connect,
+        &rules,
+        &[("alpha".to_string(), KEY.to_vec())],
+    );
+    // `beta` has no key of its own, so the request refuses; A's key is never
+    // written into B's header.
+    assert_eq!(outcome.refusal, Some(RequestRefusal::MissingMaterial));
+    assert!(outcome.header_edits.is_empty());
+}
+
+#[test]
+fn item6_absolute_form_target_on_another_host_refuses() {
+    // Audit: tunnel to api.example.com, absolute-form target to evil.example.
+    let rules = [rule("repo_key", Location::Bearer)];
+    let bearer = format!("Bearer {PLACEHOLDER}");
+    let request = RequestView::new(
+        "https://evil.example/v1/x",
+        vec![HeaderField::value("Authorization", bearer.as_bytes())],
+    );
+    let target = RequestTarget {
+        host: "api.example.com".to_string(),
+        port: 443,
+        scheme: "https",
+        target: "https://evil.example/v1/x",
+    };
+    let outcome = evaluate_request_with_connect(
+        &request,
+        &target,
+        &connect(),
+        &rules,
+        &[("repo_key".to_string(), KEY.to_vec())],
+    );
+    assert_eq!(
+        outcome.refusal,
+        Some(RequestRefusal::TargetMismatch(
+            TargetRefusal::AuthorityMismatch
+        ))
+    );
+}
+
+#[test]
+fn item7_header_substitution_before_a_refusal_leaves_no_key() {
+    // Audit: rule 1 substitutes X-A, rule 2 declares X-B which appears twice.
+    let rules = [
+        rule("repo_key", Location::Header("X-A".to_string())),
+        rule("repo_key", Location::Header("X-B".to_string())),
+    ];
+    let request = RequestView::new(
+        "/v1/x",
+        vec![
+            HeaderField::value("X-A", PLACEHOLDER.as_bytes()),
+            HeaderField::value("X-B", PLACEHOLDER.as_bytes()),
+            HeaderField::value("X-B", PLACEHOLDER.as_bytes()),
+        ],
+    );
+    let outcome = evaluate_request_with_connect(
+        &request,
+        &target("/v1/x"),
+        &connect(),
+        &rules,
+        &[("repo_key".to_string(), KEY.to_vec())],
+    );
+    assert_eq!(outcome.refusal, Some(RequestRefusal::DuplicateField));
+    let rendered = format!("{outcome:?}");
+    assert!(!rendered.contains("sk-live-0123456789abcdef"), "{rendered}");
+    assert!(outcome.header_edits.is_empty());
+    assert!(!outcome.substituted());
+}
+
+#[test]
+fn item8_ipv6_userinfo_is_never_authorized() {
+    // Audit: https://[::1]@evil.example/v1?k=... parsed as host [::1].
+    assert_eq!(
+        split_absolute("https://[::1]@evil.example/v1?k=x"),
+        Err(TargetRefusal::MalformedAuthority)
+    );
+}
+
+#[test]
+fn item9_double_encoded_traversal_is_refused() {
+    // Audit: /v1/%252e%252e/echo passed the /v1 prefix.
+    assert_eq!(
+        normalize_request_target("/v1/%252e%252e/echo"),
+        Err(TargetRefusal::AmbiguousPathSeparator)
+    );
+}
+
+#[test]
+fn item11_encoded_query_alias_is_a_duplicate() {
+    // Audit: /v1?key=...&%6bey=other.
+    let rules = [rule("repo_key", Location::Query("key".to_string()))];
+    let target_text = format!("/v1/x?key={PLACEHOLDER}&%6bey=other");
+    let request = RequestView::new(&target_text, Vec::new());
+    let outcome = evaluate_request_with_connect(
+        &request,
+        &target(&target_text),
+        &connect(),
+        &rules,
+        &[("repo_key".to_string(), KEY.to_vec())],
+    );
+    assert_eq!(outcome.refusal, Some(RequestRefusal::DuplicateField));
+}
+
+#[test]
+fn item11_duplicate_json_members_refuse() {
+    // Audit: {"key":"...","key":"..."}.
+    let rules = [rule("repo_key", Location::Json("/key".to_string()))];
+    let body = format!("{{\"key\":\"{PLACEHOLDER}\",\"key\":\"{PLACEHOLDER}\"}}");
+    let request = RequestView::new(
+        "/v1/x",
+        vec![HeaderField::value("Content-Type", b"application/json")],
+    )
+    .with_body(body.as_bytes());
+    let outcome = evaluate_request_with_connect(
+        &request,
+        &target("/v1/x"),
+        &connect(),
+        &rules,
+        &[("repo_key".to_string(), KEY.to_vec())],
+    );
+    assert_eq!(outcome.refusal, Some(RequestRefusal::DuplicateField));
+}
+
+#[test]
+fn item12_a_fragment_is_not_a_query() {
+    let rules = [rule("repo_key", Location::Query("k".to_string()))];
+    let target_text = format!("/v1/x#{PLACEHOLDER}?k=1");
+    let request = RequestView::new(&target_text, Vec::new());
+    let outcome = evaluate_request_with_connect(
+        &request,
+        &target(&target_text),
+        &connect(),
+        &rules,
+        &[("repo_key".to_string(), KEY.to_vec())],
+    );
+    assert!(!outcome.substituted());
+}
+
+#[test]
+fn item12_debug_output_does_not_print_key_bytes() {
+    let rules = [rule("repo_key", Location::Header("X-A".to_string()))];
+    let request = RequestView::new(
+        "/v1/x",
+        vec![HeaderField::value("X-A", PLACEHOLDER.as_bytes())],
+    );
+    let outcome = evaluate_request_with_connect(
+        &request,
+        &target("/v1/x"),
+        &connect(),
+        &rules,
+        &[("repo_key".to_string(), KEY.to_vec())],
+    );
+    let rendered = format!("{outcome:?}");
+    assert!(!rendered.contains("sk-live-0123456789abcdef"), "{rendered}");
+}
+
+#[test]
+fn item13_the_audit_record_refuses_key_shaped_metadata() {
+    // Audit: the key written into `origin`.
+    let record = AuditRecordV1::new(
+        1,
+        "repo_key",
+        Decision::Literal,
+        secret_rules::AuditReason::Matched,
+        "r",
+        "sk-live-0123456789abcdef",
+    );
+    assert!(record.to_json_line().is_err());
+}
+
+#[test]
+fn item13_the_audit_record_reason_is_not_free_text() {
+    assert!(secret_rules::AuditReason::parse("secrets_remote_refused").is_none());
+    let key = b"sk-live-0123456789abcdef";
+    assert!(secret_rules::AuditReason::parse(std::str::from_utf8(key).unwrap()).is_none());
+}
