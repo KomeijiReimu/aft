@@ -2389,7 +2389,7 @@ pub(in crate::x) fn scoped() {
         .iter()
         .map(|&index| crate::list_envelope_drift_guard::find_enclosing_item(&lines, index))
         .collect::<Vec<_>>();
-    let expected = vec!["plain", "restricted", "scoped"];
+    let expected = ["plain", "restricted", "scoped"].map(String::from).to_vec();
     assert_eq!(
         (conformance, drift_guard),
         (expected.clone(), expected),
