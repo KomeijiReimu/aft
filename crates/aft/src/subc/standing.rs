@@ -25,24 +25,50 @@ use crate::standing_roots::{StandingRootEntry, StandingRoots};
 pub(super) const STANDING_MAINTENANCE_INTERVAL: std::time::Duration = super::DRAIN_TICK_PERIOD;
 
 pub(super) struct StandingWorker {
-    requests: std::sync::mpsc::SyncSender<()>,
+    requests: Option<std::sync::mpsc::SyncSender<()>>,
+    shutdown: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl StandingWorker {
     pub(super) fn start(mut work: impl FnMut() + Send + 'static) -> Self {
         let (requests, rx) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker = std::thread::spawn(move || {
             while rx.recv().is_ok() {
+                if worker_shutdown.load(Ordering::Acquire) {
+                    break;
+                }
                 work();
             }
         });
-        Self { requests }
+        Self {
+            requests: Some(requests),
+            shutdown,
+            worker: Some(worker),
+        }
     }
 
     pub(super) fn request(&self) {
         // At most one follow-up pass is queued while a reconciliation is busy.
         // Resolution remains live on each pass, with no stale identity cache.
-        let _ = self.requests.try_send(());
+        if let Some(requests) = &self.requests {
+            let _ = requests.try_send(());
+        }
+    }
+}
+
+impl Drop for StandingWorker {
+    fn drop(&mut self) {
+        // Reconciliation can own a SQLite connection even after the transport
+        // has disconnected. Stop queued passes and join the current pass so its
+        // owning connection closes before the module loop releases storage.
+        self.shutdown.store(true, Ordering::Release);
+        self.requests.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -1833,6 +1859,60 @@ mod tests {
             0,
             "no key is derived for a provisional session"
         );
+    }
+
+    #[test]
+    fn standing_worker_drop_waits_for_owned_sqlite_connection() {
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let connection = Arc::new(parking_lot::Mutex::new(
+            crate::db::open(&temp.path().join("aft.db")).unwrap(),
+        ));
+        let owner = Arc::downgrade(&connection);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = StandingWorker::start(move || {
+            assert!(connection.lock().is_autocommit());
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        worker.request();
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (dropping_tx, dropping_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let dropping = std::thread::spawn(move || {
+            dropping_tx.send(()).unwrap();
+            drop(worker);
+            done_tx.send(()).unwrap();
+        });
+        dropping_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let returned_early = done_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+        // Release the controlled work even if teardown incorrectly returned,
+        // so a failed assertion cannot strand its connection-owning thread.
+        release_tx.send(()).unwrap();
+        dropping.join().unwrap();
+        assert!(
+            !returned_early,
+            "worker drop returned while SQLite was still owned"
+        );
+        assert!(
+            owner.upgrade().is_none(),
+            "connection owner survived worker drop"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let targets = std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+                .filter(|target| target.starts_with(temp.path()))
+                .collect::<Vec<_>>();
+            assert!(
+                targets.is_empty(),
+                "SQLite descriptors survived teardown: {targets:?}"
+            );
+        }
     }
 
     #[test]
