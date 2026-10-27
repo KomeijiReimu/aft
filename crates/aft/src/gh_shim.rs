@@ -7860,11 +7860,12 @@ fn refusal_line(code: RefusalCode, text: &str) -> String {
     format!("gh-shim: {}: {text}", code.as_str())
 }
 
-/// Test seam: when a test installs a refusal sink, `refuse` records the
-/// rendered line there instead of writing to stderr, so tests can assert the
-/// exact refusal the agent would see without stealing the process's shared
-/// file descriptor 2 (which parallel tests also use). The sink is
-/// thread-local, so parallel tests never see each other's refusals.
+// Test seam: when a test installs a refusal sink, `refuse` records the
+// rendered line there instead of writing to stderr, so tests can assert the
+// exact refusal the agent would see without stealing the process's shared
+// file descriptor 2 (which parallel tests also use). The sink is
+// thread-local, so parallel tests never see each other's refusals.
+// (Plain comments: doc comments do not attach to a `thread_local!` block.)
 #[cfg(test)]
 thread_local! {
     static REFUSAL_SINK: std::cell::RefCell<

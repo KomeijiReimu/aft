@@ -1387,7 +1387,9 @@ fn audit_head_write_still_routes_through_the_relay() {
 #[test]
 fn audit_worker_credential_command_keeps_the_credential_refusal() {
     let _lock = crate::test_env::process_env_lock();
-    let fixture = Fixture::new(20);
+    // Held for its environment and installed manifest, not its paths: the
+    // credential arm needs an active manifest, nothing else from the fixture.
+    let _fixture = Fixture::new(20);
     let _worker = Env::set(
         crate::gh_shim_ticket::GH_SHIM_WORKER_ENV,
         Some(OsStr::new("1")),
