@@ -832,7 +832,7 @@ export function formatPatternMatchReminder(matches: readonly PatternMatchEntry[]
     .map((match) => {
       const context = (
         match.batch
-          ? formatWatchLineBatch(match.task_id, match.batch, false, true)
+          ? formatWatchLineBatch(match.task_id, match.batch, false)
           : match.context || match.match_text
       ).replace(/\n/g, "\n      > ");
       if (match.batch) {

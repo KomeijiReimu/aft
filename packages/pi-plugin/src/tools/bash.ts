@@ -414,7 +414,7 @@ const BashTaskParams = Type.Object({
 });
 
 const BashStatusParams = Type.Object({
-  outputOffset: Type.Optional(
+  output_offset: Type.Optional(
     Type.Integer({
       minimum: 0,
       maximum: Number.MAX_SAFE_INTEGER,
@@ -422,7 +422,7 @@ const BashStatusParams = Type.Object({
         "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
     }),
   ),
-  stderrOffset: Type.Optional(
+  stderr_offset: Type.Optional(
     Type.Integer({
       minimum: 0,
       maximum: Number.MAX_SAFE_INTEGER,
@@ -1150,7 +1150,7 @@ export function createBashStatusTool(ctx: PluginContext) {
       // bash_status is snapshot-only. wait_for / exit / timeout_ms moved to
       // bash_watch; if the agent passes them here they're silently ignored
       // at the TypeBox schema layer.
-      const paging = params.outputOffset !== undefined || params.stderrOffset !== undefined;
+      const paging = params.output_offset !== undefined || params.stderr_offset !== undefined;
       const data = paging
         ? await callBashBridge(
             bridge,
@@ -1159,14 +1159,14 @@ export function createBashStatusTool(ctx: PluginContext) {
               task_id: params.task_id,
               output_mode: params.output_mode,
               output_offset: coerceOptionalInt(
-                params.outputOffset,
-                "outputOffset",
+                params.output_offset,
+                "output_offset",
                 0,
                 Number.MAX_SAFE_INTEGER,
               ),
               stderr_offset: coerceOptionalInt(
-                params.stderrOffset,
-                "stderrOffset",
+                params.stderr_offset,
+                "stderr_offset",
                 0,
                 Number.MAX_SAFE_INTEGER,
               ),
@@ -1177,7 +1177,7 @@ export function createBashStatusTool(ctx: PluginContext) {
       if (data.success === false) throw new Error(String(data.message ?? "bash_status failed"));
       if (paging)
         return bashStatusResult(
-          formatBashOutputPages(data, true),
+          formatBashOutputPages(data, false),
           data as unknown as BashStatusDetails,
         );
       const details = data as unknown as BashStatusDetails;

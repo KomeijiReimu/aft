@@ -60,14 +60,11 @@ export function mergeWatchLineBatches(
   return merged;
 }
 
-/** Render masked source lines and copyable, host-specific byte-page recovery calls.
- * taskKey follows the host's task-id spelling; offset keys follow offsetCamelCase
- * (Pi spells the task id task_id but takes camelCase page offsets). */
+/** Render masked source lines and copyable, host-specific byte-page recovery calls. */
 export function formatWatchLineBatch(
   taskId: string,
   batch: BashWatchLineBatch,
   camelCase: boolean,
-  offsetCamelCase: boolean = camelCase,
 ): string {
   const lines = batch.lines.map(
     (line) =>
@@ -76,7 +73,7 @@ export function formatWatchLineBatch(
   if (batch.dropped_lines > 0 || batch.skipped_long_lines > 0) {
     const taskKey = camelCase ? "taskId" : "task_id";
     const cursor = batch.first_dropped_stream === "stderr" ? "stderr" : "output";
-    const offsetKey = offsetCamelCase ? `${cursor}Offset` : `${cursor}_offset`;
+    const offsetKey = camelCase ? `${cursor}Offset` : `${cursor}_offset`;
     const incomplete =
       batch.skipped_long_lines > 0
         ? ` ${batch.skipped_long_lines} lines longer than 64 KiB were skipped, so the scan is incomplete.`

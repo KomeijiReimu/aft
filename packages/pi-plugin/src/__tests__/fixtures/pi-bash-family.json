@@ -98,13 +98,13 @@
         "task_id"
       ],
       "properties": {
-        "outputOffset": {
+        "output_offset": {
           "type": "integer",
           "minimum": 0,
           "maximum": 9007199254740991,
           "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset."
         },
-        "stderrOffset": {
+        "stderr_offset": {
           "type": "integer",
           "minimum": 0,
           "maximum": 9007199254740991,

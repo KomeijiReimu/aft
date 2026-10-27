@@ -1283,7 +1283,7 @@ describe("bash tool adapter", () => {
       .get("bash_status")!
       .execute(
         "call",
-        { task_id: "bash-lines", outputOffset: 16, stderrOffset: 10 },
+        { task_id: "bash-lines", output_offset: 16, stderr_offset: 10 },
         undefined,
         undefined,
         { cwd: projectRoot },
@@ -1294,7 +1294,7 @@ describe("bash tool adapter", () => {
     ];
     expect(status[1]).toMatchObject({ output_offset: 16, stderr_offset: 10 });
     expect(result.content[0].text).toContain("masked output");
-    expect(result.content[0].text).toContain("next outputOffset: 48");
+    expect(result.content[0].text).toContain("next output_offset: 48");
     expect(result.content[0].text).not.toContain("RAW-SECRET");
   });
 
