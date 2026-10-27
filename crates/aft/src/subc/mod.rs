@@ -243,6 +243,12 @@ mod remote_policy;
 pub(crate) mod result_body;
 mod retained_result;
 mod rich_ui;
+// Drives the chunk queries and Occipital's route shapes through the real
+// frame loop, so it lives beside the chunk module but runs as a child of this
+// module to reach the loop and its test fixtures.
+#[cfg(test)]
+#[path = "rich_ui/chunks/route_tests.rs"]
+mod rich_ui_chunk_route_tests;
 mod run_scope;
 mod scope_describe;
 #[cfg(test)]

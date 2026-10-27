@@ -182,4 +182,4 @@ where
 
 #[cfg(test)]
 #[path = "chunks/tests.rs"]
-mod tests;
+pub(crate) mod tests;

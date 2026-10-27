@@ -1,6 +1,5 @@
 use std::sync::{Arc, Mutex};
 
-use base64::Engine as _;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -72,12 +71,13 @@ pub(crate) fn reassemble(digest: &str, mut fetch: impl FnMut(u64) -> Value) -> V
         } else {
             fetch(index)
         };
-        let fields: Vec<&str> = reply
+        let mut fields: Vec<&str> = reply
             .as_object()
             .unwrap()
             .keys()
             .map(String::as_str)
             .collect();
+        fields.sort_unstable();
         assert_eq!(fields, ["bytes", "chunks", "data", "digest", "index"]);
         assert_eq!(reply["digest"], digest);
         assert_eq!(reply["index"], index);
