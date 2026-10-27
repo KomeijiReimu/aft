@@ -10368,7 +10368,11 @@ impl AppContext {
             let reopened =
                 CallGraphStore::open_readonly(callgraph_dir.clone(), project_root.clone());
             // This thread's first open finished before the reconcile thread
-            // starts, so the comparison opens as a second reader.
+            // starts, so the comparison opens as a second reader. The
+            // test-only count lets the ordering test observe this.
+            #[cfg(test)]
+            self.callgraph_reconcile
+                .note_ensure_open_completed_for_test();
             self.start_pending_callgraph_reconcile();
             if let Some(store) = reopened? {
                 let store = Arc::new(store);
@@ -18367,6 +18371,7 @@ mod callgraph_store_for_ops_tests {
             "the reopen must service the gap left by the eviction"
         );
         let completed_before = ctx.callgraph_reconcile.completed();
+        let opens_before = ctx.callgraph_reconcile.ensure_open_completed_for_test();
         let (entered, release) = ctx.callgraph_reconcile.hold_next_for_test();
         // Single-shot: the caller's first open completes before the reconcile
         // thread starts, so the two never race inside SQLite recovery.
@@ -18374,12 +18379,16 @@ mod callgraph_store_for_ops_tests {
             .ensure_callgraph_store()
             .expect("reopen callgraph store");
         assert!(store.is_some(), "reopen callgraph store");
-        entered
-            .recv_timeout(Duration::from_secs(10))
-            .expect("reconcile started after the caller's open");
-        assert!(
-            ctx.callgraph_store().read().unwrap().is_some(),
-            "the caller's store is installed before the reconcile thread starts"
+        // The entry hold captured how many of the caller's opens had finished
+        // when the reconcile thread started: exactly this reopen. With the old
+        // spawn-first order the parked thread enters before the caller's open
+        // and the count is still the previous one.
+        assert_eq!(
+            entered
+                .recv_timeout(Duration::from_secs(10))
+                .expect("reconcile started after the caller's open"),
+            opens_before + 1,
+            "the caller's open completed before the reconcile thread started"
         );
         drop(release);
         assert!(
