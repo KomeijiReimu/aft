@@ -101,6 +101,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)'
 test-timing-hooks = []
 # In-process integration fixtures need the real binary for native re-exec.
 test-sandbox-launcher = []
+# Deterministic producer inputs for real-wire conformance fixtures, never production.
+test-conformance-result-inputs = []
 semantic-chunk-census = []
 
 [dependencies]
@@ -264,9 +266,9 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 # Enable the launcher seam only in test builds, not ordinary aft binaries.
-agent-file-tools = { path = ".", features = ["test-sandbox-launcher"] }
+agent-file-tools = { path = ".", features = ["test-sandbox-launcher", "test-conformance-result-inputs"] }
 graphql-parser = "0.4.1"
-cortexkit-role-tool-provider-conformance = "=0.13.0"
+cortexkit-role-tool-provider-conformance = "=0.13.1"
 cortexkit-role-agent-data = { version = "=0.2.3", features = ["test-vectors"] }
 cortexkit-role-harness = "=0.1.0"
 async-trait = "0.1"

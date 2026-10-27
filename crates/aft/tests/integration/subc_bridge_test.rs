@@ -3332,7 +3332,9 @@ fn subc_bridge_management_surface_is_passive_closed_and_first_party() {
 fn subc_bridge_health_check_returns_root_status_report() {
     run_subc_bridge_test_inner(
         "subc_bridge_health_check_returns_root_status_report",
-        Duration::from_secs(30),
+        // Exceeds the driver's 30 s wait for an Ok health report, so a report
+        // that never turns Ok fails with its detail instead of the watchdog.
+        Duration::from_secs(60),
         Vec::new,
         drive_health_check_daemon,
         |_, executor, roots| {
@@ -13424,20 +13426,38 @@ async fn drive_health_check_daemon(input: FakeDaemonInput) {
     // Bind acknowledgement follows configure commit, not health publication.
     // Wait for the actor to release its configure work, then acknowledge an
     // actual post-bind cache refresh instead of polling a throttled snapshot.
+    //
+    // Even after that barrier, a loaded runner can report Degraded for a
+    // moment: the rollup marks a root busy when one of its state locks is held
+    // while the census reads it, and the health reply itself marks the report
+    // Degraded when the executor scheduler lock is held at that instant. Both
+    // clear on their own, and the test worker only republishes the rollup on
+    // request, so each attempt requests a fresh rollup before asking again.
+    // Any other Degraded cause persists across attempts and still fails here,
+    // with the last report's detail in the message.
     let root_id = ProjectRootId::from_path(&root1).expect("bound root identity");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !executor.actor_is_idle(&root_id) {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut corr = 20;
+    let report = loop {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !executor.actor_is_idle(&root_id) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            health_probe
+                .request_refresh()
+                .await
+                .expect("rollup published");
+        })
+        .await
+        .expect("post-bind health publication barrier");
+        send_control_request(&mut stream, corr, ModuleControlRequest::HealthCheck {}).await;
+        let report = expect_health_check_report(&mut stream, corr).await;
+        if report.status == subc_protocol::session::HealthStatus::Ok || Instant::now() >= deadline {
+            break report;
         }
-        health_probe
-            .request_refresh()
-            .await
-            .expect("rollup published");
-    })
-    .await
-    .expect("post-bind health publication barrier");
-    send_control_request(&mut stream, 20, ModuleControlRequest::HealthCheck {}).await;
-    let report = expect_health_check_report(&mut stream, 20).await;
+        corr += 1;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     let metrics = report.metrics.clone().expect("health check metrics");
     let work = metrics.get("views_work").expect("production work counters");
     assert_eq!(work["pid"], std::process::id());
@@ -13462,7 +13482,13 @@ async fn drive_health_check_daemon(input: FakeDaemonInput) {
             "missing production counter {field}: {work}"
         );
     }
-    assert_eq!(report.status, subc_protocol::session::HealthStatus::Ok);
+    assert_eq!(
+        report.status,
+        subc_protocol::session::HealthStatus::Ok,
+        "health.check never reported Ok within 30 s; last detail: {:?}, stale_reason: {}",
+        report.detail,
+        metrics.get("stale_reason").unwrap_or(&Value::Null),
+    );
     for (section, fields) in [
         (
             "lsp",

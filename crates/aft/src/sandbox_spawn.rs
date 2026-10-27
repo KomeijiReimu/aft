@@ -5226,6 +5226,23 @@ pub(crate) fn cleanup_task_temp_dir(path: &Path) -> std::io::Result<()> {
     }
     // Older persisted tasks kept their temporary files inside the IO bundle.
     if is_managed_task_temp_dir(path) {
+        #[cfg(unix)]
+        {
+            // Pinned and symlink-safe, restoring owner access to read-only
+            // directories the command left behind; see `task_temp::remove`.
+            let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+                return Ok(());
+            };
+            let result =
+                crate::bash_background::persistence::PinnedDir::open(parent).and_then(|parent| {
+                    crate::bash_background::persistence::remove_directory_tree_at(&parent, name)
+                });
+            return match result {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                result => result,
+            };
+        }
+        #[cfg(not(unix))]
         return match std::fs::remove_dir_all(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             result => result,

@@ -129,6 +129,13 @@ pub(crate) struct TrashReport {
     pub incomplete: bool,
     /// Counts kept entries, or deferred containers when admission or census failed.
     pub kept_by_reason: BTreeMap<String, usize>,
+    /// The durable-storage census (directory identities no trash removal may
+    /// touch), taken at most once per reaper pass and shared by every trash
+    /// container that pass visits. Taking it again for each container spent
+    /// the pass budget before later domains (`inspect` and after) were
+    /// reached. Not part of the published report.
+    #[serde(skip)]
+    pub(crate) protections: Option<Result<Arc<Vec<(u64, u64)>>, String>>,
 }
 
 impl TrashReport {
@@ -2316,6 +2323,25 @@ impl std::fmt::Display for RetentionDeadline {
 
 impl std::error::Error for RetentionDeadline {}
 
+/// A validation walk met more than [`TREE_ENTRIES`] entries and stopped
+/// before it saw the whole tree.
+#[derive(Debug)]
+struct TreeEntryLimit;
+
+impl std::fmt::Display for TreeEntryLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("retention tree entry limit reached")
+    }
+}
+
+impl std::error::Error for TreeEntryLimit {}
+
+fn is_tree_entry_limit(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|error| error.is::<TreeEntryLimit>())
+}
+
 fn is_retention_deadline(error: &io::Error) -> bool {
     error
         .get_ref()
@@ -2361,7 +2387,7 @@ fn validate_tree_with_admission(
             let Some(entry) = entries.next() else { break };
             let entry = entry?;
             if examined >= TREE_ENTRIES {
-                return Err(io::Error::other("retention tree entry limit reached"));
+                return Err(io::Error::other(TreeEntryLimit));
             }
             examined += 1;
             let kind = entry.file_type()?;
@@ -2479,6 +2505,138 @@ fn verify_retirement_witness(
         if witness.members.get(&name) != Some(&actual) {
             return Err(io::Error::other("unverified retirement member retained"));
         }
+    }
+    Ok(())
+}
+
+/// Retirement directories made by AFT releases up to v0.62.0 carry no witness:
+/// those releases renamed a cache into `.retention-trash` without writing one,
+/// and the reaper that ships witnesses refuses every entry without one, so
+/// their disk space was never reclaimed. The current retirement writes the
+/// witness before the rename, so a witness-less entry it leaves behind is a
+/// source that was swapped during the rename, which can hold anything.
+///
+/// A witness-less entry is therefore deleted only when its contents prove it
+/// is an AFT root cache (the `inspect`, `index`, `callgraph` and similar
+/// per-checkout folders): every entry is a file name AFT itself creates there,
+/// nothing is a symlink, every entry is owned by the current user and not
+/// writable by anyone else, and no live process still holds a read marker in
+/// it. Anything else is kept, and the error names what is missing.
+fn verify_retirement_proof(
+    storage: &StoragePaths,
+    directory: &crate::bash_background::persistence::PinnedDir,
+    nonce: &str,
+    budget: &mut crate::bash_background::persistence::RepairBudget,
+) -> io::Result<()> {
+    match directory.repair_read_file(std::ffi::OsStr::new(RETIREMENT_WITNESS)) {
+        Ok(_) => verify_retirement_witness(storage, directory, nonce, budget),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            verify_unwitnessed_cache_retirement(directory, budget).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "retirement witness {RETIREMENT_WITNESS} is missing (retired by AFT \
+                         v0.62.0 or earlier, or a source swapped during retirement) and the \
+                         contents do not prove an AFT cache: {error}; AFT keeps it, delete {} \
+                         by hand if its contents are not needed",
+                        directory.path().display()
+                    ),
+                )
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether `name` is a file AFT creates directly inside a root cache folder.
+fn unwitnessed_cache_file(name: &str) -> bool {
+    if matches!(
+        name,
+        "writer.lease" | "cache.lock" | "semantic.lock" | "symbols.lock"
+    ) {
+        return true;
+    }
+    if let Some(key) = name.strip_suffix(".current") {
+        return key_valid(key);
+    }
+    let database = ["-wal", "-shm", "-journal"]
+        .iter()
+        .find_map(|suffix| name.strip_suffix(suffix))
+        .unwrap_or(name);
+    unwitnessed_generation_name(database)
+}
+
+/// `<key>.sqlite` or `<key>.g<ordinal>.<pid>.sqlite`: a cache database, also
+/// used as the generation label of its `readers/` folder.
+fn unwitnessed_generation_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".sqlite") else {
+        return false;
+    };
+    let mut parts = stem.split('.');
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(key), None, None, None) => key_valid(key),
+        (Some(key), Some(ordinal), Some(pid), None) => {
+            key_valid(key) && ordinal.strip_prefix('g').is_some_and(digits) && digits(pid)
+        }
+        _ => false,
+    }
+}
+
+fn verify_unwitnessed_cache_retirement(
+    directory: &crate::bash_background::persistence::PinnedDir,
+    budget: &mut crate::bash_background::persistence::RepairBudget,
+) -> io::Result<()> {
+    let refuse = |what: String| Err(io::Error::other(what));
+    if !directory.repair_status()?.private {
+        return refuse("the directory is writable by other users or not owned by this user".into());
+    }
+    let mut cache_files = 0;
+    let mut names = directory.repair_names(budget)?;
+    names.sort();
+    for name in names {
+        let status = directory.repair_entry_status(&name)?;
+        let text = name.to_string_lossy();
+        if !status.private {
+            return refuse(format!(
+                "{text} is writable by other users or not owned by this user"
+            ));
+        }
+        if status.is_file && unwitnessed_cache_file(&text) {
+            cache_files += 1;
+            continue;
+        }
+        if !(status.is_dir && name == "readers") {
+            return refuse(format!(
+                "{text} is not an entry AFT creates in a cache folder"
+            ));
+        }
+        let readers = directory.repair_child(&name)?;
+        for generation in readers.repair_names(budget)? {
+            let label = generation.to_string_lossy();
+            let status = readers.repair_entry_status(&generation)?;
+            if !(status.is_dir && status.private && unwitnessed_generation_name(&label)) {
+                return refuse(format!(
+                    "readers/{label} is not a private read-marker generation folder"
+                ));
+            }
+            let markers = readers.repair_child(&generation)?;
+            for marker in markers.repair_names(budget)? {
+                let status = markers.repair_entry_status(&marker)?;
+                let marker = marker.to_string_lossy();
+                if !(status.is_file && status.private && marker.ends_with(".json")) {
+                    return refuse(format!(
+                        "readers/{label}/{marker} is not a private read marker"
+                    ));
+                }
+            }
+        }
+    }
+    if cache_files == 0 {
+        return refuse("it holds no AFT cache files".into());
+    }
+    if crate::root_cache::sweep_all_read_markers_pinned(directory, budget, false)?.protected {
+        return refuse("a live process still holds a read marker in it".into());
     }
     Ok(())
 }
@@ -2824,7 +2982,14 @@ fn reap_trash_with_cursor(
     if entries.is_empty() && !mount_local {
         return Ok(report.incomplete);
     }
-    let protected = crate::root_cache::retention_protections_with_budget(storage, budget);
+    let protected = report
+        .protections
+        .get_or_insert_with(|| {
+            crate::root_cache::retention_protections_with_budget(storage, budget)
+                .map(Arc::new)
+                .map_err(|error| error.to_string())
+        })
+        .clone();
     let parent = crate::bash_background::persistence::PinnedDir::repair_open_path(
         trash
             .parent()
@@ -2866,10 +3031,20 @@ fn reap_trash_with_cursor(
             budget.enter(0).map_err(|error| ("budget", error))?;
             // Measure only safe, same-filesystem trees. Measurements omit unsafe
             // or unexamined trees and can precede a partially successful unlink.
-            let files = validate_tree_with_admission(&path, deadline, true, &|| budget.enter(0))
-                .map_err(|error| ("tree_guard", error))?;
-            bytes = files.iter().map(|(_, size)| *size).sum();
-            measured = true;
+            let oversized =
+                match validate_tree_with_admission(&path, deadline, true, &|| budget.enter(0)) {
+                    Ok(files) => {
+                        bytes = files.iter().map(|(_, size)| *size).sum();
+                        measured = true;
+                        false
+                    }
+                    // A tree larger than one validation walk may examine could
+                    // never be validated, so it would never be reclaimed. It is
+                    // removed below by a walk that applies the same rules as it
+                    // goes and keeps its progress when a pass ends.
+                    Err(error) if is_tree_entry_limit(&error) => true,
+                    Err(error) => return Err(("tree_guard", error)),
+                };
             if !name.strip_prefix("retired-").is_some_and(|nonce| {
                 nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
             }) {
@@ -2893,7 +3068,7 @@ fn reap_trash_with_cursor(
             let expected = child
                 .directory_identity()
                 .map_err(|error| ("identity", error))?;
-            verify_retirement_witness(storage, &child, &name["retired-".len()..], budget)
+            verify_retirement_proof(storage, &child, &name["retired-".len()..], budget)
                 .map_err(|error| ("witness", error))?;
             let protected = protected
                 .as_ref()
@@ -2901,18 +3076,58 @@ fn reap_trash_with_cursor(
             #[cfg(test)]
             test_hook(&storage.artifacts, "reap-root");
             let mut warnings = Vec::new();
-            let result = parent.repair_remove_child_with_budget(
-                entry.file_name().as_os_str(),
-                expected,
-                protected,
-                &mut 0,
-                &mut warnings,
-                budget,
-            );
+            let mut removed = 0;
+            let result = if oversized {
+                parent.repair_remove_regular_child_with_budget(
+                    entry.file_name().as_os_str(),
+                    expected,
+                    protected,
+                    &mut removed,
+                    &mut warnings,
+                    budget,
+                )
+            } else {
+                parent.repair_remove_child_with_budget(
+                    entry.file_name().as_os_str(),
+                    expected,
+                    protected,
+                    &mut removed,
+                    &mut warnings,
+                    budget,
+                )
+            };
             for warning in warnings {
                 crate::slog_warn!("{warning}");
             }
-            result.map_err(|error| ("unlink_guard", error))?;
+            match result {
+                Ok(()) => {}
+                // What this pass removed stays removed, and the witness is
+                // deleted last, so the next pass verifies the rest and
+                // continues instead of starting over.
+                Err(error)
+                    if oversized
+                        && crate::bash_background::persistence::is_repair_budget_stop(&error) =>
+                {
+                    return Err((
+                        "removal_in_progress",
+                        io::Error::new(
+                            error.kind(),
+                            format!(
+                                "oversized entry: removed {removed} entries this pass, \
+                                 later passes continue: {error}"
+                            ),
+                        ),
+                    ));
+                }
+                Err(error)
+                    if error.get_ref().is_some_and(|inner| {
+                        inner.is::<crate::bash_background::persistence::NonRegularEntryRetained>()
+                    }) =>
+                {
+                    return Err(("tree_guard", error));
+                }
+                Err(error) => return Err(("unlink_guard", error)),
+            }
             match parent.repair_child(entry.file_name().as_os_str()) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
                 Err(error) => Err(("unlink_status", error)),
@@ -2986,6 +3201,8 @@ fn reap_retired(storage: &StoragePaths) -> io::Result<()> {
         ..Default::default()
     };
     let result = reap_retired_with_budget(storage, deadline, &mut budget, &mut report);
+    // The census belongs to this pass only; a later pass takes a fresh one.
+    report.protections = None;
     if let Err(error) = &result {
         report.incomplete = true;
         if report.kept_by_reason.is_empty() {
@@ -5703,6 +5920,323 @@ mod storage_retention_tests {
         fs::remove_dir_all(&retired).unwrap();
         fs::create_dir(&retired).unwrap();
         assert_trash_kept_once(temp.path(), &retired, "witness");
+    }
+
+    const UNWITNESSED_GENERATION: &str = "0123456789abcdef.g1761300000000000000.4242.sqlite";
+
+    /// An `inspect` cache folder retired by AFT v0.62.0 or earlier, which
+    /// wrote no retirement witness: the files a real one holds, and a read
+    /// marker whose process (on another host) stopped heartbeating long ago.
+    fn unwitnessed_inspect_retirement() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("retention")).unwrap();
+        let retired = temp.path().join(format!(
+            "inspect/.retention-trash/retired-{}",
+            "0123456789abcdef".repeat(2)
+        ));
+        let generation = retired.join("readers").join(UNWITNESSED_GENERATION);
+        fs::create_dir_all(&generation).unwrap();
+        for name in [
+            "writer.lease".to_owned(),
+            "cache.lock".into(),
+            "semantic.lock".into(),
+            "symbols.lock".into(),
+            "0123456789abcdef.current".into(),
+            UNWITNESSED_GENERATION.into(),
+            format!("{UNWITNESSED_GENERATION}-wal"),
+        ] {
+            fs::write(retired.join(name), b"inspect cache").unwrap();
+        }
+        let marker = generation.join("4242.other-host.1761300000000.0.json");
+        fs::write(
+            &marker,
+            serde_json::to_vec(&crate::root_cache::ReadMarkerMetadata {
+                pid: 4242,
+                hostname: "other-host".into(),
+                created_at_ms: 1_761_300_000_000,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        filetime::set_file_mtime(
+            &marker,
+            filetime::FileTime::from_unix_time(1_000_000_000, 0),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&retired, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        (temp, retired)
+    }
+
+    #[test]
+    fn retention_trash_reaps_unwitnessed_inspect_cache_retirement() {
+        let (temp, retired) = unwitnessed_inspect_retirement();
+        super::reap_retired(&StoragePaths::same(temp.path())).unwrap();
+        assert!(
+            !retired.exists(),
+            "a witness-less retirement holding only AFT cache files was kept"
+        );
+        assert_eq!(trash_report(temp.path()).removed_entries, 1);
+    }
+
+    #[test]
+    fn retention_trash_keeps_unwitnessed_retirements_it_cannot_prove() {
+        type Change = Box<dyn Fn(&Path, &Path)>;
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut cases: Vec<(&str, &str, Change)> = vec![
+            (
+                "foreign file",
+                "witness",
+                Box::new(|retired, _| fs::write(retired.join("notes.txt"), b"user data").unwrap()),
+            ),
+            (
+                "live reader",
+                "witness",
+                // A marker from another host that heartbeated just now.
+                Box::new(|retired, _| {
+                    let marker = retired
+                        .join("readers")
+                        .join(UNWITNESSED_GENERATION)
+                        .join("4242.other-host.1761300000000.0.json");
+                    filetime::set_file_mtime(marker, filetime::FileTime::now()).unwrap();
+                }),
+            ),
+        ];
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            cases.push((
+                "symlink",
+                "tree_guard",
+                Box::new(|retired, outside| {
+                    std::os::unix::fs::symlink(outside, retired.join("cache.lock-link")).unwrap()
+                }),
+            ));
+            cases.push((
+                "group-writable file",
+                "witness",
+                Box::new(|retired, _| {
+                    fs::set_permissions(
+                        retired.join("cache.lock"),
+                        fs::Permissions::from_mode(0o664),
+                    )
+                    .unwrap()
+                }),
+            ));
+        }
+        for (case, reason, change) in cases {
+            let (temp, retired) = unwitnessed_inspect_retirement();
+            let outside = temp.path().join("outside");
+            fs::write(&outside, b"outside").unwrap();
+            change(&retired, &outside);
+            assert_trash_kept_once(temp.path(), &retired, reason);
+            assert!(
+                retired.join(UNWITNESSED_GENERATION).exists(),
+                "{case}: cache payload was removed"
+            );
+            assert_eq!(fs::read(&outside).unwrap(), b"outside", "{case}");
+        }
+    }
+
+    #[test]
+    fn retention_trash_unwitnessed_reason_names_the_unrecognized_entry() {
+        let (temp, retired) = unwitnessed_inspect_retirement();
+        fs::write(retired.join("notes.txt"), b"user data").unwrap();
+        let directory = crate::bash_background::persistence::PinnedDir::open(&retired).unwrap();
+        let error = verify_retirement_proof(
+            &StoragePaths::same(temp.path()),
+            &directory,
+            &"0123456789abcdef".repeat(2),
+            &mut crate::bash_background::persistence::RepairBudget::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(".aft-retirement.json is missing"), "{error}");
+        assert!(
+            error.contains("notes.txt is not an entry AFT creates in a cache folder"),
+            "{error}"
+        );
+        assert!(error.contains("delete "), "{error}");
+    }
+
+    /// A retired cache with more entries than one validation walk examines
+    /// (`TREE_ENTRIES`), split over subfolders the way real caches are.
+    fn oversized_retirement(temp: &Path) -> PathBuf {
+        fs::create_dir_all(temp.join("retention")).unwrap();
+        let cache = temp.join("index/0123456789abcdef");
+        for folder in 0..8 {
+            let folder = cache.join(format!("shard-{folder}"));
+            fs::create_dir_all(&folder).unwrap();
+            for file in 0..TREE_ENTRIES / 6 {
+                fs::write(folder.join(format!("blob-{file}")), b"blob").unwrap();
+            }
+        }
+        retire_directory(temp, &cache).unwrap();
+        fs::read_dir(temp.join("index/.retention-trash"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+    }
+
+    fn reap_index_trash(
+        temp: &Path,
+        budget: &mut crate::bash_background::persistence::RepairBudget,
+    ) -> TrashReport {
+        let mut report = TrashReport::default();
+        reap_trash(
+            &StoragePaths::same(temp),
+            &temp.join("index/.retention-trash"),
+            false,
+            Instant::now() + Duration::from_secs(60),
+            budget,
+            &mut report,
+        )
+        .unwrap();
+        report
+    }
+
+    #[test]
+    fn retention_trash_removes_an_oversized_retirement_across_passes() {
+        let temp = tempfile::tempdir().unwrap();
+        let retired = oversized_retirement(temp.path());
+        let count = |path: &Path| walkdir_count(path);
+        let before = count(&retired);
+        assert!(
+            before > TREE_ENTRIES,
+            "fixture must exceed one walk: {before}"
+        );
+        // A pass whose entry budget runs out part-way through the removal.
+        let mut budget =
+            crate::bash_background::persistence::RepairBudget::with_entries(TREE_ENTRIES / 2);
+        let report = reap_index_trash(temp.path(), &mut budget);
+        assert_eq!(
+            report.kept_by_reason.get("removal_in_progress"),
+            Some(&1),
+            "{report:?}"
+        );
+        let after_first = count(&retired);
+        assert!(after_first < before, "the first pass removed nothing");
+        assert!(
+            retired.join(RETIREMENT_WITNESS).is_file(),
+            "the stopped removal lost the proof the next pass needs"
+        );
+        // The next pass continues from what is left, it does not start over.
+        let report = reap_index_trash(
+            temp.path(),
+            &mut crate::bash_background::persistence::RepairBudget::new(),
+        );
+        assert_eq!(report.removed_entries, 1, "{report:?}");
+        assert!(!retired.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_trash_oversized_removal_stops_at_a_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let retired = oversized_retirement(temp.path());
+        let before = walkdir_count(&retired);
+        let outside = temp.path().join("outside");
+        fs::write(&outside, b"outside").unwrap();
+        // Plant the link after the validation walk and right before removal,
+        // so the incremental removal (not the validation walk, whose reach
+        // depends on directory order) is what meets it.
+        let link = retired.join("shard-7/zz-link");
+        let planted = (outside.clone(), link.clone());
+        let _hook = observe_test_hook(
+            temp.path(),
+            Arc::new(move |step| {
+                if step == "reap-root" && fs::symlink_metadata(&planted.1).is_err() {
+                    std::os::unix::fs::symlink(&planted.0, &planted.1).unwrap();
+                }
+            }),
+        );
+        let (report, logs) = crate::logging::capture_log_lines(|| {
+            reap_index_trash(
+                temp.path(),
+                &mut crate::bash_background::persistence::RepairBudget::new(),
+            )
+        });
+        assert_eq!(
+            report.kept_by_reason.get("tree_guard"),
+            Some(&1),
+            "{report:?}"
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("retained reason=tree_guard")
+                    && line.contains("non-regular entry retained")
+                    && line.contains("zz-link")),
+            "the incremental removal did not report the link: {logs:?}"
+        );
+        assert!(
+            walkdir_count(&retired) < before,
+            "the incremental removal never ran"
+        );
+        assert!(fs::symlink_metadata(&link).is_ok());
+        assert!(retired.join(RETIREMENT_WITNESS).is_file());
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+    }
+
+    fn walkdir_count(path: &Path) -> usize {
+        let mut count = 0;
+        let mut pending = vec![path.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                count += 1;
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                }
+            }
+        }
+        count
+    }
+
+    /// Every trash container shares one durable-storage census per pass. A
+    /// census per container spent the pass budget before later domains, so
+    /// their entries were kept with "repair traversal limit exceeded".
+    #[test]
+    fn retention_trash_census_is_taken_once_per_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("retention")).unwrap();
+        // Durable state the census walks: every name costs one budget entry.
+        let durable = temp.path().join("durable-state");
+        fs::create_dir(&durable).unwrap();
+        for file in 0..1500 {
+            fs::write(durable.join(format!("record-{file}")), b"r").unwrap();
+        }
+        let mut retired = Vec::new();
+        for domain in ["views", "inspect"] {
+            let cache = temp.path().join(domain).join("0123456789abcdef");
+            fs::create_dir_all(&cache).unwrap();
+            fs::write(cache.join("payload"), b"retired").unwrap();
+            retire_directory(temp.path(), &cache).unwrap();
+            retired.push(temp.path().join(domain).join(".retention-trash"));
+        }
+        // Room for one census of the durable state, not one per container.
+        let mut budget = crate::bash_background::persistence::RepairBudget::with_entries(2500);
+        let mut report = TrashReport::default();
+        reap_retired_with_budget(
+            &StoragePaths::same(temp.path()),
+            Instant::now() + Duration::from_secs(60),
+            &mut budget,
+            &mut report,
+        )
+        .unwrap();
+        assert_eq!(report.removed_entries, 2, "{report:?}");
+        for trash in retired {
+            assert_eq!(
+                fs::read_dir(&trash).unwrap().count(),
+                0,
+                "{}",
+                trash.display()
+            );
+        }
     }
 
     #[cfg(unix)]

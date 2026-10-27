@@ -486,6 +486,42 @@ fn tool_result_builders_fit_large_images_and_bound_ast_matches() {
 }
 
 #[test]
+fn tool_result_every_preset_and_confined_catalog_declares_format() {
+    for preset in tool_provider::CatalogPreset::ALL {
+        for confined in [false, true] {
+            let (request, preset) =
+                tool_provider::validate_catalog_request(json!({"preset": preset.name()})).unwrap();
+            let render = if confined {
+                tool_provider::catalog_for_confined_request
+            } else {
+                tool_provider::catalog_for_request
+            };
+            let catalog = render(
+                request,
+                preset,
+                &[],
+                true,
+                true,
+                true,
+                crate::config::DEFAULT_BASH_WORKER_WAIT_MAX_MS,
+            )
+            .unwrap();
+            let tools = catalog["tools"].as_array().unwrap();
+            assert!(!tools.is_empty(), "{} confined={confined}", preset.name());
+            for tool in tools {
+                assert_eq!(
+                    tool["result_format"],
+                    "tool-result/v1",
+                    "{} confined={confined} tool={}",
+                    preset.name(),
+                    tool["name"]
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn tool_result_catalog_switch_preserves_schemas_digests_and_pins() {
     for preset in tool_provider::CatalogPreset::ALL {
         let original = tool_provider::tools_for_session(preset, &[], true, true, true);
@@ -664,6 +700,158 @@ async fn tool_result_capability_is_selected_per_bind_not_per_call() {
                 "legacy route must ignore call capability claims"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn tool_result_non_negotiating_routes_keep_legacy_success_and_error_bytes() {
+    let _watcher_disabled = crate::test_env::without_project_watcher();
+    let project = scratch_project();
+    let root = project.path().to_path_buf();
+    let module_root = root.clone();
+    let executor = Arc::new(Executor::new());
+    let _actors = FixtureActors(executor.clone());
+    let (mut daemon, module) = tokio::io::duplex(64 * 1024);
+    let module_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (read, write) = tokio::io::split(module);
+        runtime.block_on(run_module_loop(
+            read,
+            write,
+            &module_root.join("absent-connection.json"),
+            App::default_shared(),
+            executor,
+            |request, ctx| {
+                if request.command == "configure" {
+                    return crate::commands::configure::handle_configure(&request, ctx);
+                }
+                if request.params["file"]
+                    .as_str()
+                    .is_some_and(|file| std::path::Path::new(file).ends_with("success.txt"))
+                {
+                    Response::success(
+                        "same-id",
+                        json!({"content":"route success", "producer_budget":result_body::active()}),
+                    )
+                } else {
+                    Response::error_with_data(
+                        "same-id",
+                        "path_outside_root",
+                        "outside root",
+                        json!({"producer_budget":result_body::active()}),
+                    )
+                }
+            },
+            Some(test_support::bind_config_without_indexes(&module_root)),
+            false,
+            usize::MAX,
+            None,
+            &module_root.join("storage"),
+            QuiescedLsp::ReapInBackground,
+            None,
+            None,
+        ))
+    });
+    async fn receive(daemon: &mut tokio::io::DuplexStream, channel: u16, corr: u64) -> Frame {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let frame = read_frame(daemon).await.unwrap().unwrap();
+                if frame.header.channel == channel && frame.header.corr == corr {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("legacy route response timed out")
+    }
+    let hello = receive(&mut daemon, 0, HELLO_CORR).await;
+    assert_eq!(hello.header.ty, FrameType::Hello);
+    write_frame(
+        &mut daemon,
+        &Frame::build(
+            FrameType::HelloAck,
+            control_flags(),
+            0,
+            0,
+            HELLO_CORR,
+            b"{}".to_vec(),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut replies = Vec::new();
+    for (channel, capabilities) in [(1, None), (2, Some(vec!["content/v1".to_owned()]))] {
+        let bind = ModuleControlRequest::RouteBind {
+            route_channel: channel,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".into(),
+            },
+            identity: subc_protocol::BindIdentity::new(&root, "opencode", "legacy-result-bytes"),
+            principal: Some(Principal::Direct),
+            consumer_capabilities: capabilities,
+            admission_facts: Default::default(),
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        };
+        write_frame(
+            &mut daemon,
+            &Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                channel as u64,
+                serde_json::to_vec(&bind).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let ack = receive(&mut daemon, 0, channel as u64).await;
+        assert_eq!(
+            ack.header.ty,
+            FrameType::Response,
+            "bind refused for channel {channel}: {}",
+            String::from_utf8_lossy(&ack.body)
+        );
+        assert!(matches!(
+            serde_json::from_slice::<ModuleControlResponse>(&ack.body).unwrap(),
+            ModuleControlResponse::RouteBindAck {}
+        ));
+        for (corr, path) in [(10, "success.txt"), (11, "error.txt")] {
+            write_frame(
+                &mut daemon,
+                &Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    channel,
+                    1,
+                    corr,
+                    serde_json::to_vec(&json!({"name":"read", "arguments":{"path":path}})).unwrap(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            replies.push((corr, receive(&mut daemon, channel, corr).await));
+        }
+    }
+    drop(daemon);
+    module_thread.join().unwrap().unwrap();
+    for (corr, frame) in replies {
+        assert_eq!(frame.header.ty, FrameType::Response);
+        let expected: &[u8] = if corr == 10 {
+            br#"{"content":[{"type":"text","text":"route success"}],"isError":false,"structuredContent":{"id":"same-id","success":true,"content":"route success","producer_budget":false,"text":"route success"}}"#
+        } else {
+            br#"{"content":[{"type":"text","text":"outside root"}],"isError":true,"structuredContent":{"id":"same-id","success":false,"code":"path_outside_root","message":"outside root","producer_budget":false,"text":"outside root"}}"#
+        };
+        assert_eq!(frame.body, expected, "legacy bytes changed for call {corr}");
     }
 }
 

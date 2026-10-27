@@ -460,11 +460,42 @@ fn start_mock_embedding_error_server() -> (String, thread::JoinHandle<()>) {
     (base_url, handle)
 }
 
-/// How long the recovering server holds its first response. It is well past
-/// the 1s bound `slow_query_embedding_degrades_within_budget_and_next_query_retries_fresh`
+/// How long the recovering server holds its first response. It is far past
+/// every bound `slow_query_embedding_degrades_within_budget_and_next_query_retries_fresh`
 /// asserts, so a search that waits for this response instead of honouring
-/// its 500ms query budget fails that bound instead of slipping under it.
-const SLOW_FIRST_EMBEDDING_RESPONSE: Duration = Duration::from_millis(2_000);
+/// its 500ms query budget fails those bounds instead of slipping under them,
+/// while a loaded runner that is merely slow at the lexical fallback after
+/// the budget fires still passes.
+const SLOW_FIRST_EMBEDDING_RESPONSE: Duration = Duration::from_millis(10_000);
+
+/// Holds a request's connection open without answering until `hold` has
+/// passed or the client closes the connection, whichever comes first. A
+/// client that gave up after its timeout no longer needs a reply, so ending
+/// the hold there keeps the test from idling out the full hold at teardown.
+fn hold_unless_client_disconnects(stream: &mut std::net::TcpStream, hold: Duration) {
+    let deadline = Instant::now() + hold;
+    let mut scratch = [0u8; 4096];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || stream.set_read_timeout(Some(remaining)).is_err() {
+            return;
+        }
+        match stream.read(&mut scratch) {
+            // The client closed its side: nobody is waiting for the reply.
+            Ok(0) => return,
+            // Late request bytes (for example a body sent after the headers).
+            Ok(_) => {}
+            // The read timed out; the loop re-checks the deadline.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            // Reset or aborted connection: the client is gone.
+            Err(_) => return,
+        }
+    }
+}
 
 fn start_recovering_slow_embedding_server() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow embedding server");
@@ -480,7 +511,7 @@ fn start_recovering_slow_embedding_server() -> (String, Arc<AtomicUsize>, thread
                 let mut request = [0u8; 4096];
                 let _ = stream.read(&mut request);
                 if ordinal == 0 {
-                    thread::sleep(SLOW_FIRST_EMBEDDING_RESPONSE);
+                    hold_unless_client_disconnects(&mut stream, SLOW_FIRST_EMBEDDING_RESPONSE);
                 }
                 let body = r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#;
                 let response = format!(
@@ -1830,12 +1861,40 @@ fn slow_query_embedding_degrades_within_budget_and_next_query_retries_fresh() {
 
     // Checked first so a budget that is not enforced reports as a budget
     // failure: the search would then wait for the server's held response,
-    // which arrives well after this bound.
+    // which arrives only after this bound. The bound is deliberately loose
+    // (half the hold) because the lexical fallback that runs after the
+    // budget fires can take hundreds of milliseconds on a loaded runner;
+    // the phase checks below pin the budget itself.
     assert!(
-        elapsed < Duration::from_millis(1_000),
-        "500ms query budget took {elapsed:?}; phases: {}",
+        elapsed < SLOW_FIRST_EMBEDDING_RESPONSE / 2,
+        "500ms query budget took {elapsed:?}, as if it waited for the held \
+         embedding response; phases: {}",
         format_query_embedding_phases(&phases, started)
     );
+    #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+    {
+        let offset_of = |phase: &str| {
+            phases
+                .iter()
+                .find(|(name, _)| *name == phase)
+                .map(|(_, at)| at.duration_since(started))
+        };
+        // The budget is what ended the embedding request: its timeout became
+        // observable no earlier than the 500ms budget (less a margin for
+        // timer granularity) and long before the server would have replied.
+        let deadline_fired = offset_of("deadline_fire_observed").unwrap_or_else(|| {
+            panic!(
+                "500ms query budget never fired; phases: {}",
+                format_query_embedding_phases(&phases, started)
+            )
+        });
+        assert!(
+            deadline_fired >= Duration::from_millis(400)
+                && deadline_fired < SLOW_FIRST_EMBEDDING_RESPONSE / 4,
+            "500ms query budget fired at {deadline_fired:?}, not near the budget; phases: {}",
+            format_query_embedding_phases(&phases, started)
+        );
+    }
     #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
     assert_eq!(
         phases.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
