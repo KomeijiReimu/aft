@@ -65,15 +65,163 @@ impl HeadPaths {
     }
 }
 
-pub(super) fn delta_requires_full_read(
+/// The HEAD directories whose members a watcher batch obliges a publication to
+/// read again, or `None` when the whole checkout must be read.
+///
+/// A named member is read again by name. A named HEAD directory may be the only
+/// evidence that its children changed, were removed or were renamed away, so
+/// every member under it is read again. Every other member keeps its previous
+/// entry. A named path that is neither (a new untracked file, an editor's
+/// temporary file, a rename destination) has no member under it, because every
+/// ancestor of a member is a HEAD directory; `nonmember_is_inert` decides
+/// whether such a path can still stand for a member under another spelling.
+/// A batch that names no member and no HEAD directory at all is not evidence
+/// that the watcher observed the checkout, so it still reads everything.
+pub(super) fn delta_read_scope(
     head: &[crate::alias::TrackedPath],
     paths: &OnceLock<HeadPaths>,
     changed: &BTreeSet<Vec<u8>>,
-) -> bool {
+    mut nonmember_is_inert: impl FnMut(&[u8]) -> bool,
+) -> Option<BTreeSet<Vec<u8>>> {
     let paths = paths.get_or_init(|| HeadPaths::new(head));
-    changed.iter().any(|path| {
-        HeadPaths::contains(&paths.directories, path) || !HeadPaths::contains(&paths.members, path)
+    let mut directories = BTreeSet::new();
+    let mut names_head_path = false;
+    for path in changed {
+        if HeadPaths::contains(&paths.directories, path) {
+            directories.insert(path.clone());
+            names_head_path = true;
+        } else if HeadPaths::contains(&paths.members, path) {
+            names_head_path = true;
+        } else if !nonmember_is_inert(path) {
+            return None;
+        }
+    }
+    names_head_path.then_some(directories)
+}
+
+/// Whether `path` lies under one of `directories` (HEAD directories from
+/// [`delta_read_scope`]).
+pub(super) fn within_directories(directories: &BTreeSet<Vec<u8>>, path: &[u8]) -> bool {
+    !directories.is_empty()
+        && path
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| *byte == b'/' && directories.contains(&path[..index]))
+}
+
+/// [`delta_read_scope`] for a checkout publication. A named path that is no
+/// HEAD member and no HEAD directory forces a full read when it may be a member
+/// under another name: a spelling that a case-insensitive or Unicode-normalizing
+/// file system, or Windows, can resolve to a member; an ignore or attributes
+/// file; a symlink, or a path reached through a symlinked directory; or a file
+/// with another hard link.
+pub(super) fn checkout_delta_scope(
+    request: &AssemblyRequest,
+    head: &[crate::alias::TrackedPath],
+    paths: &OnceLock<HeadPaths>,
+    snapshot: Option<&HeadSnapshot>,
+) -> Option<BTreeSet<Vec<u8>>> {
+    let relevant = snapshot.and_then(relevant_names);
+    let mut canonical_root = None;
+    delta_read_scope(head, paths, &request.changed_paths, |path| {
+        let Some(relevant) = relevant else {
+            return false;
+        };
+        if uncertain_spelling(path)
+            || relevant.contains(&path.to_ascii_lowercase())
+            || is_rule_file(path)
+        {
+            return false;
+        }
+        canonical_root
+            .get_or_insert_with(|| fs::canonicalize(&request.project_root).ok())
+            .as_deref()
+            .is_some_and(|canonical| {
+                nonmember_on_disk_is_inert(&request.project_root, canonical, path)
+            })
     })
+}
+
+/// Spellings that some file system may resolve to a differently spelled path:
+/// non-ASCII names (Unicode normalization), Windows separators, drive and
+/// stream colons, short-name tildes, and trailing dots or spaces.
+fn uncertain_spelling(path: &[u8]) -> bool {
+    !path.is_ascii()
+        || RelPath::new(path.to_vec()).is_err()
+        || path.iter().any(|byte| matches!(byte, b'\\' | b':' | b'~'))
+        || path
+            .split(|byte| *byte == b'/')
+            .any(|part| part.last().is_some_and(|byte| matches!(byte, b'.' | b' ')))
+}
+
+fn is_rule_file(path: &[u8]) -> bool {
+    matches!(
+        path.to_ascii_lowercase()
+            .rsplit(|byte| *byte == b'/')
+            .next(),
+        Some(b".gitattributes" | b".gitignore" | b".aftignore" | b".ignore")
+    )
+}
+
+/// Every HEAD member and HEAD directory, ASCII-lowercased, or `None` when a
+/// member name is not ASCII and cannot be folded reliably. Built once per HEAD.
+fn relevant_names(head: &HeadSnapshot) -> Option<&BTreeSet<Vec<u8>>> {
+    head.relevant
+        .get_or_init(|| {
+            #[cfg(test)]
+            PRECHECK_PATH_BUILDS.with(|builds| builds.set(builds.get() + 1));
+            let mut relevant = BTreeSet::new();
+            for entry in head.entries.iter() {
+                if !entry.rel_path.is_ascii() {
+                    return None;
+                }
+                let path = entry.rel_path.to_ascii_lowercase();
+                for (index, byte) in path.iter().enumerate() {
+                    if *byte == b'/' {
+                        relevant.insert(path[..index].to_vec());
+                    }
+                }
+                relevant.insert(path);
+            }
+            Some(relevant)
+        })
+        .as_ref()
+}
+
+/// The named path, or its nearest existing ancestor when it is gone, must be a
+/// plain file or directory that the checkout reaches without a symlink, and a
+/// file must have no other hard link. Anything else may be a member under
+/// another name. `path` is ASCII (see [`uncertain_spelling`]).
+fn nonmember_on_disk_is_inert(root: &Path, canonical_root: &Path, path: &[u8]) -> bool {
+    let parts = path.split(|byte| *byte == b'/').collect::<Vec<_>>();
+    for depth in (0..=parts.len()).rev() {
+        let mut absolute = root.to_path_buf();
+        let mut expected = canonical_root.to_path_buf();
+        for part in &parts[..depth] {
+            let part = String::from_utf8_lossy(part);
+            absolute.push(part.as_ref());
+            expected.push(part.as_ref());
+        }
+        let metadata = match fs::symlink_metadata(&absolute) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return false,
+        };
+        if metadata.file_type().is_symlink() {
+            return false;
+        }
+        if depth == parts.len()
+            && !metadata.is_dir()
+            && !matches!(
+                crate::file_identity::metadata_with_link_count(&absolute),
+                Ok((_, crate::file_identity::FileIdentity::Known { .. }, 1))
+            )
+        {
+            return false;
+        }
+        return fs::canonicalize(&absolute).is_ok_and(|canonical| canonical == expected);
+    }
+    false
 }
 
 type RemovalStamp = (Vec<u8>, i64);
@@ -726,35 +874,12 @@ pub(super) fn irrelevant_delta(
     // Case-fold ASCII names even on case-sensitive hosts: the same watcher
     // batches can come from case-insensitive checkouts. Non-ASCII spellings,
     // host path aliases and control files are uncertain, never evidence for a skip.
-    let relevant = head.relevant.get_or_init(|| {
-        #[cfg(test)]
-        PRECHECK_PATH_BUILDS.with(|builds| builds.set(builds.get() + 1));
-        let mut relevant = BTreeSet::new();
-        for entry in head.entries.iter() {
-            if !entry.rel_path.is_ascii() {
-                return None;
-            }
-            let path = entry.rel_path.to_ascii_lowercase();
-            for (index, byte) in path.iter().enumerate() {
-                if *byte == b'/' {
-                    relevant.insert(path[..index].to_vec());
-                }
-            }
-            relevant.insert(path);
-        }
-        Some(relevant)
-    });
-    let Some(relevant) = relevant else {
+    let Some(relevant) = relevant_names(&head) else {
         return Ok(false);
     };
     if request.changed_paths.iter().any(|path| {
         let lower = path.to_ascii_lowercase();
-        !path.is_ascii()
-            || RelPath::new(path.clone()).is_err()
-            || path.iter().any(|byte| matches!(byte, b'\\' | b':' | b'~'))
-            || path
-                .split(|byte| *byte == b'/')
-                .any(|part| part.last().is_some_and(|byte| matches!(byte, b'.' | b' ')))
+        uncertain_spelling(path)
             || is_resolution_input(path)
             || is_resolution_input(&lower)
             || matches!(
@@ -1132,7 +1257,10 @@ mod tests {
         let _reset = Reset;
         PATH_COMPARISONS.with(|stats| stats.set((0, Some(4_000_000))));
         let paths = OnceLock::new();
-        assert!(!delta_requires_full_read(&head, &paths, &changed));
+        assert_eq!(
+            delta_read_scope(&head, &paths, &changed, |_| false),
+            Some(BTreeSet::new())
+        );
         let comparisons = PATH_COMPARISONS.with(|stats| stats.get().0);
         assert!(
             comparisons > changed.len(),
@@ -1144,7 +1272,10 @@ mod tests {
             changed.len()
         );
         PATH_COMPARISONS.with(|stats| stats.set((0, Some(200_000))));
-        assert!(!delta_requires_full_read(&head, &paths, &changed));
+        assert_eq!(
+            delta_read_scope(&head, &paths, &changed, |_| false),
+            Some(BTreeSet::new())
+        );
         println!(
             "watcher_delta warm_comparisons={}",
             PATH_COMPARISONS.with(|stats| stats.get().0)
@@ -1862,6 +1993,127 @@ mod tests {
                 .entries()
                 .all(|(path, _)| !path.as_bytes().starts_with(b"group/")));
         }
+    }
+
+    /// Publishes `request` and returns the served manifest, whether a new
+    /// generation was published, and how many members were read from disk.
+    fn publish_counting_reads(request: &AssemblyRequest) -> (Manifest, bool, usize) {
+        let mut reads = 0;
+        let mut count = |phase: &str| {
+            reads += usize::from(phase == "working_tree_read");
+            Ok(())
+        };
+        let mut prepared = prepare_checkout_deferring(request, true, &mut count).unwrap();
+        let published = prepared.commit().unwrap().published;
+        prepared.settle_status();
+        drop(prepared);
+        let view = ViewStore::open(&request.storage, &request.scope).unwrap();
+        let manifest = view
+            .load_manifest(&view.current_generation().unwrap().unwrap())
+            .unwrap();
+        (manifest, published, reads)
+    }
+
+    #[test]
+    fn views_directory_event_reads_only_that_directorys_members() {
+        let (project, _storage, mut request) = fixture();
+        for directory in 0..40 {
+            let path = project.path().join(format!("big/d{directory:02}"));
+            fs::create_dir_all(&path).unwrap();
+            for file in 0..25 {
+                fs::write(
+                    path.join(format!("f{file:02}.rs")),
+                    format!("pub fn f{directory}_{file}() {{}}\n"),
+                )
+                .unwrap();
+            }
+        }
+        fs::create_dir_all(project.path().join("edit/nested")).unwrap();
+        for name in ["edit/a.rs", "edit/b.rs", "edit/nested/c.rs"] {
+            fs::write(project.path().join(name), "pub fn before() {}\n").unwrap();
+        }
+        git(project.path(), &["add", "-A"]);
+        git(project.path(), &["commit", "--quiet", "-m", "large"]);
+        request.changed_paths.clear();
+        publish(&request);
+
+        // An agent's atomic write: a temporary file renamed over the member.
+        // The watcher names the directory and the vanished temporary file,
+        // not the member itself.
+        let temporary = project.path().join("edit/.aft-source-0123.tmp");
+        fs::write(&temporary, "pub fn edited() {}\n").unwrap();
+        fs::rename(&temporary, project.path().join("edit/a.rs")).unwrap();
+        request.changed_paths =
+            BTreeSet::from([b"edit".to_vec(), b"edit/.aft-source-0123.tmp".to_vec()]);
+        let (manifest, published, reads) = publish_counting_reads(&request);
+        assert!(published);
+        assert_eq!(reads, 3, "only the named directory's members are read");
+        assert_eq!(
+            manifest.to_json_bytes().unwrap(),
+            rebuild_manifest(&request).to_json_bytes().unwrap()
+        );
+
+        // A deleted directory drops its members and keeps every other one.
+        fs::remove_dir_all(project.path().join("edit")).unwrap();
+        request.changed_paths = BTreeSet::from([b"edit".to_vec()]);
+        let (manifest, published, reads) = publish_counting_reads(&request);
+        assert!(published);
+        assert_eq!(reads, 0);
+        assert!(manifest
+            .entries()
+            .all(|(path, _)| !path.as_bytes().starts_with(b"edit/")));
+        assert_eq!(manifest.entries().count(), 8 + 40 * 25);
+        assert_eq!(
+            manifest.to_json_bytes().unwrap(),
+            rebuild_manifest(&request).to_json_bytes().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn views_hard_linked_nonmember_event_forces_full_read() {
+        let (project, _storage, mut request) = fixture();
+        fs::hard_link(
+            project.path().join("f2.rs"),
+            project.path().join("alias.rs"),
+        )
+        .unwrap();
+        fs::write(
+            project.path().join("alias.rs"),
+            "pub fn through_alias() {}\n",
+        )
+        .unwrap();
+        request.changed_paths = BTreeSet::from([b"alias.rs".to_vec()]);
+        let (manifest, published, reads) = publish_counting_reads(&request);
+        assert!(published);
+        assert_eq!(reads, 8, "a hard-linked name may be any member");
+        assert_eq!(
+            manifest.to_json_bytes().unwrap(),
+            rebuild_manifest(&request).to_json_bytes().unwrap()
+        );
+    }
+
+    #[test]
+    fn views_periodic_verification_reads_once_and_publishes_only_changes() {
+        let (project, storage, mut request) = fixture();
+        let view = ViewStore::open(storage.path(), &request.scope).unwrap();
+        request.changed_paths.clear();
+        expire_verification_for_test(view.view_dir());
+        let (_, published, reads) = publish_counting_reads(&request);
+        assert!(!published, "an unchanged checkout publishes nothing");
+        assert_eq!(reads, 8, "the full read is not repeated to verify itself");
+        assert!(!full_verification_due(view.view_dir()));
+
+        // An edit no watcher event named is still found and published.
+        expire_verification_for_test(view.view_dir());
+        fs::write(project.path().join("f3.rs"), "pub fn missed() {}\n").unwrap();
+        let (manifest, published, _) = publish_counting_reads(&request);
+        assert!(published);
+        assert_eq!(
+            manifest.to_json_bytes().unwrap(),
+            rebuild_manifest(&request).to_json_bytes().unwrap()
+        );
+        assert!(!full_verification_due(view.view_dir()));
     }
 
     #[test]
