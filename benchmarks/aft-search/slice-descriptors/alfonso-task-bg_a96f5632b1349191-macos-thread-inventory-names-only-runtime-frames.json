@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "idle-root-retention-thread-inventory"
+  ],
+  "note": "Test-only: the macOS thread inventory in crates/aft/src/subc/idle_root_retention_tests.rs now also looks at the program counter and the arm64 link register for a thread's start routine, so a thread sampled while running its spawn closure's own code is named by that closure instead of only by the pthread entry frames. No aft_search ranking, fusion, lane admission or truncation change."
+}
