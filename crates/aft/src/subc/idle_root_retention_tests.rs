@@ -690,7 +690,8 @@ mod thread_inventory {
                 .then_some(info)
         }
 
-        /// The demangled name of the symbol `info` found, if it found one.
+        /// The demangled name of the symbol recorded in `info`, if `dladdr`
+        /// found one.
         fn symbol_name(info: &libc::Dl_info) -> Option<String> {
             if info.dli_sname.is_null() {
                 return None;
@@ -734,9 +735,9 @@ mod thread_inventory {
         /// the running function (from the program counter), then on arm64
         /// the function the link register returns into.
         ///
-        /// The frame pointer chain yields return addresses, so it names the
-        /// running function's caller and everything outside it, never the
-        /// running function itself. A thread caught executing its spawn
+        /// The frame pointer chain yields return addresses: once the running
+        /// function has saved its frame record, the chain names its caller
+        /// and everything outside it, but never the running function itself. A thread caught executing its spawn
         /// closure's own code has no saved frame naming the closure; neither
         /// has one caught entering or leaving a callee (before the callee
         /// saves its frame record, or after it restores it), because the
@@ -849,9 +850,10 @@ mod thread_inventory {
             assert!(start.starts_with("std::"), "{start}");
             assert!(!os_workqueue, "{start}");
 
-            // Entering a runtime callee before it saved its frame record:
-            // the program counter is in the callee and only the link
-            // register returns into the closure.
+            // This synthetic register state models an arm64 thread entering
+            // a runtime callee before the callee saved its frame record: the
+            // program counter is in the callee, and only the link register,
+            // not yet saved, returns into the closure.
             let (start, _) = describe_start(
                 1,
                 Stack {
