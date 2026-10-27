@@ -15450,10 +15450,28 @@ mod tests {
             crate::search_index::SearchIndex::read_from_disk(&cache_dir, &canonical_root).is_some()
         );
         ctx.mark_subc_bound();
-        assert!(ctx
-            .ensure_callgraph_store()
-            .expect("reopen callgraph store")
-            .is_some());
+        // The watcher-gap reconcile this reopen schedules opens the same
+        // store on its own thread while this thread opens it. Two first
+        // opens of one WAL file race inside SQLite recovery and the loser
+        // reports SQLITE_BUSY, which production treats as transient
+        // (Building, deferred reconcile) and retries. Retry within a bound
+        // here so the test keeps its reopen claim instead of failing on the
+        // first busy probe.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let reopened = loop {
+            match ctx.ensure_callgraph_store() {
+                Ok(store) => break store,
+                Err(error) if error.is_transient_lock_contention() => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "reopen callgraph store stayed busy past its bound: {error}"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("reopen callgraph store: {error}"),
+            }
+        };
+        assert!(reopened.is_some(), "reopen callgraph store");
         assert!(live_roots[&root].idle_artifacts_evicted);
     }
 
