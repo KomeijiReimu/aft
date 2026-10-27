@@ -1143,7 +1143,8 @@ fn drain_decoder(
     }
 }
 
-/// Decide one hop of a placeholder fetch (M3: every hop is a new request).
+/// Decide one hop of a placeholder fetch; every hop, redirects included, is
+/// evaluated as a new request.
 ///
 /// Returns the URL to send when a rule substitutes a key into this hop, or
 /// `None` to send `current` itself, whose placeholders then go out literally.
@@ -1162,7 +1163,7 @@ fn secret_hop(
         Some(query) => format!("{path}?{query}"),
         None => path.to_string(),
     };
-    // Only an HTTPS hop can carry a key (M1).
+    // Only an HTTPS hop can carry a key.
     let authority = (current.scheme() == "https")
         .then(|| current.host_str().zip(current.port_or_known_default()))
         .flatten()
@@ -1307,7 +1308,7 @@ fn secret_hop(
     let Ok(substituted) = std::str::from_utf8(&substituted) else {
         return Err(refused(&*held, "malformed_query"));
     };
-    // M2: the path sent with a key is the normalized path the rule matched,
+    // The path sent with a key is the normalized path the rule matched,
     // never another spelling of it.
     let Ok(normalized) = normalize_request_target(path) else {
         return Err(refused(&*held, "malformed_path"));
