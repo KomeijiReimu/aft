@@ -636,16 +636,23 @@ impl CheckoutSemantic {
     /// is where `search` caches its index. The owner's scope-wide state can
     /// differ: a publication replaces it while held snapshots keep the state
     /// they were bound to.
-    pub fn serving_index(&self) -> Option<Arc<SemanticIndex>> {
+    ///
+    /// An error names why the index could not be built (for example, the
+    /// installed generation is not resident); the caller reports the semantic
+    /// lane as unavailable for that reason.
+    pub fn serving_index(&self) -> Result<Arc<SemanticIndex>, String> {
         let installed = self.installed();
+        if let Some(index) = self.plane.cached_index_for(&self.access, &installed) {
+            return Ok(index);
+        }
+        #[cfg(test)]
+        if let Some(reason) = lock(&SERVING_INDEX_BUILD_FAILURES).get(&self.root).cloned() {
+            return Err(reason);
+        }
         self.plane
-            .cached_index_for(&self.access, &installed)
-            .or_else(|| {
-                self.plane
-                    .overlay(&self.access, &self.root, &installed)
-                    .ok()
-                    .map(|overlay| overlay.index)
-            })
+            .overlay(&self.access, &self.root, &installed)
+            .map(|overlay| overlay.index)
+            .map_err(|error| error.to_string())
     }
 
     /// Resident bytes this checkout accounts for: the family arena (shared
@@ -1547,6 +1554,31 @@ pub(crate) fn delay_startup_io_for_test(phase: &str) {
         .and_then(|raw| raw.parse::<u64>().ok())
     {
         std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
+/// Reasons `serving_index` reports instead of building the index, by checkout
+/// root, so a test can make the build fail without corrupting a generation.
+#[cfg(test)]
+static SERVING_INDEX_BUILD_FAILURES: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, String>>,
+> = std::sync::LazyLock::new(|| Mutex::new(Default::default()));
+
+/// Makes `serving_index` fail with `reason` for the checkout at `root` whenever
+/// it would build the index, until the returned guard drops.
+#[cfg(test)]
+pub(crate) fn fail_serving_index_build_for_test(root: &Path, reason: &str) -> ServingIndexFailure {
+    lock(&SERVING_INDEX_BUILD_FAILURES).insert(root.to_path_buf(), reason.to_owned());
+    ServingIndexFailure(root.to_path_buf())
+}
+
+#[cfg(test)]
+pub(crate) struct ServingIndexFailure(PathBuf);
+
+#[cfg(test)]
+impl Drop for ServingIndexFailure {
+    fn drop(&mut self) {
+        lock(&SERVING_INDEX_BUILD_FAILURES).remove(&self.0);
     }
 }
 

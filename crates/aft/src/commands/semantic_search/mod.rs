@@ -527,12 +527,15 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                 // itself rebuilds an out-of-date one). Between a publication
                 // and the worker's rebuild there is none; `serving_index`
                 // then builds it, because without a snapshot the semantic
-                // lane would silently drop out of this search. Views-off
-                // roots never have a checkout view.
+                // lane would silently drop out of this search. If it cannot
+                // be built, the lane is failed for this search with that
+                // reason, never served from the legacy index, which a
+                // views-on root does not build. Views-off roots never have a
+                // checkout view.
                 let checkout_index = matches!(status, SemanticIndexStatus::Ready { .. })
                     .then(|| self.ctx.checkout_semantic_runtime())
                     .flatten()
-                    .and_then(|runtime| runtime.serving_index());
+                    .and_then(|runtime| runtime.serving_index().ok());
                 if let Some(index) = checkout_index {
                     SemanticReadiness {
                         status,
@@ -10034,6 +10037,77 @@ mod tests {
             sampled,
             Some(Arc::as_ptr(&runtime.index().unwrap())),
             "readiness must hold the index that search scores for the installed snapshot"
+        );
+    }
+
+    /// A views-on root is served only by its checkout view. When the view's
+    /// index for the installed snapshot cannot be built, the search must not
+    /// answer lexical hits under `semantic: ready`: it reports the semantic
+    /// lane as unavailable and names why.
+    #[test]
+    fn views_on_search_names_a_checkout_index_that_cannot_be_built() {
+        let project = tempfile::tempdir().expect("project");
+        let storage = tempfile::tempdir().expect("storage");
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        std::fs::write(
+            root.join("lib.rs"),
+            "pub fn watchdog_needle() -> u8 {\n    1\n}\n",
+        )
+        .unwrap();
+        let ctx = test_context(&root);
+        install_ready_search_index(&ctx, &root);
+        let slot = ctx.checkout_semantic();
+        let (epoch, _wake) = slot.begin();
+        let runtime = Arc::new(
+            crate::views::semantic_runtime::CheckoutSemantic::new(
+                &crate::root_cache::StoragePaths::same(storage.path()),
+                "family",
+                "scope",
+                &root,
+                crate::views::semantic::SemanticProducer::current(
+                    "readiness-model",
+                    crate::semantic_index::EmbedTextCaps::default(),
+                ),
+                Arc::downgrade(slot),
+            )
+            .unwrap(),
+        );
+        runtime.load().unwrap();
+        // Fill and fold without the worker's rebuild, so the installed
+        // snapshot has no index and the next sample has to build one.
+        runtime
+            .refresh(
+                crate::views::semantic::FillBudget::default(),
+                &mut |texts: Vec<String>| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
+            )
+            .unwrap();
+        assert!(slot.install(epoch, Arc::clone(&runtime)));
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
+        // The error the plane reports when the installed generation is not
+        // resident.
+        let reason = "semantic plane: semantic generation not resident";
+        let _failure =
+            crate::views::semantic_runtime::fail_serving_index_build_for_test(&root, reason);
+
+        let response = response_value(handle_semantic_search(
+            &semantic_request("where is the watchdog needle defined", 5),
+            &ctx,
+        ));
+        assert_eq!(response["success"], true, "{response:#}");
+        assert_eq!(
+            response["semantic_status"], "unavailable",
+            "a checkout view that cannot serve must not read as ready: {response:#}"
+        );
+        assert_eq!(response["complete"], false, "{response:#}");
+        assert_eq!(response["lexical_only_fallback"], true, "{response:#}");
+        let text = response["text"].as_str().expect("text");
+        assert!(
+            text.contains(&format!("Semantic search unavailable: {reason}")),
+            "the reply must name the reason: {text}"
+        );
+        assert!(
+            !text.contains("semantic: ready"),
+            "the reply must not claim a ready semantic lane: {text}"
         );
     }
 
