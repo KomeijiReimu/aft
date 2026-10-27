@@ -4270,6 +4270,22 @@ async fn gh_shim_router_host_v1_background_reply_is_terminal_and_flat() {
     assert!(reply["structuredContent"].get("data").is_none());
 }
 
+/// Reads a task record the daemon may be rewriting at that moment. The daemon
+/// replaces the file atomically, and a read that races the replacement fails
+/// with `Interrupted` ("task artifact was concurrently replaced") rather than
+/// returning stale or torn data; that is a "read again", not a test failure.
+fn read_task_settled(metadata: &Path) -> aft::bash_background::persistence::PersistedTask {
+    for _ in 0..200 {
+        match aft::bash_background::persistence::read_task(metadata) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            other => return other.unwrap(),
+        }
+    }
+    panic!("task record at {} kept being replaced", metadata.display());
+}
+
 #[tokio::test]
 async fn worker_gh_read_t10_promotion_keeps_the_original_command_grant() {
     if !native_available() {
@@ -4283,9 +4299,7 @@ async fn worker_gh_read_t10_promotion_keeps_the_original_command_grant() {
     let temp = wait_test_file(&ready).await;
     let (task, metadata) = worker_gh_read::observe_task(Path::new(&temp));
     assert!(
-        !aft::bash_background::persistence::read_task(&metadata)
-            .unwrap()
-            .notify_on_completion,
+        !read_task_settled(&metadata).notify_on_completion,
         "start as a foreground command"
     );
     let scope = jail.read_holder.lock().unwrap().binds["worker-session"].clone();
@@ -4319,10 +4333,7 @@ async fn worker_gh_read_t10_promotion_keeps_the_original_command_grant() {
     .await
     .unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
-        while !aft::bash_background::persistence::read_task(&metadata)
-            .unwrap()
-            .notify_on_completion
-        {
+        while !read_task_settled(&metadata).notify_on_completion {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
