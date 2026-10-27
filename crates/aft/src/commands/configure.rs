@@ -2895,24 +2895,98 @@ fn audit01_warning_current_generation_publishes() {
     assert_eq!(rx.try_recv().unwrap().0, 2);
 }
 
-type SearchIndexSymbolFile = (PathBuf, SystemTime);
-
-fn search_index_symbol_files(index: &SearchIndex) -> Vec<SearchIndexSymbolFile> {
-    index
-        .files
-        .iter()
-        .filter(|entry| !entry.path.as_os_str().is_empty())
-        .map(|entry| (entry.path.clone(), entry.modified))
-        .collect()
+/// What persisting a freshly loaded search index did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchIndexPersist {
+    /// The cache this index last wrote itself (after a cold build or an
+    /// earlier write) still matches its current state, so a rewrite would
+    /// only produce the same bytes again.
+    AlreadyCurrent,
+    Written,
+    Failed,
 }
 
+impl SearchIndexPersist {
+    fn succeeded(self) -> bool {
+        !matches!(self, Self::Failed)
+    }
+}
+
+/// Persist the index configure loaded. A cold build has already written
+/// `cache.bin`; rewriting it right away cost a second full publish (another
+/// copy of the file table and every posting streamed back through), so that
+/// write is skipped unless something changed since the build.
+fn persist_loaded_search_index(
+    index: &mut SearchIndex,
+    cache_dir: &Path,
+    git_head: Option<&str>,
+) -> SearchIndexPersist {
+    if index.disk_cache_is_current(cache_dir, git_head) {
+        return SearchIndexPersist::AlreadyCurrent;
+    }
+    if index.write_to_disk(cache_dir, git_head) {
+        SearchIndexPersist::Written
+    } else {
+        SearchIndexPersist::Failed
+    }
+}
+
+/// The index's file table, shared with the prewarm instead of copied. Entries
+/// with an empty path are files removed since the build and are skipped.
+type SearchIndexSymbolFiles = Arc<Vec<crate::search_index::FileEntry>>;
+
+fn search_index_symbol_files(index: &SearchIndex) -> SearchIndexSymbolFiles {
+    Arc::clone(&index.files)
+}
+
+/// When a symbol-cache prewarm should give up before visiting every file.
+/// The prewarm can run for a long time on a large root, so it stops between
+/// files when its configuration is replaced or its root has been unbound past
+/// the abandon grace. Idle eviction resets the symbol cache to a new
+/// generation, which the prewarm checks on every file as well.
+#[derive(Clone)]
+struct SymbolPrewarmStop {
+    lifecycle: crate::context::SubcLifecycleAdmission,
+    content_generation_flag: Arc<AtomicU64>,
+    content_generation: u64,
+}
+
+impl SymbolPrewarmStop {
+    fn requested(&self) -> bool {
+        if self.content_generation_flag.load(Ordering::SeqCst) != self.content_generation {
+            return true;
+        }
+        let mut abandoned = false;
+        self.lifecycle.cancel_if_abandoned(|| abandoned = true);
+        abandoned
+    }
+
+    #[cfg(test)]
+    fn never() -> Self {
+        Self {
+            lifecycle: crate::context::SubcLifecycleAdmission::default(),
+            content_generation_flag: Arc::new(AtomicU64::new(0)),
+            content_generation: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Called with the number of files visited so far, after each prewarm file.
+    static SYMBOL_PREWARM_AFTER_FILE: std::cell::RefCell<Option<Box<dyn FnMut(usize)>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_symbol_cache_prewarm(
     root: PathBuf,
     symbol_cache: SharedSymbolCache,
     symbol_storage: Option<PathBuf>,
     symbol_project_key: String,
     symbol_cache_generation: u64,
-    symbol_files: Vec<SearchIndexSymbolFile>,
+    symbol_files: SearchIndexSymbolFiles,
+    stop: SymbolPrewarmStop,
     is_worktree_bridge: bool,
     session_id: Option<String>,
 ) {
@@ -2925,6 +2999,7 @@ fn spawn_symbol_cache_prewarm(
                 symbol_project_key,
                 symbol_cache_generation,
                 symbol_files,
+                &stop,
                 is_worktree_bridge,
             );
         });
@@ -2940,13 +3015,15 @@ fn prewarm_symbol_cache_file(
     result.map(|(_, cache_changed)| cache_changed)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prewarm_symbol_cache_from_search_files(
     root: PathBuf,
     symbol_cache: SharedSymbolCache,
     symbol_storage: Option<PathBuf>,
     symbol_project_key: String,
     symbol_cache_generation: u64,
-    symbol_files: Vec<SearchIndexSymbolFile>,
+    symbol_files: SearchIndexSymbolFiles,
+    stop: &SymbolPrewarmStop,
     is_worktree_bridge: bool,
 ) {
     #[cfg(debug_assertions)]
@@ -2982,20 +3059,52 @@ fn prewarm_symbol_cache_from_search_files(
         symbol_cache.clone(),
         Some(symbol_cache_generation),
     );
-    for (path, modified) in &symbol_files {
-        let cached = symbol_cache
-            .read()
-            .map(|cache| cache.contains_path_with_mtime(path, *modified))
-            .unwrap_or(false);
-        if cached {
-            skipped_files += 1;
+    let mut stopped = false;
+    let mut visited = 0usize;
+    for entry in symbol_files.iter() {
+        if entry.path.as_os_str().is_empty() {
             continue;
         }
-        match prewarm_symbol_cache_file(&mut parser, path) {
-            Ok(true) => warmed_files += 1,
-            Ok(false) => skipped_files += 1,
-            Err(_) => {}
+        if stop.requested() {
+            stopped = true;
+            break;
         }
+        let cached = match symbol_cache.read() {
+            Ok(cache) if cache.generation() == symbol_cache_generation => {
+                cache.contains_path_with_mtime(&entry.path, entry.modified)
+            }
+            // A reset (idle eviction or a newer configure) replaced the
+            // cache this prewarm was filling; nothing it warms is kept.
+            _ => {
+                stopped = true;
+                break;
+            }
+        };
+        if cached {
+            skipped_files += 1;
+        } else {
+            match prewarm_symbol_cache_file(&mut parser, &entry.path) {
+                Ok(true) => warmed_files += 1,
+                Ok(false) => skipped_files += 1,
+                Err(_) => {}
+            }
+        }
+        visited += 1;
+        #[cfg(test)]
+        SYMBOL_PREWARM_AFTER_FILE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(visited);
+            }
+        });
+    }
+    // The file table can be the largest thing a large root holds; let it go
+    // as soon as the prewarm stops reading it, not after persistence.
+    drop(symbol_files);
+    if stopped {
+        slog_info!(
+            "symbol cache prewarm stopped after {} files: its root was released or reconfigured",
+            visited
+        );
     }
 
     let total_files = symbol_cache.read().map(|cache| cache.len()).unwrap_or(0);
@@ -3252,6 +3361,44 @@ fn walk_semantic_project_files_bounded(
 ) -> Result<Vec<PathBuf>, usize> {
     let filters = build_path_filters(&[], &[]).unwrap_or_default();
     walk_project_files_bounded_matching(root, &filters, max_files, is_semantic_indexed_extension)
+}
+
+#[cfg(test)]
+mod nested_worktree_semantic_tests {
+    use super::*;
+
+    #[test]
+    fn semantic_enumeration_skips_nested_linked_worktrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture =
+            crate::git_probe::init_repo_with_nested_worktree_for_test(dir.path(), "semantic");
+        let files = walk_semantic_project_files_bounded(&fixture.root, 1000)
+            .expect("fixture walk must complete")
+            .into_iter()
+            .map(|path| {
+                path.strip_prefix(&fixture.root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            files.contains("src/main.rs"),
+            "missing main file: {files:?}"
+        );
+        assert!(
+            files.contains("vendor/independent/inner.rs"),
+            "nested independent repository must still be walked: {files:?}"
+        );
+        assert!(
+            files.contains("submod/code.rs"),
+            "submodule-style checkout must still be walked: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|path| path.starts_with("linked/")),
+            "nested linked worktree files were enumerated: {files:?}"
+        );
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -6025,6 +6172,11 @@ fn schedule_artifact_loads_admitted(
                         }
                     }
                     let symbol_files = search_index_symbol_files(&index);
+                    let prewarm_stop = SymbolPrewarmStop {
+                        lifecycle: search_lifecycle.clone(),
+                        content_generation_flag: Arc::clone(&search_content_generation_flag),
+                        content_generation: search_content_generation,
+                    };
                     let pending_bytes = index.estimated_memory().estimated_bytes.unwrap_or(0);
                     let root_for_log = root_for_search.clone();
                     let published = search_lifecycle.run_if_current(
@@ -6039,6 +6191,7 @@ fn schedule_artifact_loads_admitted(
                                 symbol_project_key,
                                 symbol_cache_generation,
                                 symbol_files,
+                                prewarm_stop,
                                 true,
                                 log_ctx::current_session(),
                             );
@@ -6206,7 +6359,8 @@ fn schedule_artifact_loads_admitted(
                     let published =
                         search_persist_epoch_flag.run_if_current(search_persist_epoch, || {
                             let head = index.stored_git_head().map(str::to_owned);
-                            index.write_to_disk(&cache_dir, head.as_deref())
+                            persist_loaded_search_index(&mut index, &cache_dir, head.as_deref())
+                                .succeeded()
                         });
                     persistence_succeeded = published == Some(true);
                     if published.is_none() {
@@ -6225,6 +6379,11 @@ fn schedule_artifact_loads_admitted(
                     );
                 }
                 let symbol_files = search_index_symbol_files(&index);
+                let prewarm_stop = SymbolPrewarmStop {
+                    lifecycle: search_lifecycle.clone(),
+                    content_generation_flag: Arc::clone(&search_content_generation_flag),
+                    content_generation: search_content_generation,
+                };
                 let pending_bytes = index.estimated_memory().estimated_bytes.unwrap_or(0);
                 let root_for_log = root_for_search.clone();
                 let published = search_lifecycle.run_if_current(
@@ -6239,6 +6398,7 @@ fn schedule_artifact_loads_admitted(
                             symbol_project_key,
                             symbol_cache_generation,
                             symbol_files,
+                            prewarm_stop,
                             false,
                             log_ctx::current_session(),
                         );
@@ -9758,6 +9918,53 @@ fn callgraph_store_upgrade_required(ctx: &AppContext) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn issue1007_configure_skips_second_publish_only_when_nothing_pending() {
+        use super::{persist_loaded_search_index, SearchIndex, SearchIndexPersist};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("lib.rs"), "fn configured_marker() {}\n").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut index =
+            SearchIndex::build_with_limit_to_cache_dir(&root, 1024 * 1024, cache.path());
+        let head = index.stored_git_head().map(str::to_owned);
+        let written = std::fs::read(cache.path().join("cache.bin")).unwrap();
+
+        // Straight after a cold build the cache already holds this index.
+        assert_eq!(
+            persist_loaded_search_index(&mut index, cache.path(), head.as_deref()),
+            SearchIndexPersist::AlreadyCurrent
+        );
+        assert_eq!(
+            std::fs::read(cache.path().join("cache.bin")).unwrap(),
+            written
+        );
+
+        // A pending change is written, and only then is the cache current.
+        std::fs::write(root.join("added.rs"), "fn added_marker() {}\n").unwrap();
+        index.update_file(&root.join("added.rs"));
+        assert_eq!(
+            persist_loaded_search_index(&mut index, cache.path(), head.as_deref()),
+            SearchIndexPersist::Written
+        );
+        assert_ne!(
+            std::fs::read(cache.path().join("cache.bin")).unwrap(),
+            written
+        );
+        assert_eq!(
+            persist_loaded_search_index(&mut index, cache.path(), head.as_deref()),
+            SearchIndexPersist::AlreadyCurrent
+        );
+
+        // An index read back from disk did not write the cache, so it keeps
+        // the existing write.
+        let mut reloaded = SearchIndex::read_from_disk(cache.path(), &root).unwrap();
+        assert_eq!(
+            persist_loaded_search_index(&mut reloaded, cache.path(), head.as_deref()),
+            SearchIndexPersist::Written
+        );
+    }
+
+    #[test]
     fn semantic_refresh_debounce_caps_sustained_requests() {
         let started = std::time::Instant::now();
         let mut debounce =
@@ -10690,12 +10897,17 @@ mod tests {
             .expect("persist symbol cache fixture");
     }
 
-    fn symbol_file(path: &std::path::Path) -> super::SearchIndexSymbolFile {
+    fn symbol_file(path: &std::path::Path) -> crate::search_index::FileEntry {
         let modified = std::fs::metadata(path)
             .expect("stat source")
             .modified()
             .expect("source mtime");
-        (path.to_path_buf(), modified)
+        crate::search_index::FileEntry {
+            path: path.to_path_buf(),
+            size: 0,
+            modified,
+            content_hash: crate::cache_freshness::zero_hash(),
+        }
     }
 
     #[test]
@@ -10773,7 +10985,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let root = project.path().to_path_buf();
         let storage_dir = storage.path().to_path_buf();
-        let files = vec![symbol_file(&source)];
+        let files = Arc::new(vec![symbol_file(&source)]);
         let writer_cache = shared.clone();
         let writer = std::thread::spawn(move || {
             crate::symbol_cache_disk::observe_next_lock_acquisition(waiting_tx);
@@ -10784,6 +10996,7 @@ mod tests {
                 project_key.to_string(),
                 0,
                 files,
+                &super::SymbolPrewarmStop::never(),
                 false,
             );
             done_tx.send(()).expect("report prewarm completion");
@@ -10887,7 +11100,8 @@ mod tests {
             Some(storage.path().to_path_buf()),
             project_key.to_string(),
             0,
-            vec![symbol_file(&source)],
+            Arc::new(vec![symbol_file(&source)]),
+            &super::SymbolPrewarmStop::never(),
             false,
         );
 
@@ -10923,7 +11137,8 @@ mod tests {
             Some(storage.path().to_path_buf()),
             project_key.to_string(),
             0,
-            vec![symbol_file(&existing), symbol_file(&added)],
+            Arc::new(vec![symbol_file(&existing), symbol_file(&added)]),
+            &super::SymbolPrewarmStop::never(),
             false,
         );
 
@@ -10961,7 +11176,8 @@ mod tests {
             Some(storage.path().to_path_buf()),
             project_key.to_string(),
             0,
-            Vec::new(),
+            Arc::new(Vec::new()),
+            &super::SymbolPrewarmStop::never(),
             false,
         );
 
@@ -10969,6 +11185,119 @@ mod tests {
         let disk = crate::symbol_cache_disk::read_from_disk(storage.path(), project_key)
             .expect("read compacted cache");
         assert!(disk.is_empty());
+    }
+
+    #[test]
+    fn issue1007_symbol_prewarm_stops_between_files_and_releases_file_table() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::sync::atomic::AtomicU64;
+
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Trigger {
+            Nothing,
+            Reconfigure,
+            AbandonPastGrace,
+            IdleEviction,
+        }
+        const FILES: usize = 24;
+        const STOP_AFTER: usize = 3;
+
+        let _guard = symbol_cache_prewarm_test_mutex()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let project = tempfile::tempdir().expect("create project dir");
+        let sources: Vec<_> = (0..FILES)
+            .map(|index| {
+                write_symbol_cache_source(
+                    project.path(),
+                    &format!("src/file_{index:02}.rs"),
+                    &format!("pub fn prewarmed_{index}() {{}}\n"),
+                )
+            })
+            .collect();
+
+        for trigger in [
+            Trigger::Nothing,
+            Trigger::Reconfigure,
+            Trigger::AbandonPastGrace,
+            Trigger::IdleEviction,
+        ] {
+            let ctx = Rc::new(AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                Config::default(),
+            ));
+            // With no grace, an unbind is already past it when the prewarm
+            // next checks.
+            ctx.set_unbound_build_abandon_grace_for_test(Duration::ZERO);
+            let generation = ctx.reset_symbol_cache();
+            let content_generation = Arc::new(AtomicU64::new(7));
+            let stop = super::SymbolPrewarmStop {
+                lifecycle: ctx.subc_lifecycle_admission(),
+                content_generation_flag: Arc::clone(&content_generation),
+                content_generation: 7,
+            };
+            let files = Arc::new(sources.iter().map(|path| symbol_file(path)).collect());
+            let file_table = Arc::downgrade(&files);
+
+            let visited = Rc::new(Cell::new(0usize));
+            let hook_visited = Rc::clone(&visited);
+            let hook_ctx = Rc::clone(&ctx);
+            super::SYMBOL_PREWARM_AFTER_FILE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |count| {
+                    hook_visited.set(count);
+                    if count != STOP_AFTER {
+                        return;
+                    }
+                    match trigger {
+                        Trigger::Nothing => {}
+                        // A configure with different settings.
+                        Trigger::Reconfigure => {
+                            content_generation.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Trigger::AbandonPastGrace => hook_ctx.mark_subc_unbound(),
+                        // Idle eviction drops the root's artifacts by
+                        // resetting the symbol cache to a new generation.
+                        Trigger::IdleEviction => {
+                            hook_ctx.reset_symbol_cache();
+                        }
+                    }
+                }));
+            });
+            super::prewarm_symbol_cache_from_search_files(
+                project.path().to_path_buf(),
+                ctx.symbol_cache(),
+                None,
+                "prewarm-stop".to_string(),
+                generation,
+                files,
+                &stop,
+                true,
+            );
+            super::SYMBOL_PREWARM_AFTER_FILE.with(|hook| *hook.borrow_mut() = None);
+
+            let expected_visits = if trigger == Trigger::Nothing {
+                FILES
+            } else {
+                STOP_AFTER
+            };
+            assert_eq!(
+                visited.get(),
+                expected_visits,
+                "{trigger:?}: the prewarm must stop before the next file"
+            );
+            assert!(
+                file_table.upgrade().is_none(),
+                "{trigger:?}: the prewarm must release the shared file table"
+            );
+            let cached = ctx.symbol_cache().read().unwrap().len();
+            let expected_cached = match trigger {
+                Trigger::Nothing => FILES,
+                Trigger::IdleEviction => 0,
+                Trigger::Reconfigure | Trigger::AbandonPastGrace => STOP_AFTER,
+            };
+            assert_eq!(cached, expected_cached, "{trigger:?}");
+        }
     }
 
     struct EnvVarGuard {

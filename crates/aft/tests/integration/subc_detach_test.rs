@@ -847,6 +847,11 @@ fn drain_with_live_lsp_servers_and_writer(
         if writer_delay == "1000" {
             assert!(log.contains("phase=log_flush_done flushed=false"),
                 "slow writer must exhaust the async flush budget: {}", log_tail(&log));
+            // The terminal marker is mirrored to stderr after the queued
+            // flush; the stderr exit fence must deliver it there as well as
+            // to the durable file checked below.
+            assert!(log.contains("subc exit phase=process_exit mode="),
+                "stderr exit fence must deliver the terminal marker: {}", log_tail(&log));
         }
         // Print phase and LSP summary lines. The bound below uses the LSP
         // phase's own elapsed value, never the outer process-exit observation.
@@ -1185,6 +1190,11 @@ impl ModuleProcess {
             // A writer this slow cannot acknowledge a flush inside the exit
             // budget, wherever in its batch delay the request lands.
             command.env("AFT_TEST_LOG_FLUSH_HOLD_MS", hold);
+            // Keep the stderr mirror from writing the exit's last lines until
+            // the stderr exit fence starts, so the stderr assertions prove the
+            // fence delivers them instead of depending on the mirror thread
+            // being scheduled before the process exits.
+            command.env("AFT_TEST_STDERR_EXIT_HOLD", "1");
         }
         if let Some(bin_dir) = bin_dir {
             // The test supplies its language servers through `bin_dir`. An

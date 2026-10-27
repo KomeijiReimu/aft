@@ -5738,6 +5738,26 @@ async fn runon_sends_the_whole_compound_line_remote_exactly_as_written() {
 }
 
 #[tokio::test]
+async fn runon_macos_reaches_the_wire_request_as_macos_platform() {
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({"command": "uname -a", "runon": "macos", "compressed": false}),
+    );
+    assert!(response.success, "{response:?}");
+    let task_id = response.data["task_id"].as_str().unwrap().to_string();
+    let _done = terminal(ctx.bash_background(), &task_id).await;
+    let runs = exec_runs(&daemon);
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0]["platform"], "macos");
+    assert!(runs[0].get("weight_hint").is_none(), "{runs:?}");
+    assert!(runs[0].get("network").is_none(), "{runs:?}");
+}
+
+#[tokio::test]
 async fn runon_vcpu_count_is_sent_as_weight_hint_on_the_wire() {
     let daemon = daemon(Script::Plain, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
@@ -5798,6 +5818,9 @@ async fn malformed_runon_vcpu_requests_are_refused_before_dispatch() {
         "windows,4c",
         "windows,net",
         "windows,wat",
+        "macos,4c",
+        "macos,net",
+        "macos,wat",
     ] {
         let response = handle_with_policy(
             &restarted_context(dir.path()),
@@ -5807,9 +5830,9 @@ async fn malformed_runon_vcpu_requests_are_refused_before_dispatch() {
         assert!(!response.success, "{runon}: {response:?}");
         let message = response.data["message"].as_str().unwrap_or_default();
         assert!(message.contains(runon), "{runon}: {response:?}");
-        let reason = if runon == "windows,4c" {
+        let reason = if runon == "windows,4c" || runon == "macos,4c" {
             "fixed at 4 vCPUs"
-        } else if runon == "windows,net" {
+        } else if runon == "windows,net" || runon == "macos,net" {
             "no network"
         } else {
             "not valid"
@@ -9500,6 +9523,91 @@ async fn concurrent_stop_and_registration_of_a_shared_task_never_deadlock() {
             .filter(|completion| completion.task_id == task_id)
             .count();
         assert_eq!(completions, 1, "round {round}: completions for {task_id}");
+        assert_paused(&project, &task_id);
+        recovery.detach();
+        project.detach();
+    }
+}
+
+/// Repeated owner stops can replace metadata during every optimistic replay
+/// open. A busy writer is not a corrupt task: replay must still register it
+/// and deliver its stop, even when the bounded open retries are exhausted.
+#[tokio::test]
+async fn a_stop_racing_every_replay_metadata_open_still_delivers_one_completion() {
+    use std::os::unix::fs::MetadataExt;
+
+    // Disk discovery resolves then reads metadata (skip 0/1); the batch's
+    // revalidation repeats those opens (skip 2/3). Project-scoped discovery
+    // reads metadata directly after resolving directories (skip 0, true).
+    for (skip_metadata_opens, project_scoped) in
+        [(1, false), (0, false), (2, false), (3, false), (0, true)]
+    {
+        let open_attempts = crate::bash_background::persistence::metadata_open_attempts_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let scope = owner_scope(&format!(
+            "stop-during-replay-metadata-open-{skip_metadata_opens}-{project_scoped}"
+        ));
+        let (_daemon, _clock, task_id, json) =
+            saved_due_draining_retry(dir.path(), &scope, u32::MAX).await;
+        let (recovered, errors) =
+            BgTaskRegistry::recover_saved_scope_tasks(dir.path(), &scope, &[]);
+        assert!(errors.is_empty(), "{errors:?}");
+        let recovery = recovered.into_iter().next().unwrap();
+        let project = registry();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let registration = {
+            let (project, storage) = (project.clone(), dir.path().to_path_buf());
+            std::thread::spawn(move || {
+                let mut metadata_opens = 0;
+                crate::bash_background::persistence::with_artifact_validation_hook_for_test(
+                    move |file| {
+                        let opened = file.metadata().unwrap();
+                        let current = fs::metadata(&json).unwrap();
+                        if (opened.dev(), opened.ino()) != (current.dev(), current.ino()) {
+                            return;
+                        }
+                        metadata_opens += 1;
+                        // Pause with the old metadata open, before its link count
+                        // is checked. Each owner write unlinks that exact handle.
+                        if (skip_metadata_opens + 1..=skip_metadata_opens + open_attempts)
+                            .contains(&metadata_opens)
+                        {
+                            reached_tx
+                                .send(metadata_opens - skip_metadata_opens)
+                                .unwrap();
+                            release_rx
+                                .recv_timeout(Duration::from_secs(30))
+                                .expect("the owner must release the metadata reader");
+                        }
+                    },
+                    || {
+                        if project_scoped {
+                            project.replay_session_for_project(&storage, "session", &storage)
+                        } else {
+                            project.replay_session(&storage, "session")
+                        }
+                    },
+                )
+            })
+        };
+        for attempt in 1..=open_attempts {
+            assert_eq!(
+                reached_rx.recv_timeout(Duration::from_secs(30)).unwrap(),
+                attempt
+            );
+            if attempt < open_attempts {
+                recovery
+                    .record_owner_pause_intent(&recovery.task(&task_id).unwrap())
+                    .unwrap();
+            } else {
+                let members = recovery.begin_scope_pause(&scope).unwrap();
+                recovery.pause_scope(&scope, true, &members).unwrap();
+            }
+            release_tx.send(()).unwrap();
+        }
+        registration.join().unwrap().unwrap();
+        assert_project_told_of_the_stop_once(&project, &task_id);
         assert_paused(&project, &task_id);
         recovery.detach();
         project.detach();

@@ -351,6 +351,11 @@ fn startup_replay_preserves_reader_instance() {
         key(dir.path()),
         StartReservation {
             instance,
+            definition: None,
+            source_file: None,
+            notification_versions: Default::default(),
+            pending_notifications: Default::default(),
+            replay_pid: None,
             deferred_events: Vec::new(),
             clients_generation: manager.clients_generation,
             signal: Arc::new(StartSignal::default()),

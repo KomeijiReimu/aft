@@ -132,12 +132,19 @@ fn collect_watched_file_events(manager: &mut LspManager) -> serde_json::Value {
 }
 
 fn collect_watched_file_events_from_ctx(ctx: &AppContext) -> serde_json::Value {
-    let event = collect_event(&mut ctx.lsp(), |event| {
-        matches!(
-            event,
-            LspEvent::Notification { method, .. } if method == "custom/watchedFilesChanged"
-        )
-    })
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let event = loop {
+        // An asynchronous post-write hook may need this manager to send its
+        // queued changes. Do not retain the guard while waiting for its notification.
+        let drained = ctx.lsp().drain_events();
+        if let Some(event) = drained.into_iter().find(|event| matches!(
+            event, LspEvent::Notification { method, .. } if method == "custom/watchedFilesChanged"
+        )) { break Some(event); }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
     .unwrap_or_else(|| {
         #[cfg(windows)]
         panic!(
@@ -260,9 +267,9 @@ fn pyright_diagnostics_for(
     // Start the server first so its startup does not use up the edit's
     // diagnostics budget, which production caps at 10 seconds.
     assert!(
-        !ctx.lsp()
-            .ensure_server_for_file(file, &ctx.config())
-            .is_empty(),
+        !crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| startup_manager
+            .ensure_server_for_file(file, &ctx.config()))
+        .is_empty(),
         "pyright should start for the fixture before diagnostics can be checked"
     );
 
@@ -484,9 +491,9 @@ fn pyright_edit_error_reaches_status_bar_alert_source_and_inline_diagnostics() {
         "configure failed: {configured:#}"
     );
     assert!(
-        !ctx.lsp()
-            .ensure_server_for_file(&file, &ctx.config())
-            .is_empty(),
+        !crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| startup_manager
+            .ensure_server_for_file(&file, &ctx.config()))
+        .is_empty(),
         "pyright should start for the fixture"
     );
 
@@ -2079,7 +2086,10 @@ fn test_ensure_file_open_detects_disk_drift() {
 
     let mut manager = manager_with_fake_server();
     // Open the file the first time.
-    manager.ensure_file_open(file, &config).expect("first open");
+    crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_file_open(file, &config)
+    })
+    .expect("first open");
 
     let original_mtime = fs::metadata(file).unwrap().modified().unwrap();
 
@@ -2096,9 +2106,10 @@ fn test_ensure_file_open_detects_disk_drift() {
     // Drain anything queued and then re-open. Should re-sync (didChange).
     let _ = manager.drain_events();
 
-    manager
-        .ensure_file_open(file, &config)
-        .expect("re-open after drift");
+    crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_file_open(file, &config)
+    })
+    .expect("re-open after drift");
 
     // The fake server emits "custom/documentChanged" on didChange. If
     // ensure_file_open detected drift, that notification arrives.
@@ -3497,7 +3508,9 @@ fn workspace_unchanged_reply_does_not_relabel_an_interleaved_report() {
         ] {
             manager.set_extra_env(name, "1");
         }
-        let keys = manager.ensure_server_for_file(&files[0], &config);
+        let keys = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+            startup_manager.ensure_server_for_file(&files[0], &config)
+        });
         assert_eq!(keys.len(), 1, "workspace producer must start");
         let key = &keys[0];
         let file = key.root.join("src/main.rs");

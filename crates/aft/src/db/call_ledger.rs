@@ -899,8 +899,34 @@ pub fn ack_through(
     ack(conn, custodian, through.seq).map(Ok)
 }
 
+/// Whether this process admits keyed tool-provider calls and therefore owns
+/// restart recovery of the call ledger. Only the subc module admits ledger
+/// rows; standalone sessions and CLI commands share the same aft.db but never
+/// write a row, so they must not settle the module's in-flight calls. Unit
+/// tests run as a provider so their direct ledger fixtures keep recovering.
+static LEDGER_PROVIDER_PROCESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(cfg!(test));
+
+/// Marks this process as the call ledger's provider. The subc module calls it
+/// before it can open a database, so its first pool runs restart recovery.
+pub fn mark_provider_process() {
+    LEDGER_PROVIDER_PROCESS.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn is_provider_process() -> bool {
+    LEDGER_PROVIDER_PROCESS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Called once when a process installs its database, before admitting calls.
 /// A dispatch with a durable task is observed, never re-sent.
+///
+/// Recovery settles every unsettled row in the file. Rows record no owning
+/// process, so this is correct only while one module process owns a given
+/// aft.db's call ledger: a second module sharing the file would have its
+/// in-flight calls settled here as not_started or unknown. A change that lets
+/// two modules share one storage root must first add an owner column and limit
+/// recovery to rows whose owner is gone. Processes that never admit calls skip
+/// recovery entirely (see [`recover_pool_once`]).
 pub fn recover(conn: &Connection) -> rusqlite::Result<()> {
     let mut stmt =
         conn.prepare("SELECT carrier,call_key FROM call_ledger WHERE state!='Settled'")?;
@@ -953,9 +979,16 @@ pub fn recover(conn: &Connection) -> rusqlite::Result<()> {
 /// Project actors share the tracked connection. Attaching a second registry
 /// to that connection is not a provider restart. Weak references also avoid
 /// keeping closed databases alive or confusing a reused allocation address.
+///
+/// Does nothing outside the provider process: a standalone session opening
+/// the shared aft.db has no ledger rows of its own, and every unsettled row
+/// there may belong to a module that is still running the call.
 pub fn recover_pool_once(
     pool: &std::sync::Arc<std::sync::Mutex<super::TrackedConnection>>,
 ) -> rusqlite::Result<()> {
+    if !is_provider_process() {
+        return Ok(());
+    }
     type Pool = std::sync::Mutex<super::TrackedConnection>;
     static RECOVERED: std::sync::LazyLock<std::sync::Mutex<Vec<std::sync::Weak<Pool>>>> =
         std::sync::LazyLock::new(Default::default);

@@ -222,6 +222,10 @@ pub(crate) fn sweep_scoped_files(
             return sweep;
         }
     }
+    // Watcher changes still queued for the manager lock (an edit made by
+    // another program, say) have not reached the servers, which would
+    // otherwise be read as if they had analyzed the files as they are now.
+    ctx.lsp_forward_queued_watcher_changes();
     // A check an earlier request expected and that never began is asked for
     // again now, so it can run while the files are opened.
     {

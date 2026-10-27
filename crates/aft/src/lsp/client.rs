@@ -1974,14 +1974,21 @@ impl LspClient {
     /// published so far describe the files before the save; see
     /// [`Self::rust_check_state`].
     pub(crate) fn record_save_sent(&mut self, uri: &lsp_types::Uri) {
+        self.record_save_sent_at(
+            uri,
+            Instant::now(),
+            self.rust_check_begins_read.load(Ordering::SeqCst),
+        );
+    }
+
+    fn record_save_sent_at(&mut self, uri: &lsp_types::Uri, at: Instant, begins_read: u64) {
         if self.rust_checks_on_save {
-            let now = Instant::now();
             self.rust_save = Some(RustSaveRequest {
                 uri: uri.clone(),
                 due_at: None,
-                last_sent_at: Some(now),
+                last_sent_at: Some(at),
                 sends: 1,
-                begins_read_at_send: Some(self.rust_check_begins_read.load(Ordering::SeqCst)),
+                begins_read_at_send: Some(begins_read),
             });
         }
     }
@@ -2296,6 +2303,38 @@ impl LspClient {
             writer: self.writer.clone(),
             received_before_request,
         })
+    }
+
+    /// Clone the installed writer and rust-analyzer check-begin counter for
+    /// startup replay. The worker captures each save's write time and current
+    /// counter value without waiting for the manager lock.
+    pub(crate) fn startup_notification_writer(
+        &self,
+    ) -> Result<(LspWriter, Arc<AtomicU64>), LspError> {
+        self.ensure_can_send()?;
+        Ok((
+            self.writer.clone(),
+            Arc::clone(&self.rust_check_begins_read),
+        ))
+    }
+
+    pub(crate) fn record_startup_sync(
+        &mut self,
+        uri: &lsp_types::Uri,
+        opened: bool,
+        saved: Option<(Instant, u64)>,
+    ) {
+        self.note_analysis_document(
+            if opened {
+                "textDocument/didOpen"
+            } else {
+                "textDocument/didChange"
+            },
+            &json!({"textDocument": {"uri": uri.as_str()}}),
+        );
+        if let Some((at, begins_read)) = saved {
+            self.record_save_sent_at(uri, at, begins_read);
+        }
     }
 
     /// Send a notification (fire-and-forget).

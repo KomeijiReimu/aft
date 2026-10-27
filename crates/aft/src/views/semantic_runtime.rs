@@ -622,11 +622,30 @@ impl CheckoutSemantic {
             .map_err(|error| error.to_string())
     }
 
-    /// The index this checkout last built, possibly for an older snapshot,
-    /// without building anything. Readiness reports use it: they run on the
-    /// search path and only need to know that an index is being served.
-    pub fn cached_index(&self) -> Option<Arc<SemanticIndex>> {
-        self.plane.cached_index(&self.access)
+    /// The index searches score for the installed snapshot, for the search
+    /// engine's readiness snapshot. Returns the one already built for that
+    /// snapshot, even when later fills made it out of date, so a sample
+    /// normally builds nothing. It builds one only when the installed snapshot
+    /// has none yet: right after a fill is published and installed, before the
+    /// worker rebuilds it, or for a borrower's fresh reader binding. Reporting
+    /// no index there would make the engine plan no semantic lane and answer
+    /// with lexical hits alone, and the search that follows would build the
+    /// same index anyway.
+    ///
+    /// The lookup goes through the installed snapshot's reader binding, which
+    /// is where `search` caches its index. The owner's scope-wide state can
+    /// differ: a publication replaces it while held snapshots keep the state
+    /// they were bound to.
+    pub fn serving_index(&self) -> Option<Arc<SemanticIndex>> {
+        let installed = self.installed();
+        self.plane
+            .cached_index_for(&self.access, &installed)
+            .or_else(|| {
+                self.plane
+                    .overlay(&self.access, &self.root, &installed)
+                    .ok()
+                    .map(|overlay| overlay.index)
+            })
     }
 
     /// Resident bytes this checkout accounts for: the family arena (shared

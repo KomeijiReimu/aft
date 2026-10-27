@@ -786,27 +786,49 @@ pub fn prepare_checkout_deferring(
     let stamps = manifest_incremental::StoreStamps::read(&callgraph, &semantic)?;
     let admission = manifest_incremental::admission_snapshot(&request.storage);
     let trusted = cached.as_ref().filter(|cached| cached.stamps == stamps);
-    // Directory notifications may be the only evidence for changed, removed,
-    // or renamed children. Read their whole HEAD subtree rather than treating
-    // its cached members as individually observed unchanged files.
-    let rebuild_all = request.changed_paths.is_empty()
+    // A watcher batch reads again only what it names: named members, and every
+    // member under a named HEAD directory, since a directory notification may
+    // be the only evidence for changed, removed or renamed children. Every
+    // other member keeps its previous entry. The whole checkout is read when
+    // there is no batch (a rescan, an ignore-rule change, a periodic
+    // verification), when HEAD or the index moved since the cached manifest,
+    // and when the batch names no member or HEAD directory, or names a path
+    // that may be a member under another spelling.
+    let reread_directories = if request.changed_paths.is_empty()
         || !head_cached
         || cached
             .as_ref()
             .is_none_or(|cached| cached.tree != head_tree)
-        || manifest_incremental::delta_requires_full_read(
+    {
+        None
+    } else {
+        manifest_incremental::checkout_delta_scope(
+            request,
             &head,
             &head_paths,
-            &request.changed_paths,
-        );
-    // A batch naming no HEAD member is not evidence that the checkout was
-    // observed completely; preserve the full metadata/probe path in that case.
+            head_snapshot.as_ref(),
+        )
+    };
+    let rebuild_all = reread_directories.is_none();
+    let reread_directories = reread_directories.unwrap_or_default();
+    let reread = |path: &[u8]| {
+        request.changed_paths.contains(path)
+            || manifest_incremental::within_directories(&reread_directories, path)
+    };
+    // Cached metadata stands in for a stat only when the stores and the
+    // registry of live databases are unchanged since the cached manifest.
     let incremental = !rebuild_all
         && trusted.is_some()
         && cached
             .as_ref()
             .is_some_and(|cached| cached.admission == admission);
-    let verify = verification_due && previous.is_some();
+    // A periodic verification checks the incremental claims against a fresh
+    // full read. When this publication listed HEAD afresh and read every member
+    // anyway (no batch, or the HEAD listing was not reusable), it makes no
+    // incremental claim: reading the checkout a second time would only repeat
+    // the same read, and an unchanged result is then a no-op below like any
+    // other identical manifest.
+    let verify = verification_due && previous.is_some() && !(rebuild_all && !head_cached);
     let assembly_started = Instant::now();
     let mut blocking_paths = BTreeSet::new();
     let mut semantic_pending_paths = BTreeSet::new();
@@ -843,11 +865,7 @@ pub fn prepare_checkout_deferring(
         let cached_metadata = cached
             .as_ref()
             .and_then(|cached| cached.metadata.get(&tracked.rel_path))
-            .filter(|metadata| {
-                incremental
-                    && !request.changed_paths.contains(&tracked.rel_path)
-                    && metadata.is_file()
-            });
+            .filter(|metadata| incremental && !reread(&tracked.rel_path) && metadata.is_file());
         let excluded = match cached_metadata {
             Some(metadata) => {
                 crate::project_content::is_excluded_event(&absolute)
@@ -878,7 +896,7 @@ pub fn prepare_checkout_deferring(
             };
             member_metadata.insert(tracked.rel_path.clone(), metadata);
         }
-        if !rebuild_all && !request.changed_paths.contains(&tracked.rel_path) {
+        if !rebuild_all && !reread(&tracked.rel_path) {
             if let Some(entry) = previous
                 .as_ref()
                 .and_then(|manifest| manifest.get(&rel_path))

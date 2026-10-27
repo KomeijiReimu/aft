@@ -520,16 +520,19 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
         ) {
             Some(status) => {
                 let status = status.clone();
-                // A views-on root reports its checkout view's last built
-                // index. A readiness sample runs on the search path, so it
-                // never builds one: the fill worker builds it before the
-                // lane is served and after every fill, and a search builds
-                // it if it is still out of date. Views-off roots never have
-                // a checkout view.
+                // A views-on root reports the index its checkout view serves
+                // for the installed snapshot. The fill worker builds it
+                // before the lane is served and after every fill, so a sample
+                // normally finds it built, possibly out of date (the search
+                // itself rebuilds an out-of-date one). Between a publication
+                // and the worker's rebuild there is none; `serving_index`
+                // then builds it, because without a snapshot the semantic
+                // lane would silently drop out of this search. Views-off
+                // roots never have a checkout view.
                 let checkout_index = matches!(status, SemanticIndexStatus::Ready { .. })
                     .then(|| self.ctx.checkout_semantic_runtime())
                     .flatten()
-                    .and_then(|runtime| runtime.cached_index());
+                    .and_then(|runtime| runtime.serving_index());
                 if let Some(index) = checkout_index {
                     SemanticReadiness {
                         status,
@@ -7202,6 +7205,9 @@ fn collect_degraded_grep_files(
     // abort the daemon if a disappearing child mount reports ENXIO.
     let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
     let boundary = crate::walk_boundary::DeviceBoundary::for_root(project_root).ok();
+    // Skip nested linked worktrees of this repository; the walk root itself is
+    // always admitted (depth 0).
+    let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(project_root);
     let mut builder = ignore::WalkBuilder::new(project_root);
     builder.same_file_system(true).hidden(false);
     let walker = crate::context::apply_project_ignore_rules(&mut builder, project_root)
@@ -7224,7 +7230,8 @@ fn collect_degraded_grep_files(
                 if crate::project_content::is_excluded_with_file_type(
                     entry.path(),
                     file_type.as_ref(),
-                ) {
+                ) || crate::search_index::is_nested_worktree_entry(entry, &worktrees)
+                {
                     return false;
                 }
                 let name = entry.file_name().to_string_lossy();
@@ -9953,8 +9960,8 @@ mod tests {
     }
 
     /// A readiness sample runs on the search path, so it reports the views-on
-    /// checkout index the worker last built and never builds one, even when
-    /// that index is out of date for the installed snapshot.
+    /// checkout index the worker last built for the installed snapshot and
+    /// does not rebuild it, even when that index is out of date.
     #[test]
     fn readiness_sample_never_builds_the_checkout_semantic_index() {
         use extensions::ReadinessSource as _;
@@ -10006,6 +10013,72 @@ mod tests {
             runtime.plane().overlay_builds(),
             builds,
             "a readiness sample built the checkout semantic index"
+        );
+    }
+
+    /// After a fill is folded into a new generation, the worker installs that
+    /// generation before it rebuilds the scored index. A search in that window
+    /// must still see the views-on semantic lane as ready: with no snapshot the
+    /// engine plans no semantic lane and answers lexical hits only, with no
+    /// symbol names or previews, while the reply still says `semantic: ready`.
+    #[test]
+    fn readiness_sample_serves_a_freshly_published_checkout_view() {
+        use extensions::ReadinessSource as _;
+        let project = tempfile::tempdir().expect("project");
+        let storage = tempfile::tempdir().expect("storage");
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn needle() -> u8 {\n    1\n}\n").unwrap();
+        let ctx = test_context(&root);
+        let slot = ctx.checkout_semantic();
+        let (epoch, _wake) = slot.begin();
+        let runtime = Arc::new(
+            crate::views::semantic_runtime::CheckoutSemantic::new(
+                &crate::root_cache::StoragePaths::same(storage.path()),
+                "family",
+                "scope",
+                &root,
+                crate::views::semantic::SemanticProducer::current(
+                    "readiness-model",
+                    crate::semantic_index::EmbedTextCaps::default(),
+                ),
+                Arc::downgrade(slot),
+            )
+            .unwrap(),
+        );
+        runtime.load().unwrap();
+        // Fill and fold, which publishes and installs a new generation, without
+        // the scored-index rebuild the worker runs afterwards.
+        let published_before = runtime.installed().generation().name().to_owned();
+        runtime
+            .refresh(
+                crate::views::semantic::FillBudget::default(),
+                &mut |texts: Vec<String>| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
+            )
+            .unwrap();
+        assert_ne!(
+            runtime.installed().generation().name(),
+            published_before,
+            "the fill must publish a new generation"
+        );
+        assert!(slot.install(epoch, Arc::clone(&runtime)));
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
+
+        let source = RuntimeReadinessSource { ctx: &ctx };
+        let observation = source.sample();
+        let sampled = observation
+            .semantic
+            .snapshot
+            .as_ref()
+            .and_then(extensions::SemanticSnapshot::index)
+            .map(|index| index as *const crate::semantic_index::SemanticIndex);
+        assert!(
+            sampled.is_some(),
+            "a freshly published checkout view must report as ready"
+        );
+        assert_eq!(
+            sampled,
+            Some(Arc::as_ptr(&runtime.index().unwrap())),
+            "readiness must hold the index that search scores for the installed snapshot"
         );
     }
 
@@ -13066,7 +13139,7 @@ mod tests {
             .expect("initialize external git fixture");
         assert!(git_status.success());
         let storage = tempfile::tempdir().expect("storage");
-        for file_index in 0..64 {
+        for file_index in 0..8 {
             let file = external_root.join(format!(
                 "packages/pkg_{}/src/module_{file_index}.rs",
                 file_index % 8
@@ -13101,7 +13174,7 @@ mod tests {
         );
         assert_eq!(first["success"], true, "initial borrow failed: {first:?}");
 
-        for file_index in 0..40 {
+        for file_index in 0..8 {
             let file = external_root.join(format!(
                 "packages/pkg_{}/src/module_{file_index}.rs",
                 file_index % 8
@@ -13115,16 +13188,30 @@ mod tests {
         let mut rebuilt = SearchIndex::build(&external_root);
         rebuilt.write_to_disk(&cache_dir, None);
 
-        let started = Instant::now();
+        // The churned generation holds 8 files, inside the 10-entry budget
+        // below, while its trigram lookup table holds far more entries, so
+        // the reload reads the 8 file entries and then stops at the entry
+        // budget. The time budget is generous on purpose: with time unable
+        // to stop the reload, a count inside 1..=10 proves the entry budget
+        // is what stopped it. The lower bound matters too: a probe that
+        // never saw the reload (for example a root-key mismatch) reads 0
+        // and fails loudly instead of passing vacuously. Elapsed time
+        // cannot show any of this on a loaded runner, where the whole
+        // search can exceed 1 s even when the reload itself stopped
+        // immediately.
+        let records =
+            crate::search_index::observe_borrowed_load_records_read_for_test(&external_root);
         let degraded = crate::readonly_artifacts::with_borrowed_search_load_limits_for_test(
             10,
-            Duration::from_secs(5),
+            Duration::from_secs(60),
             || response_value(handle_semantic_search(&req, &ctx)),
         );
+        crate::search_index::unobserve_borrowed_load_records_read_for_test(&external_root);
 
         assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "churned generation must stop at the borrowed-load budget"
+            (1..=10).contains(&records.load(Ordering::SeqCst)),
+            "churned generation must stop at the borrowed-load entry budget, read {} records",
+            records.load(Ordering::SeqCst)
         );
         assert_eq!(degraded["success"], true);
         assert_ne!(degraded["fully_degraded"], true);
@@ -15117,15 +15204,28 @@ mod tests {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let started = std::time::Instant::now();
-        let response = response_value(handle_semantic_search(
-            &semantic_request("contention_marker", 5),
-            &ctx,
-        ));
+        // A first-search wait far longer than the time bound below: if the
+        // search ever waited out that budget on the writer-held index instead
+        // of degrading at once, the bound fails.
+        let response =
+            with_first_search_index_load_wait_budget_for_test(Duration::from_secs(120), || {
+                response_value(handle_semantic_search(
+                    &semantic_request("contention_marker", 5),
+                    &ctx,
+                ))
+            });
         drop(writer_guard);
 
+        // The property is that a contended index degrades with a disclosure
+        // instead of blocking: this thread holds the write lock until the
+        // search returns, so a search that blocked on it would never return,
+        // and one that waited out the first-search budget would take 120 s.
+        // The bound sits far above the product's per-read 250 ms artifact
+        // budget so that a loaded runner's slowness cannot fail it.
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "contended search exceeded bounded response time"
+            elapsed < Duration::from_secs(30),
+            "contended search took {elapsed:?}, far past its bounded response time: {response:#?}"
         );
         assert_eq!(response["success"], true);
         assert_eq!(response["lexical_only_fallback"], true);
@@ -15912,27 +16012,45 @@ mod split_request_tests {
                 save_external_index(&root, storage.path());
             }
             let ctx = external_context(session.path(), storage.path(), false);
-            let response = search(
-                &ctx,
-                serde_json::json!({
-                    "query": "the scheduler drains the work queue", "pattern": "drain_now", "path": root,
-                }),
-            );
+            // This test ranks a pattern definition after its host; the
+            // borrowed-load, disk-check and first-search waits it does not
+            // test run generous here so a loaded runner cannot truncate the
+            // file list being ranked.
+            let search_split = |params: serde_json::Value| {
+                crate::readonly_artifacts::with_borrowed_search_load_limits_for_test(
+                    1_000_000,
+                    Duration::from_secs(30),
+                    || {
+                        external_disk_check::with_budgets_for_test(
+                            Duration::from_secs(30),
+                            Duration::from_secs(30),
+                            || {
+                                with_first_search_index_load_wait_budget_for_test(
+                                    Duration::from_secs(30),
+                                    || search(&ctx, params),
+                                )
+                            },
+                        )
+                    },
+                )
+            };
+            let response = search_split(serde_json::json!({
+                "query": "the scheduler drains the work queue", "pattern": "drain_now", "path": root,
+            }));
             assert_eq!(response["success"], true, "{response}");
             let files = file_names(&response);
-            let host = files.iter().position(|name| name == "p3.rs").unwrap();
+            let Some(host) = files.iter().position(|name| name == "p3.rs") else {
+                panic!("host p3.rs missing from results: {response}");
+            };
             assert_eq!(files[host + 1], "defines.rs", "{response}");
             assert!(response["results"][host + 1]["supports"]
                 .as_str()
                 .unwrap()
                 .ends_with("p3.rs"));
-            let page = search(
-                &ctx,
-                serde_json::json!({
-                    "query": "the scheduler drains the work queue", "pattern": "drain_now", "path": root,
-                    "offset": host, "topK": 2,
-                }),
-            );
+            let page = search_split(serde_json::json!({
+                "query": "the scheduler drains the work queue", "pattern": "drain_now", "path": root,
+                "offset": host, "topK": 2,
+            }));
             assert_eq!(file_names(&page), ["p3.rs", "defines.rs"], "{page}");
         }
     }

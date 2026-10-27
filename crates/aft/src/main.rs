@@ -406,6 +406,14 @@ fn main() {
                     aft::subc::exit_elapsed().as_millis()
                 );
                 let flushed = aft::logging::flush_durable_log(flush_wait);
+                // AFT_TEST_STDERR_EXIT_HOLD keeps every stderr line from here
+                // on queued until the stderr exit fence below starts, so a test
+                // can prove the fence delivers them rather than rely on the
+                // mirror thread happening to run first. Release builds ignore it.
+                #[cfg(debug_assertions)]
+                if std::env::var_os("AFT_TEST_STDERR_EXIT_HOLD").is_some() {
+                    aft::logging::hold_stderr_mirror_until_exit_fence();
+                }
                 aft::slog_info!(
                     "subc exit phase=log_flush_done flushed={} elapsed_ms={}",
                     flushed,
@@ -1391,7 +1399,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
 
 fn dispatch_on_route(req: RawRequest, ctx: &AppContext) -> Response {
     if req.worker_session() {
-        ctx.lsp().disable_rust_cargo_for_worker();
+        ctx.disable_rust_cargo_for_worker();
     }
     if ctx.claim_database_runtime_retry(&req.command) {
         ctx.retry_database_runtime();
@@ -1758,7 +1766,7 @@ fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
 
 fn dispatch_outcome_on_route(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
     if req.worker_session() {
-        ctx.lsp().disable_rust_cargo_for_worker();
+        ctx.disable_rust_cargo_for_worker();
     }
     // The request is admitted here: pin the published config so every handler
     // below, and every worker thread a deferred handler starts, uses this

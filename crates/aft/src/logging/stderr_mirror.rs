@@ -49,10 +49,44 @@ enum Message {
     Drain(SyncSender<bool>),
 }
 
+/// Test-only (debug builds): parks the worker so that records logged during
+/// process exit are still queued when the exit fence starts. That is the
+/// state a busy host can leave them in when the process exits right after
+/// logging them, and the fence must still deliver them.
+#[cfg(debug_assertions)]
+#[derive(Default)]
+struct ExitHold {
+    armed: std::sync::Mutex<bool>,
+    released: std::sync::Condvar,
+}
+
+#[cfg(debug_assertions)]
+impl ExitHold {
+    fn arm(&self) {
+        *self.armed.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+
+    fn release(&self) {
+        *self.armed.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        self.released.notify_all();
+    }
+
+    fn wait(&self) {
+        let armed = self.armed.lock().unwrap_or_else(|e| e.into_inner());
+        // Bounded so a hold that is never released cannot keep a test
+        // process's worker parked forever.
+        let _ = self
+            .released
+            .wait_timeout_while(armed, Duration::from_secs(10), |armed| *armed);
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct Mirror {
     tx: Option<SyncSender<Message>>,
     health: Arc<MirrorHealth>,
+    #[cfg(debug_assertions)]
+    exit_hold: Arc<ExitHold>,
 }
 
 impl Mirror {
@@ -63,10 +97,16 @@ impl Mirror {
     ) -> io::Result<(Self, JoinHandle<()>)> {
         let (tx, rx) = mpsc::sync_channel(capacity);
         let worker_health = Arc::clone(&health);
+        #[cfg(debug_assertions)]
+        let exit_hold = Arc::new(ExitHold::default());
+        #[cfg(debug_assertions)]
+        let worker_hold = Arc::clone(&exit_hold);
         let worker = thread::Builder::new()
             .name("aft-stderr-mirror".into())
             .spawn(move || {
                 while let Ok(message) = rx.recv() {
+                    #[cfg(debug_assertions)]
+                    worker_hold.wait();
                     // No channel or file-sink lock is held during stderr I/O.
                     let result = match &message {
                         Message::Record(bytes) => sink.write_all(bytes),
@@ -92,6 +132,8 @@ impl Mirror {
             Self {
                 tx: Some(tx),
                 health,
+                #[cfg(debug_assertions)]
+                exit_hold,
             },
             worker,
         ))
@@ -99,7 +141,12 @@ impl Mirror {
 
     pub(super) fn disabled(health: Arc<MirrorHealth>) -> Self {
         health.start_failures.fetch_add(1, Ordering::Relaxed);
-        Self { tx: None, health }
+        Self {
+            tx: None,
+            health,
+            #[cfg(debug_assertions)]
+            exit_hold: Arc::default(),
+        }
     }
 
     pub(super) fn record(&self, bytes: &[u8]) {
@@ -121,6 +168,8 @@ impl Mirror {
     // Only process teardown waits for this fence. Ordinary logger flushes stay
     // nonblocking, including when stderr is full or its sink is wedged.
     pub(super) fn drain_on_exit(&self, timeout: Duration) -> bool {
+        #[cfg(debug_assertions)]
+        self.exit_hold.release();
         let Some(tx) = self.tx.as_ref() else {
             return false;
         };
@@ -146,6 +195,13 @@ impl Mirror {
         received
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .unwrap_or(false)
+    }
+
+    /// Test-only (debug builds): stop writing records until `drain_on_exit`
+    /// starts. See [`ExitHold`].
+    #[cfg(debug_assertions)]
+    pub(super) fn hold_until_exit_fence(&self) {
+        self.exit_hold.arm();
     }
 
     fn enqueue(&self, message: Message) {
@@ -227,6 +283,36 @@ mod tests {
         worker.join().unwrap();
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    fn exit_hold_keeps_records_queued_until_the_exit_fence_starts() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (mirror, worker) = Mirror::spawn(
+            GateWriter {
+                bytes: Arc::clone(&bytes),
+                write_gate: None,
+                flush_gate: None,
+            },
+            8,
+            Arc::new(MirrorHealth::default()),
+        )
+        .unwrap();
+        mirror.hold_until_exit_fence();
+        mirror.record(b"process exit marker\n");
+        thread::sleep(Duration::from_millis(50));
+        let written_while_held = bytes.lock().unwrap().clone();
+        let drained = mirror.drain_on_exit(Duration::from_secs(5));
+        drop(mirror);
+        worker.join().unwrap();
+        assert!(
+            written_while_held.is_empty(),
+            "held worker wrote {:?}",
+            String::from_utf8_lossy(&written_while_held)
+        );
+        assert!(drained, "exit fence did not release the held worker");
+        assert_eq!(&*bytes.lock().unwrap(), b"process exit marker\n");
+    }
+
     #[test]
     fn full_queue_drops_whole_records_and_flushes_without_waiting() {
         let bytes = Arc::new(Mutex::new(Vec::new()));
@@ -301,6 +387,8 @@ mod tests {
         let mirror = Mirror {
             tx: Some(tx),
             health: Arc::clone(&health),
+            #[cfg(debug_assertions)]
+            exit_hold: Arc::default(),
         };
         mirror.record(&vec![b'x'; MAX_RECORD_BYTES + 1]);
         assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));

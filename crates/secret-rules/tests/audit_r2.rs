@@ -330,7 +330,9 @@ fn item14_mixed_standard_and_urlsafe_alphabet_is_scrubbed() {
 #[test]
 fn item14_long_base64_body_stays_linear() {
     // A one-megabyte base64 body with no key in it: the scrubber must finish
-    // quickly (the old per-offset decode took minutes).
+    // in linear time (the old per-offset decode took minutes). The bound is
+    // loose on purpose: a linear scan of this body took 7 s in a debug build on
+    // a loaded CI runner, and the quadratic one takes minutes.
     let body: String = (0..1_000_000)
         .map(|index| char::from(b'A' + (index % 26) as u8))
         .collect();
@@ -338,7 +340,7 @@ fn item14_long_base64_body_stays_linear() {
     let output = scrub_bytes(MIN_KEY, "x", body.as_bytes()).unwrap();
     assert_eq!(output.len(), body.len());
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
+        started.elapsed() < std::time::Duration::from_secs(60),
         "base64 body took {:?}",
         started.elapsed()
     );

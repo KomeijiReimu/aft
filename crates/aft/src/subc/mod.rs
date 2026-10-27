@@ -219,6 +219,8 @@ mod bash_selector_tests;
 mod codemode;
 mod consent;
 pub(crate) use consent::directory_scope;
+#[cfg(all(test, unix))]
+mod deleted_root_reclaim_tests;
 mod drain;
 mod flow_read;
 mod health;
@@ -1437,6 +1439,10 @@ struct RootMeta {
     /// tasks. The kill waits out signal grace periods, so it never runs on
     /// the frame loop; the reaper retains the root until it finishes.
     reclaim_kill_in_flight: Option<Arc<AtomicBool>>,
+    /// Minimum spacing between kill submissions, including failed spawns and
+    /// kills that leave surviving processes. Sweeps must not create a thread
+    /// on every tick while a process cannot be terminated.
+    reclaim_kill_submitted_at: Option<Instant>,
     /// When the idle reaper last submitted the unbound-teardown persist for
     /// this root. Sweeps run every few hundred milliseconds, so a persist that
     /// could not clear its blocker (cache lock contention, a failed write) is
@@ -1677,6 +1683,7 @@ impl RootMeta {
             consecutive_missing_sweeps: 0,
             presence_generation_seen: 0,
             reclaim_kill_in_flight: None,
+            reclaim_kill_submitted_at: None,
             teardown_persist_submitted_at: None,
             ttl_retention_logged: None,
             configure_tail_in_flight: false,
@@ -2161,6 +2168,8 @@ struct IdleReapOutcome {
 /// Minimum gap between unbound-teardown persist attempts for one root.
 const UNBOUND_TEARDOWN_PERSIST_RETRY: Duration = Duration::from_secs(60);
 
+const RECLAIM_KILL_RETRY: Duration = Duration::from_secs(30);
+
 /// Count an unbound root retained past its idle TTL and log the reason once
 /// per distinct blocker.
 fn note_unbound_ttl_retention(
@@ -2532,14 +2541,32 @@ fn reap_idle_roots_with_presence(
                     meta.reclaim_kill_in_flight
                         .get_or_insert_with(|| Arc::new(AtomicBool::new(false))),
                 );
-                let tasks_settled = !kill_in_flight.load(Ordering::Acquire)
-                    && ctx.bash_background().try_has_running_tasks() == Some(false);
-                if !tasks_settled {
-                    if !kill_in_flight.swap(true, Ordering::AcqRel) {
-                        spawn_reclaimed_root_task_kill(&ctx, &root_id, kill_in_flight);
+                let retention = if kill_in_flight.load(Ordering::Acquire) {
+                    Some(health::DeletedTaskRetention::KillInFlight)
+                } else {
+                    match ctx
+                        .bash_background()
+                        .try_has_reclaimable_tasks_for_root(&root_id)
+                    {
+                        Some(false) => None,
+                        None => Some(health::DeletedTaskRetention::RegistryBusy),
+                        Some(true) => {
+                            let retry_due =
+                                meta.reclaim_kill_submitted_at.is_none_or(|submitted| {
+                                    now.saturating_duration_since(submitted) >= RECLAIM_KILL_RETRY
+                                });
+                            if retry_due && !kill_in_flight.swap(true, Ordering::AcqRel) {
+                                meta.reclaim_kill_submitted_at = Some(now);
+                                spawn_reclaimed_root_task_kill(&ctx, &root_id, kill_in_flight);
+                                Some(health::DeletedTaskRetention::KillInFlight)
+                            } else {
+                                Some(health::DeletedTaskRetention::KillBackoff)
+                            }
+                        }
                     }
-                    census.deleted_retained += 1;
-                    census.artifact_eviction_blocked += 1;
+                };
+                if let Some(retention) = retention {
+                    census.note_deleted_task_retained(retention);
                     continue;
                 }
             }
@@ -2553,7 +2580,12 @@ fn reap_idle_roots_with_presence(
             continue;
         };
         let taken_pending = Some(taken_pending);
-        if let Some(blocker) = ctx.try_artifact_eviction_blocker(false) {
+        let blocker = if deleted {
+            ctx.try_artifact_eviction_blocker_for_deleted_root(false, &root_id)
+        } else {
+            ctx.try_artifact_eviction_blocker(false)
+        };
+        if let Some(blocker) = blocker {
             if let Some(pending) = taken_pending {
                 ctx.restore_pending_reconciliation_state_without_waiting(pending);
             }
@@ -2584,7 +2616,12 @@ fn reap_idle_roots_with_presence(
             continue;
         }
         let memory_before = ctx.memory_root_snapshot();
-        if !ctx.try_evict_idle_artifacts() {
+        let evicted = if deleted {
+            ctx.try_evict_idle_artifacts_for_deleted_root(&root_id)
+        } else {
+            ctx.try_evict_idle_artifacts()
+        };
+        if !evicted {
             if let Some(pending) = taken_pending {
                 ctx.restore_pending_reconciliation_state_without_waiting(pending);
             }
@@ -4129,6 +4166,9 @@ fn run_subc_mode_inner(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
+    // Before any database opens: this process admits keyed calls, so it is
+    // the one that recovers the call ledger after a restart.
+    crate::db::call_ledger::mark_provider_process();
     let _daemon_storage_lease = crate::root_cache::acquire_daemon_storage_lease(&ctx.storage_dir())
         .map_err(SubcError::StorageLease)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -5675,6 +5715,7 @@ where
                             user_config_path.as_deref(),
                             tool_response_body_limit,
                             Some(&run_scopes),
+                            storage_dir,
                         )
                         .await
                         {
@@ -7039,6 +7080,12 @@ async fn close_daemon_connection(
     }
 }
 
+/// `storage_dir` is the storage root the module selected at startup, the one
+/// its daemon storage lease covers. A new actor starts from it so that the
+/// bind's configure opens aft.db and the actor's other durable state in that
+/// same root. Starting from an empty `storage_dir` would let the actor fall
+/// back to the default data home and split the module's data in two whenever
+/// the module was started with an explicit storage path.
 fn register_actor_for_bind(
     shared_app: &Arc<App>,
     executor: &Arc<Executor>,
@@ -7046,6 +7093,7 @@ fn register_actor_for_bind(
     bind_root_id: &ProjectRootId,
     route_channel: u16,
     root_was_live: bool,
+    storage_dir: &Path,
 ) -> bool {
     if executor.actor_registered(bind_root_id) {
         log::debug!(
@@ -7066,7 +7114,10 @@ fn register_actor_for_bind(
 
     let actor_ctx = Arc::new(AppContext::from_app(
         Arc::clone(shared_app),
-        Config::default(),
+        Config {
+            storage_dir: Some(storage_dir.to_path_buf()),
+            ..Config::default()
+        },
     ));
     install_bash_compressor(&actor_ctx);
     actor_ctx.install_fleet_status_client(Some(push_senders.fleet_status_client.clone()));
@@ -7842,6 +7893,7 @@ async fn handle_control_request(
     user_config_path: Option<&Path>,
     tool_response_body_limit: usize,
     run_scopes: Option<&run_scope::RunScopes>,
+    storage_dir: &Path,
 ) -> Result<(), SubcError> {
     metrics.mark_frame_loop_entry("handle_control_request", frame);
     let request = match serde_json::from_slice::<ModuleControlRequest>(&frame.body) {
@@ -8258,6 +8310,7 @@ async fn handle_control_request(
                 &bind_root_id,
                 route_channel,
                 root_was_live,
+                storage_dir,
             );
 
             sync_bg_live_delivery_sessions(executor, routes, Some(&bind_root_id), Some(metrics));
@@ -9624,7 +9677,6 @@ impl PlainToolRun {
                         && manifest::tool_call_is_mutating(&bare_name, &arguments))
                     .then(|| {
                         crate::sandbox_spawn::ToolLaunchPolicy::for_session(
-                            ctx,
                             identity_for_run.spawn_principal.clone(),
                             access_grants::alfonso_worker(&identity_for_run),
                         )
@@ -10721,7 +10773,7 @@ async fn handle_tool_call(
     // enable Cargo indirectly by selecting a head catalog on its route.
     if access_grants::alfonso_worker(&identity) {
         if let Some(ctx) = executor.actor_context(&identity.root) {
-            ctx.lsp().disable_rust_cargo_for_worker();
+            ctx.disable_rust_cargo_for_worker();
         }
     }
     let lane = command_lane(&bare_name);
@@ -12795,10 +12847,17 @@ pub(crate) mod test_support {
         if short_deadline {
             assert_eq!(response.data["status"], "running", "{response:?}");
             assert_eq!(response.data["waited"]["reason"], "timeout", "{response:?}");
+            // Check which deadline the watch applied rather than how fast a
+            // loaded runner delivered it. The client's 1 s deadline (received
+            // 400 ms late) leaves a wait limit under a second or two, while
+            // the default worker window with timeoutMs=1_800_000 is tens of
+            // minutes, so 10 s separates the two with room for scheduling lag.
+            let limit_ms = response.data["waited"]["limit_ms"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("watch reply names its wait limit: {response:?}"));
             assert!(
-                started.elapsed() < Duration::from_millis(650),
-                "queued watch missed shortened reply cutoff: {:?}",
-                started.elapsed()
+                limit_ms < 10_000,
+                "queued watch ignored the client deadline: wait limit {limit_ms} ms"
             );
             return;
         }
@@ -14806,6 +14865,7 @@ mod tests {
                 Some(&test_support::bind_config_without_indexes(dir.path())),
                 usize::MAX,
                 None,
+                &ctx.storage_dir(),
             )
             .await
             .expect("admit route bind");
@@ -16929,7 +16989,12 @@ mod tests {
         );
         ctx.lsp()
             .set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN".into(), "1".into());
-        assert_eq!(ctx.lsp().ensure_server_for_file(&file, &config).len(), 1);
+        assert_eq!(
+            crate::lsp::manager::settled_lsp(&mut ctx.lsp(), |startup_manager| startup_manager
+                .ensure_server_for_file(&file, &config))
+            .len(),
+            1
+        );
         assert_eq!(ctx.lsp().active_client_count(), 1);
         let executor = Arc::new(Executor::new());
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
@@ -16956,7 +17021,9 @@ mod tests {
             .any(|failure| matches!(failure.result, ServerAttemptResult::ProjectClosed)));
         assert_eq!(ctx.lsp().active_client_count(), 0);
 
-        let file_denied = ctx.lsp().ensure_server_for_file_detailed(&file, &config);
+        let file_denied = crate::lsp::manager::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+            startup_manager.ensure_server_for_file_detailed(&file, &config)
+        });
         assert!(file_denied
             .attempts
             .iter()
@@ -16986,7 +17053,12 @@ mod tests {
         ctx.mark_subc_bound();
         ctx.lsp()
             .set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN".into(), "0".into());
-        assert_eq!(ctx.lsp().ensure_server_for_file(&file, &config).len(), 1);
+        assert_eq!(
+            crate::lsp::manager::settled_lsp(&mut ctx.lsp(), |startup_manager| startup_manager
+                .ensure_server_for_file(&file, &config))
+            .len(),
+            1
+        );
         let deadline = Instant::now() + Duration::from_secs(10);
         while ctx.lsp_child_registry().health_snapshot().children_total > 1 {
             assert!(Instant::now() < deadline, "old client must be reaped");
@@ -17036,7 +17108,12 @@ mod tests {
             "AFT_FAKE_LSP_CWD",
             &root.as_path().parent().unwrap().to_string_lossy(),
         );
-        assert_eq!(ctx.lsp().ensure_server_for_file(&file, &config).len(), 1);
+        assert_eq!(
+            crate::lsp::manager::settled_lsp(&mut ctx.lsp(), |startup_manager| startup_manager
+                .ensure_server_for_file(&file, &config))
+            .len(),
+            1
+        );
         assert_eq!(ctx.lsp().active_client_count(), 1);
         let pids = ctx.lsp_child_registry().pids();
         assert_eq!(pids.len(), 1, "one tracked server child: {pids:?}");

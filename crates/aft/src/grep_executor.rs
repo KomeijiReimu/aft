@@ -1238,12 +1238,22 @@ fn target_walk_builder(
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
     // the daemon, so never open directories outside this walk root's filesystem.
     builder.same_file_system(true).hidden(false);
+    // Skip nested linked worktrees of this repository: their files are indexed
+    // under their own roots, and walking them here duplicates every file.
+    // The named starting path itself is always admitted (depth 0), so an
+    // explicitly named target inside a worktree still walks, exactly like an
+    // explicitly named ignored directory.
+    let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(search_root);
     crate::context::apply_project_ignore_rules(&mut builder, search_root)
         .parents(!crate::context::confinement::active())
         .filter_entry(move |entry| {
             let file_type = entry.file_type();
             if crate::project_content::is_excluded_with_file_type(entry.path(), file_type.as_ref())
             {
+                floor_disclosure.record_source_exclusion(entry.path());
+                return false;
+            }
+            if crate::search_index::is_nested_worktree_entry(entry, &worktrees) {
                 floor_disclosure.record_source_exclusion(entry.path());
                 return false;
             }

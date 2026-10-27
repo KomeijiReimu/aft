@@ -4689,6 +4689,9 @@ pub struct AppContext {
     watcher_runtime_identity: parking_lot::Mutex<Option<WatcherRuntimeIdentity>>,
     watcher_counters: RwLock<Arc<WatcherCounters>>,
     lsp_manager: Arc<parking_lot::Mutex<LspManager>>,
+    /// The LSP manager's "a worker used this root" flag, readable without the
+    /// manager lock (see [`AppContext::disable_rust_cargo_for_worker`]).
+    lsp_rust_worker_policy: Arc<std::sync::atomic::AtomicBool>,
     /// Advances with every configuration publication; a background
     /// language-server applicability walk stores its result only while it
     /// still matches (see `refresh_project_applicability`).
@@ -4714,6 +4717,10 @@ pub struct AppContext {
     lsp_watcher_forward_slot: crate::lsp::manager::WatcherForwardSlot,
     /// How many of those helper threads were started, for tests.
     lsp_watcher_forward_helpers_spawned: AtomicUsize,
+    /// Held by tests to keep that helper thread from forwarding anything
+    /// (see [`Self::pause_lsp_watcher_forwarding_for_test`]); never held
+    /// otherwise.
+    lsp_watcher_forward_pause: Arc<parking_lot::Mutex<()>>,
     #[cfg(test)]
     lsp_classified_watcher_forwards: parking_lot::Mutex<Option<Vec<Vec<PathBuf>>>>,
     /// Document and configuration-file changes waiting for the LSP manager
@@ -5502,6 +5509,7 @@ impl AppContext {
             watcher_thread: parking_lot::Mutex::new(None),
             watcher_runtime_identity: parking_lot::Mutex::new(None),
             watcher_counters: RwLock::new(watcher_counters),
+            lsp_rust_worker_policy: lsp_manager.rust_worker_policy(),
             lsp_manager: Arc::new(parking_lot::Mutex::new(lsp_manager)),
             project_applicability_epoch: Arc::new(AtomicU64::new(0)),
             project_applicability_progress: Arc::default(),
@@ -5509,6 +5517,7 @@ impl AppContext {
             lsp_post_edit_worker_running: Arc::new(AtomicBool::new(false)),
             lsp_watcher_forward_slot: Default::default(),
             lsp_watcher_forward_helpers_spawned: AtomicUsize::new(0),
+            lsp_watcher_forward_pause: Arc::default(),
             #[cfg(test)]
             lsp_classified_watcher_forwards: Default::default(),
             lsp_pending_change_slot: Default::default(),
@@ -5587,38 +5596,24 @@ impl AppContext {
         context
     }
 
-    /// Current omission-preserving status values. Generation identities are
-    /// checked before project scoping or tsconfig-membership work, so a cache hit
-    /// faithfully reuses each category's presence or absence.
+    /// Explicit status reads wait for a coherent diagnostic snapshot. Publishers
+    /// use the nonblocking accessor so a busy manager never clears their bar.
     pub fn status_bar_count_values(&self) -> StatusBarCountValues {
-        self.try_status_bar_count_values()
-            .unwrap_or_else(|| {
-                // Explicit status reads may still report independent Tier-2
-                // categories. Publishers use the try accessor and skip contention.
-                let tier2 = self
-                    .status_bar_tier2
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                StatusBarCountValues {
-                    errors: None,
-                    warnings: None,
-                    dead_code: tier2.dead_code,
-                    unused_exports: tier2.unused_exports,
-                    duplicates: tier2.duplicates,
-                    todos: tier2.todos,
-                    tier2_stale: tier2.stale,
-                    disabled_categories: Vec::new(),
-                    diagnostics: None,
-                    diagnostics_reason: None,
-                    diagnostics_gaps: Vec::new(),
-                }
-            })
+        self.status_bar_count_values_inner(true)
+            .expect("a blocking status read obtains the language-server manager")
             .mask_disabled(&self.config().inspect)
     }
 
     /// A busy manager is not a missing diagnostic producer. Publishers must
     /// leave their previous bar untouched and retry on a later signal.
     pub(crate) fn try_status_bar_count_values(&self) -> Option<StatusBarCountValues> {
+        self.status_bar_count_values_inner(false)
+    }
+
+    fn status_bar_count_values_inner(
+        &self,
+        wait_for_manager: bool,
+    ) -> Option<StatusBarCountValues> {
         #[cfg(test)]
         STATUS_COUNT_PROBES.with(|count| count.set(count.get() + 1));
         let tier2 = self
@@ -5627,7 +5622,11 @@ impl AppContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let tsconfig_generation = self.tsconfig_membership.lock().generation();
-        let lsp = self.lsp_manager.try_lock()?;
+        let lsp = if wait_for_manager {
+            self.lsp_manager.lock()
+        } else {
+            self.lsp_manager.try_lock()?
+        };
         let diagnostics_generation = lsp.diagnostics_generation();
         let (authoritative, producer_gaps) = lsp.project_diagnostics_authority();
         let pending_reason = if lsp.has_project_applicability() {
@@ -10378,7 +10377,10 @@ impl AppContext {
             return Ok(None);
         }
         self.revalidate_callgraph_store_generation();
-        self.start_pending_callgraph_reconcile();
+        // A pending watcher-gap comparison opens this same store on its own
+        // thread. Every open below therefore finishes before that thread
+        // starts, so the two never race as concurrent first opens inside
+        // SQLite recovery, where the loser reports SQLITE_BUSY.
         let force_token = self.callgraph_force_token_for_build();
         if force_token.is_none() {
             if let Some(store) = {
@@ -10388,6 +10390,9 @@ impl AppContext {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 guard.as_ref().map(Arc::clone)
             } {
+                // A reader is already resident, so starting the pending
+                // comparison here cannot race a first open.
+                self.start_pending_callgraph_reconcile();
                 self.schedule_legacy_callgraph_migration_if_needed(
                     store.as_ref(),
                     store.project_root().to_path_buf(),
@@ -10406,9 +10411,16 @@ impl AppContext {
         // migrate it on the cold-build lane. Opening before the writer path is
         // also the cheap fast path for an already-published root generation.
         if force_token.is_none() {
-            if let Some(store) =
-                CallGraphStore::open_readonly(callgraph_dir.clone(), project_root.clone())?
-            {
+            let reopened =
+                CallGraphStore::open_readonly(callgraph_dir.clone(), project_root.clone());
+            // This thread's first open finished before the reconcile thread
+            // starts, so the comparison opens as a second reader. The
+            // test-only count lets the ordering test observe this.
+            #[cfg(test)]
+            self.callgraph_reconcile
+                .note_ensure_open_completed_for_test();
+            self.start_pending_callgraph_reconcile();
+            if let Some(store) = reopened? {
                 let store = Arc::new(store);
                 {
                     let mut guard = self
@@ -10463,7 +10475,10 @@ impl AppContext {
         )?;
         drop(store);
 
-        let Some(store) = CallGraphStore::open_readonly(callgraph_dir, project_root)? else {
+        let reopened = CallGraphStore::open_readonly(callgraph_dir, project_root);
+        // As above: the comparison starts only after this open completed.
+        self.start_pending_callgraph_reconcile();
+        let Some(store) = reopened? else {
             return Ok(None);
         };
         let store = Arc::new(store);
@@ -14286,6 +14301,22 @@ impl AppContext {
         &self,
         include_pending: bool,
     ) -> Option<ArtifactEvictionBlocker> {
+        self.try_artifact_eviction_blocker_for_root(include_pending, None)
+    }
+
+    pub(crate) fn try_artifact_eviction_blocker_for_deleted_root(
+        &self,
+        include_pending: bool,
+        root: &crate::path_identity::ProjectRootId,
+    ) -> Option<ArtifactEvictionBlocker> {
+        self.try_artifact_eviction_blocker_for_root(include_pending, Some(root))
+    }
+
+    fn try_artifact_eviction_blocker_for_root(
+        &self,
+        include_pending: bool,
+        deleted_root: Option<&crate::path_identity::ProjectRootId>,
+    ) -> Option<ArtifactEvictionBlocker> {
         use ArtifactEvictionBlocker as Blocker;
         if self.standing_artifact_exempt.load(Ordering::Acquire) {
             return Some(Blocker::StandingRoot);
@@ -14311,7 +14342,13 @@ impl AppContext {
             Some(true) => return Some(Blocker::InspectTier2),
             Some(false) => {}
         }
-        match self.bash_background.try_has_running_tasks() {
+        let bash_busy = match deleted_root {
+            Some(root) => self
+                .bash_background
+                .try_has_reclaimable_tasks_for_root(root),
+            None => self.bash_background.try_has_running_tasks(),
+        };
+        match bash_busy {
             None => return Some(Blocker::LockContended),
             Some(true) => return Some(Blocker::BashRunning),
             Some(false) => {}
@@ -14410,7 +14447,27 @@ impl AppContext {
     /// when eviction is unsafe or a lock was contended; the reaper retries on
     /// its next sweep.
     pub(crate) fn try_evict_idle_artifacts(&self) -> bool {
-        if self.try_artifact_eviction_blocker(true).is_some() {
+        self.try_evict_idle_artifacts_for_root(None)
+    }
+
+    /// Deleted-root reclamation uses the same root-scoped task gate both before
+    /// and during eviction. Artifact handles belong to this root, so only its
+    /// tasks block reclamation of those handles.
+    pub(crate) fn try_evict_idle_artifacts_for_deleted_root(
+        &self,
+        root: &crate::path_identity::ProjectRootId,
+    ) -> bool {
+        self.try_evict_idle_artifacts_for_root(Some(root))
+    }
+
+    fn try_evict_idle_artifacts_for_root(
+        &self,
+        deleted_root: Option<&crate::path_identity::ProjectRootId>,
+    ) -> bool {
+        if self
+            .try_artifact_eviction_blocker_for_root(true, deleted_root)
+            .is_some()
+        {
             return false;
         }
         let Some(mut callgraph_store) = try_write_unpoisoned(&self.callgraph_store) else {
@@ -14649,6 +14706,24 @@ impl AppContext {
         self.lsp_manager.lock()
     }
 
+    /// Keep Cargo-driven rust-analyzer checks off for this root from the first
+    /// worker call on (see [`LspManager::disable_rust_cargo_for_worker`]).
+    ///
+    /// Every worker tool call asks for this, so the flag is read without the
+    /// manager lock first: once it is set the call returns at once instead of
+    /// waiting behind a language-server start or a diagnostics request that
+    /// holds the lock. After one call sets the flag, later calls never take
+    /// the lock; only calls racing that first one may still contend for it.
+    pub fn disable_rust_cargo_for_worker(&self) {
+        if self
+            .lsp_rust_worker_policy
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        self.lsp_manager.lock().disable_rust_cargo_for_worker();
+    }
+
     /// The LSP manager if no other thread holds it right now. For callers on
     /// the subc frame loop, which must not wait behind a server start or a
     /// diagnostics request.
@@ -14844,10 +14919,12 @@ impl AppContext {
         drop(slot);
         let manager = Arc::clone(&self.lsp_manager);
         let forward_slot = Arc::clone(&self.lsp_watcher_forward_slot);
+        let pause = Arc::clone(&self.lsp_watcher_forward_pause);
         match std::thread::Builder::new()
             .name("aft-lsp-watched-files".into())
-            .spawn(move || crate::lsp::manager::run_watcher_forward_helper(&manager, &forward_slot))
-        {
+            .spawn(move || {
+                crate::lsp::manager::run_watcher_forward_helper(&manager, &forward_slot, &pause)
+            }) {
             Ok(_) => {
                 self.lsp_watcher_forward_helpers_spawned
                     .fetch_add(1, Ordering::Relaxed);
@@ -14858,6 +14935,45 @@ impl AppContext {
                 crate::slog_warn!("could not reach LSP servers after a watcher change: {error}");
             }
         }
+    }
+
+    /// Forward the watcher changes still queued for the LSP manager (see
+    /// [`Self::lsp_forward_or_queue_watcher_changes`]) now, waiting for its
+    /// lock, instead of leaving them to the helper thread.
+    ///
+    /// Diagnostics readers call this first. A change that is still queued has
+    /// not reached the language servers: rust-analyzer has neither heard of
+    /// it nor been asked for the `cargo check` it needs, so nothing marks its
+    /// published results as describing the files before the change, and a
+    /// reader would certify them as current. Once forwarded, the check the
+    /// change asked for counts as running until it reports.
+    ///
+    /// The backlog is taken while holding the manager lock, the order the
+    /// helper uses, so changes reach the servers in the order they were
+    /// queued. The slot itself stays in place: the helper still owns it,
+    /// finds it empty, and clears it.
+    pub(crate) fn lsp_forward_queued_watcher_changes(&self) {
+        let reloads = {
+            let mut lsp = self.lsp_manager.lock();
+            let Some(backlog) = self
+                .lsp_watcher_forward_slot
+                .lock()
+                .as_mut()
+                .map(std::mem::take)
+            else {
+                return;
+            };
+            backlog.apply(&mut lsp)
+        };
+        crate::lsp::manager::spawn_watcher_rust_workspace_reloads(&self.lsp_manager, reloads);
+    }
+
+    /// Keep the helper thread that forwards queued watcher changes from
+    /// forwarding anything until the returned guard is dropped, so a test
+    /// can act while a change waits in the queue.
+    #[doc(hidden)]
+    pub fn pause_lsp_watcher_forwarding_for_test(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.lsp_watcher_forward_pause.lock()
     }
 
     /// How many helper threads have waited for the LSP manager lock on behalf
@@ -15110,30 +15226,13 @@ impl AppContext {
                 err
             );
         }
-        let mut lsp = manager.lock();
-        let remaining = deadline.saturating_duration_since(Instant::now());
-
-        // Register the wake receiver while the manager is still locked. Events
-        // that raced with registration remain on the raw receiver; events won by
-        // another drain path wake this waiter after that path updates the store.
-        let mut wait = lsp.start_post_edit_diagnostics_wait(
+        crate::lsp::fresh_wait::wait_for_post_edit_diagnostics_unlocked(
+            || manager.lock(),
             file_path,
             &expected_versions,
             &pre_snapshot,
-            remaining,
-        );
-        let mut complete = lsp.poll_post_edit_diagnostics_wait(&mut wait, None);
-        drop(lsp);
-
-        while !complete && !wait.deadline_reached() {
-            // Waiting on channel activity does not require access to manager
-            // state, so other LSP operations can continue their bookkeeping.
-            let event = wait.next_event();
-            let mut lsp = manager.lock();
-            complete = lsp.poll_post_edit_diagnostics_wait(&mut wait, event);
-        }
-
-        manager.lock().finish_post_edit_diagnostics_wait(wait)
+            deadline,
+        )
     }
 
     /// Collect custom server root_markers from user config for use in
@@ -18672,6 +18771,72 @@ mod callgraph_store_for_ops_tests {
         assert_eq!(response.data["total_callers"], 2, "{response:?}");
         assert_ne!(response.data["complete"], false, "{response:?}");
         assert_eq!(ctx.callgraph_cold_build_spawn_count_for_test(), 0);
+    }
+
+    #[test]
+    fn ensure_reopens_before_starting_pending_reconcile() {
+        let project = TempDir::new().expect("project tempdir");
+        let storage = TempDir::new().expect("storage tempdir");
+        std::fs::write(
+            project.path().join("main.rs"),
+            "fn entry() { leaf(); }\nfn leaf() {}\n",
+        )
+        .expect("source file");
+        let root = std::fs::canonicalize(project.path()).expect("canonical project root");
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        ));
+        ctx.set_canonical_cache_root(root.clone());
+        let key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &key, false);
+        // Publish a ready store, then drop the resident the way idle eviction
+        // does, leaving a watcher gap behind for the next reopen to compare.
+        assert!(ctx
+            .ensure_callgraph_store()
+            .expect("publish callgraph store")
+            .is_some());
+        ctx.invalidate_artifacts_after_watcher_gap();
+        assert_eq!(
+            ctx.pending_callgraph_reconcile_reason().as_deref(),
+            Some("watcher gap"),
+            "the reopen must service the gap left by the eviction"
+        );
+        let completed_before = ctx.callgraph_reconcile.completed();
+        let opens_before = ctx.callgraph_reconcile.ensure_open_completed_for_test();
+        let (entered, release) = ctx.callgraph_reconcile.hold_next_for_test();
+        // Single-shot: the caller's first open completes before the reconcile
+        // thread starts, so the two never race inside SQLite recovery.
+        let store = ctx
+            .ensure_callgraph_store()
+            .expect("reopen callgraph store");
+        assert!(store.is_some(), "reopen callgraph store");
+        // The entry hold captured how many of the caller's opens had finished
+        // when the reconcile thread started: exactly this reopen. With the old
+        // spawn-first order the parked thread enters before the caller's open
+        // and the count is still the previous one.
+        assert_eq!(
+            entered
+                .recv_timeout(Duration::from_secs(10))
+                .expect("reconcile started after the caller's open"),
+            opens_before + 1,
+            "the caller's open completed before the reconcile thread started"
+        );
+        drop(release);
+        assert!(
+            ctx.callgraph_reconcile
+                .wait_for_idle_for_test(Duration::from_secs(30)),
+            "pending comparison settled"
+        );
+        assert_eq!(
+            ctx.callgraph_reconcile.completed(),
+            completed_before + 1,
+            "the pending comparison still ran"
+        );
     }
 
     #[test]
@@ -24075,5 +24240,41 @@ mod semantic_probe_tests {
         assert!(!ctx.semantic_refresh_probe_ready());
         assert!(!ctx.semantic_refresh_probe_is_scheduled());
         assert!(!ctx.completion_drains_have_work());
+    }
+}
+
+#[cfg(test)]
+mod worker_rust_cargo_policy_tests {
+    use super::*;
+
+    /// Every worker tool call asks to keep Cargo checks off. Once the flag is
+    /// set, asking again must not wait for the LSP manager lock, which a
+    /// language-server start or a diagnostics request can hold for seconds.
+    #[test]
+    fn worker_rust_cargo_policy_is_answered_without_the_lsp_lock_once_set() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config::default(),
+        );
+        assert!(!ctx.lsp().rust_cargo_disabled_for_worker());
+        ctx.disable_rust_cargo_for_worker();
+        assert!(ctx.lsp().rust_cargo_disabled_for_worker());
+
+        let held = ctx.lsp();
+        let (answered_tx, answered_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                ctx.disable_rust_cargo_for_worker();
+                let _ = answered_tx.send(());
+            });
+            let answered = answered_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok();
+            drop(held);
+            assert!(
+                answered,
+                "a repeated worker call waited for the LSP manager lock"
+            );
+        });
     }
 }

@@ -54,6 +54,11 @@ impl TestPty {
     }
 }
 
+/// How long a test waits for a task it expects to finish. Generous because a
+/// loaded CI runner can take seconds to start a shell (PowerShell on Windows
+/// especially); waits that expect nothing to happen stay short.
+const POSITIVE_COMPLETION_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[cfg(unix)]
 fn wait_for_terminal_status(aft: &mut AftProcess, task_id: &str) -> serde_json::Value {
     let started = std::time::Instant::now();
@@ -73,7 +78,7 @@ fn wait_for_terminal_status(aft: &mut AftProcess, task_id: &str) -> serde_json::
             return status;
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < POSITIVE_COMPLETION_WAIT,
             "timed out waiting for terminal bash status: {status:?}"
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -468,7 +473,13 @@ fn bash_streams_progress_and_returns_final_response() {
         if status["status"] == "completed" {
             break status;
         }
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // This test checks what a finished task reports, not how fast the shell
+        // starts; a task that never finishes still fails here, with its last
+        // status.
+        assert!(
+            started.elapsed() < POSITIVE_COMPLETION_WAIT,
+            "task did not complete within {POSITIVE_COMPLETION_WAIT:?}; last status: {status:?}"
+        );
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
     assert_eq!(
@@ -888,7 +899,10 @@ fn bash_timeout_terminates_shell_process_group_grandchild() {
         if status["status"] == "timed_out" {
             break;
         }
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(
+            started.elapsed() < POSITIVE_COMPLETION_WAIT,
+            "task did not time out within {POSITIVE_COMPLETION_WAIT:?}; last status: {status:?}"
+        );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     let pid: i32 = std::fs::read_to_string(&pid_file)

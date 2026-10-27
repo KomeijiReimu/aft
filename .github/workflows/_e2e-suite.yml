@@ -57,6 +57,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -443,6 +447,10 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -524,6 +532,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       # cache-bin: false makes rust-cache safe on macOS: the old failure was
       # the cached ~/.cargo/bin shim overwriting the fresh cargo shim (which

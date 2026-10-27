@@ -165,6 +165,7 @@ mod score_floor_drop_test;
 mod search_index_warm_restart_test;
 mod security_test;
 mod semantic_disk_test;
+mod shared_db_call_ledger_test;
 mod shared_db_contention_test;
 mod shared_index_scope_test;
 mod stage_card_floor_test;

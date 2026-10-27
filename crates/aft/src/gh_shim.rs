@@ -35,7 +35,14 @@ use subc_protocol::{BindIdentity, RouteTarget};
 mod native_guard;
 pub(crate) mod read_contract;
 mod rename_guard;
+mod v22_rows;
 mod worker_reads;
+
+use v22_rows::{
+    canonicalize_pr_edit_from, canonicalize_review_thread, canonicalize_v22_api_from,
+    classify_review_thread_mutation, is_review_thread_tuple, review_reply_tuple,
+    review_thread_mutation,
+};
 
 #[cfg(test)]
 #[path = "gh_shim/security_audit_tests.rs"]
@@ -115,6 +122,89 @@ const V19_ADMIN_TUPLES: &[&str] = &[
     "workflow enable",
 ];
 const PRIVATE_REPORTING_PATH_GLOB: &str = "/repos/*/*/private-vulnerability-reporting";
+// v22 bot speech on pull requests. `pr edit` (title and body only) is limited to
+// pull requests the calling seat's bot opened: the route holder checks the
+// author before it writes, as it does for `issue edit`. Resolving or
+// unresolving a review thread changes only that thread's public state, the
+// same class as closing an issue. Before v22, `pr edit` was an admin-tier row
+// that ran only as the operator's label-only edit; at v22 it is declared
+// governed and the label-only shape keeps its operator row (see
+// `is_reviewed_operator_label_tuple`).
+const V22_GOVERNED_TUPLES: &[&str] = &[
+    "pr edit",
+    REVIEW_THREAD_RESOLVE_TUPLE,
+    REVIEW_THREAD_UNRESOLVE_TUPLE,
+];
+// Installing, upgrading or removing a gh extension puts a program on the
+// operator's machine that later runs with the operator's gh login, so it is
+// operator administration. Listing installed extensions is a read and is
+// declared in the manifest's mechanical tier instead.
+const V22_ADMIN_TUPLES: &[&str] = &[
+    "extension install",
+    "extension upgrade",
+    "extension remove",
+    "stack merge",
+];
+/// `gh stack` (the github/gh-stack extension) subcommands that can write to
+/// GitHub. The extension calls the GitHub API in-process with whatever token gh
+/// is logged in with and never through `gh` itself, so delegating one of these
+/// would publish pull requests and stacks as the operator, not the bot, and the
+/// shim would never see the individual calls. They are declared admin: refused
+/// with a text naming the bot-speech route, or run as audited operator
+/// administration under `GH_SHIM_BYPASS=operator`. `checkout` is here because
+/// its interactive conflict resolution can unstack on GitHub; `delete` is the
+/// extension's alias of `unstack`. `push` makes no API call, but it writes the
+/// stack's branches to GitHub with the operator's git credentials, always as
+/// a `--force-with-lease` push, so it is the operator writing too.
+const V22_STACK_WRITE_TUPLES: &[&str] = &[
+    "stack submit",
+    "stack sync",
+    "stack link",
+    "stack unstack",
+    "stack delete",
+    "stack checkout",
+    "stack push",
+];
+/// Refusal for a `gh stack` subcommand that would write as the operator.
+/// `{command}` is replaced with the command, such as `stack submit`.
+const STACK_WRITE_REFUSAL_TEXT: &str = r#"`{command}` is refused: the gh-stack extension writes to GitHub with the operator's login, not the bot's. To do it as the bot: push the branch with git, open each pull request with `gh pr create --base <parent branch>`, then create the stack with `gh api -X POST repos/<owner>/<repo>/stacks --input <file>`, where the file holds `{"pull_requests": [...]}`. Add to a stack with `.../stacks/<number>/add` and dissolve it with `.../stacks/<number>/unstack`. To run it as the operator instead, re-run with GH_SHIM_BYPASS=operator; the shim records that in its audit log."#;
+/// The stack REST endpoints admitted as bot speech, and the asynchronous merge
+/// endpoint kept as operator administration like `pr merge`.
+const STACK_CREATE_PATH_GLOB: &str = "/repos/*/*/stacks";
+const STACK_ADD_PATH_GLOB: &str = "/repos/*/*/stacks/*/add";
+const STACK_UNSTACK_PATH_GLOB: &str = "/repos/*/*/stacks/*/unstack";
+const STACK_WRITE_METHOD: &str = "POST";
+const MERGE_ASYNC_PATH_GLOB: &str = "/repos/*/*/pulls/*/merge-async";
+const MERGE_ASYNC_METHOD: &str = "PUT";
+/// Governed tuples for the GraphQL review-thread mutations. `gh api graphql`
+/// has no subcommand to name them by, so the tuple is `graphql` plus the
+/// mutation name, lower-cased like every manifest tuple.
+const REVIEW_THREAD_RESOLVE_TUPLE: &str = "graphql resolvereviewthread";
+const REVIEW_THREAD_UNRESOLVE_TUPLE: &str = "graphql unresolvereviewthread";
+/// The argv form of the review-thread mutations: one inline GraphQL mutation
+/// document whose only input is the thread's node id.
+const GRAPHQL_MUTATION_FORM: &str = "graphql-mutation";
+/// The REST reply to a pull request review comment, which posts into that
+/// comment's review thread.
+const REVIEW_REPLY_PATH_GLOB: &str = "/repos/*/*/pulls/*/comments/*/replies";
+const REVIEW_REPLY_METHOD: &str = "POST";
+/// The REST edit of a pull request. Through the shim it carries only a title
+/// and a body and is routed as `pr edit`, so it has the same own-pull-request
+/// author check. Changing the base branch is refused: it changes what the pull
+/// request merges into, which is not speech.
+const PULL_EDIT_PATH_GLOB: &str = "/repos/*/*/pulls/*";
+const PULL_EDIT_METHOD: &str = "PATCH";
+/// The body fields a governed `pr edit` may carry, in manifest order.
+const PR_EDIT_BODY_FIELDS: &[&str] = &["title", "body"];
+/// `gh pr edit` flags that change labels. They have their own operator row
+/// (`GH_SHIM_BYPASS=operator`, labels and nothing else), so the governed
+/// route refuses them by name rather than as unknown flags.
+const PR_EDIT_LABEL_FLAGS: &[&str] = &["--add-label", "--remove-label"];
+/// Refusal for a governed `pr edit` that also changes labels.
+const PR_EDIT_LABEL_REFUSAL_TEXT: &str = r#"`pr edit` as the bot changes only the title and body of a pull request the bot opened. Label changes run as the operator: re-run with GH_SHIM_BYPASS=operator (labels only)."#;
+/// Refusal for any other `gh pr edit` flag on the governed route. `{flag}` is
+/// replaced with the refused flag as the caller spelled it.
+const PR_EDIT_FLAG_REFUSAL_TEXT: &str = r#"`{flag}`: `pr edit` as the bot accepts only --title/-t, --body/-b, --body-file/-F and --repo."#;
 /// The body fields the `pr create` reader produces, in the order the manifest
 /// declares them. The reader is purpose-built for this list, so a signed
 /// declaration naming any other list is refused rather than half-honoured.
@@ -160,6 +250,9 @@ const PR_CREATE_UNSUPPORTED_FLAGS: &[&str] = &[
 // is refused on this path, and without the bypass `issue edit` stays on the
 // governed own-issue route.
 const V14_OPERATOR_LABEL_TUPLES: &[&str] = &["issue edit"];
+// v22 declares `pr edit` governed, so its label-only operator row moves from
+// the admin tier to this governed-tuple bypass, exactly like `issue edit`.
+const V22_OPERATOR_LABEL_TUPLES: &[&str] = &["pr edit"];
 // v14 extends the same operator row to two verbs that have no bot-speech route
 // at all. Maintainers gating design work put labels such as `design-approved`
 // on issues and `trivial` on pull requests, and create those labels when a
@@ -928,7 +1021,7 @@ where
                     delegate_to_upstream,
                 )
             } else {
-                refuse(RefusalCode::AdminTier, &admin_refusal_text(&tuple))
+                refuse(RefusalCode::AdminTier, &admin_tier_refusal_text(&tuple))
             }
         }
         Classification::Governed { tuple, canonical } => {
@@ -938,10 +1031,15 @@ where
             if operator_bypass_requested()
                 && is_reviewed_operator_label_tuple(manifest.manifest_version, &tuple)
             {
+                let target = if tuple == "pr edit" {
+                    LabelTarget::PullRequest
+                } else {
+                    LabelTarget::Issue
+                };
                 return dispatch_operator_label_edit(
                     args,
                     &tuple,
-                    LabelTarget::Issue,
+                    target,
                     paths,
                     now,
                     delegate_to_upstream,
@@ -1106,6 +1204,16 @@ where
         );
     }
     delegate_to_upstream(args)
+}
+
+/// Refusal text for an administration-tier verb reached without the operator
+/// bypass: the `gh stack` writes explain why the extension cannot speak as the
+/// bot and name the route that can; every other verb gets the generic text.
+fn admin_tier_refusal_text(tuple: &str) -> String {
+    if V22_STACK_WRITE_TUPLES.contains(&tuple) {
+        return STACK_WRITE_REFUSAL_TEXT.replace("{command}", tuple);
+    }
+    admin_refusal_text(tuple)
 }
 
 /// Refusal text for an administration-tier verb reached without the operator
@@ -1885,7 +1993,10 @@ struct GraphqlDocumentShape {
 /// Parser recovery trees cannot authorize reads. GitHub still validates fields
 /// against its schema; only queries and fragments may cross this boundary.
 fn graphql_document_shape(document: &str) -> GraphqlDocumentShape {
-    use apollo_parser::{cst::Definition, Parser};
+    use apollo_parser::{
+        cst::{CstNode, Definition},
+        Parser,
+    };
 
     let parsed = Parser::new(document).parse();
     if parsed.errors().next().is_some() {
@@ -1911,6 +2022,24 @@ fn graphql_document_shape(document: &str) -> GraphqlDocumentShape {
         }
     }
     shape.read_only &= has_operation;
+    // The review-thread mutations are admitted only as their own governed
+    // documents. A read-only document that names either field anywhere (in a
+    // fragment, behind an alias) is not passed through as an operator read:
+    // GitHub would reject it, and refusing it keeps the one admitted shape of
+    // these mutations unambiguous.
+    shape.read_only &= !parsed
+        .document()
+        .syntax()
+        .descendants()
+        .filter_map(apollo_parser::cst::Field::cast)
+        .any(|field| {
+            field.name().is_some_and(|name| {
+                matches!(
+                    name.text().as_str(),
+                    "resolveReviewThread" | "unresolveReviewThread"
+                )
+            })
+        });
     shape
 }
 
@@ -1923,7 +2052,12 @@ fn write_target(args: &[OsString], target: &TargetRepository, cwd: &Path) -> Wri
             // `{owner}/{repo}` placeholders are filled by upstream `gh` from
             // `GH_REPO` or the origin, so those endpoints resolve below.
             if let Some(shape) = api_request_shape(&args[head_index..]) {
-                if !shape.path.starts_with("/repos/") {
+                // A review-thread mutation names its thread by node id, so
+                // its repository comes from `GH_REPO` or the origin below,
+                // like an endpoint written with `{owner}/{repo}`.
+                let review_thread =
+                    shape.path == "/graphql" && review_thread_mutation(args).is_ok();
+                if !shape.path.starts_with("/repos/") && !review_thread {
                     return WriteTarget::NotARepository {
                         description: format!(
                             "calls {}, an endpoint outside /repos/<owner>/<repo>",
@@ -4480,6 +4614,8 @@ fn is_reviewed_admin_tuple(manifest_version: u64, tuple: &str) -> bool {
         || (manifest_version >= 13 && V13_ADMIN_TUPLES.contains(&tuple))
         || (manifest_version >= 15 && V15_ADMIN_TUPLES.contains(&tuple))
         || (manifest_version >= 19 && V19_ADMIN_TUPLES.contains(&tuple))
+        || (manifest_version >= 22
+            && (V22_ADMIN_TUPLES.contains(&tuple) || V22_STACK_WRITE_TUPLES.contains(&tuple)))
 }
 
 fn is_reviewed_governed_tuple(manifest_version: u64, tuple: &str) -> bool {
@@ -4488,12 +4624,14 @@ fn is_reviewed_governed_tuple(manifest_version: u64, tuple: &str) -> bool {
         || (manifest_version >= 14 && V14_GOVERNED_TUPLES.contains(&tuple))
         || (manifest_version >= 16 && V16_GOVERNED_TUPLES.contains(&tuple))
         || (manifest_version >= 19 && V19_GOVERNED_TUPLES.contains(&tuple))
+        || (manifest_version >= 22 && V22_GOVERNED_TUPLES.contains(&tuple))
 }
 
 /// True for a governed tuple whose label-only form the operator bypass may run
 /// upstream. Only reached for a tuple the manifest already declares governed.
 fn is_reviewed_operator_label_tuple(manifest_version: u64, tuple: &str) -> bool {
-    manifest_version >= 14 && V14_OPERATOR_LABEL_TUPLES.contains(&tuple)
+    (manifest_version >= 14 && V14_OPERATOR_LABEL_TUPLES.contains(&tuple))
+        || (manifest_version >= 22 && V22_OPERATOR_LABEL_TUPLES.contains(&tuple))
 }
 
 /// True for an admin-tier tuple that runs only in its operator row's narrow
@@ -4503,13 +4641,57 @@ fn is_reviewed_operator_row_admin_tuple(manifest_version: u64, tuple: &str) -> b
     manifest_version >= 14 && V14_OPERATOR_ROW_ADMIN_TUPLES.contains(&tuple)
 }
 
-/// True for the one API rule that may be governed rather than admin: the v14
-/// own-comment PATCH. Every other governed API rule stays undeclared, so a
-/// signed rule alone cannot widen raw API writes into bot speech.
+/// True for the API rules that may be governed rather than admin: the v14
+/// own-comment PATCH, and from v22 the review-comment reply POST, the pull
+/// request PATCH (title and body), and the three stack writes. Every other
+/// governed API rule stays undeclared, so a signed rule alone cannot widen raw
+/// API writes into bot speech.
 fn is_reviewed_governed_api_rule(manifest_version: u64, rule: &ApiRule) -> bool {
-    manifest_version >= 14
-        && rule.method.eq_ignore_ascii_case(OWN_COMMENT_PATCH_METHOD)
-        && rule.path_glob == OWN_COMMENT_PATCH_PATH_GLOB
+    let is = |method: &str, glob: &str| {
+        rule.method.eq_ignore_ascii_case(method) && rule.path_glob == glob
+    };
+    (manifest_version >= 14 && is(OWN_COMMENT_PATCH_METHOD, OWN_COMMENT_PATCH_PATH_GLOB))
+        || (manifest_version >= 22
+            && (is(REVIEW_REPLY_METHOD, REVIEW_REPLY_PATH_GLOB)
+                || is(PULL_EDIT_METHOD, PULL_EDIT_PATH_GLOB)
+                || is(STACK_WRITE_METHOD, STACK_CREATE_PATH_GLOB)
+                || is(STACK_WRITE_METHOD, STACK_ADD_PATH_GLOB)
+                || is(STACK_WRITE_METHOD, STACK_UNSTACK_PATH_GLOB)))
+}
+
+/// The fixed canonicalization of a reviewed governed API rule. API rules carry
+/// none of their own (manifest canonicalization keys name argv tuples), so the
+/// shape is fixed here, next to the reader that produces it.
+fn governed_api_canonicalization(rule: &ApiRule) -> Canonicalization {
+    let strings = |values: &[&str]| values.iter().map(|value| value.to_string()).collect();
+    match rule.path_glob.as_str() {
+        REVIEW_REPLY_PATH_GLOB => Canonicalization {
+            argv_forms: strings(&[BODY_ONLY_FORM]),
+            target_fields: strings(&["number", "comment_id"]),
+            body_fields: strings(&["body"]),
+        },
+        PULL_EDIT_PATH_GLOB => Canonicalization {
+            argv_forms: strings(&["target-and-fields"]),
+            target_fields: strings(&["number"]),
+            body_fields: strings(PR_EDIT_BODY_FIELDS),
+        },
+        STACK_CREATE_PATH_GLOB => Canonicalization {
+            argv_forms: strings(&[FIELDS_ONLY_FORM]),
+            target_fields: Vec::new(),
+            body_fields: strings(&["pull_requests"]),
+        },
+        STACK_ADD_PATH_GLOB => Canonicalization {
+            argv_forms: strings(&["target-and-fields"]),
+            target_fields: strings(&["stack_number"]),
+            body_fields: strings(&["pull_requests"]),
+        },
+        STACK_UNSTACK_PATH_GLOB => Canonicalization {
+            argv_forms: strings(&["target-only"]),
+            target_fields: strings(&["stack_number"]),
+            body_fields: Vec::new(),
+        },
+        _ => own_comment_patch_canonicalization(),
+    }
 }
 
 /// The own-comment PATCH is declared by an API rule, which carries no
@@ -4645,18 +4827,23 @@ fn command_head(args: &[OsString]) -> Option<(String, Option<String>, usize)> {
 }
 
 fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Classification {
-    let Some((method, path, has_fields)) = api_method_and_path(args) else {
+    let Some(shape) = api_request_shape(args) else {
         return Classification::Unclassified;
     };
+    // The method upstream `gh` sends: a field or `--input` payload without a
+    // named method is a POST, which is how a review reply is usually written.
+    // Before v22 no POST rule exists, so an implicit POST stays undeclared
+    // exactly as it did when it was read as a GET with fields.
+    let method = shape.effective_method();
+    let (path, has_fields) = (shape.path, shape.has_fields);
     if path == "/graphql" {
         // Like a field-free REST GET, an inspected GraphQL read delegates to
         // the real gh unchanged under the operator's existing login. It never
         // mints an assertion or routes through the governed-write relay.
-        return if graphql_query_is_read_only(args) {
-            Classification::Mechanical
-        } else {
-            Classification::Unclassified
-        };
+        if graphql_query_is_read_only(args) {
+            return Classification::Mechanical;
+        }
+        return classify_review_thread_mutation(args, manifest, platform);
     }
     let matches = manifest
         .api_rules
@@ -4682,19 +4869,26 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
         {
             return Classification::Unclassified;
         }
+        // The asynchronous merge is `pr merge` by another endpoint, reviewed as
+        // operator administration from v22 and for PUT only.
+        if rule.path_glob == MERGE_ASYNC_PATH_GLOB
+            && (manifest.manifest_version < 22 || method != MERGE_ASYNC_METHOD)
+        {
+            return Classification::Unclassified;
+        }
         return Classification::Admin {
             tuple: api_tuple(rule),
         };
     }
-    // The own-comment PATCH is the one API write admitted as bot speech. It
-    // crosses the field wall below because the shim parses its payload itself
-    // and forwards only the single body field it recognized, rather than
+    // The reviewed governed API rules are the only API writes admitted as bot
+    // speech. They cross the field wall below because the shim parses their
+    // payload itself and forwards only the fields it recognized, rather than
     // handing the holder bytes it never read.
     if rule.tier == Tier::Governed && is_reviewed_governed_api_rule(manifest.manifest_version, rule)
     {
         return Classification::Governed {
             tuple: api_tuple(rule),
-            canonical: own_comment_patch_canonicalization(),
+            canonical: governed_api_canonicalization(rule),
         };
     }
     // Field payloads change request semantics independently of the endpoint.
@@ -4724,6 +4918,29 @@ fn api_rule_matches_path(rule: &ApiRule, path: &str) -> bool {
         let segments = path.split('/').collect::<Vec<_>>();
         return matches!(segments.as_slice(), ["", "repos", owner, repo, "private-vulnerability-reporting"]
             if !owner.is_empty() && !repo.is_empty());
+    }
+    if matches!(
+        rule.path_glob.as_str(),
+        REVIEW_REPLY_PATH_GLOB
+            | PULL_EDIT_PATH_GLOB
+            | STACK_CREATE_PATH_GLOB
+            | STACK_ADD_PATH_GLOB
+            | STACK_UNSTACK_PATH_GLOB
+            | MERGE_ASYNC_PATH_GLOB
+    ) {
+        // The same reason: `/repos/*/*/pulls/*` must name one pull request,
+        // not every endpoint below it, so each `*` matches one non-empty
+        // path segment.
+        let pattern = rule.path_glob.split('/').collect::<Vec<_>>();
+        let segments = path.split('/').collect::<Vec<_>>();
+        return pattern.len() == segments.len()
+            && pattern.iter().zip(&segments).all(|(expected, actual)| {
+                if *expected == "*" {
+                    !actual.is_empty()
+                } else {
+                    expected == actual
+                }
+            });
     }
     glob::Pattern::new(&rule.path_glob).is_ok_and(|pattern| pattern.matches(path))
 }
@@ -4920,9 +5137,10 @@ impl GithubReadMutation {
             "issue comment" | "issue edit" | "issue reaction" | "issue close" | "issue reopen" => {
                 GithubReadResourceKind::Issue
             }
-            "pr comment" | "pr review" | "pr close" | "pr reopen" | "pr ready" => {
+            "pr comment" | "pr review" | "pr close" | "pr reopen" | "pr ready" | "pr edit" => {
                 GithubReadResourceKind::PullRequest
             }
+            action if action == review_reply_tuple() => GithubReadResourceKind::PullRequest,
             _ => return None,
         };
         let normalized_repository = canonical_repository_key(request.repository.as_deref()?)?;
@@ -5006,6 +5224,18 @@ fn canonicalize_governed_from<R: Read>(
             manifest_version,
             stdin,
         );
+    }
+    if tuple == "pr edit" {
+        return canonicalize_pr_edit_from(
+            args,
+            subcommand_index,
+            canonical,
+            manifest_version,
+            stdin,
+        );
+    }
+    if is_review_thread_tuple(tuple) {
+        return canonicalize_review_thread(args, tuple, canonical, manifest_version);
     }
     let target_and_state = is_target_and_state(canonical);
     let pr_ready = tuple == "pr ready";
@@ -5547,6 +5777,9 @@ fn canonicalize_governed_api_from<R: Read>(
     manifest_version: u64,
     stdin: &mut R,
 ) -> Result<GovernedRequest, CanonicalizeError> {
+    if let Some(request) = canonicalize_v22_api_from(args, tuple, manifest_version, stdin) {
+        return request;
+    }
     let target_field = canonical
         .target_fields
         .first()
@@ -7590,6 +7823,10 @@ fn unix_seconds() -> u64 {
 #[cfg(test)]
 #[path = "gh_shim/v19_tests.rs"]
 mod v19_tests;
+
+#[cfg(test)]
+#[path = "gh_shim/v22_tests.rs"]
+mod v22_tests;
 
 #[cfg(test)]
 // Release-profile test builds carry no dev key in the trust set, so the tests

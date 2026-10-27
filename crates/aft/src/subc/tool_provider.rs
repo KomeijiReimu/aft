@@ -4961,6 +4961,8 @@ mod tests {
 
 #[cfg(test)]
 mod route_tests {
+    mod carrier_samples;
+
     use super::super::*;
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5061,9 +5063,6 @@ mod route_tests {
         metrics: &Arc<DispatchPathMetrics>,
         dispatch: DispatchFn,
     ) -> WriterFrame {
-        let executor = Arc::new(Executor::new());
-        assert!(executor.register_actor(identity.root.clone(), ctx));
-        let routes = HashMap::from([(route_key(41, 1), identity)]);
         let frame = Frame::build(
             FrameType::Request,
             control_flags(),
@@ -5073,6 +5072,19 @@ mod route_tests {
             serde_json::to_vec(&body).unwrap(),
         )
         .unwrap();
+        exchange_frame_with_actor(frame, identity, ctx, metrics, dispatch).await
+    }
+
+    async fn exchange_frame_with_actor(
+        frame: Frame,
+        identity: RouteIdentity,
+        ctx: Arc<AppContext>,
+        metrics: &Arc<DispatchPathMetrics>,
+        dispatch: DispatchFn,
+    ) -> WriterFrame {
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(identity.root.clone(), ctx));
+        let routes = HashMap::from([(route_key(41, 1), identity)]);
         // As on the frame loop, a scoped worker's saved confinement is read
         // off the loop first when memory cannot answer for it.
         let decoded = DecodedFrame {
@@ -6883,6 +6895,164 @@ mod route_tests {
                 ctx.config().sandbox.profile.head.to_string()
             );
         }
+    }
+
+    /// Building a worker's formatter launch policy creates a private task
+    /// directory and a full sandbox profile, which used to happen before
+    /// dispatch on every mutating worker call. Calls that launch no formatter
+    /// or checker must not build it at all; a call that launches tools builds
+    /// it once and shares it across its commands; and a policy that cannot be
+    /// built refuses with exactly the text it gave when it was built up front.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_edit_builds_tool_launch_policy_only_when_a_tool_launches() {
+        use crate::sandbox_spawn::{SandboxTaskKind, ToolLaunchPolicy};
+        let _guard = EXCHANGE_LOCK.lock().await;
+        /// Content `launch` makes the call build a formatter command and,
+        /// through a second policy handle, a checker command (building a
+        /// command is what resolves the policy); any other content builds no
+        /// tool command.
+        fn observe(request: RawRequest, ctx: &AppContext) -> Response {
+            let policy = ToolLaunchPolicy::for_request(ctx);
+            if request.params["content"].as_str() != Some("launch") {
+                return Response::success(request.id, json!({"launched": false}));
+            }
+            let formatter = policy
+                .command(std::ffi::OsStr::new("formatter-probe"), &[])
+                .map(|_| ());
+            let nested = ToolLaunchPolicy::for_request(ctx);
+            let checker = nested
+                .command(std::ffi::OsStr::new("checker-probe"), &[])
+                .map(|_| ());
+            match (formatter, checker) {
+                (Ok(()), Ok(())) => Response::success(request.id, json!({"launched": true})),
+                (Err(formatter), Err(checker)) => {
+                    assert_eq!(formatter, checker);
+                    Response::success(request.id, json!({"refusal": formatter}))
+                }
+                other => panic!("one call's tools must share one policy: {other:?}"),
+            }
+        }
+        let (_project, storage, ctx, mut identity) = worker_route(
+            RouteRole::ToolProviderV1,
+            subc_protocol::call_mode::CallMode::Classic,
+        );
+        let operator_binary = storage.path().join("operator-aft");
+        std::fs::write(&operator_binary, "operator executable fixture").unwrap();
+        let _launcher = crate::sandbox_spawn::install_sandbox_launcher_for_test(
+            &identity.project_root,
+            operator_binary.clone(),
+        );
+        ctx.update_config(|config| {
+            config.gh_shim.binary_path = Some(operator_binary);
+            config.sandbox.profile.worker = crate::config::SandboxMode::Relaxed;
+        });
+        let data = Arc::get_mut(&mut identity.0).unwrap();
+        let mut scope = stamp("worker");
+        scope.owner = Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        };
+        data.scope = Some(scope);
+        assert!(super::super::access_grants::alfonso_worker(&identity));
+        let root = identity.project_root.clone();
+        crate::sandbox_spawn::install_sandbox_spawn_test_seam(root.clone());
+        let tool_policy_builds = || {
+            crate::sandbox_spawn::sandbox_spawn_test_observations(&root)
+                .into_iter()
+                .filter(|observation| observation.task_kind == SandboxTaskKind::ExternalTool)
+                .count()
+        };
+        let call = |content: &str, profile_reads: usize| -> Value {
+            let run = PlainToolRun {
+                bare_name: "write".into(),
+                arguments: json!({"path": "pin.rs", "content": content}),
+                format_context: Default::default(),
+                tool_call_context: ToolCallContext {
+                    project_root: identity.project_root.clone(),
+                    session_id: Some(identity.session.clone()),
+                    request_id: "tool-policy-lazy".into(),
+                    diagnostics_on_edit: false,
+                    preview: false,
+                    edit_slot_survives: None,
+                    report_registration_downgrade: false,
+                    standard_edit_grammar: true,
+                    disabled_tools: None,
+                    worker_session: true,
+                    host_tool_names: None,
+                },
+                dispatch: observe,
+                bind_trust: identity.trust,
+                identity: identity.clone(),
+                request_id: "tool-policy-lazy".into(),
+                ledger_key: None,
+                io_budget: crate::bounded_io::Budget::after(Duration::from_secs(30)),
+                approved_io_window: None,
+                reply_deadline: Instant::now() + Duration::from_secs(30),
+            };
+            let (done, _completion) = oneshot::channel();
+            let job = run.job(
+                crate::access_policy::AskRoute::Lowered,
+                PhaseTrace::new(Instant::now()),
+                done,
+            );
+            // The fixture also asserts how many times a profile prepared the
+            // account-home canaries (only relaxed profiles off Linux do), so a
+            // call that launches nothing proves no profile was built here too.
+            crate::worker_jail_canary::with_test_preparation_home(
+                storage.path(),
+                profile_reads,
+                || job(&ctx).data,
+            )
+        };
+        let relaxed_profile_reads = usize::from(!cfg!(target_os = "linux"));
+
+        for _ in 0..5 {
+            let data = call("pub fn edited() {}\n", 0);
+            assert_eq!(data["launched"], false, "{data}");
+        }
+        assert_eq!(
+            tool_policy_builds(),
+            0,
+            "worker calls that launch no tool must not build a launch policy"
+        );
+
+        let data = call("launch", relaxed_profile_reads);
+        assert_eq!(data["launched"], true, "{data}");
+        assert_eq!(
+            tool_policy_builds(),
+            1,
+            "one call's formatter and checker must share one launch policy"
+        );
+
+        // A file where the task directories belong makes the policy's private
+        // tool directory impossible to create, so the policy refuses.
+        let task_root = storage.path().join("bash-tasks");
+        if task_root.is_dir() {
+            std::fs::remove_dir_all(&task_root).unwrap();
+        }
+        std::fs::write(&task_root, "not a directory").unwrap();
+        let data = call("launch", 0);
+        let built_up_front = crate::sandbox_spawn::with_authenticated_principal(
+            identity.spawn_principal.clone(),
+            || {
+                crate::sandbox_spawn::with_worker_jail(true, || {
+                    crate::log_ctx::with_session(Some(identity.session.clone()), || {
+                        ToolLaunchPolicy::resolve(&ctx)
+                    })
+                })
+            },
+        );
+        let expected = built_up_front
+            .command(std::ffi::OsStr::new("formatter-probe"), &[])
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            expected
+                .starts_with("sandbox_unavailable: failed to allocate a private tool directory"),
+            "{expected}"
+        );
+        assert_eq!(data["refusal"], expected, "{data}");
+        crate::sandbox_spawn::clear_sandbox_spawn_test_seam(&root);
     }
 
     /// Fetch the worker catalog with `confine: "root"`, which saves the fence.

@@ -39,7 +39,11 @@ fn event(journal: &Journal, root: &Path, name: &str, kind: notify::EventKind) {
 }
 fn capture(root: &Path, mode: BashChangedFiles) -> (Arc<Journal>, Arc<Capture>) {
     let journal = Arc::new(Journal::default());
+    // These tests check what the report says when git answers, not how fast
+    // git starts; give the before-image capture an ample budget.
+    TEST_GIT_CAPTURE_BUDGET.with(|slot| slot.set(Some(Duration::from_secs(30))));
     let mut capture = Capture::begin(root.to_path_buf(), journal.clone(), mode, true);
+    TEST_GIT_CAPTURE_BUDGET.with(|slot| slot.set(None));
     if mode == BashChangedFiles::Diff {
         let config = crate::config::Config::default();
         let home = std::env::var_os("HOME")

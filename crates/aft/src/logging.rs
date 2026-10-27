@@ -1616,6 +1616,16 @@ pub fn flush_stderr_on_exit(timeout: std::time::Duration) -> bool {
         .is_none_or(|mirror| mirror.drain_on_exit(timeout))
 }
 
+/// Test-only (debug builds): stop the stderr mirror from writing until
+/// [`flush_stderr_on_exit`] starts, so the lines logged in between are still
+/// queued when the exit fence runs. Without the fence they would be lost.
+#[cfg(debug_assertions)]
+pub fn hold_stderr_mirror_until_exit_fence() {
+    if let Some(mirror) = STDERR_MIRROR.get() {
+        mirror.hold_until_exit_fence();
+    }
+}
+
 /// Persist the last process-exit line without depending on the async writer.
 /// Taking its active sink prevents later rotation or reconfiguration from
 /// moving the marker. Queued diagnostics may be abandoned once their bounded
@@ -2376,13 +2386,14 @@ pub fn note_tool_call_trace(
 
     let waiting_on_build_id = phases.waiting_on_build_id.as_deref().unwrap_or("-");
     crate::slog_debug!(
-        "tool_call phase name={} session={} channel={} corr={} total_ms={:.3} queue_ms={:.3} translate_ms={:.3} exec_ms={:.3} format_ms={:.3} finalize_ms={:.3} egress_ms={:.3} egress_enqueue_ms={:.3} egress_queue_ms={:.3} egress_prepare_ms={:.3} egress_write_ms={:.3} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} waiting_on={} waiting_on_build_id={} wait_ms={} root={}",
+        "tool_call phase name={} session={} channel={} corr={} total_ms={:.3} queue_ms={:.3} setup_ms={:.3} translate_ms={:.3} exec_ms={:.3} format_ms={:.3} finalize_ms={:.3} egress_ms={:.3} egress_enqueue_ms={:.3} egress_queue_ms={:.3} egress_prepare_ms={:.3} egress_write_ms={:.3} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} waiting_on={} waiting_on_build_id={} wait_ms={} root={}",
         name,
         session,
         channel,
         corr,
         duration_millis_f64(phases.total),
         duration_millis_f64(phases.queue),
+        duration_millis_f64(phases.setup),
         duration_millis_f64(phases.translate),
         duration_millis_f64(phases.execute),
         duration_millis_f64(phases.format),
@@ -2417,13 +2428,14 @@ pub fn note_tool_call_trace(
             detail.push_str(edit_phases);
         }
         let message = format!(
-            "slow tool_call name={} session={} channel={} corr={} total={}ms queue={} translate={} exec={} format={} finalize={} egress={} egress_enqueue={} egress_queue={} egress_prepare={} egress_write={} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} waiting_on={} waiting_on_build_id={} wait_ms={}{} root={}",
+            "slow tool_call name={} session={} channel={} corr={} total={}ms queue={} setup={} translate={} exec={} format={} finalize={} egress={} egress_enqueue={} egress_queue={} egress_prepare={} egress_write={} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} waiting_on={} waiting_on_build_id={} wait_ms={}{} root={}",
             name,
             session,
             channel,
             corr,
             duration_millis_u64(phases.total),
             slow_phase_time(phases.queue, None),
+            slow_phase_time(phases.setup, phases.cpu.setup),
             slow_phase_time(phases.translate, phases.cpu.translate),
             slow_phase_time(phases.execute, phases.cpu.execute),
             slow_phase_time(phases.format, phases.cpu.format),
@@ -3415,6 +3427,7 @@ mod tests {
         ToolCallPhaseDurations {
             cpu: crate::run_tool_call::ToolCallPhaseCpu::default(),
             queue: Duration::ZERO,
+            setup: Duration::ZERO,
             translate: Duration::ZERO,
             execute: Duration::from_millis(120),
             format: Duration::ZERO,

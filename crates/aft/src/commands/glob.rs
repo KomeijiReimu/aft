@@ -910,7 +910,14 @@ mod tests {
                 "id": "glob-bulk-lower-bound", "command": "glob", "pattern": "bulk/*.txt"
             }))
             .unwrap();
-            let response = handle_glob(&request, &ctx);
+            // This test checks the reported lower bound, not deadline handling.
+            // A slow CI runner (Windows) can spend the default 5 s request
+            // budget on 140 per-path checks, so give the request a generous
+            // budget of its own.
+            let response = crate::bounded_io::with_budget(
+                Some(crate::bounded_io::Budget::after(Duration::from_secs(60))),
+                || handle_glob(&request, &ctx),
+            );
             assert!(response.success, "{response:?}");
             let body = &response.data;
             let lower_bound = body["total_lower_bound"]

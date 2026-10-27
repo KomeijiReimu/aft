@@ -173,6 +173,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       # cache-bin: false keeps a cached ~/.cargo/bin from overwriting the fresh
       # cargo shim, as in build-darwin-x64.
@@ -245,6 +249,10 @@ jobs:
           targets: x86_64-apple-darwin
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -404,6 +412,10 @@ jobs:
           targets: aarch64-pc-windows-msvc
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -446,6 +458,10 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -777,7 +793,15 @@ jobs:
         working-directory: packages/aft-cli
 
       - name: Fetch final v0.48.1 activation baseline
-        run: git fetch --force origin refs/tags/v0.48.1:refs/tags/v0.48.1
+        run: |
+          set -euo pipefail
+          # Retry so a brief network failure reaching github.com does not
+          # fail the release.
+          for attempt in 1 2 3; do
+            git fetch --force origin refs/tags/v0.48.1:refs/tags/v0.48.1 && break
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            sleep 20
+          done
 
       - name: Prepare publication records from the tagged candidate
         run: node scripts/release-gate-v049.mjs --prepare --snapshot-dir "${{ runner.temp }}/governed-publication" --candidate

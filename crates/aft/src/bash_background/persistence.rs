@@ -4932,6 +4932,27 @@ std::thread_local! {
     static BEFORE_ARTIFACT_VALIDATION: std::cell::RefCell<Option<Box<dyn FnMut(&File)>>> = const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(all(test, unix))]
+pub(crate) fn metadata_open_attempts_for_test() -> u32 {
+    METADATA_OPEN_ATTEMPTS
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn with_artifact_validation_hook_for_test<T>(
+    hook: impl FnMut(&File) + 'static,
+    read: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<Box<dyn FnMut(&File)>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BEFORE_ARTIFACT_VALIDATION.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+    let _restore =
+        Restore(BEFORE_ARTIFACT_VALIDATION.with(|slot| slot.replace(Some(Box::new(hook)))));
+    read()
+}
+
 #[cfg(unix)]
 pub fn set_close_on_exec(fd: RawFd, enabled: bool) -> io::Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };

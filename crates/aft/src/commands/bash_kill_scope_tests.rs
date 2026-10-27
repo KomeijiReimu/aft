@@ -95,15 +95,8 @@ fn bash_kill_scope_kills_promoted_background_and_grandchildren() {
     );
     let foreground = tasks.start(&stamp, "foreground", "sleep 30", false);
     assert!(tasks.registry.promote(&foreground, "foreground").unwrap());
-    wait_for(|| pid_file.exists());
-    let pid: i32 = std::fs::read_to_string(&pid_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    assert!(crate::bash_background::process::is_process_alive(
-        pid as u32
-    ));
+    let pid = read_pid(&pid_file);
+    assert!(crate::bash_background::process::is_process_alive(pid));
     let reply = tasks.cancel(&stamp);
     assert!(reply.success, "{reply:?}");
     let killed = reply.data["killed"].as_array().unwrap();
@@ -132,7 +125,7 @@ fn bash_kill_scope_kills_promoted_background_and_grandchildren() {
             .take_cancelled_call_notices(session)
             .is_empty());
     }
-    wait_for(|| !crate::bash_background::process::is_process_alive(pid as u32));
+    wait_for(|| !crate::bash_background::process::is_process_alive(pid));
 }
 
 #[test]
@@ -343,12 +336,27 @@ fn bash_kill_scope_next_bash_family_reply_names_cancellation_once() {
     assert!(!again.contains("cancelled by owner"));
 }
 
+/// Waits for a pid file written by `echo $! > file` and returns the pid.
+///
+/// The shell creates the file before `echo` writes into it, so the file can
+/// exist while still empty or partly written. Only a newline-terminated line
+/// that parses counts as complete; the bound is generous for slow runners.
 fn read_pid(path: &std::path::Path) -> u32 {
-    std::fs::read_to_string(path)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap()
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let contents = std::fs::read_to_string(path).unwrap_or_default();
+        if contents.ends_with('\n') {
+            if let Ok(pid) = contents.trim().parse() {
+                return pid;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pid file {} never held a complete pid: {contents:?}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// A module restart leaves a project's saved tasks out of every live registry
@@ -390,7 +398,6 @@ fn bash_kill_scope_stops_saved_task_before_its_project_binds() {
     let other_pid_file = project.path().join("other");
     let task = start(&stamp, "session", &paused_pid_file);
     let other_task = start(&other, "other-session", &other_pid_file);
-    wait_for(|| paused_pid_file.exists() && other_pid_file.exists());
     let paused_pid = read_pid(&paused_pid_file);
     let other_pid = read_pid(&other_pid_file);
     // The module exits: its registry lets go of the tasks without stopping

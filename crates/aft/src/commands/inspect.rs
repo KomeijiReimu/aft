@@ -387,7 +387,7 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
         return Response::error(&req.id, crate::root_cache::CACHE_DIR_UNAVAILABLE, reason);
     }
     if req.worker_session() {
-        ctx.lsp().disable_rust_cargo_for_worker();
+        ctx.disable_rust_cargo_for_worker();
     }
     handle_inspect_payload(
         req,
@@ -546,7 +546,7 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
         return Response::error(&req.id, crate::root_cache::CACHE_DIR_UNAVAILABLE, reason);
     }
     if req.worker_session() {
-        ctx.lsp().disable_rust_cargo_for_worker();
+        ctx.disable_rust_cargo_for_worker();
     }
     let phase_log = InspectPhaseLog::for_request(req.id.clone());
     let deadline = InspectRequestDeadline::from_config(&ctx.config());
@@ -1346,7 +1346,7 @@ pub(crate) fn handle_inspect_deferred_with_reply_deadline(
     reply_deadline: Option<Instant>,
 ) -> DispatchOutcome {
     if req.worker_session() {
-        ctx.lsp().disable_rust_cargo_for_worker();
+        ctx.disable_rust_cargo_for_worker();
     }
     let watcher_pending = crate::response_finalize::watcher_query_pending(&ctx, "inspect");
     let request_id = req.id.clone();

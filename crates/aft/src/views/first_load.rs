@@ -2269,8 +2269,8 @@ impl CheckoutDriver {
         delta.record_intent(path);
         // Membership is unchanged, so are the ignore rules it was walked under.
         delta.record_root_ignore_files(installed.snapshot.root_ignore_files().cloned());
-        // One known-path event cannot prove that delivery remained continuous
-        // for the whole watcher stream.
+        // The persistent live delta retains any stream-wide delivery gap;
+        // recording a known path cannot make the watcher healthy again.
         installed.snapshot = delta
             .snapshot()
             .with_readers(installed.readers.clone())
@@ -3941,6 +3941,114 @@ mod composite_tests {
         assert_eq!(
             driver.live.lock().unwrap().watcher(),
             super::super::snapshot::WatcherState::Reconciling
+        );
+    }
+
+    #[test]
+    fn watcher_cookie_overflow_preserves_composition_readers_and_live_journals() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        drop(
+            SiblingLoader::new(driver.clone(), vec![])
+                .load(&access)
+                .unwrap(),
+        );
+        let file = RelPath::new(b"file.rs".to_vec()).unwrap();
+        driver.live.lock().unwrap().apply(
+            file.clone(),
+            LiveEntry::new(DiskState::of_bytes(b"updated content"), 1),
+        );
+        driver.live.lock().unwrap().set_readiness(
+            file.clone(),
+            super::super::snapshot::PlanePatch {
+                content: crate::blob_store::v2::ContentHash::of(b"updated content"),
+                planes: EntryPlanes {
+                    trigram: Some(super::super::readiness::PlaneState::pending(
+                        "checkout repair",
+                    )),
+                    ..Default::default()
+                },
+            },
+        );
+        driver.record_change(file.clone());
+        let held = driver.installed_bundle();
+        let journal = driver.live.lock().unwrap().journal().to_vec();
+        assert!(!journal.is_empty());
+        let ticket = driver.begin_watcher_cookie().unwrap();
+        driver.record_watcher_overflow();
+        driver.record_watcher_cookie(ticket.path());
+        let observed = ticket.wait_timeout(std::time::Duration::ZERO).unwrap();
+        let current = driver.installed_bundle();
+        assert_eq!(
+            observed.watcher,
+            super::super::snapshot::WatcherState::Overflowed
+        );
+        assert_eq!(observed.revision, current.revision);
+        assert!(current.revision > held.revision);
+        assert_eq!(current.seq, held.seq);
+        assert!(Arc::ptr_eq(&current.composed, &held.composed));
+        assert!(Arc::ptr_eq(&current.readers, &held.readers));
+        assert!(Arc::ptr_eq(
+            current.snapshot.readers().unwrap(),
+            &held.readers
+        ));
+        assert_eq!(
+            current.snapshot.readiness_patches(),
+            held.snapshot.readiness_patches()
+        );
+        assert_eq!(driver.live.lock().unwrap().journal(), journal.as_slice());
+        assert!(current.snapshot.pending_intent().any(|path| path == &file));
+        assert_eq!(
+            held.snapshot.watcher(),
+            super::super::snapshot::WatcherState::Healthy
+        );
+        assert!(current.snapshot.epoch() > held.snapshot.epoch());
+        let cut = current.snapshot.install_cut().unwrap();
+        assert_eq!(cut.seq, held.seq);
+        assert_eq!(cut.epoch, current.snapshot.epoch());
+        assert!(Arc::ptr_eq(&cut.resident, &held.composed));
+    }
+
+    #[test]
+    fn watcher_cookie_each_overflow_refuses_a_walk_cut_before_the_gap() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        let loader = SiblingLoader::new(driver.clone(), vec![]);
+        drop(loader.load(&access).unwrap());
+        for _ in 0..2 {
+            let (walk, revision) = loader
+                .reconciled(&access, driver.installed_snapshot().generation().clone())
+                .unwrap();
+            driver.record_watcher_overflow();
+            assert!(driver.installed_snapshot().epoch() > walk.install_cut().unwrap().epoch);
+            let error = driver.install(&access, &walk, revision).unwrap_err();
+            assert!(error.reason.contains("EpochChanged"), "{error:?}");
+            let stale_epoch_walk = walk
+                .clone()
+                .with_install_cut(driver.installed_snapshot().install_cut().unwrap().clone());
+            let error = driver
+                .install(&access, &stale_epoch_walk, revision)
+                .unwrap_err();
+            assert!(
+                error
+                    .reason
+                    .contains("watcher is not healthy or strictly reconciled"),
+                "{error:?}"
+            );
+            assert_eq!(
+                driver.installed_snapshot().watcher(),
+                super::super::snapshot::WatcherState::Overflowed
+            );
+        }
+        let (walk, revision) = loader
+            .reconciled(&access, driver.installed_snapshot().generation().clone())
+            .unwrap();
+        driver.install(&access, &walk, revision).unwrap();
+        assert_eq!(
+            driver.installed_snapshot().watcher(),
+            super::super::snapshot::WatcherState::Healthy
         );
     }
 

@@ -314,6 +314,47 @@ impl<'a> BorrowedIndexLoadBudget<'a> {
     }
 }
 
+/// Borrowed-load record reads observed per fixture root. A borrowed reload
+/// parses on a background thread, so a thread-local counter on the searching
+/// thread cannot see it; each test registers its own temporary root and the
+/// read loop bumps only that root's counter. Asserting the count stayed at or
+/// below the entry budget proves the reload stopped at the entry budget,
+/// which a wall-clock bound cannot show on a loaded machine.
+#[cfg(test)]
+static BORROWED_LOAD_RECORDS_READ_PROBES: OnceLock<Mutex<HashMap<PathBuf, Arc<AtomicUsize>>>> =
+    OnceLock::new();
+
+/// Register `root` for borrowed-load record observation and return its
+/// counter. Callers remove the probe with
+/// [`unobserve_borrowed_load_records_read_for_test`] after the assertion.
+#[cfg(test)]
+pub(crate) fn observe_borrowed_load_records_read_for_test(root: &Path) -> Arc<AtomicUsize> {
+    let counter = Arc::new(AtomicUsize::new(0));
+    BORROWED_LOAD_RECORDS_READ_PROBES
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap()
+        .insert(root.to_path_buf(), Arc::clone(&counter));
+    counter
+}
+
+/// Stop observing borrowed-load record reads for `root`.
+#[cfg(test)]
+pub(crate) fn unobserve_borrowed_load_records_read_for_test(root: &Path) {
+    if let Some(probes) = BORROWED_LOAD_RECORDS_READ_PROBES.get() {
+        probes.lock().unwrap().remove(root);
+    }
+}
+
+#[cfg(test)]
+fn note_borrowed_load_record_read_for_test(project_root: &Path) {
+    if let Some(probes) = BORROWED_LOAD_RECORDS_READ_PROBES.get() {
+        if let Some(counter) = probes.lock().unwrap().get(project_root) {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Read an artifact pointer without allowing a writer to strand an interactive request.
 ///
 /// Index refreshes publish through `RwLock`s and can legitimately hold a write guard while
@@ -503,6 +544,20 @@ pub struct SearchIndex {
     base_file_count: u32,
     delta_packed_bytes: usize,
     compaction_state: Arc<Mutex<CompactionState>>,
+    /// The `cache.bin` this index last wrote itself, and the header values it
+    /// wrote there. `None` for an index read from disk or built in memory.
+    published_cache: Option<PublishedCache>,
+}
+
+/// Where an index wrote its own cache, and the header fields that a rewrite
+/// from the index would take from mutable index state.
+#[derive(Clone, Debug)]
+struct PublishedCache {
+    cache_dir: PathBuf,
+    /// Stored the way the header stores it: no head is an empty string.
+    git_head: String,
+    ignore_fingerprint: String,
+    max_file_size: u64,
 }
 
 // A query must observe postings and superseded base files from one version;
@@ -734,6 +789,23 @@ impl SearchIndex {
         !self.delta.postings.is_empty()
             || !self.delta.superseded.is_empty()
             || self.path_to_id.len() != self.base_file_count as usize
+    }
+
+    /// True when `write_to_disk(cache_dir, git_head)` would only rewrite the
+    /// cache this index already wrote there: same files, postings, HEAD,
+    /// ignore fingerprint and size limit, and no change since. A cold build
+    /// writes `cache.bin` itself, so callers that persist right after one can
+    /// skip a second full rewrite of the same bytes.
+    pub(crate) fn disk_cache_is_current(&self, cache_dir: &Path, git_head: Option<&str>) -> bool {
+        let Some(published) = self.published_cache.as_ref() else {
+            return false;
+        };
+        published.cache_dir == cache_dir
+            && published.git_head == git_head.unwrap_or_default()
+            && !self.ignore_rules_fingerprint.is_empty()
+            && published.ignore_fingerprint == self.ignore_rules_fingerprint
+            && published.max_file_size == self.max_file_size
+            && !self.has_pending_disk_changes()
     }
 
     /// Returns an immutable snapshot for queries. Callers must obtain the
@@ -1894,6 +1966,7 @@ impl SearchIndex {
             base_file_count: 0,
             delta_packed_bytes: 0,
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
+            published_cache: None,
         }
     }
 
@@ -2532,6 +2605,12 @@ impl SearchIndex {
                 self.file_trigram_count = Arc::new(plan.file_trigram_count);
                 self.git_head = plan.git_head.filter(|head| !head.is_empty());
                 self.ignore_rules_fingerprint = plan.ignore_fingerprint;
+                self.published_cache = Some(PublishedCache {
+                    cache_dir: cache_dir.to_path_buf(),
+                    git_head: self.git_head.clone().unwrap_or_default(),
+                    ignore_fingerprint: self.ignore_rules_fingerprint.clone(),
+                    max_file_size: self.max_file_size,
+                });
                 true
             }
             Err(error) => {
@@ -2839,6 +2918,10 @@ impl SearchIndex {
             if unindexed[0] == 1 {
                 unindexed_files.insert(file_id_u32);
             }
+            #[cfg(test)]
+            if borrowed_load_budget.is_some() {
+                note_borrowed_load_record_read_for_test(&project_root);
+            }
         }
 
         if !reader_has_remaining(&mut reader, postings_body_end, 8).ok()? {
@@ -2923,6 +3006,10 @@ impl SearchIndex {
                 offset,
                 count,
             });
+            #[cfg(test)]
+            if borrowed_load_budget.is_some() {
+                note_borrowed_load_record_read_for_test(&project_root);
+            }
         }
 
         let base = BasePostings {
@@ -2968,6 +3055,7 @@ impl SearchIndex {
             base_file_count: u32::try_from(file_count).ok()?,
             delta_packed_bytes: 0,
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
+            published_cache: None,
         };
 
         if migrated_counts && allow_legacy_repair {
@@ -5225,11 +5313,10 @@ fn build_streaming_index(
     let ignore_fingerprint = ignore_rules_fingerprint_cancellable(&project_root, keep_going)
         .ok_or(std::io::ErrorKind::Interrupted)?;
     let filters = PathFilters::default();
-    let paths =
-        walk_build_files_cancellable(&project_root, &filters, keep_going).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Interrupted, "search refresh superseded")
-        })?;
-    crate::cold_build_limiter::progress::phase("indexing", Some(paths.len()));
+    let mut walk = BuildFileWalk::new(&project_root, &filters);
+    // The walk and the indexing now run together, so the file total is known
+    // only once the walk ends; it is reported then.
+    crate::cold_build_limiter::progress::phase("indexing", None);
     let pool_size = search_index_build_pool_size();
     let chunk_size = pool_size.saturating_mul(4).clamp(1, 32);
     let pool = rayon::ThreadPoolBuilder::new()
@@ -5253,8 +5340,20 @@ fn build_streaming_index(
     let mut file_trigram_count = Vec::new();
     let mut indexed = 0usize;
 
+    // Read once at publish time and shared by the written cache and the
+    // returned index, so the two always agree on HEAD.
+    let mut git_head: Option<String> = None;
     let build_result = (|| -> std::io::Result<BasePostings> {
-        for chunk in paths.chunks(chunk_size) {
+        while !walk.is_finished() {
+            let chunk = walk.next_chunk(chunk_size, keep_going).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::Interrupted, "search refresh superseded")
+            })?;
+            if walk.is_finished() {
+                crate::cold_build_limiter::progress::remaining(chunk.len());
+            }
+            if chunk.is_empty() {
+                continue;
+            }
             if !keep_going() {
                 return Err(std::io::ErrorKind::Interrupted.into());
             }
@@ -5278,18 +5377,22 @@ fn build_streaming_index(
                 None => prepare_chunk(),
             };
 
-            for (path, prepared) in chunk.iter().zip(prepared) {
+            let chunk_len = chunk.len();
+            for (mut path, prepared) in chunk.into_iter().zip(prepared) {
+                // The walk's paths carry spare capacity. The index keeps them
+                // for its lifetime, so trim them to their length first.
+                path.shrink_to_fit();
                 match prepared {
                     PreparedSearchPath::Indexed(file) => {
                         let file_id = u32::try_from(files.len())
                             .map_err(|_| std::io::Error::other("too many files to index"))?;
+                        path_to_id.insert(path.clone(), file_id);
                         files.push(FileEntry {
-                            path: path.clone(),
+                            path,
                             size: file.metadata.size,
                             modified: file.metadata.modified,
                             content_hash: file.content_hash,
                         });
-                        path_to_id.insert(path.clone(), file_id);
                         file_trigram_count.push(file.trigram_map.len() as u32);
                         for (trigram, filter) in file.trigram_map {
                             block.push(SpillRecord {
@@ -5304,13 +5407,13 @@ fn build_streaming_index(
                     PreparedSearchPath::Unindexed(metadata) => {
                         let file_id = u32::try_from(files.len())
                             .map_err(|_| std::io::Error::other("too many files to index"))?;
+                        path_to_id.insert(path.clone(), file_id);
                         files.push(FileEntry {
-                            path: path.clone(),
+                            path,
                             size: metadata.size,
                             modified: metadata.modified,
                             content_hash: cache_freshness::zero_hash(),
                         });
-                        path_to_id.insert(path.clone(), file_id);
                         unindexed_files.insert(file_id);
                         file_trigram_count.push(0);
                         indexed += 1;
@@ -5326,7 +5429,7 @@ fn build_streaming_index(
                     spill_seq += 1;
                 }
             }
-            crate::cold_build_limiter::progress::advance(chunk.len());
+            crate::cold_build_limiter::progress::advance(chunk_len);
         }
 
         crate::cold_build_limiter::progress::phase("publishing", None);
@@ -5339,38 +5442,47 @@ fn build_streaming_index(
             sources.push(Box::new(SpillSegmentSource::open(path)?));
         }
 
+        git_head = current_git_head(&project_root);
+        // The tables move into the plan and back out after the write. Cloning
+        // them held a second copy of every path while the cache was written.
         let plan = CacheWritePlan {
             project_root: project_root.clone(),
-            git_head: current_git_head(&project_root),
+            git_head: git_head.clone(),
             ignore_fingerprint: ignore_fingerprint.clone(),
             max_file_size,
-            files: files.clone(),
-            path_to_id: path_to_id.clone(),
-            unindexed_files: unindexed_files.clone(),
-            file_trigram_count: file_trigram_count.clone(),
-            id_map: Arc::new(
-                (0..files.len())
-                    .filter_map(|id| {
-                        let id = u32::try_from(id).ok()?;
-                        Some((id, id))
-                    })
-                    .collect(),
-            ),
+            files: std::mem::take(&mut files),
+            path_to_id: std::mem::take(&mut path_to_id),
+            unindexed_files: std::mem::take(&mut unindexed_files),
+            file_trigram_count: std::mem::take(&mut file_trigram_count),
+            // Only a rewrite of an existing index renumbers files. A cold
+            // build's ids are already the cache's ids, and the writer never
+            // reads this map, so it stays empty.
+            id_map: Arc::new(HashMap::new()),
         };
-        write_cache_file_from_sources(
+        let written = write_cache_file_from_sources(
             cache_dir,
             &plan,
             &mut sources,
             crate::write_ledger::Domain::SearchIndexBuild,
             keep_going,
-        )
+        );
+        files = plan.files;
+        path_to_id = plan.path_to_id;
+        unindexed_files = plan.unindexed_files;
+        file_trigram_count = plan.file_trigram_count;
+        written
     })();
 
     let _ = fs::remove_dir_all(&spill_dir);
     let base = build_result?;
     let base_file_count =
         u32::try_from(files.len()).map_err(|_| std::io::Error::other("too many files to index"))?;
-    let git_head = current_git_head(&project_root);
+    let published_cache = Some(PublishedCache {
+        cache_dir: cache_dir.to_path_buf(),
+        git_head: git_head.clone().unwrap_or_default(),
+        ignore_fingerprint: ignore_fingerprint.clone(),
+        max_file_size,
+    });
     let index = SearchIndex {
         base: Some(Arc::new(base)),
         delta: Arc::new(DeltaState::default()),
@@ -5389,6 +5501,7 @@ fn build_streaming_index(
         base_file_count,
         delta_packed_bytes: 0,
         compaction_state: Arc::new(Mutex::new(CompactionState::default())),
+        published_cache,
     };
     Ok((index, indexed))
 }
@@ -5429,8 +5542,7 @@ fn write_cache_file_from_sources(
         write_u64(&mut writer, 0)?;
 
         let postings_section_start = writer.stream_position()?;
-        let postings_header = build_postings_header_bytes(plan, keep_going)?;
-        write_search_build_bytes(&mut writer, &postings_header, keep_going)?;
+        write_postings_header(&mut writer, plan, keep_going)?;
         let postings_blob_len_patch = writer.stream_position()?;
         write_u64(&mut writer, 0)?;
         let postings_blob_start = writer.stream_position()?;
@@ -5577,14 +5689,16 @@ fn write_search_build_bytes(
     Ok(())
 }
 
-fn build_postings_header_bytes(
+/// Writes the file table straight to the cache writer. Building it in memory
+/// first held another copy of every relative path while the cache was written.
+fn write_postings_header(
+    writer: &mut impl Write,
     plan: &CacheWritePlan,
     keep_going: &dyn Fn() -> bool,
-) -> std::io::Result<Vec<u8>> {
+) -> std::io::Result<()> {
     check_search_build(keep_going)?;
-    let mut writer = BufWriter::new(Cursor::new(Vec::new()));
     writer.write_all(INDEX_MAGIC)?;
-    write_u32(&mut writer, INDEX_VERSION)?;
+    write_u32(writer, INDEX_VERSION)?;
 
     let head = plan.git_head.as_deref().unwrap_or_default();
     let root = plan.project_root.to_string_lossy();
@@ -5597,11 +5711,11 @@ fn build_postings_header_bytes(
     let file_count = u32::try_from(plan.files.len())
         .map_err(|_| std::io::Error::other("too many files to cache"))?;
 
-    write_u32(&mut writer, head_len)?;
-    write_u32(&mut writer, root_len)?;
-    write_u32(&mut writer, ignore_fingerprint_len)?;
-    write_u64(&mut writer, plan.max_file_size)?;
-    write_u32(&mut writer, file_count)?;
+    write_u32(writer, head_len)?;
+    write_u32(writer, root_len)?;
+    write_u32(writer, ignore_fingerprint_len)?;
+    write_u64(writer, plan.max_file_size)?;
+    write_u32(writer, file_count)?;
     writer.write_all(head.as_bytes())?;
     writer.write_all(root.as_bytes())?;
     writer.write_all(plan.ignore_fingerprint.as_bytes())?;
@@ -5632,19 +5746,15 @@ fn build_postings_header_bytes(
         };
 
         writer.write_all(&[unindexed])?;
-        write_u32(&mut writer, path_len)?;
-        write_u64(&mut writer, file.size)?;
-        write_u64(&mut writer, modified.as_secs())?;
-        write_u32(&mut writer, modified.subsec_nanos())?;
+        write_u32(writer, path_len)?;
+        write_u64(writer, file.size)?;
+        write_u64(writer, modified.as_secs())?;
+        write_u32(writer, modified.subsec_nanos())?;
         writer.write_all(file.content_hash.as_bytes())?;
         writer.write_all(path.as_bytes())?;
     }
 
-    writer.flush()?;
-    Ok(writer
-        .into_inner()
-        .map_err(|error| std::io::Error::other(error.to_string()))?
-        .into_inner())
+    Ok(())
 }
 
 fn build_lookup_section_bytes(
@@ -6663,29 +6773,65 @@ pub(crate) fn walk_project_files(root: &Path, filters: &PathFilters) -> Vec<Path
         .expect("unbounded project walk cannot exceed a file limit")
 }
 
+/// The cold build's file walk, read a chunk at a time. The streaming build
+/// indexes each chunk before asking for the next one, so it never holds the
+/// whole root's path list: on a root with a million files that list alone was
+/// several hundred megabytes. Files come out in the same order as one
+/// collected walk, so file ids and the written cache do not change.
+struct BuildFileWalk<'a> {
+    root: &'a Path,
+    filters: &'a PathFilters,
+    walker: ignore::Walk,
+    finished: bool,
+}
+
+impl<'a> BuildFileWalk<'a> {
+    fn new(root: &'a Path, filters: &'a PathFilters) -> Self {
+        Self {
+            root,
+            filters,
+            walker: project_walk_builder(root).build(),
+            finished: false,
+        }
+    }
+
+    /// True once the walk has returned its last file.
+    fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// The next `max` admitted files, or fewer when the walk ends first.
+    /// `keep_going` is checked before every walk entry, as the collected walk
+    /// did, and a cancelled walk returns `None`.
+    fn next_chunk(&mut self, max: usize, keep_going: &dyn Fn() -> bool) -> Option<Vec<PathBuf>> {
+        let mut paths = Vec::new();
+        while paths.len() < max && !self.finished {
+            if !keep_going() {
+                return None;
+            }
+            let Some(entry) = self.walker.next() else {
+                self.finished = true;
+                break;
+            };
+            let Ok(entry) = entry else {
+                continue;
+            };
+            if entry.file_type().is_some_and(|kind| kind.is_file())
+                && self.filters.matches(self.root, entry.path())
+            {
+                paths.push(entry.into_path());
+            }
+        }
+        Some(paths)
+    }
+}
+
 fn walk_build_files_cancellable(
     root: &Path,
     filters: &PathFilters,
     keep_going: &dyn Fn() -> bool,
 ) -> Option<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    let mut walker = project_walk_builder(root).build();
-    loop {
-        if !keep_going() {
-            return None;
-        }
-        let Some(entry) = walker.next() else {
-            return Some(paths);
-        };
-        let Ok(entry) = entry else {
-            continue;
-        };
-        if entry.file_type().is_some_and(|kind| kind.is_file())
-            && filters.matches(root, entry.path())
-        {
-            paths.push(entry.into_path());
-        }
-    }
+    BuildFileWalk::new(root, filters).next_chunk(usize::MAX, keep_going)
 }
 
 pub fn walk_project_files_bounded_default(
@@ -6806,10 +6952,35 @@ fn project_walk_builder_pruned(
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
     // the daemon, so never open directories outside this walk root's filesystem.
     builder.same_file_system(true).hidden(false);
+    // Nested linked worktrees of this repository index again under their own
+    // roots; prune them here so every walk sharing this builder skips them.
+    // The named root itself is always admitted (depth 0), so an explicitly
+    // targeted walk inside a worktree still reads it.
+    let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(search_root);
     crate::context::apply_project_ignore_rules(&mut builder, search_root).filter_entry(
-        move |entry| project_walk_admits_entry(entry, excludes) && descend(entry.path()),
+        move |entry| {
+            project_walk_admits_entry(entry, excludes)
+                && descend(entry.path())
+                && !is_nested_worktree_entry(entry, &worktrees)
+        },
     );
     builder
+}
+
+/// True when `entry` is a directory below the walk root that is itself a
+/// nested linked worktree of this repository, which the walk must prune.
+/// Shared by every walker built on the project walk; the depth check keeps
+/// an explicitly named root (depth 0) admitted.
+pub(crate) fn is_nested_worktree_entry(
+    entry: &ignore::DirEntry,
+    worktrees: &crate::project_content::NestedWorktreeBoundary,
+) -> bool {
+    entry.depth() > 0
+        && entry
+            .file_type()
+            .as_ref()
+            .is_some_and(std::fs::FileType::is_dir)
+        && worktrees.is_nested_worktree_root(entry.path())
 }
 
 /// The membership rule the project walk applies to each entry on top of the
@@ -11991,6 +12162,143 @@ mod tests {
                 loc_mask: (trigram % 127) as u8,
             })
             .collect()
+    }
+
+    /// A tree that spans several walk chunks and has every kind of file the
+    /// build records: indexed, binary (unindexed) and over the size limit.
+    fn chunked_build_fixture(root: &Path) {
+        for dir in 0..5 {
+            let dir_path = root.join(format!("dir_{dir}")).join("nested");
+            fs::create_dir_all(&dir_path).unwrap();
+            for file in 0..30 {
+                fs::write(
+                    dir_path.join(format!("file_{file:02}.rs")),
+                    format!("fn marker_{dir}_{file}() {{ let shared_token = {file}; }}\n"),
+                )
+                .unwrap();
+            }
+        }
+        fs::write(root.join("binary.bin"), [0u8, 159, 146, 150, 0, 1, 2]).unwrap();
+        fs::write(root.join("large.txt"), "shared_token ".repeat(200)).unwrap();
+    }
+
+    #[test]
+    fn issue1007_chunked_build_walk_matches_collected_walk_and_cancels() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        chunked_build_fixture(&root);
+        let filters = PathFilters::default();
+        let collected = walk_build_files_cancellable(&root, &filters, &|| true).unwrap();
+        assert!(collected.len() > 100, "fixture must span several chunks");
+
+        let mut walk = BuildFileWalk::new(&root, &filters);
+        let mut chunked = Vec::new();
+        while !walk.is_finished() {
+            let chunk = walk.next_chunk(7, &|| true).unwrap();
+            assert!(chunk.len() <= 7);
+            chunked.extend(chunk);
+        }
+        assert_eq!(chunked, collected, "chunks must keep the walk's order");
+
+        let calls = AtomicUsize::new(0);
+        let mut walk = BuildFileWalk::new(&root, &filters);
+        assert!(walk.next_chunk(5, &|| true).is_some());
+        assert!(walk
+            .next_chunk(usize::MAX, &|| calls.fetch_add(1, Ordering::SeqCst) < 3)
+            .is_none());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "checked before every entry"
+        );
+    }
+
+    #[test]
+    fn issue1007_cold_build_cache_reloads_identically() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        chunked_build_fixture(&root);
+        let cache = tempfile::tempdir().unwrap();
+        let built = SearchIndex::build_with_limit_to_cache_dir(&root, 1024, cache.path());
+        assert_eq!(built.unindexed_files.len(), 2, "binary and oversize files");
+
+        // The built index lists files in walk order with dense ids.
+        let walked =
+            walk_build_files_cancellable(&root, &PathFilters::default(), &|| true).unwrap();
+        let built_paths: Vec<_> = built.files.iter().map(|file| file.path.clone()).collect();
+        assert_eq!(built_paths, walked);
+        for (id, file) in built.files.iter().enumerate() {
+            assert_eq!(built.path_to_id.get(&file.path), Some(&(id as u32)));
+        }
+
+        let reloaded = SearchIndex::read_from_disk(cache.path(), &root).expect("cache reloads");
+        // A loaded cache serves queries once configure verifies it; mark it
+        // ready the same way so both answer from their postings.
+        let mut reloaded = reloaded;
+        reloaded.ready = true;
+        assert!(built.ready);
+        assert_eq!(reloaded.files.len(), built.files.len());
+        for (left, right) in built.files.iter().zip(reloaded.files.iter()) {
+            assert_eq!(left.path, right.path);
+            assert_eq!(left.size, right.size);
+            assert_eq!(left.modified, right.modified);
+            assert_eq!(left.content_hash, right.content_hash);
+        }
+        assert_eq!(*reloaded.path_to_id, *built.path_to_id);
+        assert_eq!(*reloaded.unindexed_files, *built.unindexed_files);
+        assert_eq!(*reloaded.file_trigram_count, *built.file_trigram_count);
+        assert_eq!(reloaded.git_head, built.git_head);
+        for pattern in ["shared_token", "marker_3_17", "fn marker_", "absent_text"] {
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    built.grep(pattern, true, &[], &[], &root, 1000).unwrap()
+                ),
+                format!(
+                    "{:?}",
+                    reloaded.grep(pattern, true, &[], &[], &root, 1000).unwrap()
+                ),
+                "grep {pattern}"
+            );
+        }
+
+        // Rewriting the reloaded index through the base+delta writer gives
+        // the cold build's bytes, so the moved tables and the streamed header
+        // wrote the same cache a full rewrite does.
+        let rewrite = tempfile::tempdir().unwrap();
+        let head = reloaded.stored_git_head().map(str::to_owned);
+        assert!(reloaded.write_to_disk(rewrite.path(), head.as_deref()));
+        assert_eq!(
+            fs::read(cache.path().join("cache.bin")).unwrap(),
+            fs::read(rewrite.path().join("cache.bin")).unwrap()
+        );
+    }
+
+    #[test]
+    fn issue1007_disk_cache_is_current_only_for_unchanged_cold_build() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        chunked_build_fixture(&root);
+        let cache = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let mut index = SearchIndex::build_with_limit_to_cache_dir(&root, 1024, cache.path());
+        let head = index.stored_git_head().map(str::to_owned);
+        assert!(index.disk_cache_is_current(cache.path(), head.as_deref()));
+        assert!(!index.disk_cache_is_current(other.path(), head.as_deref()));
+        assert!(!index.disk_cache_is_current(cache.path(), Some("another-head")));
+
+        let reloaded = SearchIndex::read_from_disk(cache.path(), &root).unwrap();
+        assert!(
+            !reloaded.disk_cache_is_current(cache.path(), head.as_deref()),
+            "an index read from disk never wrote the cache itself"
+        );
+
+        fs::write(root.join("added.rs"), "fn added_after_build() {}\n").unwrap();
+        index.update_file(&root.join("added.rs"));
+        assert!(index.has_pending_disk_changes());
+        assert!(!index.disk_cache_is_current(cache.path(), head.as_deref()));
+        assert!(index.write_to_disk(cache.path(), head.as_deref()));
+        assert!(index.disk_cache_is_current(cache.path(), head.as_deref()));
     }
 
     #[test]

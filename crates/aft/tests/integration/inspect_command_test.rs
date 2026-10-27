@@ -3561,14 +3561,32 @@ fn configure_fake_rust_lsp(ctx: &AppContext) {
 
 fn open_with_lsp(ctx: &AppContext, file: &Path, content: &str) {
     let config = ctx.config().clone();
-    ctx.lsp()
-        .notify_file_changed(file, content, &config)
-        .expect("notify file changed");
-    let diagnostics = ctx
-        .lsp()
-        .wait_for_diagnostics(file, &config, Duration::from_secs(30));
+    let (pre_snapshot, expected_versions) = {
+        let mut lsp = ctx.lsp();
+        lsp.drain_events();
+        let pre_snapshot = lsp.snapshot_pre_edit_state(file);
+        let expected_versions = lsp
+            .notify_file_changed_versioned(file, content, &config)
+            .expect("notify file changed");
+        (pre_snapshot, expected_versions)
+    };
     assert!(
-        !diagnostics.is_empty(),
+        !expected_versions.is_empty(),
+        "fake LSP should match {file:?}"
+    );
+    let result = aft::lsp::fresh_wait::wait_for_post_edit_diagnostics_unlocked(
+        || ctx.lsp(),
+        file,
+        &expected_versions,
+        &pre_snapshot,
+        std::time::Instant::now() + Duration::from_secs(30),
+    );
+    assert!(
+        result.complete(),
+        "fake LSP must report the notified versions for {file:?}: {result:?}"
+    );
+    assert!(
+        !result.diagnostics.is_empty(),
         "fake LSP should publish diagnostics for {file:?}"
     );
 }
@@ -4353,9 +4371,9 @@ fn rust_worker_inspect_capacity_refusal_is_partial_and_names_cap() {
         manager.override_binary(ServerKind::Rust, fake_server_path());
         manager.disable_rust_cargo_for_worker();
         assert_eq!(
-            manager
-                .ensure_server_for_file(file, &Config::default())
-                .len(),
+            crate::test_helpers::settled_lsp(&mut manager, |startup_manager| startup_manager
+                .ensure_server_for_file(file, &Config::default()))
+            .len(),
             1
         );
         occupied.push(manager);
@@ -4820,14 +4838,14 @@ fn review_python_background_pull_preserves_queued_rust_alert_once() {
     std::fs::write(&rust, "pub fn broken() {}\n").unwrap();
     configure_fake_rust_lsp(&ctx);
     let config = ctx.config();
-    let rust_key = ctx
-        .lsp()
-        .ensure_file_open(&rust, &config)
-        .unwrap()
-        .server_keys
-        .into_iter()
-        .find(|key| key.kind == ServerKind::Rust)
-        .unwrap();
+    let rust_key = crate::test_helpers::settled_lsp(&mut ctx.lsp(), |manager| {
+        manager.ensure_file_open(&rust, &config)
+    })
+    .unwrap()
+    .server_keys
+    .into_iter()
+    .find(|key| key.kind == ServerKind::Rust)
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         ctx.lsp().drain_events();
@@ -4842,7 +4860,10 @@ fn review_python_background_pull_preserves_queued_rust_alert_once() {
         .set_extra_env("AFT_FAKE_LSP_PULL_DELAY_SIGNAL", signal.to_str().unwrap());
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL_DELAY_MS", "500");
     let python = root.join("broken.py");
-    ctx.lsp().ensure_file_open(&python, &config).unwrap();
+    crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_file_open(&python, &config)
+    })
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     while !signal.exists() {
         ctx.lsp().drain_events();
@@ -4919,7 +4940,10 @@ fn python_dynamic_pull_populates_status_and_alert_source_without_inspect() {
     let (dir, ctx, log) = dynamic_python_pull_fixture();
     let file = std::fs::canonicalize(dir.path()).unwrap().join("broken.py");
     let config = ctx.config();
-    ctx.lsp().ensure_file_open(&file, &config).unwrap();
+    crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_file_open(&file, &config)
+    })
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut snapshots = Vec::new();
     loop {
@@ -4986,7 +5010,10 @@ fn open_dynamic_python(
     expected: usize,
 ) -> Vec<aft::alert_state::AcceptedDiagnosticSnapshot> {
     let config = ctx.config();
-    ctx.lsp().ensure_file_open(file, &config).unwrap();
+    crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_file_open(file, &config)
+    })
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut accepted = Vec::new();
     loop {
@@ -5294,7 +5321,10 @@ fn scoped_python_progress_second_file_after_idle_without_new_run_settles() {
     std::fs::write(dir.path().join("second.py"), "value: int = 'wrong'\n").unwrap();
     let first = std::fs::canonicalize(dir.path()).unwrap().join("broken.py");
     let config = ctx.config();
-    ctx.lsp().ensure_file_open(&first, &config).unwrap();
+    crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_file_open(&first, &config)
+    })
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut ended = false;
     loop {
@@ -5489,7 +5519,10 @@ fn scoped_python_progress_reanalysis_keeps_warm_counts_and_alert_episode() {
         .diagnostics_store_mut_for_test()
         .mark_stale_for_file(&file);
     let config = ctx.config();
-    ctx.lsp().ensure_file_open(&file, &config).unwrap();
+    crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_file_open(&file, &config)
+    })
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let drained = ctx.lsp().drain_events();
@@ -7606,10 +7639,10 @@ fn scoped_diagnostics_open_no_documents_and_close_none() {
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
 
     let config = ctx.config().clone();
-    let open_result = ctx
-        .lsp()
-        .ensure_file_open(&pre_opened, &config)
-        .expect("pre-open document");
+    let open_result = crate::test_helpers::settled_lsp(&mut ctx.lsp(), |manager| {
+        manager.ensure_file_open(&pre_opened, &config)
+    })
+    .expect("pre-open document");
     assert_eq!(open_result.newly_opened.len(), 1);
     let pre_open_events = collect_lsp_notifications(&ctx, "custom/documentOpened", 1);
     assert_eq!(pre_open_events[0]["uri"], file_uri(&pre_opened));
@@ -7669,9 +7702,10 @@ fn scoped_inspect_without_diagnostics_does_no_producer_work() {
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
-    ctx.lsp()
-        .ensure_file_open(&pre_opened, &ctx.config())
-        .unwrap();
+    crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_file_open(&pre_opened, &ctx.config())
+    })
+    .unwrap();
     collect_lsp_notifications(&ctx, "custom/documentOpened", 1);
     ctx.update_status_bar_tier2(Some(11), Some(12), Some(13), Some(14), false);
 
@@ -9178,6 +9212,134 @@ fn scoped_rust_inspect_reports_a_removed_field_after_an_outside_edit_with_real_r
     assert_removed_field_reported(&after);
 }
 
+/// When a watcher drain forwards an outside edit while another thread holds
+/// the LSP manager, the change waits in a queue for a helper thread, and
+/// until that helper runs rust-analyzer has not heard of the edit, so no
+/// `cargo check` is expected for it. The helper is held here, the way a
+/// loaded machine can delay it, so the inspect runs while the change is still
+/// queued. It must deliver the change itself and then report the compiler
+/// error of the check the change starts, or name that check as still
+/// running; the stale answer it used to give is a complete result without
+/// that error.
+#[test]
+fn scoped_rust_inspect_forwards_a_queued_outside_edit_before_certifying() {
+    let (_temp_dir, root, lib) = single_crate_fixture("queued-outside-edit");
+    let ctx = configured_context_with_diagnostics_timeout(&root, 40_000);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "0");
+    let warm = scoped_diagnostics_inspect(&ctx, "queued-outside-edit-warm", "src/lib.rs");
+    assert!(!reported_check_still_running(&warm), "{warm:#}");
+    // The fake's own analysis always reports a test error and warning; only
+    // a check of a file containing `fake_compile_error` adds this one.
+    assert!(
+        !diagnostic_messages_for(&warm, "src/lib.rs")
+            .iter()
+            .any(|message| message == "fake compile error"),
+        "control: the file compiles before the outside edit: {warm:#}"
+    );
+
+    // Another program adds a compiler error.
+    fs::write(&lib, "// fake_compile_error\npub fn f() {}\n").unwrap();
+    let paused = queue_watcher_change_for_held_helper(&ctx, &lib);
+
+    let after = scoped_diagnostics_inspect(&ctx, "queued-outside-edit-after", "src/lib.rs");
+    drop(paused);
+    if reported_check_still_running(&after) {
+        return;
+    }
+    let text = after["text"].as_str().expect("rendered text");
+    assert!(
+        diagnostic_messages_for(&after, "src/lib.rs")
+            .iter()
+            .any(|message| message == "fake compile error"),
+        "the compiler error of the outside edit is missing: {text}\n{after:#}"
+    );
+}
+
+/// Forward the watcher's change to `path` while another thread holds the LSP
+/// manager, so it is queued for the helper thread, and keep that helper from
+/// delivering it until the returned guard is dropped.
+fn queue_watcher_change_for_held_helper<'a>(
+    ctx: &'a AppContext,
+    path: &Path,
+) -> parking_lot::MutexGuard<'a, ()> {
+    let paused = ctx.pause_lsp_watcher_forwarding_for_test();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    thread::scope(|scope| {
+        scope.spawn(move || {
+            let _busy = ctx.lsp();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().unwrap();
+        ctx.lsp_forward_watcher_file_events(&[path.to_path_buf()]);
+        release_tx.send(()).unwrap();
+    });
+    assert!(
+        ctx.lsp_watcher_forward_pending_for_test(),
+        "control: the change must still be queued"
+    );
+    paused
+}
+
+/// `lsp_diagnostics` reads the same check state as inspect, so a change
+/// still queued for the held helper thread must not be answered from
+/// rust-analyzer's results for the file before it: the answer reports the
+/// compiler error of the check the change starts, or is incomplete with the
+/// note that the check is still running.
+#[test]
+fn rust_lsp_diagnostics_forwards_a_queued_outside_edit_before_answering() {
+    let (_temp_dir, root, lib) = single_crate_fixture("queued-outside-edit-lsp");
+    let ctx = configured_context_with_diagnostics_timeout(&root, 40_000);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "0");
+    let lsp_diagnostics = |id: &str| -> Value {
+        serde_json::to_value(aft::commands::lsp_diagnostics::handle_lsp_diagnostics(
+            &request(json!({
+                "id": id,
+                "command": "lsp_diagnostics",
+                "file": lib.display().to_string(),
+                "wait_ms": 10_000,
+            })),
+            &ctx,
+        ))
+        .expect("response serializes")
+    };
+    let compiler_error_reported = |response: &Value| {
+        response["diagnostics"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|diagnostic| diagnostic["message"] == "fake compile error")
+    };
+    let warm = lsp_diagnostics("queued-outside-edit-lsp-warm");
+    assert_eq!(warm["success"], true, "{warm:#}");
+    assert!(
+        !compiler_error_reported(&warm),
+        "control: the file compiles before the outside edit: {warm:#}"
+    );
+
+    // Another program adds a compiler error.
+    fs::write(&lib, "// fake_compile_error\npub fn f() {}\n").unwrap();
+    let paused = queue_watcher_change_for_held_helper(&ctx, &lib);
+
+    let after = lsp_diagnostics("queued-outside-edit-lsp-after");
+    drop(paused);
+    assert_eq!(after["success"], true, "{after:#}");
+    if after["complete"] == false && after["note"].as_str().is_some() {
+        assert_eq!(
+            after["note"], "rust-analyzer: cargo check still running; retry",
+            "{after:#}"
+        );
+        return;
+    }
+    assert!(
+        compiler_error_reported(&after),
+        "the compiler error of the outside edit is missing: {after:#}"
+    );
+}
+
 /// The opposite direction: a compiler error present when rust-analyzer
 /// starts (its first `cargo check` reports it) is then fixed with an AFT
 /// edit. `use of moved value` comes only from the compiler, never from
@@ -9542,7 +9704,9 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
     let ctx = new_context();
     let config = ctx.config();
     let file = root.join("src/lib.rs");
-    ctx.lsp().ensure_server_for_file(&file, &config);
+    crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_server_for_file(&file, &config)
+    });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
     loop {
         ctx.lsp().drain_events();
@@ -9844,7 +10008,9 @@ fn scoped_rust_inspect_does_not_take_a_check_announced_before_a_save_for_the_sav
     // a request round trip prove it ran and the reader queued its events,
     // without draining those events through the manager before the save.
     let config = ctx.config().clone();
-    let started = ctx.lsp().ensure_server_for_file(&lib, &config);
+    let started = crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_server_for_file(&lib, &config)
+    });
     assert!(!started.is_empty(), "the fake rust server must start");
     wait_for_path_event(&completed, "initial check completed");
     ctx.lsp()

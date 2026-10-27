@@ -1,0 +1,10 @@
+{
+  "request_frame": {
+    "header_hex": "5b0000000200002900010000000700000000000000",
+    "body_utf8": "{\"op\":\"tool.call\",\"name\":\"aft_search\",\"preset\":\"worker\",\"arguments\":{\"pattern\":\"greeting\"}}"
+  },
+  "reply_frame": {
+    "header_hex": "1f0100000201002900010000000700000000000000",
+    "body_utf8": "{\"content\":[{\"type\":\"text\",\"text\":\"main.rs\\n1: fn greeting() -> &'static str {\\n6:     println!(\\\"{}\\\", greeting());\\n\\n1 files match (2 matching lines); one result per file, definitions first.\\n[interpreted_as: regex]\\ntrigram: ready\\nsemantic: unavailable: disabled\"}],\"isError\":false}"
+  }
+}
