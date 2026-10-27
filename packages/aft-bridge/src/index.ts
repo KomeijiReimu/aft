@@ -81,15 +81,6 @@ export {
   TERMINAL_SCAN_INCOMPLETE_TEXT,
 } from "./bash-output-page.js";
 export {
-  BASH_PERMISSION_NOT_SETTLED,
-  type BashPermissionAsk,
-  BashPermissionLoopError,
-  bashPermissionRetryGrants,
-  escalationAskText,
-  groupBashPermissionAsks,
-  withBashPermissionLoop,
-} from "./bash-permissions.js";
-export {
   type BashAckTarget,
   bashAckKey,
   bashAckRequest,
@@ -98,6 +89,15 @@ export {
   bashAckTargets,
   bashPatternAckTarget,
 } from "./bash-pattern-ack.js";
+export {
+  BASH_PERMISSION_NOT_SETTLED,
+  type BashPermissionAsk,
+  BashPermissionLoopError,
+  bashPermissionRetryGrants,
+  escalationAskText,
+  groupBashPermissionAsks,
+  withBashPermissionLoop,
+} from "./bash-permissions.js";
 export {
   formatBashOutputPages,
   formatWatchLineBatch,
