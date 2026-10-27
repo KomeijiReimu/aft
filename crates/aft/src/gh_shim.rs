@@ -536,6 +536,12 @@ const REPO_VALUE_FLAGS: &[&str] = &[
 const RESERVED_SELF_REPORT: &[&str] = &["--status", "--shim-version"];
 const CO_AUTHOR_LINE_REPORT: &str = "--co-author-line";
 const GOVERNANCE_UNAVAILABLE_TEXT: &str = "the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns";
+/// Refusal text for a write-class command from a worker shell. A worker shell
+/// carries a read broker, never a write ticket, so no write can ever be
+/// spoken from it: the text names the permanent condition and tells the agent
+/// where to take the write instead of suggesting a retry.
+const WORKER_WRITE_REFUSED_TEXT: &str =
+    "workers cannot write to GitHub; report what should be posted to your parent instead";
 /// Human-readable text for a local discovery-probe deadline expiry. A deadline
 /// that expires on a loaded host does not mean the daemon is unreachable, so
 /// this arm must not say "unreachable". The classification stays
@@ -555,6 +561,7 @@ const GH_SHIM_STATE_DIR_ENV: &str = "AFT_GH_SHIM_STATE_DIR";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RefusalCode {
     WorkerNativeGh,
+    WorkerWriteRefused,
     Unclassified,
     AdminTier,
     ManifestBelowFloor,
@@ -577,8 +584,9 @@ pub enum RefusalCode {
 }
 
 impl RefusalCode {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::WorkerNativeGh,
+        Self::WorkerWriteRefused,
         Self::Unclassified,
         Self::AdminTier,
         Self::ManifestBelowFloor,
@@ -603,6 +611,7 @@ impl RefusalCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::WorkerNativeGh => "gh_shim_worker_native_gh",
+            Self::WorkerWriteRefused => "gh_shim_worker_write_refused",
             Self::Unclassified => "gh_shim_unclassified",
             Self::AdminTier => "gh_shim_admin_tier",
             Self::ManifestBelowFloor => "gh_shim_manifest_below_floor",
@@ -786,6 +795,21 @@ fn run_with(
             },
             delegate,
         );
+    }
+
+    // A worker shell carries a read broker, never a write ticket, so no
+    // write-class command can be spoken from it. Refuse here, before the
+    // manifest lookup, the rung probe for governance reachability, and any
+    // relay traffic, with an
+    // instruction instead of a retry hint: retrying cannot help, and the old
+    // governance-unavailable text sent agents back to retry forever. Reads
+    // (`is_unbound_safe`) fall through to the governed-read path unchanged.
+    if relay_client::RelayContext::from_process()
+        .worker_broker
+        .is_some()
+        && !is_unbound_safe(args)
+    {
+        return refuse(RefusalCode::WorkerWriteRefused, WORKER_WRITE_REFUSED_TEXT);
     }
 
     // Presence-based regressed-manifest arm. Decide from the installed artifact
@@ -7827,9 +7851,13 @@ fn exec_real_gh(real_gh: PathBuf, args: &[OsString]) -> i32 {
     }
 }
 
-fn refuse(code: RefusalCode, text: &str) -> i32 {
+fn refusal_line(code: RefusalCode, text: &str) -> String {
     let text = text.replace(['\n', '\r'], " ");
-    eprintln!("gh-shim: {}: {text}", code.as_str());
+    format!("gh-shim: {}: {text}", code.as_str())
+}
+
+fn refuse(code: RefusalCode, text: &str) -> i32 {
+    eprintln!("{}", refusal_line(code, text));
     match code {
         RefusalCode::OutcomeUnknown => OUTCOME_UNKNOWN_EXIT_STATUS,
         _ => REFUSAL_EXIT_STATUS,
@@ -10826,7 +10854,7 @@ mod tests {
 
     #[test]
     fn refusal_and_self_report_codes_are_separate_closed_sets() {
-        assert_eq!(RefusalCode::ALL.len(), 20);
+        assert_eq!(RefusalCode::ALL.len(), 21);
         assert_eq!(
             RefusalCode::WorkerNativeGh.as_str(),
             "gh_shim_worker_native_gh"
@@ -10835,8 +10863,20 @@ mod tests {
             .iter()
             .all(|code| code.as_str().starts_with("gh_shim_")));
         assert_eq!(
+            RefusalCode::WorkerWriteRefused.as_str(),
+            "gh_shim_worker_write_refused"
+        );
+        assert_eq!(
             RefusalCode::GovernanceUnavailable.as_str(),
             "gh_shim_governance_unavailable"
+        );
+        assert_eq!(
+            WORKER_WRITE_REFUSED_TEXT,
+            "workers cannot write to GitHub; report what should be posted to your parent instead"
+        );
+        assert_eq!(
+            refusal_line(RefusalCode::WorkerWriteRefused, WORKER_WRITE_REFUSED_TEXT),
+            "gh-shim: gh_shim_worker_write_refused: workers cannot write to GitHub; report what should be posted to your parent instead"
         );
         assert_eq!(
             RefusalCode::OutcomeUnknown.as_str(),
