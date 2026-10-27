@@ -9287,6 +9287,60 @@ fn scoped_rust_inspect_reports_a_removed_field_after_an_outside_edit_with_real_r
     assert_removed_field_reported(&after);
 }
 
+/// When a watcher drain forwards an outside edit while another thread holds
+/// the LSP manager, the change waits in a queue for a helper thread, and
+/// until that helper runs rust-analyzer has not heard of the edit, so no
+/// `cargo check` is expected for it. The helper is held here, the way a
+/// loaded machine can delay it, so the inspect runs while the change is still
+/// queued. It must deliver the change itself and then report the compiler
+/// error of the check the change starts, or name that check as still
+/// running; the stale answer it used to give is a clean, complete result.
+#[test]
+fn scoped_rust_inspect_forwards_a_queued_outside_edit_before_certifying() {
+    let (_temp_dir, root, lib) = single_crate_fixture("queued-outside-edit");
+    let ctx = configured_context_with_diagnostics_timeout(&root, 40_000);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "0");
+    let warm = scoped_diagnostics_inspect(&ctx, "queued-outside-edit-warm", "src/lib.rs");
+    assert!(!reported_check_still_running(&warm), "{warm:#}");
+    assert_eq!(warm["summary"]["diagnostics"]["errors"], 0, "{warm:#}");
+
+    // Another program adds a compiler error.
+    fs::write(&lib, "// fake_compile_error\npub fn f() {}\n").unwrap();
+    let paused = ctx.pause_lsp_watcher_forwarding_for_test();
+    // Forward the watcher's change while another thread holds the manager,
+    // so it is queued for the (held) helper thread.
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            let _busy = ctx.lsp();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().unwrap();
+        ctx.lsp_forward_watcher_file_events(std::slice::from_ref(&lib));
+        release_tx.send(()).unwrap();
+    });
+    assert!(
+        ctx.lsp_watcher_forward_pending_for_test(),
+        "control: the change must still be queued"
+    );
+
+    let after = scoped_diagnostics_inspect(&ctx, "queued-outside-edit-after", "src/lib.rs");
+    drop(paused);
+    if reported_check_still_running(&after) {
+        return;
+    }
+    let text = after["text"].as_str().expect("rendered text");
+    assert!(
+        diagnostic_messages_for(&after, "src/lib.rs")
+            .iter()
+            .any(|message| message == "fake compile error"),
+        "the compiler error of the outside edit is missing: {text}\n{after:#}"
+    );
+}
+
 /// The opposite direction: a compiler error present when rust-analyzer
 /// starts (its first `cargo check` reports it) is then fixed with an AFT
 /// edit. `use of moved value` comes only from the compiler, never from
