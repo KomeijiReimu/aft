@@ -1682,6 +1682,12 @@ pub struct PersistedTask {
     /// written before AFT recorded it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_key: Option<super::TaskCallKey>,
+    /// The v1 `bash` schema pin the call carried, if any. Absent on pinless
+    /// calls and on records written before AFT recorded it. An absent pin
+    /// means the task gets no view record. The task-record format keeps its
+    /// version: older JSON without this field still reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_pin: Option<String>,
     /// The daemon's scope owner, reference and epoch at spawn. A reconnect
     /// must not relabel a running command as belonging to the new route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1787,6 +1793,7 @@ impl PersistedTask {
             status_reason: None,
             output_incomplete: false,
             call_key,
+            schema_pin: super::current_schema_pin(),
             scope: super::registry::scope_for_spawn(),
             remote: None,
             execution_note: None,
@@ -1948,6 +1955,7 @@ impl From<BashTaskRow> for PersistedTask {
             status_reason: None,
             output_incomplete: false,
             call_key: None,
+            schema_pin: None,
             scope: None,
             remote: None,
             execution_note: None,
@@ -6093,6 +6101,46 @@ mod tests {
         let error = read_task_at(&resolved).unwrap_err().to_string();
         assert!(error.contains("storage_requires_newer_reader"), "{error}");
         assert!(error.contains("7"), "{error}");
+    }
+    #[test]
+    fn schema_pin_is_an_optional_defaulted_field_and_keeps_schema_version() {
+        // The task-record format keeps version 7: older files without the
+        // field still read, with no pin.
+        assert_eq!(SCHEMA_VERSION, 7);
+        let directory = tempfile::tempdir().unwrap();
+        let (resolved, task) = counted_task(directory.path());
+        assert!(task.schema_pin.is_none());
+        let mut value = serde_json::to_value(&task).unwrap();
+        assert!(
+            value.get("schema_pin").is_none(),
+            "pinless tasks omit the field"
+        );
+        // A file written before the field existed reads with no pin.
+        value.as_object_mut().unwrap().remove("schema_pin");
+        std::fs::write(&resolved.paths.json, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(read_task_at(&resolved).unwrap().schema_pin.is_none());
+        // The dispatch pin is recorded at spawn when the call carried one.
+        let pinned = crate::bash_background::with_schema_pin(Some("sha256:pin".into()), || {
+            PersistedTask::starting(
+                "bash-0000000000000043".into(),
+                "counted".into(),
+                "true".into(),
+                directory.path().to_path_buf(),
+                None,
+                None,
+                true,
+                false,
+            )
+        });
+        assert_eq!(pinned.schema_pin.as_deref(), Some("sha256:pin"));
+        // A pin survives a disk round trip.
+        let mut task = task;
+        task.schema_pin = Some("sha256:pin".into());
+        write_task_at(&resolved, &task).unwrap();
+        assert_eq!(
+            read_task_at(&resolved).unwrap().schema_pin.as_deref(),
+            Some("sha256:pin")
+        );
     }
     #[test]
     fn durability_bash_record_payload_count() {
