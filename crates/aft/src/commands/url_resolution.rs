@@ -14,7 +14,7 @@ use crate::url_fetch::{
 /// Refusal for a placeholder fetch made outside an outline or zoom call, which
 /// would have no call end to delete its private document at.
 const SECRET_FETCH_NEEDS_CALL: &str =
-    "Secret placeholder URLs can only be fetched by outline or zoom; nothing was fetched.";
+    "Secret placeholder URLs can only be fetched with aft_outline or aft_zoom; nothing was fetched.";
 
 pub(super) fn resolve_file_or_url(
     req: &RawRequest,
@@ -1402,7 +1402,10 @@ mod url_tests {
                 panic!("a placeholder URL reached the cached fetch")
             })
             .expect_err("no call scope is open");
-            assert_eq!(refused.data["message"], SECRET_FETCH_NEEDS_CALL);
+            assert_eq!(
+                refused.data["message"],
+                "Secret placeholder URLs can only be fetched with aft_outline or aft_zoom; nothing was fetched."
+            );
             assert!(!fixture
                 .ctx
                 .cache_dir()
