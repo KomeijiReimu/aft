@@ -1909,5 +1909,50 @@ mod url_tests {
             );
             assert_eq!(server.targets().len(), 1, "the duplicate was never sent");
         }
+
+        /// A key that holds another label's whole placeholder in its middle
+        /// would be re-formed when the other key is scrubbed out of the
+        /// bytes around it; the fetch refuses it before any request.
+        #[test]
+        fn a_key_holding_another_labels_placeholder_is_refused_before_sending() {
+            const K_A: &[u8] = b"AAA{{ck-secret:other}}BBB";
+            const K_B: &[u8] = b"0123456789abcdef";
+            let fixture = fixture(Default::default());
+            let server = serve(&fixture.tls, |_| {
+                Some(markdown(b"# Title\n\nAAA0123456789abcdefBBB\n"))
+            });
+            let port = server.addr.port();
+            let url = format!(
+                "https://api.secret.test:{port}/v1/doc.md?key={PLACEHOLDER}&other={{{{ck-secret:other}}}}"
+            );
+            let vault = FakeVault::new();
+            vault.set_resolution(
+                "test",
+                crate::secret::granted(rule("api.secret.test", port, "/v1"), "grant-1"),
+            );
+            vault.set_material("test", vec![K_A.to_vec()]);
+            let other = LabelRule {
+                label: "other".into(),
+                location: Location::Query("other".into()),
+                ..rule("api.secret.test", port, "/v1")
+            };
+            vault.set_resolution("other", crate::secret::granted(other, "grant-2"));
+            vault.set_material("other", vec![K_B.to_vec()]);
+            let (run, documents) = run_with(
+                &fixture,
+                &vault,
+                &[("api.secret.test", server.addr)],
+                &request("zoom", &url, serde_json::json!({"symbol": "Title"})),
+                no_extra,
+            );
+            assert!(!run.response.success, "{:?}", run.response.data);
+            assert!(
+                run.strings().contains("(material_not_admissible)"),
+                "{}",
+                run.strings()
+            );
+            assert_eq!(server.targets().len(), 0, "nothing may be sent");
+            assert_absent(&run, &documents, &[K_A, K_B]);
+        }
     }
 }

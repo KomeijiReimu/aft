@@ -18,10 +18,11 @@ pub enum MaterialRefusal {
     Empty,
     /// Fewer than [`MIN_KEY_LEN`] bytes.
     TooShort,
-    /// The key text appears inside its own label's placeholder, or overlaps
-    /// the placeholder's start or end so that writing the placeholder next to
-    /// surrounding text could re-form the key (see
-    /// [`key_overlaps_placeholder`]).
+    /// The key text appears inside its own label's placeholder, holds the
+    /// placeholder prefix (and so possibly any label's whole placeholder), or
+    /// overlaps the placeholder's start or end, so that writing a placeholder
+    /// next to surrounding text could re-form the key (see
+    /// [`key_contains_placeholder_prefix`] and [`key_overlaps_placeholder`]).
     SubstringOfPlaceholder,
     /// A header value cannot carry this byte (CTL, or a byte above 0x7E).
     NonVisibleHeaderByte,
@@ -39,7 +40,7 @@ pub fn check_admissible(
     // The placeholder check runs before the length floor: a key that is part
     // of its own placeholder is refused for that reason, whatever its length,
     // because the length floor alone would describe it wrongly.
-    if key_is_substring_of_placeholder(key, label) {
+    if key_is_substring_of_placeholder(key, label) || key_contains_placeholder_prefix(key) {
         return Err(MaterialRefusal::SubstringOfPlaceholder);
     }
     if key.len() < MIN_KEY_LEN {
@@ -81,6 +82,18 @@ fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+/// True when `key` contains the placeholder prefix `{{ck-secret:` anywhere.
+///
+/// Such a key can contain another label's whole placeholder. For keys
+/// `AAA{{ck-secret:other}}BBB` (label `test`) and `0123456789abcdef` (label
+/// `other`), scrubbing the second key out of `AAA0123456789abcdefBBB` writes
+/// `AAA{{ck-secret:other}}BBB`, the first key. No real key contains the
+/// prefix, so refusing every such key closes the class whatever labels are
+/// installed alongside it.
+pub fn key_contains_placeholder_prefix(key: &[u8]) -> bool {
+    bytes_contain(key, crate::placeholder::PLACEHOLDER_PREFIX.as_bytes())
 }
 
 /// True when the scrubber's replacement of `key` by `placeholder` could

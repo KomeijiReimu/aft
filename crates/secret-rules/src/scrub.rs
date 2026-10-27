@@ -277,8 +277,10 @@ impl MatcherSet {
     /// Refuses a label whose placeholder spells `key` (for example the key's
     /// hex or base64 as the label): the placeholder is written into responses
     /// unscanned, so it must not carry the key it stands for. Refuses too a
-    /// key that overlaps the placeholder's start or end, which the written
-    /// placeholder could re-form together with the bytes beside it.
+    /// key that holds the placeholder prefix anywhere (it could hold another
+    /// label's whole placeholder) or overlaps the placeholder's start or end,
+    /// which a written placeholder could re-form together with the bytes
+    /// beside it. [`Scrubber::install`] checks the same across labels.
     pub fn new(label: &str, key: &[u8]) -> Result<Self, ScrubError> {
         let matcher = Self {
             key: Zeroizing::new(key.to_vec()),
@@ -286,6 +288,7 @@ impl MatcherSet {
             replacement: placeholder_for(label),
         };
         if matcher.discloses(&matcher.replacement)
+            || crate::material::key_contains_placeholder_prefix(key)
             || crate::material::key_overlaps_placeholder(key, &matcher.replacement)
         {
             return Err(ScrubError::ReplacementDisclosesKey);
@@ -1373,5 +1376,39 @@ mod tests {
             .and_then(|first| Ok((first, MatcherSet::new("other", b"fedcba9876543210")?)))
             .and_then(|(first, second)| Scrubber::new(vec![first, second]));
         assert!(pair.is_err());
+    }
+
+    /// A key that holds another label's whole placeholder (or just the
+    /// placeholder prefix) anywhere is refused: scrubbing the other key out of
+    /// the bytes around it would re-form it.
+    #[test]
+    fn a_key_containing_another_labels_placeholder_is_refused() {
+        let query = crate::location::Location::Query("k".into());
+        let k_a: &[u8] = b"AAA{{ck-secret:other}}BBB";
+        let k_b: &[u8] = b"0123456789abcdef";
+        assert!(crate::material::check_admissible(k_a, "test", &query).is_err());
+        assert!(MatcherSet::new("test", k_a).is_err());
+        assert!(MatcherSet::new("test", b"0123456789{{ck-secret:abcdef").is_err());
+        // Whatever the installation order, both keys are never held at once.
+        let a_then_b = MatcherSet::new("test", k_a)
+            .and_then(|a| Ok(vec![a, MatcherSet::new("other", k_b)?]))
+            .and_then(Scrubber::new);
+        assert!(a_then_b.is_err());
+        let mut b_only = Scrubber::new(vec![MatcherSet::new("other", k_b).unwrap()]).unwrap();
+        assert!(MatcherSet::new("test", k_a)
+            .and_then(|a| b_only.install(a))
+            .is_err());
+        // With only the other key installable, every chunking of the upstream
+        // bytes yields exactly the refused key, which therefore can never be
+        // one the scrubber holds.
+        let input: &[u8] = b"AAA0123456789abcdefBBB";
+        for split in 0..=input.len() {
+            let mut scrubber = Scrubber::new(vec![MatcherSet::new("other", k_b).unwrap()]).unwrap();
+            let mut out = scrubber.push(&input[..split]);
+            out.extend_from_slice(&scrubber.push(&input[split..]));
+            out.extend_from_slice(&scrubber.finish());
+            assert_eq!(out, k_a, "split at {split}");
+            assert!(crate::material::check_admissible(&out, "test", &query).is_err());
+        }
     }
 }

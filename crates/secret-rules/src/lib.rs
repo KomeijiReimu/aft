@@ -27,8 +27,8 @@ pub use location::{
     LabelOutcome, LabelRule, Location, RequestOutcome, RequestRefusal, RequestView,
 };
 pub use material::{
-    check_admissible, encode_for_location, key_is_substring_of_placeholder,
-    key_overlaps_placeholder, MaterialRefusal, MIN_KEY_LEN,
+    check_admissible, encode_for_location, key_contains_placeholder_prefix,
+    key_is_substring_of_placeholder, key_overlaps_placeholder, MaterialRefusal, MIN_KEY_LEN,
 };
 pub use placeholder::{
     contains_placeholder_prefix, contains_placeholder_prefix_loose, is_label, mentions_label,

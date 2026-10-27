@@ -572,6 +572,7 @@ fn replacement_collides(rule: &LabelRule, keys: &[(String, Vec<u8>)]) -> Option<
             !key.is_empty()
                 && (crate::scrub::replacement_discloses(placeholder.as_bytes(), key)
                     || crate::material::key_is_substring_of_placeholder(key, &rule.label)
+                    || crate::material::key_contains_placeholder_prefix(key)
                     || crate::material::key_overlaps_placeholder(key, placeholder.as_bytes()))
         })
         .then_some(RequestRefusal::ReplacementDisclosesKey)
