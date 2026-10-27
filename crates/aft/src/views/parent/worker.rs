@@ -249,10 +249,9 @@ fn refresh_trigram(session: &ParentSession, child: &Child) {
             Plane::Gap("no trigram index has been built for this repository yet".into());
         return;
     };
-    if read(&child.trigram)
-        .ready()
-        .is_some_and(|current| matches!(&current.source, TrigramSource::Legacy(current) if *current == artifact))
-    {
+    if read(&child.trigram).ready().is_some_and(
+        |current| matches!(&current.source, TrigramSource::Legacy(current) if *current == artifact),
+    ) {
         // Same artifact: changes since it was read arrive as watcher paths
         // and through the backstop, never by reading the artifact again.
         return;
@@ -327,10 +326,9 @@ fn install_view_trigram(
     generation: &Arc<super::super::snapshot::ComposedGeneration>,
 ) {
     let published = PublishedChild::of(generation);
-    if read(&child.trigram)
-        .ready()
-        .is_some_and(|current| matches!(&current.source, TrigramSource::View(current) if *current == published))
-    {
+    if read(&child.trigram).ready().is_some_and(
+        |current| matches!(&current.source, TrigramSource::View(current) if *current == published),
+    ) {
         return;
     }
     child.loads.fetch_add(1, Ordering::SeqCst);
@@ -349,7 +347,9 @@ fn install_view_trigram(
                 session,
                 child,
                 TrigramChild {
-                    index: Arc::new(crate::search_index::SearchIndex::from_view_snapshot(snapshot)),
+                    index: Arc::new(crate::search_index::SearchIndex::from_view_snapshot(
+                        snapshot,
+                    )),
                     source: TrigramSource::View(published),
                 },
             );

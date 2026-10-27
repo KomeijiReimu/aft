@@ -761,26 +761,6 @@ pub(crate) fn has_open_connections_under(path: &Path) -> bool {
         .any(|(path, database)| path.starts_with(&key) && !database.openers.is_empty())
 }
 
-/// Describe every registered connection to a database under `path`, naming
-/// the database, the opener's store label and the thread that opened it.
-/// Tests use it to show what still holds files they are about to delete.
-#[cfg(test)]
-pub(crate) fn open_connections_under_for_test(path: &Path) -> Vec<String> {
-    let key = registry_key(path);
-    open_databases()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .filter(|(path, _)| path.starts_with(&key))
-        .flat_map(|(path, database)| {
-            database
-                .openers
-                .iter()
-                .map(move |opener| format!("{} held by {}", path.display(), opener.describe()))
-        })
-        .collect()
-}
-
 /// Report `action` if it is about to delete, rename, or replace the database
 /// file at `path` while this process still has a connection open on it.
 ///

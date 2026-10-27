@@ -848,14 +848,15 @@ fn parent_grep_and_glob_read_views_on_children_from_their_v3_lexical_view() {
     std::fs::remove_file(folder.root.join("README.md")).unwrap();
     let mut expected_grep = BTreeSet::new();
     let mut children = Vec::new();
-    for child in &folder.children {
+    for (index, child) in folder.children.iter().enumerate() {
+        // The child's bind publishes its v3 lexical view.
         let ctx = configure(child, &folder.storage, config_doc(true, TRIGRAM_ONLY, None));
-        let prefix = child.strip_prefix(&folder.root).unwrap().to_path_buf();
-        expected_grep.extend(grep_rows(&grep(&ctx, COMMON), child, &prefix));
         assert!(!trigram_artifact(child, &folder.storage).exists());
+        let prefix = format!("repo-{index:02}");
+        expected_grep.insert((format!("{prefix}/src/lib.rs"), 5));
+        expected_grep.insert((format!("{prefix}/src/util.rs"), 2));
         children.push(ctx);
     }
-    assert_eq!(expected_grep.len(), 4, "every child contributes two lines");
 
     let parent = configure(
         &folder.root,
@@ -873,7 +874,11 @@ fn parent_grep_and_glob_read_views_on_children_from_their_v3_lexical_view() {
     assert_eq!(answer["complete"], true, "{answer:#}");
     assert!(session.view_route_counts()[1] >= 1);
     let globbed = glob(&parent, "**/*.rs");
-    assert_eq!(globbed["files"].as_array().map(Vec::len), Some(4), "{globbed:#}");
+    assert_eq!(
+        globbed["files"].as_array().map(Vec::len),
+        Some(4),
+        "{globbed:#}"
+    );
     let routed = session.view_route_counts()[1];
     assert!(routed >= 2, "{routed}");
 
@@ -894,7 +899,11 @@ fn parent_grep_and_glob_read_views_on_children_from_their_v3_lexical_view() {
     );
     for child in session.children() {
         assert_eq!(child.loads(), 1, "an unchanged publication is not reloaded");
-        assert_eq!(child.applied_paths(), 0, "the parent applied an edit itself");
+        assert_eq!(
+            child.applied_paths(),
+            0,
+            "the parent applied an edit itself"
+        );
     }
     drop(children);
 }
@@ -1042,7 +1051,11 @@ fn parent_callgraph_reads_child_v3_views_and_answers_as_of_their_publication() {
     // A foreign reader names the publication it answers as of; it never
     // claims the child's graph is current.
     assert_eq!(callers["as_of"]["child"], "graph", "{callers:#}");
-    assert_eq!(callers["as_of"]["generation"], first.as_str(), "{callers:#}");
+    assert_eq!(
+        callers["as_of"]["generation"],
+        first.as_str(),
+        "{callers:#}"
+    );
     assert!(callers["as_of"]["published_at_ms"].is_u64(), "{callers:#}");
     assert_eq!(session.view_route_counts()[0], 1);
 
@@ -1180,7 +1193,11 @@ fn parent_callgraph_reads_child_v3_views_and_answers_as_of_their_publication() {
         )
         .unwrap(),
     );
-    assert_eq!(followed["as_of"]["generation"], second.as_str(), "{followed:#}");
+    assert_eq!(
+        followed["as_of"]["generation"],
+        second.as_str(),
+        "{followed:#}"
+    );
     assert!(followed.to_string().contains("second"), "{followed:#}");
     // The parent built and wrote no call graph of its own.
     assert!(parent.callgraph_store().read().unwrap().is_none());

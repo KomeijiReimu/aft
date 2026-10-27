@@ -31,11 +31,6 @@ thread_local! {
 }
 
 #[cfg(test)]
-pub(crate) fn reset_head_tree_entry_calls_for_test() {
-    HEAD_TREE_ENTRY_CALLS.with(|calls| calls.set(0));
-}
-
-#[cfg(test)]
 pub(crate) fn head_tree_entry_calls_for_test() -> usize {
     HEAD_TREE_ENTRY_CALLS.with(std::cell::Cell::get)
 }

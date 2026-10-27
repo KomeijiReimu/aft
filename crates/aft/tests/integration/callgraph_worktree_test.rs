@@ -244,15 +244,27 @@ fn callgraph_worktree_publishes_unique_source_without_an_owner_writer_or_overlay
         aft::views::callgraph::PRODUCER,
     )
     .full_key();
-    let blobs = aft::blob_store::BlobStore::open(
+    // With views on, the worktree's own content lands in the family's v3
+    // call-graph plane; the v1 blob store is a legacy writer a views-routed
+    // root no longer runs.
+    let family = ctx.memoized_artifact_cache_key(&checkout);
+    let rows = aft::blob_store::v3::PlaneReader::open_existing(
         &storage,
-        aft::search_index::artifact_cache_key(&checkout),
-        aft::blob_store::BlobPlane::Callgraph,
+        &family,
+        aft::blob_store::v2::FamilyPlane::Callgraph,
     )
     .unwrap();
     assert!(
-        blobs.contains(&key).unwrap(),
-        "worktree must put its own immutable blob"
+        rows.contains(&aft::blob_store::v2::FamilyKey::from(&key))
+            .unwrap(),
+        "worktree must put its own immutable row"
+    );
+    assert!(
+        !storage
+            .join("blobs")
+            .join(aft::search_index::artifact_cache_key(&checkout))
+            .exists(),
+        "a views-routed worktree must not open a v1 blob store"
     );
     assert!(
         aft::callgraph_store::CallGraphStore::open_readonly(ctx.callgraph_store_dir(), checkout)

@@ -978,9 +978,6 @@ pub(crate) fn schedule_with_reason(
 mod tests;
 
 #[cfg(test)]
-pub(crate) use tests::{CompletionOutcome, Completions};
-
-#[cfg(test)]
 thread_local! {
     static IN_COMMIT_BARRIER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -1003,12 +1000,6 @@ impl Drop for CommitBarrierMark {
     fn drop(&mut self) {
         IN_COMMIT_BARRIER.set(false);
     }
-}
-
-/// Whether this thread is inside a publication's commit barrier.
-#[cfg(test)]
-pub(crate) fn in_commit_barrier_for_test() -> bool {
-    IN_COMMIT_BARRIER.get()
 }
 
 #[cfg(test)]

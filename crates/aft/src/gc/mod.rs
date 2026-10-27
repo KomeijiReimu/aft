@@ -114,16 +114,6 @@ pub(crate) fn sweep_bounded(
     )
 }
 
-#[cfg(test)]
-pub(crate) fn sweep_semantic_handoff_for_test(
-    request: SweepRequest<'_>,
-) -> Result<SweepReport, SweepError> {
-    // The view-publication test runs GC while its assembler holds a callgraph
-    // SQLite connection. Collect only semantic blobs so the test never opens a
-    // second descriptor on that live callgraph database.
-    sweep_planes_bounded(request, &|| false, &[BlobPlane::Semantic])
-}
-
 fn sweep_planes_bounded(
     request: SweepRequest<'_>,
     cancelled: &dyn Fn() -> bool,
