@@ -15871,27 +15871,45 @@ mod split_request_tests {
                 save_external_index(&root, storage.path());
             }
             let ctx = external_context(session.path(), storage.path(), false);
-            let response = search(
-                &ctx,
-                serde_json::json!({
-                    "query": "the scheduler drains the work queue", "pattern": "drain_now", "path": root,
-                }),
-            );
+            // This test ranks a pattern definition after its host; the
+            // borrowed-load, disk-check and first-search waits it does not
+            // test run generous here so a loaded runner cannot truncate the
+            // file list being ranked.
+            let search_split = |params: serde_json::Value| {
+                crate::readonly_artifacts::with_borrowed_search_load_limits_for_test(
+                    1_000_000,
+                    Duration::from_secs(30),
+                    || {
+                        external_disk_check::with_budgets_for_test(
+                            Duration::from_secs(30),
+                            Duration::from_secs(30),
+                            || {
+                                with_first_search_index_load_wait_budget_for_test(
+                                    Duration::from_secs(30),
+                                    || search(&ctx, params),
+                                )
+                            },
+                        )
+                    },
+                )
+            };
+            let response = search_split(serde_json::json!({
+                "query": "the scheduler drains the work queue", "pattern": "drain_now", "path": root,
+            }));
             assert_eq!(response["success"], true, "{response}");
             let files = file_names(&response);
-            let host = files.iter().position(|name| name == "p3.rs").unwrap();
+            let Some(host) = files.iter().position(|name| name == "p3.rs") else {
+                panic!("host p3.rs missing from results: {response}");
+            };
             assert_eq!(files[host + 1], "defines.rs", "{response}");
             assert!(response["results"][host + 1]["supports"]
                 .as_str()
                 .unwrap()
                 .ends_with("p3.rs"));
-            let page = search(
-                &ctx,
-                serde_json::json!({
-                    "query": "the scheduler drains the work queue", "pattern": "drain_now", "path": root,
-                    "offset": host, "topK": 2,
-                }),
-            );
+            let page = search_split(serde_json::json!({
+                "query": "the scheduler drains the work queue", "pattern": "drain_now", "path": root,
+                "offset": host, "topK": 2,
+            }));
             assert_eq!(file_names(&page), ["p3.rs", "defines.rs"], "{page}");
         }
     }
