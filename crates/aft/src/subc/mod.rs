@@ -219,6 +219,8 @@ mod bash_selector_tests;
 mod codemode;
 mod consent;
 pub(crate) use consent::directory_scope;
+#[cfg(all(test, unix))]
+mod deleted_root_reclaim_tests;
 mod drain;
 mod flow_read;
 mod health;
@@ -1437,6 +1439,10 @@ struct RootMeta {
     /// tasks. The kill waits out signal grace periods, so it never runs on
     /// the frame loop; the reaper retains the root until it finishes.
     reclaim_kill_in_flight: Option<Arc<AtomicBool>>,
+    /// Minimum spacing between kill submissions, including failed spawns and
+    /// kills that leave surviving processes. Sweeps must not create a thread
+    /// on every tick while a process cannot be terminated.
+    reclaim_kill_submitted_at: Option<Instant>,
     /// When the idle reaper last submitted the unbound-teardown persist for
     /// this root. Sweeps run every few hundred milliseconds, so a persist that
     /// could not clear its blocker (cache lock contention, a failed write) is
@@ -1677,6 +1683,7 @@ impl RootMeta {
             consecutive_missing_sweeps: 0,
             presence_generation_seen: 0,
             reclaim_kill_in_flight: None,
+            reclaim_kill_submitted_at: None,
             teardown_persist_submitted_at: None,
             ttl_retention_logged: None,
             configure_tail_in_flight: false,
@@ -2161,6 +2168,8 @@ struct IdleReapOutcome {
 /// Minimum gap between unbound-teardown persist attempts for one root.
 const UNBOUND_TEARDOWN_PERSIST_RETRY: Duration = Duration::from_secs(60);
 
+const RECLAIM_KILL_RETRY: Duration = Duration::from_secs(30);
+
 /// Count an unbound root retained past its idle TTL and log the reason once
 /// per distinct blocker.
 fn note_unbound_ttl_retention(
@@ -2532,14 +2541,32 @@ fn reap_idle_roots_with_presence(
                     meta.reclaim_kill_in_flight
                         .get_or_insert_with(|| Arc::new(AtomicBool::new(false))),
                 );
-                let tasks_settled = !kill_in_flight.load(Ordering::Acquire)
-                    && ctx.bash_background().try_has_running_tasks() == Some(false);
-                if !tasks_settled {
-                    if !kill_in_flight.swap(true, Ordering::AcqRel) {
-                        spawn_reclaimed_root_task_kill(&ctx, &root_id, kill_in_flight);
+                let retention = if kill_in_flight.load(Ordering::Acquire) {
+                    Some(health::DeletedTaskRetention::KillInFlight)
+                } else {
+                    match ctx
+                        .bash_background()
+                        .try_has_reclaimable_tasks_for_root(&root_id)
+                    {
+                        Some(false) => None,
+                        None => Some(health::DeletedTaskRetention::RegistryBusy),
+                        Some(true) => {
+                            let retry_due =
+                                meta.reclaim_kill_submitted_at.is_none_or(|submitted| {
+                                    now.saturating_duration_since(submitted) >= RECLAIM_KILL_RETRY
+                                });
+                            if retry_due && !kill_in_flight.swap(true, Ordering::AcqRel) {
+                                meta.reclaim_kill_submitted_at = Some(now);
+                                spawn_reclaimed_root_task_kill(&ctx, &root_id, kill_in_flight);
+                                Some(health::DeletedTaskRetention::KillInFlight)
+                            } else {
+                                Some(health::DeletedTaskRetention::KillBackoff)
+                            }
+                        }
                     }
-                    census.deleted_retained += 1;
-                    census.artifact_eviction_blocked += 1;
+                };
+                if let Some(retention) = retention {
+                    census.note_deleted_task_retained(retention);
                     continue;
                 }
             }
@@ -2553,7 +2580,12 @@ fn reap_idle_roots_with_presence(
             continue;
         };
         let taken_pending = Some(taken_pending);
-        if let Some(blocker) = ctx.try_artifact_eviction_blocker(false) {
+        let blocker = if deleted {
+            ctx.try_artifact_eviction_blocker_for_deleted_root(false, &root_id)
+        } else {
+            ctx.try_artifact_eviction_blocker(false)
+        };
+        if let Some(blocker) = blocker {
             if let Some(pending) = taken_pending {
                 ctx.restore_pending_reconciliation_state_without_waiting(pending);
             }
@@ -2584,7 +2616,12 @@ fn reap_idle_roots_with_presence(
             continue;
         }
         let memory_before = ctx.memory_root_snapshot();
-        if !ctx.try_evict_idle_artifacts() {
+        let evicted = if deleted {
+            ctx.try_evict_idle_artifacts_for_deleted_root(&root_id)
+        } else {
+            ctx.try_evict_idle_artifacts()
+        };
+        if !evicted {
             if let Some(pending) = taken_pending {
                 ctx.restore_pending_reconciliation_state_without_waiting(pending);
             }

@@ -75,6 +75,19 @@ impl UnboundRetention {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum DeletedTaskRetention {
+    KillInFlight,
+    KillBackoff,
+    RegistryBusy,
+}
+
+const DELETED_TASK_RETENTION_LABELS: [&str; 3] = [
+    "task_kill_in_flight",
+    "task_kill_backoff",
+    "task_registry_busy",
+];
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct ReapBlockerCensus {
     pub(super) deleted_retained: usize,
@@ -89,6 +102,7 @@ pub(super) struct ReapBlockerCensus {
     pub(super) actor_state_busy: usize,
     pub(super) artifact_eviction_blocked: usize,
     pub(super) artifact_eviction_failed: usize,
+    deleted_task_blockers: [usize; 3],
     /// Existing roots with no bound route that are past their idle TTL but
     /// were not evicted, counted once each under the reason in
     /// `unbound_blockers`.
@@ -97,6 +111,12 @@ pub(super) struct ReapBlockerCensus {
 }
 
 impl ReapBlockerCensus {
+    pub(super) fn note_deleted_task_retained(&mut self, reason: DeletedTaskRetention) {
+        self.deleted_retained += 1;
+        self.artifact_eviction_blocked += 1;
+        self.deleted_task_blockers[reason as usize] += 1;
+    }
+
     pub(super) fn note_unbound_retained(&mut self, reason: UnboundRetention) {
         self.unbound_retained += 1;
         self.unbound_blockers[reason.index()] += 1;
@@ -112,7 +132,7 @@ impl ReapBlockerCensus {
     }
     pub(super) fn blocker_histogram(&self) -> String {
         format!(
-            "absence_unconfirmed={},bound_routes={},unbound_quiesced={},bash_waits={},maintenance_pending={},maintenance_queued={},pending_binds={},actor_busy={},actor_state_busy={},artifact_eviction_blocked={},artifact_eviction_failed={}",
+            "absence_unconfirmed={},bound_routes={},unbound_quiesced={},bash_waits={},maintenance_pending={},maintenance_queued={},pending_binds={},actor_busy={},actor_state_busy={},artifact_eviction_blocked={},artifact_eviction_failed={},task_kill_in_flight={},task_kill_backoff={},task_registry_busy={}",
             self.absence_unconfirmed,
             self.bound_routes,
             self.unbound_quiesced,
@@ -124,6 +144,9 @@ impl ReapBlockerCensus {
             self.actor_state_busy,
             self.artifact_eviction_blocked,
             self.artifact_eviction_failed,
+            self.deleted_task_blockers[0],
+            self.deleted_task_blockers[1],
+            self.deleted_task_blockers[2],
         )
     }
 }
@@ -147,6 +170,7 @@ struct ReapMetrics {
     actor_state_busy: AtomicUsize,
     artifact_eviction_blocked: AtomicUsize,
     artifact_eviction_failed: AtomicUsize,
+    deleted_task_blockers: [AtomicUsize; 3],
     unbound_retained: AtomicUsize,
     unbound_blockers: [AtomicUsize; UNBOUND_RETENTION_KINDS],
 }
@@ -168,6 +192,7 @@ impl ReapMetrics {
             actor_state_busy: AtomicUsize::new(0),
             artifact_eviction_blocked: AtomicUsize::new(0),
             artifact_eviction_failed: AtomicUsize::new(0),
+            deleted_task_blockers: std::array::from_fn(|_| AtomicUsize::new(0)),
             unbound_retained: AtomicUsize::new(0),
             unbound_blockers: std::array::from_fn(|_| AtomicUsize::new(0)),
         }
@@ -215,6 +240,13 @@ impl ReapMetrics {
             .store(census.artifact_eviction_blocked, Ordering::Relaxed);
         self.artifact_eviction_failed
             .store(census.artifact_eviction_failed, Ordering::Relaxed);
+        for (slot, count) in self
+            .deleted_task_blockers
+            .iter()
+            .zip(census.deleted_task_blockers)
+        {
+            slot.store(count, Ordering::Relaxed);
+        }
         self.unbound_retained
             .store(census.unbound_retained, Ordering::Relaxed);
         for (slot, count) in self
@@ -228,6 +260,11 @@ impl ReapMetrics {
     }
 
     fn snapshot(&self) -> Value {
+        let deleted_task_blockers = DELETED_TASK_RETENTION_LABELS
+            .iter()
+            .zip(self.deleted_task_blockers.iter())
+            .map(|(label, count)| ((*label).to_string(), json!(count.load(Ordering::Relaxed))))
+            .collect::<serde_json::Map<_, _>>();
         let unbound_blockers = UNBOUND_RETENTION_LABELS
             .iter()
             .zip(self.unbound_blockers.iter())
@@ -235,6 +272,7 @@ impl ReapMetrics {
             .collect::<serde_json::Map<_, _>>();
         json!({
             "deleted_retained": self.deleted_retained.load(Ordering::Relaxed),
+            "deleted_task_blockers": deleted_task_blockers,
             "blockers": {
                 "absence_unconfirmed": self.absence_unconfirmed.load(Ordering::Relaxed),
                 "bound_routes": self.bound_routes.load(Ordering::Relaxed),

@@ -12,11 +12,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(windows)]
 use std::process::{Child, Stdio};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
 #[cfg(unix)]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(all(test, unix))]
+#[path = "root_reclaim_tests.rs"]
+pub(crate) mod root_reclaim_tests;
 
 use crate::db::TrackedConnection;
 use serde::Serialize;
@@ -1302,6 +1309,10 @@ pub(crate) struct RegistryInner {
     retired_undelivered_completions: AtomicU64,
     /// Watchdog candidates only; terminal history stays in `tasks` for delivery.
     pub(crate) watchdog_tasks: Mutex<HashMap<String, Arc<BgTask>>>,
+    #[cfg(test)]
+    reclaim_kill_attempts: AtomicUsize,
+    #[cfg(test)]
+    reclaim_kill_noop: AtomicBool,
     /// Finished tasks whose scratch directory is kept on disk until its
     /// delete time, keyed by task id. See `scratch_retention`.
     retained_scratch: Mutex<HashMap<String, scratch_retention::RetainedScratch>>,
@@ -1494,6 +1505,9 @@ pub(crate) struct BgTask {
     pub(crate) session_id: String,
     pub(crate) paths: TaskPaths,
     artifact_root: PathBuf,
+    /// Canonical root identity captured at registration and retained on deletion.
+    /// Reclaim probes compare it without filesystem calls on the frame loop.
+    project_root: PathBuf,
     pub(crate) started: Instant,
     /// Whether this task holds one of the project root's background slots
     /// (`max_background_bash_tasks`): true for a background or PTY launch and
@@ -1914,6 +1928,10 @@ impl BgTaskRegistry {
                 persisted_gc_storage: Mutex::new(BTreeSet::new()),
                 retired_undelivered_completions: AtomicU64::new(0),
                 watchdog_tasks: Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                reclaim_kill_attempts: AtomicUsize::new(0),
+                #[cfg(test)]
+                reclaim_kill_noop: AtomicBool::new(false),
                 retained_scratch: Mutex::new(HashMap::new()),
                 revoked_scopes: Mutex::new(HashSet::new()),
                 held_remote_workers: Mutex::new(None),
@@ -4242,10 +4260,21 @@ impl BgTaskRegistry {
         super::memory_limit::Monitor::prepare(mib, task_id).map(Some)
     }
 
-    fn fail_memory_spawn(&self, metadata: &mut PersistedTask, paths: &TaskPaths, error: &str) {
+    fn fail_memory_spawn(
+        &self,
+        metadata: &mut PersistedTask,
+        paths: &TaskPaths,
+        error: &str,
+        canonical_project_root: PathBuf,
+    ) {
         metadata.mark_terminal(BgTaskStatus::Failed, None, Some(error.into()));
         let _ = self.persist_task(paths, metadata);
-        let _ = self.insert_rehydrated_task(metadata.clone(), paths.clone(), true);
+        let _ = self.insert_rehydrated_task_with_root(
+            metadata.clone(),
+            paths.clone(),
+            true,
+            canonical_project_root,
+        );
         self.record_live_delivery_session(&metadata.session_id);
         self.enqueue_completion_if_needed(metadata, Some(paths), true);
     }
@@ -4529,6 +4558,8 @@ impl BgTaskRegistry {
         compressed: bool,
         project_root: Option<PathBuf>,
     ) -> Result<String, RegistryError> {
+        let canonical_project_root =
+            canonicalized_path(project_root.as_deref().unwrap_or(&workdir));
         self.start_watchdog();
 
         #[cfg(target_os = "linux")]
@@ -4684,7 +4715,12 @@ impl BgTaskRegistry {
                     metadata.notify_on_completion = true;
                     metadata.mark_terminal(BgTaskStatus::Failed, None, Some(error.clone()));
                     let _ = self.persist_task(&paths, &metadata);
-                    let _ = self.insert_rehydrated_task(metadata.clone(), paths.clone(), true);
+                    let _ = self.insert_rehydrated_task_with_root(
+                        metadata.clone(),
+                        paths.clone(),
+                        true,
+                        canonical_project_root,
+                    );
                     self.record_live_delivery_session(&metadata.session_id);
                     self.enqueue_completion_if_needed(&metadata, Some(&paths), true);
                 } else {
@@ -4699,7 +4735,7 @@ impl BgTaskRegistry {
             if let Err(error) = monitor.attach(child_pid) {
                 super::process::terminate_pgid(child_pid as i32, None);
                 let _ = child.wait();
-                self.fail_memory_spawn(&mut metadata, &paths, &error);
+                self.fail_memory_spawn(&mut metadata, &paths, &error, canonical_project_root);
                 return Err(error.into());
             }
             metadata.memory_policy = Some(monitor.policy.clone());
@@ -4724,7 +4760,12 @@ impl BgTaskRegistry {
                 Some("spawn aborted".to_string()),
             );
             let _ = self.persist_task(&paths, &metadata);
-            let _ = self.insert_rehydrated_task(metadata, paths.clone(), true);
+            let _ = self.insert_rehydrated_task_with_root(
+                metadata,
+                paths.clone(),
+                true,
+                canonical_project_root,
+            );
             return Err(format!("failed to persist background task metadata: {error}").into());
         }
         metadata.mark_running(child_pid, child_pid as i32);
@@ -4741,6 +4782,7 @@ impl BgTaskRegistry {
             session_id,
             paths: paths.clone(),
             artifact_root: canonical_artifact_root(&paths),
+            project_root: canonical_project_root,
             started: Instant::now(),
             terminal_reader_done: Arc::new(AtomicBool::new(true)),
             holds_background_slot: AtomicBool::new(slot.holds_slot()),
@@ -4959,6 +5001,8 @@ impl BgTaskRegistry {
         rows: u16,
         cols: u16,
     ) -> Result<String, RegistryError> {
+        let canonical_project_root =
+            canonicalized_path(project_root.as_deref().unwrap_or(&workdir));
         self.start_watchdog();
 
         let _admission =
@@ -5091,7 +5135,12 @@ impl BgTaskRegistry {
                     metadata.pgid = spawned_pgid;
                     metadata.mark_terminal(BgTaskStatus::Failed, None, Some(error.clone()));
                     let _ = self.persist_task(&paths, &metadata);
-                    let _ = self.insert_rehydrated_task(metadata.clone(), paths.clone(), true);
+                    let _ = self.insert_rehydrated_task_with_root(
+                        metadata.clone(),
+                        paths.clone(),
+                        true,
+                        canonical_project_root,
+                    );
                     self.record_live_delivery_session(&metadata.session_id);
                     self.enqueue_completion_if_needed(&metadata, Some(&paths), true);
                 } else {
@@ -5132,6 +5181,7 @@ impl BgTaskRegistry {
             session_id,
             paths: paths.clone(),
             artifact_root: canonical_artifact_root(&paths),
+            project_root: canonical_project_root,
             started: Instant::now(),
             terminal_reader_done,
             // A PTY always runs in the background.
@@ -5306,6 +5356,8 @@ impl BgTaskRegistry {
         compressed: bool,
         project_root: Option<PathBuf>,
     ) -> Result<String, RegistryError> {
+        let canonical_project_root =
+            canonicalized_path(project_root.as_deref().unwrap_or(&workdir));
         self.start_watchdog();
 
         let _admission = self.background_admission_guard(slot);
@@ -5391,7 +5443,7 @@ impl BgTaskRegistry {
             if let Err(error) = monitor.attach(child_pid) {
                 let _ = child.kill();
                 let _ = child.wait();
-                self.fail_memory_spawn(&mut metadata, &paths, &error);
+                self.fail_memory_spawn(&mut metadata, &paths, &error, canonical_project_root);
                 return Err(error.into());
             }
             use std::io::Write;
@@ -5406,7 +5458,7 @@ impl BgTaskRegistry {
                 monitor.terminate();
                 let _ = child.kill();
                 let _ = child.wait();
-                self.fail_memory_spawn(&mut metadata, &paths, &error);
+                self.fail_memory_spawn(&mut metadata, &paths, &error, canonical_project_root);
                 return Err(error.into());
             }
             metadata.memory_policy = Some(monitor.policy.clone());
@@ -5435,6 +5487,7 @@ impl BgTaskRegistry {
             session_id,
             paths: paths.clone(),
             artifact_root: canonical_artifact_root(&paths),
+            project_root: canonical_project_root,
             started: Instant::now(),
             terminal_reader_done: Arc::new(AtomicBool::new(true)),
             holds_background_slot: AtomicBool::new(slot.holds_slot()),
@@ -9002,9 +9055,10 @@ impl BgTaskRegistry {
         self.kill_with_status_reason(task_id, session_id, BgTaskStatus::Killed, None)
     }
 
-    /// Terminate live tasks whose project root has been confirmed absent by
-    /// subc's consecutive directory-absence scans, so tasks cannot keep using
-    /// a root that has been verified for reclamation.
+    /// Terminate live tasks and terminal tasks' surviving process groups after
+    /// subc's consecutive directory-absence scans confirm their root is absent.
+    /// Root deletion is a definitive end, like scope termination: descendants
+    /// must not outlive the root just because their command already completed.
     ///
     /// The absence signal intentionally cannot distinguish deletion from
     /// renaming: a task's cwd handle can follow a moved directory even while
@@ -9012,24 +9066,37 @@ impl BgTaskRegistry {
     /// registry identity, so killing those tasks is accepted; operational
     /// guidance is to rename a project only after its live tasks have ended.
     pub fn kill_running_tasks_for_root(&self, project_root: &Path) -> usize {
+        #[cfg(test)]
+        {
+            self.inner
+                .reclaim_kill_attempts
+                .fetch_add(1, Ordering::SeqCst);
+            if self.inner.reclaim_kill_noop.load(Ordering::SeqCst) {
+                return 0;
+            }
+        }
         let canonical_root = canonicalized_path(project_root);
         let tasks = self.task_arcs();
         let targets: Vec<_> = tasks
             .into_iter()
+            .filter(|task| {
+                reclaim_root_paths_match(&task.project_root, &canonical_root, cfg!(windows))
+            })
             .filter_map(|task| {
-                let task_root = {
+                let sample_missing = {
                     let state = task.lock_state().ok()?;
-                    if !BgTask::state_is_running(&state) {
-                        return None;
-                    }
-                    state
-                        .metadata
-                        .project_root
-                        .clone()
-                        .unwrap_or_else(|| state.metadata.workdir.clone())
+                    state.metadata.status.is_terminal()
+                        && state.metadata.pgid.is_some()
+                        && state.metadata.live_descendants.is_none()
                 };
-                (canonicalized_path(&task_root) == canonical_root)
-                    .then(|| (task.task_id.clone(), task.session_id.clone()))
+                if sample_missing {
+                    self.sample_task_process_group(&task);
+                }
+                let needs_reclaim = {
+                    let state = task.lock_state().ok()?;
+                    BgTask::state_needs_root_reclaim(&state)
+                };
+                needs_reclaim.then(|| (task.task_id.clone(), task.session_id.clone()))
             })
             .collect();
 
@@ -10957,6 +11024,12 @@ impl BgTaskRegistry {
         paths: TaskPaths,
     ) -> Result<(), String> {
         let task_id = metadata.task_id.clone();
+        let canonical_project_root = canonicalized_path(
+            metadata
+                .project_root
+                .as_deref()
+                .unwrap_or(&metadata.workdir),
+        );
         // Held while the task is built and its worker started, so another
         // registry can neither build a second copy nor start a worker first.
         // Released before this registry publishes the task's pending
@@ -10987,7 +11060,7 @@ impl BgTaskRegistry {
                 return Ok(());
             }
         }
-        self.insert_rehydrated_task(metadata, paths, true)?;
+        self.insert_rehydrated_task_with_root(metadata, paths, true, canonical_project_root)?;
         let task = self
             .task(&task_id)
             .ok_or_else(|| format!("{task_id}: restored remote task missing"))?;
@@ -11309,6 +11382,29 @@ impl BgTaskRegistry {
         }
     }
 
+    /// Non-waiting counterpart of [`Self::kill_running_tasks_for_root`]. Terminal
+    /// records awaiting delivery or scratch cleanup do not keep artifacts live;
+    /// `metadata.live_descendants` and `live_descendants_omitted` still do. A
+    /// terminal group with no sample also waits for the kill worker to sample
+    /// it; terminal status can be visible before descendant sampling finishes.
+    /// The kill path refreshes those samples after signaling. A cached routing
+    /// identity avoids filesystem calls or process enumeration on the frame loop.
+    pub(crate) fn try_has_reclaimable_tasks_for_root(
+        &self,
+        project_root: &crate::path_identity::ProjectRootId,
+    ) -> Option<bool> {
+        let tasks = self.inner.tasks.try_lock().ok()?;
+        for task in tasks.values().filter(|task| {
+            reclaim_root_paths_match(&task.project_root, project_root.as_path(), cfg!(windows))
+        }) {
+            let state = task.state.try_lock().ok()?;
+            if BgTask::state_needs_root_reclaim(&state) {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+
     /// Hold the watch map lock for the duration of `while_held`, so a test can
     /// prove a caller does not wait for it.
     #[cfg(test)]
@@ -11329,7 +11425,25 @@ impl BgTaskRegistry {
         paths: TaskPaths,
         detached: bool,
     ) -> Result<(), String> {
-        self.insert_registered_task(metadata, paths, detached, None)
+        let canonical_project_root = canonicalized_path(
+            metadata
+                .project_root
+                .as_deref()
+                .unwrap_or(&metadata.workdir),
+        );
+        self.insert_rehydrated_task_with_root(metadata, paths, detached, canonical_project_root)
+    }
+
+    /// Admission and remote-claim holders pass the root resolved before locking.
+    /// Rehydrating a failed spawn must not repeat root filesystem I/O under them.
+    fn insert_rehydrated_task_with_root(
+        &self,
+        metadata: PersistedTask,
+        paths: TaskPaths,
+        detached: bool,
+        canonical_project_root: PathBuf,
+    ) -> Result<(), String> {
+        self.insert_registered_task(metadata, paths, detached, None, canonical_project_root)
     }
 
     fn insert_registered_task(
@@ -11338,6 +11452,7 @@ impl BgTaskRegistry {
         paths: TaskPaths,
         detached: bool,
         changed_files: Option<Arc<crate::bash_changed_files::Capture>>,
+        canonical_project_root: PathBuf,
     ) -> Result<(), String> {
         let task_id = metadata.task_id.clone();
         let session_id = metadata.session_id.clone();
@@ -11379,6 +11494,7 @@ impl BgTaskRegistry {
             session_id,
             paths: paths.clone(),
             artifact_root: canonical_artifact_root(&paths),
+            project_root: canonical_project_root,
             started,
             terminal_reader_done: Arc::new(AtomicBool::new(true)),
             // A task reloaded after a restart has no caller waiting on it any
@@ -14672,6 +14788,18 @@ fn modified_within(path: &Path, grace: Duration) -> bool {
         .unwrap_or(false)
 }
 
+/// Windows canonicalization adds a verbatim prefix, but a deleted root can
+/// only supply its plain routing path. Normalize the comparison, not the
+/// stored identity, without probing a directory that may no longer exist.
+fn reclaim_root_paths_match(stored: &Path, requested: &Path, windows: bool) -> bool {
+    if windows {
+        crate::windows_path::normalize_windows_path(stored)
+            == crate::windows_path::normalize_windows_path(requested)
+    } else {
+        stored == requested
+    }
+}
+
 fn canonicalized_path(path: &Path) -> PathBuf {
     #[cfg(test)]
     ROOT_LOCK_PROBE.with(|hook| {
@@ -15313,6 +15441,18 @@ impl BgTask {
                 Self::state_is_running(&poison.into_inner())
             }
         }
+    }
+
+    fn state_needs_root_reclaim(state: &BgTaskState) -> bool {
+        !state.metadata.status.is_terminal()
+            || (cfg!(unix)
+                && state.metadata.pgid.is_some()
+                && (state
+                    .metadata
+                    .live_descendants
+                    .as_ref()
+                    .is_none_or(|members| !members.is_empty())
+                    || state.metadata.live_descendants_omitted > 0))
     }
 
     fn state_is_running(state: &BgTaskState) -> bool {
@@ -17132,10 +17272,43 @@ mod tests {
         });
         registry.kill_running_tasks_for_root(dir.path());
         ROOT_LOCK_PROBE.with(|hook| hook.borrow_mut().take());
-        assert!(
-            calls.load(Ordering::SeqCst) >= 2,
-            "probe never inspected a task's root lookup"
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "root reclaim resolves only its input; task root identities are cached at registration"
         );
+    }
+
+    #[test]
+    fn root_reclaim_compares_windows_verbatim_spellings() {
+        for (verbatim, plain) in [
+            (r"\\?\C:\work\gone", r"C:\work\gone"),
+            (r"\\?\UNC\server\share\gone", r"\\server\share\gone"),
+            (r"\\?\c:\work\gone", "C:/work/gone"),
+        ] {
+            assert!(
+                reclaim_root_paths_match(Path::new(verbatim), Path::new(plain), true),
+                "{verbatim} must match {plain}"
+            );
+            assert!(
+                reclaim_root_paths_match(Path::new(plain), Path::new(verbatim), true),
+                "{plain} must match {verbatim}"
+            );
+            assert!(
+                !reclaim_root_paths_match(Path::new(verbatim), Path::new(plain), false),
+                "non-Windows comparisons must keep literal path identity"
+            );
+        }
+        assert!(!reclaim_root_paths_match(
+            Path::new(r"\\?\C:\work\gone"),
+            Path::new(r"C:\work\other"),
+            true
+        ));
+        assert!(!reclaim_root_paths_match(
+            Path::new(r"\\?\Volume{1234}\gone"),
+            Path::new(r"Volume{1234}\gone"),
+            true
+        ));
     }
 
     #[test]
