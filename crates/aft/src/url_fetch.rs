@@ -1027,6 +1027,12 @@ fn fetch_with_secrets(
                 "Unsupported content type '{content_type}' for {logical_url}. Supported: text/html, text/markdown, application/json, text/plain; source files via URL path extension (e.g. .rs, .ts, .mjs)"
             ))
         })?;
+    // An HTML page served under a source-file path would be kept as raw
+    // markup, where a key split across tags or spelled with entities is
+    // hidden from the scrub but shown by any browser. It is refused instead.
+    if extension != ".html" && resolve_extension_from_content_type(&content_type) == Some(".html") {
+        return Err(secret_fetch_refused("html_served_as_source", logical_url));
+    }
     let total_bytes = codings
         .is_empty()
         .then(|| response.content_length())

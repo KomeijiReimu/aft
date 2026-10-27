@@ -2107,5 +2107,48 @@ mod url_tests {
             assert_eq!(api.targets().len(), 1);
             assert_eq!(other.connections.load(Ordering::SeqCst), 0);
         }
+
+        /// HTML residuals: an HTML page served under a source-file path is not
+        /// kept raw, and a Markdown document that spells the key with inline
+        /// tags or a numeric reference without `;` is refused.
+        #[test]
+        fn tag_split_and_semicolon_less_key_spellings_are_refused() {
+            const K: &[u8] = b"abcdef*xyzw123456";
+            let fixture = fixture(Default::default());
+            let server = serve(&fixture.tls, |target| {
+                let (content_type, body): (&str, &[u8]) = if target.starts_with("/v1/html.md") {
+                    ("text/html", b"<html><body><h1>Doc</h1><p><span>abcdef</span><span>*xyzw123456</span></p></body></html>")
+                } else if target.starts_with("/v1/tags.md") {
+                    (
+                        "text/markdown",
+                        b"# Doc\n\n<span>abcdef</span><span>*xyzw123456</span>\n",
+                    )
+                } else {
+                    ("text/markdown", b"# Doc\n\nabcdef&#42xyzw123456\n")
+                };
+                Some(http("200 OK", &[("Content-Type", content_type)], body))
+            });
+            let port = server.addr.port();
+            let cases = [
+                ("/v1/html.md", "(html_served_as_source)"),
+                ("/v1/tags.md", "(document_discloses_key)"),
+                ("/v1/numeric.md", "(document_discloses_key)"),
+            ];
+            for (index, (path, reason)) in cases.into_iter().enumerate() {
+                let url = format!("https://api.secret.test:{port}{path}?key={PLACEHOLDER}");
+                let vault = granted_vault_with(rule("api.secret.test", port, "/v1"), K);
+                let (run, documents) = run_with(
+                    &fixture,
+                    &vault,
+                    &[("api.secret.test", server.addr)],
+                    &request("zoom", &url, serde_json::json!({"symbol": "Doc"})),
+                    no_extra,
+                );
+                assert!(!run.response.success, "{path}: {}", run.strings());
+                assert!(run.strings().contains(reason), "{path}: {}", run.strings());
+                assert!(documents.is_empty(), "{path}: a document was written");
+                assert_eq!(server.targets().len(), index + 1, "{path}");
+            }
+        }
     }
 }

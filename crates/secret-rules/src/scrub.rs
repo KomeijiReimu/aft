@@ -1168,8 +1168,9 @@ pub fn reveals_key(text: &[u8], key: &[u8]) -> bool {
 /// True when `text` spells any of `keys` in a form the scrubber recognises,
 /// as it stands or after a recipient undoes the changes a URL parser or a
 /// reader makes without being asked: dropping control bytes such as a tab,
-/// decoding percent-encoding, reading Markdown backslash escapes and decoding
-/// HTML character references.
+/// decoding percent-encoding, reading Markdown backslash escapes, decoding
+/// HTML character references (with or without the closing `;` for numeric
+/// ones) and removing inline HTML tags.
 ///
 /// The scrubber replaces a key only where it finds one, so text it passed
 /// can still carry a key that one of these changes reassembles. A caller that
@@ -1245,6 +1246,7 @@ const REVEAL_TRANSFORMS: &[RevealTransform] = &[
     percent_decoded,
     markdown_unescaped,
     html_entities_decoded,
+    without_markup_tags,
 ];
 
 /// The chains [`reveals_any`] follows: every single change on its own, then
@@ -1254,6 +1256,7 @@ const REVEAL_CHAINS: &[RevealTransform] = &[
     percent_decoded,
     markdown_unescaped,
     html_entities_decoded,
+    without_markup_tags,
     all_reveal_transforms,
 ];
 
@@ -1367,8 +1370,8 @@ const HTML_NAMED_ENTITIES: &[(&[u8], u8)] = &[
     (b"semi", b';'),
 ];
 
-/// `text` with HTML character references decoded: `&#42;`, `&#x2a;` and the
-/// named ones in [`HTML_NAMED_ENTITIES`]. HTML kept as it is (a page served
+/// `text` with HTML character references decoded: `&#42;`, `&#x2a;`, the
+/// same without `;`, and the named ones in [`HTML_NAMED_ENTITIES`]. HTML kept as it is (a page served
 /// under a source-file path) spells characters this way, and any browser or
 /// reader decodes them.
 fn html_entities_decoded(text: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
@@ -1393,9 +1396,69 @@ fn html_entities_decoded(text: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
     changed.then_some(out)
 }
 
+/// The longest tag [`without_markup_tags`] removes; a `<` with no `>` within
+/// this many bytes is kept as text.
+const MAX_TAG_LEN: usize = 1024;
+
+/// `text` with HTML tags removed (`<span>`, `</b>`, `<!-- -->`), the way a
+/// browser or a Markdown renderer shows inline markup: a key split across
+/// tags is one word on screen.
+fn without_markup_tags(text: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    if !text.contains(&b'<') {
+        return None;
+    }
+    let mut out = Zeroizing::new(Vec::with_capacity(text.len()));
+    let mut index = 0;
+    let mut changed = false;
+    while index < text.len() {
+        let opens_tag = text[index] == b'<'
+            && text
+                .get(index + 1)
+                .is_some_and(|next| next.is_ascii_alphabetic() || matches!(next, b'/' | b'!'));
+        if opens_tag {
+            let limit = (index + MAX_TAG_LEN).min(text.len());
+            if let Some(close) = text[index + 1..limit].iter().position(|byte| *byte == b'>') {
+                index += close + 2;
+                changed = true;
+                continue;
+            }
+        }
+        out.push(text[index]);
+        index += 1;
+    }
+    changed.then_some(out)
+}
+
 /// The character reference starting at `text[index]` (which is `&`): its
-/// UTF-8 bytes and its length including the `;`.
+/// UTF-8 bytes and its length including the `;` when it has one. A numeric
+/// reference without `;` (`&#42`) is decoded too, as HTML5 does.
 fn html_entity_at(text: &[u8], index: usize) -> Option<(Vec<u8>, usize)> {
+    html_entity_with_semicolon(text, index)
+        .or_else(|| numeric_reference_without_semicolon(text, index))
+}
+
+/// `&#NN` or `&#xHH` with no `;`: the longest run of digits after it.
+fn numeric_reference_without_semicolon(text: &[u8], index: usize) -> Option<(Vec<u8>, usize)> {
+    let rest = text.get(index + 1..)?.strip_prefix(b"#")?;
+    let (digits_from, radix) = match rest.first() {
+        Some(b'x' | b'X') => (1, 16),
+        _ => (0, 10),
+    };
+    let digits = rest[digits_from..]
+        .iter()
+        .take(8)
+        .take_while(|byte| char::from(**byte).is_digit(radix))
+        .count();
+    if digits == 0 {
+        return None;
+    }
+    let number = std::str::from_utf8(&rest[digits_from..digits_from + digits]).ok()?;
+    let character = char::from_u32(u32::from_str_radix(number, radix).ok()?)?;
+    Some((character.to_string().into_bytes(), 2 + digits_from + digits))
+}
+
+/// A character reference ending in `;` at `text[index]`.
+fn html_entity_with_semicolon(text: &[u8], index: usize) -> Option<(Vec<u8>, usize)> {
     // The longest reference decoded here is `&#x10FFFF;` or `&percnt;`-sized
     // names; a `;` further away ends no reference.
     let rest = text.get(index + 1..)?;
@@ -1749,5 +1812,20 @@ mod tests {
     #[ignore]
     fn measure_reveal_and_scrub_work_on_8_mib_inputs() {
         assert_work_ceiling(8 << 20);
+    }
+
+    #[test]
+    fn tag_split_and_semicolon_less_spellings_reveal_the_key() {
+        let key = b"abcdef*xyzw123456";
+        assert!(reveals_key(
+            b"<p><span>abcdef</span><span>*xyzw123456</span></p>",
+            key
+        ));
+        assert!(reveals_key(b"text abcdef&#42xyzw123456 more", key));
+        assert!(reveals_key(b"text abcdef&#x2Axyzw123456 more", key));
+        assert!(!reveals_key(
+            b"<p><span>abcdef</span> <span>*xyzw</span></p> &#42 a < b",
+            key
+        ));
     }
 }
