@@ -5426,7 +5426,7 @@ async fn consent_answered_call_returns_while_another_scope_open_is_held() {
 #[cfg(unix)]
 #[tokio::test]
 async fn scratch_read_worker_route_skips_cingulate_only_for_own_task() {
-    use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
+    use crate::bash_background::persistence::{create_task_layout, write_task_at, PersistedTask};
     use crate::bash_background::BgTaskStatus;
 
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -5438,7 +5438,13 @@ async fn scratch_read_worker_route_skips_cingulate_only_for_own_task() {
         ("worker", "bash-0123456789abcdef"),
         ("other-session", "bash-fedcba9876543210"),
     ] {
-        let paths = task_paths(&storage, session, id).unwrap();
+        // Allocate the bundle through the locked production path so the
+        // session directory is non-empty before the detached persisted-task
+        // GC from the first replay can see it. A bare task_paths + write_task
+        // leaves an empty session directory that the sweep can rmdir between
+        // creation and the first file write.
+        let task = create_task_layout(&storage, session, id).unwrap();
+        let paths = &task.paths;
         let mut metadata = PersistedTask::starting(
             id.into(),
             session.into(),
@@ -5450,7 +5456,7 @@ async fn scratch_read_worker_route_skips_cingulate_only_for_own_task() {
             false,
         );
         metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
-        write_task(&paths.json, &metadata).unwrap();
+        write_task_at(&task, &metadata).unwrap();
         std::fs::write(&paths.stdout, "task output\n").unwrap();
         std::fs::write(&paths.stderr, "").unwrap();
         std::fs::write(&paths.exit, "0\n").unwrap();
