@@ -5726,7 +5726,10 @@ async fn runon_sends_the_whole_compound_line_remote_exactly_as_written() {
     );
     // A report without a changed-file list says so, after the output. The
     // other workspace reports stay silent when absent.
-    assert!(rendered.ends_with("changed files: not reported by the runner"), "{rendered}");
+    assert!(
+        rendered.ends_with("changed files: not reported by the runner"),
+        "{rendered}"
+    );
 }
 
 #[tokio::test]
@@ -6277,10 +6280,7 @@ fn unreported_git_untracked_and_ignored_reports_stay_silent() {
         changed,
         "These files changed on the server and were NOT copied back:\n  result.txt"
     );
-    assert!(
-        !changed.contains("not reported by the runner"),
-        "{changed}"
-    );
+    assert!(!changed.contains("not reported by the runner"), "{changed}");
     let mut missing = TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 1, 0, 0);
     missing.workspace_changes = None;
     let missing = render_terminal_report(&missing).unwrap();
