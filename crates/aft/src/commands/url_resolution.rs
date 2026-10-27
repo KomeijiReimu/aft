@@ -1765,9 +1765,9 @@ mod url_tests {
         }
 
         /// HTML that spells one key character as an entity is decoded and
-        /// then Markdown-escaped by conversion; neither that escaped form nor
-        /// the entity form (HTML kept as is under a `.md` path) may reach the
-        /// output.
+        /// then Markdown-escaped by conversion, whether it is served under an
+        /// HTML path or a `.md` one; neither that escaped form nor the entity
+        /// form may reach the output.
         #[test]
         fn entity_spelled_keys_in_html_never_reach_the_output() {
             const K: &[u8] = b"abcdef*1234567890";
@@ -1782,7 +1782,7 @@ mod url_tests {
             let port = server.addr.port();
             let cases = [
                 ("/v1/page", "document_discloses_key"),
-                ("/v1/page.md", "html_served_as_source"),
+                ("/v1/page.md", "document_discloses_key"),
             ];
             for (index, (path, reason)) in cases.into_iter().enumerate() {
                 let url = format!("https://api.secret.test:{port}{path}?key={PLACEHOLDER}");
@@ -2179,9 +2179,10 @@ mod url_tests {
             assert_eq!(other.connections.load(Ordering::SeqCst), 0);
         }
 
-        /// HTML residuals: an HTML page served under a source-file path is not
-        /// kept raw, and a Markdown document that spells the key with inline
-        /// tags or a numeric reference without `;` is refused.
+        /// HTML residuals: an HTML page served under a source-file path is
+        /// converted and then checked, and a Markdown document that spells
+        /// the key with inline tags or a numeric reference without `;` is
+        /// refused.
         #[test]
         fn tag_split_and_semicolon_less_key_spellings_are_refused() {
             const K: &[u8] = b"abcdef*xyzw123456";
@@ -2201,7 +2202,7 @@ mod url_tests {
             });
             let port = server.addr.port();
             let cases = [
-                ("/v1/html.md", "(html_served_as_source)"),
+                ("/v1/html.md", "(document_discloses_key)"),
                 ("/v1/tags.md", "(document_discloses_key)"),
                 ("/v1/numeric.md", "(document_discloses_key)"),
             ];
@@ -2290,6 +2291,59 @@ mod url_tests {
             assert_refused_for(&run, "residual_check_timeout");
             assert!(documents.is_empty());
             assert_eq!(server.targets().len(), 1);
+        }
+
+        /// A text/html response is converted whatever its path says: an
+        /// ordinary PHP page succeeds, and an HTML page under a `.md` path is
+        /// still checked after conversion.
+        #[test]
+        fn html_responses_are_converted_whatever_their_path() {
+            const K: &[u8] = b"abcdef*1234567890";
+            let fixture = fixture(Default::default());
+            let server = serve(&fixture.tls, |target| {
+                let body: &[u8] = if target.starts_with("/v1/index.php") {
+                    b"<html><body><h1>Welcome</h1><p>An ordinary page &amp; text.</p></body></html>"
+                } else {
+                    b"<html><body><h1>Doc</h1><p>abcdef&#42;1234567890</p></body></html>"
+                };
+                Some(http(
+                    "200 OK",
+                    &[("Content-Type", "text/html; charset=utf-8")],
+                    body,
+                ))
+            });
+            let port = server.addr.port();
+            let routes = [("api.secret.test", server.addr)];
+
+            let url = format!("https://api.secret.test:{port}/v1/index.php?key={PLACEHOLDER}");
+            let vault = granted_vault_with(rule("api.secret.test", port, "/v1"), K);
+            let (run, documents) = run_with(
+                &fixture,
+                &vault,
+                &routes,
+                &request("zoom", &url, serde_json::json!({"symbol": "Welcome"})),
+                no_extra,
+            );
+            assert!(run.response.success, "{}", run.strings());
+            assert_eq!(documents.len(), 1);
+            assert!(
+                run.strings().contains("An ordinary page & text."),
+                "{}",
+                run.strings()
+            );
+
+            let url = format!("https://api.secret.test:{port}/v1/page.md?key={PLACEHOLDER}");
+            let vault = granted_vault_with(rule("api.secret.test", port, "/v1"), K);
+            let (run, documents) = run_with(
+                &fixture,
+                &vault,
+                &routes,
+                &request("zoom", &url, serde_json::json!({"symbol": "Doc"})),
+                no_extra,
+            );
+            assert_refused_for(&run, "document_discloses_key");
+            assert!(documents.is_empty());
+            assert_eq!(server.targets().len(), 2);
         }
     }
 }

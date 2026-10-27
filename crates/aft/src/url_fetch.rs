@@ -1031,12 +1031,13 @@ fn fetch_with_secrets(
                 "Unsupported content type '{content_type}' for {logical_url}. Supported: text/html, text/markdown, application/json, text/plain; source files via URL path extension (e.g. .rs, .ts, .mjs)"
             ))
         })?;
-    // An HTML page served under a source-file path would be kept as raw
-    // markup, where a key split across tags or spelled with entities is
-    // hidden from the scrub but shown by any browser. It is refused instead.
-    if extension != ".html" && resolve_extension_from_content_type(&content_type) == Some(".html") {
-        return Err(secret_fetch_refused("html_served_as_source", logical_url));
-    }
+    // An HTML response is converted whatever its path says (an index.php
+    // page, or a .json endpoint answering with an HTML error page). Kept raw,
+    // its markup would hide a key split across tags or spelled with entities
+    // from the scrub while any browser shows it; converted, the residual
+    // check below sees the text a reader sees.
+    let is_html =
+        extension == ".html" || resolve_extension_from_content_type(&content_type) == Some(".html");
     let total_bytes = codings
         .is_empty()
         .then(|| response.content_length())
@@ -1064,12 +1065,12 @@ fn fetch_with_secrets(
             }
         }
     }
-    if from_source_path && body_contains_nul_in_prefix(&body) {
+    if from_source_path && !is_html && body_contains_nul_in_prefix(&body) {
         return Err(UrlFetchError::new(format!(
             "Binary content detected for source URL {logical_url}"
         )));
     }
-    let (body, content_type, extension) = if extension == ".html" {
+    let (body, content_type, extension) = if is_html {
         // Converting HTML can decode entities into new text, so the converted
         // document is scrubbed again before it is written.
         let markdown = convert_html_body_to_markdown(&body, logical_url)?;
