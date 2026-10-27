@@ -196,6 +196,7 @@ fn secret_bash_legacy_remote_is_refused_before_any_job() {
         requested_vcpus: None,
         requested_network: false,
         configured_env_names: vec![],
+        return_paths: Vec::new(),
         params: crate::exec_remote::FrozenParams {
             remote_exec: Some(crate::exec_remote::policy::RemoteExecPolicy {
                 enabled: true,
