@@ -1797,10 +1797,10 @@ const HTML_NAMED_ENTITIES: &[(&[u8], u8)] = &[
     (b"semi", b';'),
 ];
 
-/// `text` with HTML character references decoded: `&#42;`, `&#x2a;`, the
-/// same without `;`, and the named ones in [`HTML_NAMED_ENTITIES`]. HTML kept
-/// as it is spells characters this way, and any browser or reader decodes
-/// them.
+/// `text` with HTML character references decoded: numeric ones with any
+/// number of digits and with or without `;` (see [`numeric_reference`]), and
+/// the named ones in [`HTML_NAMED_ENTITIES`]. HTML kept as it is spells
+/// characters this way, and any browser or reader decodes them.
 fn html_entities_decoded(text: &[u8]) -> Option<Edited> {
     if !text.contains(&b'&') {
         return None;
@@ -1821,13 +1821,12 @@ fn html_entities_decoded(text: &[u8]) -> Option<Edited> {
     rewrite.finish()
 }
 
-/// The longest tag [`without_markup_tags`] removes; a `<` with no `>` within
-/// this many bytes is kept as text.
-const MAX_TAG_LEN: usize = 1024;
-
-/// `text` with HTML tags removed (`<span>`, `</b>`, `<!-- -->`), the way a
-/// browser or a Markdown renderer shows inline markup: a key split across
-/// tags is one word on screen.
+/// `text` with HTML markup removed the way a browser's tokenizer removes it,
+/// so a key split across tags is one word on screen: start and end tags
+/// (a `>` inside a quoted attribute value does not end one), comments
+/// (`<!--` to `-->`), and the bogus comments `<!...>`, `<?...>` and `</...>`
+/// that do not start with a letter. Markup still open at the end of the text
+/// runs to the end, as in HTML. One linear pass.
 fn without_markup_tags(text: &[u8]) -> Option<Edited> {
     if !text.contains(&b'<') {
         return None;
@@ -1835,15 +1834,10 @@ fn without_markup_tags(text: &[u8]) -> Option<Edited> {
     let mut rewrite = Rewrite::with_capacity(text.len());
     let mut index = 0;
     while index < text.len() {
-        let opens_tag = text[index] == b'<'
-            && text
-                .get(index + 1)
-                .is_some_and(|next| next.is_ascii_alphabetic() || matches!(next, b'/' | b'!'));
-        if opens_tag {
-            let limit = (index + MAX_TAG_LEN).min(text.len());
-            if let Some(close) = text[index + 1..limit].iter().position(|byte| *byte == b'>') {
-                rewrite.replace(index, index + close + 2, &[]);
-                index += close + 2;
+        if text[index] == b'<' {
+            if let Some(end) = markup_end(text, index) {
+                rewrite.replace(index, end, &[]);
+                index = end;
                 continue;
             }
         }
@@ -1853,56 +1847,103 @@ fn without_markup_tags(text: &[u8]) -> Option<Edited> {
     rewrite.finish()
 }
 
-/// The character reference starting at `text[index]` (which is `&`): its
-/// UTF-8 bytes and its length including the `;` when it has one. A numeric
-/// reference without `;` (`&#42`) is decoded too, as HTML5 does.
-fn html_entity_at(text: &[u8], index: usize) -> Option<(Vec<u8>, usize)> {
-    html_entity_with_semicolon(text, index)
-        .or_else(|| numeric_reference_without_semicolon(text, index))
+/// Where the markup starting with the `<` at `text[index]` ends (just past
+/// it), or `None` when that `<` starts no markup and is plain text.
+fn markup_end(text: &[u8], index: usize) -> Option<usize> {
+    let after = index + 1;
+    let first = *text.get(after)?;
+    let past = |at: Option<usize>, len: usize| Some(at.map_or(text.len(), |at| at + len));
+    if text[after..].starts_with(b"!--") {
+        return past(find_bytes(text, after + 3, b"-->"), 3);
+    }
+    let starts_tag = first.is_ascii_alphabetic()
+        || (first == b'/' && text.get(after + 1).is_some_and(u8::is_ascii_alphabetic));
+    if starts_tag {
+        return past(tag_close(text, after), 1);
+    }
+    if matches!(first, b'!' | b'?' | b'/') {
+        return past(find_bytes(text, after, b">"), 1);
+    }
+    None
 }
 
-/// `&#NN` or `&#xHH` with no `;`: the longest run of digits after it.
-fn numeric_reference_without_semicolon(text: &[u8], index: usize) -> Option<(Vec<u8>, usize)> {
+/// The `>` that closes a tag whose name starts at `from`, skipping any `>`
+/// inside an attribute value quoted after `=`.
+fn tag_close(text: &[u8], from: usize) -> Option<usize> {
+    let mut quote: Option<u8> = None;
+    let mut after_equals = false;
+    for (at, byte) in text.iter().enumerate().skip(from) {
+        match quote {
+            Some(open) if *byte == open => quote = None,
+            Some(_) => {}
+            None => match byte {
+                b'>' => return Some(at),
+                b'"' | b'\'' if after_equals => quote = Some(*byte),
+                b'=' => after_equals = true,
+                b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' => {}
+                _ => after_equals = false,
+            },
+        }
+    }
+    None
+}
+
+/// The first `needle` in `text` at or after `from`.
+fn find_bytes(text: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    text.get(from..)?
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|at| from + at)
+}
+
+/// The character reference starting at `text[index]` (which is `&`): its
+/// UTF-8 bytes and its length.
+fn html_entity_at(text: &[u8], index: usize) -> Option<(Vec<u8>, usize)> {
+    numeric_reference(text, index).or_else(|| named_reference(text, index))
+}
+
+/// `&#` and decimal digits, or `&#x` and hex digits, read the HTML5 way: the
+/// whole digit run is consumed whatever its length (leading zeros included),
+/// the closing `;` is optional, and a value that is zero, a surrogate or past
+/// U+10FFFF reads as U+FFFD.
+fn numeric_reference(text: &[u8], index: usize) -> Option<(Vec<u8>, usize)> {
     let rest = text.get(index + 1..)?.strip_prefix(b"#")?;
-    let (digits_from, radix) = match rest.first() {
+    let (from, radix) = match rest.first() {
         Some(b'x' | b'X') => (1, 16),
         _ => (0, 10),
     };
-    let digits = rest[digits_from..]
+    let digits = rest[from..]
         .iter()
-        .take(8)
         .take_while(|byte| char::from(**byte).is_digit(radix))
         .count();
     if digits == 0 {
         return None;
     }
-    let number = std::str::from_utf8(&rest[digits_from..digits_from + digits]).ok()?;
-    let character = char::from_u32(u32::from_str_radix(number, radix).ok()?)?;
-    Some((character.to_string().into_bytes(), 2 + digits_from + digits))
+    let value = rest[from..from + digits].iter().fold(0u32, |value, byte| {
+        let digit = char::from(*byte).to_digit(radix).unwrap_or(0);
+        value.saturating_mul(radix).saturating_add(digit)
+    });
+    let character = char::from_u32(value)
+        .filter(|character| *character != '\0')
+        .unwrap_or('\u{FFFD}');
+    let mut consumed = 2 + from + digits;
+    if rest.get(from + digits) == Some(&b';') {
+        consumed += 1;
+    }
+    Some((character.to_string().into_bytes(), consumed))
 }
 
-/// A character reference ending in `;` at `text[index]`.
-fn html_entity_with_semicolon(text: &[u8], index: usize) -> Option<(Vec<u8>, usize)> {
-    // The longest reference decoded here is `&#x10FFFF;` or `&percnt;`-sized
-    // names; a `;` further away ends no reference.
+/// A named reference from [`HTML_NAMED_ENTITIES`] ending in `;`.
+fn named_reference(text: &[u8], index: usize) -> Option<(Vec<u8>, usize)> {
+    // The longest name in the table is short; a `;` further away ends no
+    // reference.
     let rest = text.get(index + 1..)?;
     let end = rest.iter().take(10).position(|byte| *byte == b';')?;
-    let body = &rest[..end];
-    let consumed = end + 2;
-    if let Some(number) = body.strip_prefix(b"#") {
-        let (digits, radix) = match number.first() {
-            Some(b'x' | b'X') => (&number[1..], 16),
-            _ => (number, 10),
-        };
-        let digits = std::str::from_utf8(digits).ok()?;
-        let code = u32::from_str_radix(digits, radix).ok()?;
-        let character = char::from_u32(code)?;
-        return Some((character.to_string().into_bytes(), consumed));
-    }
+    let name = &rest[..end];
     HTML_NAMED_ENTITIES
         .iter()
-        .find(|(name, _)| *name == body)
-        .map(|(_, byte)| (vec![*byte], consumed))
+        .find(|(known, _)| *known == name)
+        .map(|(_, byte)| (vec![*byte], end + 2))
 }
 
 #[cfg(test)]
@@ -2251,6 +2292,35 @@ mod tests {
             b"<p><span>abcdef</span> <span>*xyzw</span></p> &#42 a < b",
             key
         ));
+    }
+
+    /// The HTML spellings a browser shows as the key: zero-padded numeric
+    /// references with or without `;`, tags with quoted `>`, long tags,
+    /// processing instructions and comments containing `>`.
+    #[test]
+    fn html5_numeric_references_and_tag_forms_reveal_the_key() {
+        let key = b"abcdef*xyzw123456";
+        let long_attribute = format!(
+            "abcdef<span data-x=\"{}\">*xyzw123456</span>",
+            "a".repeat(1100)
+        );
+        let spellings: [&[u8]; 6] = [
+            b"<div>\nabcdef&#0000000042;xyzw123456\n</div>",
+            b"abcdef&#000000042xyzw123456",
+            b"abcdef<span title=\">\">*xyzw123456</span>",
+            long_attribute.as_bytes(),
+            b"abcdef<?x?>*xyzw123456",
+            b"abcdef<!-- > -->*xyzw123456",
+        ];
+        for spelling in spellings {
+            assert!(
+                reveals_key(spelling, key),
+                "{}",
+                String::from_utf8_lossy(&spelling[..spelling.len().min(80)])
+            );
+        }
+        // Text that only looks like markup is left alone.
+        assert!(!reveals_key(b"abcdef < xyzw > 123456 &#42 a", key));
     }
 
     #[test]
