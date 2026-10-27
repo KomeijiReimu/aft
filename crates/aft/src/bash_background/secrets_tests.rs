@@ -437,7 +437,7 @@ fn native_pipeline() {
         assert_eq!(seen_server.load(Ordering::SeqCst), expected_requests);
     });
     let memory_probe = root.path().join("memory-probe.py");
-    std::fs::write(&memory_probe, r#"import ctypes, os, sys
+    std::fs::write(&memory_probe, r#"import ctypes, errno, os, sys
 pid = int(sys.argv[1])
 if sys.platform == 'darwin':
     lib = ctypes.CDLL('/usr/lib/libSystem.B.dylib')
@@ -446,8 +446,9 @@ if sys.platform == 'darwin':
 else:
     try:
         f = open('/proc/%d/mem' % pid, 'rb')
-    except PermissionError:
-        pass
+    except OSError as error:
+        # Restricted procfs mounts can hide an untraceable process as ENOENT.
+        assert error.errno in (errno.EACCES, errno.EPERM, errno.ENOENT), error
     else:
         f.close()
         raise AssertionError('daemon memory exposed')
@@ -457,13 +458,18 @@ assert len(set(paths)) == 1
 assert open(paths[0], 'rb').read().count(b'BEGIN CERTIFICATE') > 1
 "#).unwrap();
     for (index, (mode, pty)) in cases.into_iter().enumerate() {
+        #[cfg(target_os = "linux")]
+        assert!(
+            std::fs::metadata(format!("/proc/{}/mem", std::process::id())).is_ok(),
+            "the target must exist outside the child sandbox"
+        );
         let ctx = context(root.path(), storage.path());
         ctx.update_config(|config| {
             config.sandbox.profile.head = mode;
             config.sandbox.profile.worker = mode;
         });
         let gate = root.path().join(format!("go-{index}"));
-        let command = format!("while [ ! -f '{}' ]; do sleep 0.05; done; test \"$HTTPS_PROXY\" = \"$https_proxy\" && test \"$HTTP_PROXY\" = \"$http_proxy\" && test -z \"${{NO_PROXY+x}}\" && test -z \"${{no_proxy+x}}\" && test -z \"${{ALL_PROXY+x}}\" && test -z \"${{all_proxy+x}}\" || exit 70; curl --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; curl --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; sleep 30", gate.display(), vault.port, vault.port);
+        let command = format!("while [ ! -f '{}' ]; do sleep 0.05; done; test -n \"$HTTPS_PROXY\" && test \"$HTTPS_PROXY\" = \"$https_proxy\" && test \"$HTTP_PROXY\" = \"$http_proxy\" && test -z \"${{NO_PROXY+x}}\" && test -z \"${{no_proxy+x}}\" && test -z \"${{ALL_PROXY+x}}\" && test -z \"${{all_proxy+x}}\" || exit 70; curl --connect-timeout 5 --max-time 10 --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; curl --connect-timeout 5 --max-time 10 --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; sleep 30", gate.display(), vault.port, vault.port);
         let command = format!(
             "python3 '{}' {} || exit 71; {command}",
             memory_probe.display(),
@@ -536,14 +542,19 @@ assert open(paths[0], 'rb').read().count(b'BEGIN CERTIFICATE') > 1
                     "secret-bash",
                     Some(root.path()),
                     Some(storage.path()),
-                    0,
+                    8192,
                 )
                 .unwrap();
             assert!(!snapshot
                 .output_preview
                 .contains(std::str::from_utf8(KEY).unwrap()));
-            if snapshot
-                .output_preview
+            let output = snapshot
+                .output_path
+                .as_ref()
+                .and_then(|path| std::fs::read(path).ok())
+                .unwrap_or_default();
+            assert!(!output.windows(KEY.len()).any(|window| window == KEY));
+            if String::from_utf8_lossy(&output)
                 .matches("{{ck-secret:test}}")
                 .count()
                 >= encodings.len() * 2

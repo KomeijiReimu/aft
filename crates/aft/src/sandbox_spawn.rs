@@ -612,6 +612,7 @@ impl SpawnPlan {
     /// A launcher alone is not a memory boundary. Linux also needs Yama on
     /// the daemon side; reading it in the launcher would be too late to ask
     /// for consent safely. Windows has no enforcing backend.
+    #[cfg(unix)]
     pub(crate) fn protects_secret_memory(&self) -> bool {
         let Self::Launcher { profile, .. } = self.policy() else {
             return false;

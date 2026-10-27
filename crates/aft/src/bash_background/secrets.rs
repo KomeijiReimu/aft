@@ -2,13 +2,23 @@
 //! memory and applied at exec, never to its persisted environment snapshot.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+#[cfg(any(unix, test))]
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
+use std::sync::Arc;
+#[cfg(any(unix, test))]
+use std::sync::Mutex;
 
+#[cfg(any(unix, test))]
 use crate::context::AppContext;
 use crate::protocol::Response;
-use crate::sandbox_spawn::{RequestedSandboxTier, SandboxTaskKind, SpawnPlan};
+#[cfg(any(unix, test))]
+use crate::sandbox_spawn::SpawnPlan;
+#[cfg(unix)]
+use crate::sandbox_spawn::{RequestedSandboxTier, SandboxTaskKind};
 use crate::secret::{SecretVault, UnavailableVault};
+#[cfg(unix)]
 use crate::secret_proxy::{GrantedLabel, ProxyConfig, SecretProxy};
 
 pub(crate) const REMOTE_REFUSED: &str =
@@ -16,11 +26,13 @@ pub(crate) const REMOTE_REFUSED: &str =
 pub(crate) const SANDBOX_REQUIRED: &str = "Secret placeholder commands require a protected sandbox on Linux or macOS; Windows cannot run them.";
 pub(crate) const ENV_CONFLICT: &str =
     "Secret placeholder commands cannot set proxy variables in env or bash.env.";
+#[cfg(unix)]
 pub(crate) const PROXY_UNAVAILABLE: &str =
     "The secret proxy or its trust bundle could not be prepared; no command was started.";
 
 pub(crate) const PROXY_KEYS: [&str; 4] = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"];
 pub(crate) const REMOVE_KEYS: [&str; 4] = ["NO_PROXY", "no_proxy", "ALL_PROXY", "all_proxy"];
+#[cfg(unix)]
 pub(crate) const TRUST_KEYS: [&str; 5] = [
     "SSL_CERT_FILE",
     "CURL_CA_BUNDLE",
@@ -122,14 +134,17 @@ pub(crate) fn preflight(
     Ok(preflight)
 }
 
+#[cfg(unix)]
 pub(crate) type SharedRuntime = Arc<Mutex<Runtime>>;
 
+#[cfg(unix)]
 pub(crate) struct Runtime {
     proxy: SecretProxy,
     bundle: PathBuf,
     pub(crate) lifetime: crate::secret::SecretScope,
 }
 
+#[cfg(unix)]
 impl Runtime {
     #[cfg(test)]
     pub(crate) fn address(&self) -> std::net::SocketAddr {
@@ -242,7 +257,7 @@ pub(crate) fn authorize(
     })
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), unix))]
 fn start_proxy(config: ProxyConfig) -> Result<SecretProxy, crate::secret_proxy::ProxyError> {
     SecretProxy::start(config)
 }
@@ -250,7 +265,7 @@ fn start_proxy(config: ProxyConfig) -> Result<SecretProxy, crate::secret_proxy::
 // Only test builds can inject this upstream config. Release launches always
 // call SecretProxy::start; neither a tool argument nor a test-only switch can
 // select this override.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn start_proxy(config: ProxyConfig) -> Result<SecretProxy, crate::secret_proxy::ProxyError> {
     match TEST_UPSTREAM.with(|slot| slot.borrow().clone()) {
         Some(upstream) => SecretProxy::start_for_test(config, upstream),
@@ -332,6 +347,7 @@ fn native_roots() -> Result<Vec<u8>, ()> {
 #[cfg(test)]
 thread_local! {
     static TEST_VAULT: std::cell::RefCell<Option<Arc<dyn SecretVault>>> = const { std::cell::RefCell::new(None) };
+    #[cfg(unix)]
     static TEST_UPSTREAM: std::cell::RefCell<Option<rustls::ClientConfig>> = const { std::cell::RefCell::new(None) };
 }
 

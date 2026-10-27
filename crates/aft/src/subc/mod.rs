@@ -232,7 +232,7 @@ mod idle_reap_frame_loop_tests;
 mod idle_root_retention_tests;
 mod perf_sweep;
 mod secret_consent;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use secret_consent::with_secret_bound_identity_for_test;
 #[cfg(test)]
 pub(crate) use secret_consent::with_secret_identity_for_test;

@@ -557,7 +557,7 @@ fn test_identity_data(root: &std::path::Path, stamp: ScopeStamp) -> super::Route
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn with_secret_bound_identity_for_test<R>(
     root: &std::path::Path,
     head: ScopeStamp,
