@@ -645,20 +645,45 @@ impl ViewStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut removed = self.reap_generation_trash()?;
-        // Most passes find nothing superseded. This read-only check then
-        // returns without taking the admission barrier, opening a writable
-        // pointer connection, or creating SQLite sidecar files.
-        if !self.has_superseded_artifacts()? {
+        // If the registry cannot be opened, the pointer is read without its
+        // barrier and the pass fails only when there is something to clean:
+        // deleting generations needs the registry, a pass with nothing
+        // superseded does not.
+        let mut unresolved = None;
+        let resolved = match registry {
+            Some(_) => None,
+            None => self.generation_sweep_registry().unwrap_or_else(|error| {
+                unresolved = Some(error);
+                None
+            }),
+        };
+        let registry = registry.or(resolved.as_ref());
+        // Disk-limit eviction refuses a view while this process has any of
+        // its SQLite files open, and checks that under the family registry
+        // barrier. Read the pointer under that barrier too: read outside it,
+        // a pass with nothing to clean could make an idle view look open to
+        // an eviction running at the same moment. A V1 view has no registry
+        // and no disk-limit eviction, so its read needs no barrier.
+        let current = match registry {
+            Some(registry) => {
+                match self.with_cleanup_admission(Some(registry), || self.pointer_census())? {
+                    Some(census) => census.generation,
+                    // The barrier is busy or the view was evicted meanwhile;
+                    // the next pass looks again.
+                    None => return Ok(removed),
+                }
+            }
+            None => self.pointer_census()?.generation,
+        };
+        // Most passes find nothing superseded. This check then returns
+        // without opening a writable pointer connection or creating SQLite
+        // sidecar files.
+        if !self.has_superseded_artifacts(current.as_deref())? {
             return Ok(removed);
         }
-        let resolved;
-        let registry = match registry {
-            Some(registry) => Some(registry),
-            None => {
-                resolved = self.generation_sweep_registry()?;
-                resolved.as_ref()
-            }
-        };
+        if let Some(error) = unresolved {
+            return Err(error);
+        }
         removed.add(self.sweep_generations_bounded(registry, GENERATION_DIRECTORY_LIMIT)?);
         Ok(removed)
     }
@@ -778,8 +803,9 @@ impl ViewStore {
         }
     }
 
-    fn has_superseded_artifacts(&self) -> Result<bool> {
-        let current = self.pointer_census()?.generation;
+    /// Whether the view directory holds files of any generation other than
+    /// `current`, the generation the pointer names.
+    fn has_superseded_artifacts(&self, current: Option<&str>) -> Result<bool> {
         let (entries, reached_end) =
             bounded_directory_entries(self.view_dir(), 0, GENERATION_DIRECTORY_LIMIT)?;
         if !reached_end {
@@ -821,7 +847,7 @@ impl ViewStore {
                             .map(|(generation, _)| generation)
                     })
                 });
-            if generation.is_some_and(|generation| current.as_deref() != Some(generation)) {
+            if generation.is_some_and(|generation| current != Some(generation)) {
                 return Ok(true);
             }
         }
@@ -3537,7 +3563,9 @@ mod storage_retention_tests {
         assert!(sidecar.is_file());
         fs::remove_file(view.manifest_path("g").unwrap()).unwrap();
         assert!(sidecar_scan(&view, &sidecars).is_empty());
-        assert!(view.has_superseded_artifacts().unwrap());
+        assert!(view
+            .has_superseded_artifacts(view.pointer_census().unwrap().generation.as_deref())
+            .unwrap());
         assert_eq!(view.sweep_generations().unwrap(), 1);
         assert!(!sidecar.exists());
     }
@@ -3666,7 +3694,9 @@ mod storage_retention_tests {
         }
         let limit = 8;
         assert!(fs::read_dir(&dir).unwrap().count() > limit * 4);
-        assert!(view.has_superseded_artifacts().unwrap());
+        assert!(view
+            .has_superseded_artifacts(view.pointer_census().unwrap().generation.as_deref())
+            .unwrap());
         let unshared_left = || {
             fs::read_dir(&dir).unwrap().any(|entry| {
                 let name = entry.unwrap().file_name().into_string().unwrap();
