@@ -204,6 +204,8 @@ fn server_key_sort(left: &ServerKey, right: &ServerKey) -> std::cmp::Ordering {
 /// server".
 #[derive(Debug, Clone)]
 pub enum ServerAttemptResult {
+    /// A reserved startup has not published its client yet.
+    InProgress { server_key: ServerKey },
     /// The root has no live route; reopening it permits a lazy start again.
     ProjectClosed,
     /// Server is running and ready to serve requests for this file.
@@ -434,15 +436,23 @@ impl ApplicableServerFailure {
 #[derive(Clone, Debug, Default)]
 pub struct ApplicableServerStartOutcomes {
     pub successful: Vec<ServerKey>,
+    pub in_progress: Vec<ServerKey>,
     pub failures: Vec<ApplicableServerFailure>,
     /// The first producer whose startup could not complete before the inspect
     /// request's shared work deadline.
     pub deadline_exceeded: Option<ServerKey>,
 }
 
+pub const START_IN_PROGRESS_STATUS: &str = "start_in_progress";
+pub const START_IN_PROGRESS_REASON: &str = "server startup is in progress; retry shortly";
+pub const STARTUP_NOTIFICATION_PATH_CAP: usize = 8_192;
+pub const STARTUP_NOTIFICATION_QUEUE_FULL: &str =
+    "language-server startup notification queue is full; retry the file change";
+
 impl ServerAttemptResult {
     pub fn failure_reason(&self) -> String {
         match self {
+            Self::InProgress { .. } => START_IN_PROGRESS_REASON.into(),
             Self::ProjectClosed => "project closed; reopen the project and retry".into(),
             Self::BinaryNotInstalled { binary } => format!("{binary} is unavailable"),
             Self::SpawnFailed { reason, .. } => {
@@ -909,7 +919,9 @@ pub struct DrainedLspEvents {
     pub events: Vec<LspEvent>,
     /// Reader identities in the same order as `events`, retained for dispatch.
     pub(crate) instances: Vec<Option<ServerInstanceId>>,
-    /// Channel receipts consumed, including events rejected as retired.
+    /// Events this drain worked through: channel receipts (including ones
+    /// rejected as retired or held back for a server still starting) plus
+    /// startup events released from the ready queue.
     pub processed: usize,
     pub diagnostics_changed: bool,
     /// Complete snapshots accepted from document-version-verified publishes
@@ -1018,6 +1030,13 @@ pub struct LspShutdownAllOutcome {
 }
 
 pub struct LspManager {
+    #[cfg(test)]
+    spawn_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    spawned_hook: Option<Arc<dyn Fn(u32) + Send + Sync>>,
+    #[cfg(test)]
+    startup_finished_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    startup_owner: Weak<parking_lot::Mutex<LspManager>>,
     retired_events_dropped: u64,
     background_pull_owner: Weak<parking_lot::Mutex<LspManager>>,
     background_pull_pending: HashSet<(ServerKey, PathBuf)>,
@@ -1044,6 +1063,8 @@ pub struct LspManager {
     /// Already accepted observations consumed while ordering a pull response.
     /// The normal event drain delivers them once to status/alert consumers.
     pending_diagnostic_observations: Vec<AcceptedDiagnosticSnapshot>,
+    /// Events applied at startup release, awaiting outward delivery exactly once.
+    ready_startup_events: std::collections::VecDeque<StartupEventDelivery>,
     /// Unified event channel — all server reader threads send here.
     event_tx: Sender<ReceivedLspEvent>,
     event_rx: Receiver<ReceivedLspEvent>,
@@ -1064,7 +1085,7 @@ pub struct LspManager {
     /// Per-(kind,root) cache of start failures. Once a server fails to start
     /// for a workspace root, later requests report the remembered failure
     /// instead of starting it again. Without this, every file open or
-    /// didChange retries `spawn_server` and logs a fresh ERROR — visible as
+    /// didChange retries startup and logs a fresh ERROR — visible as
     /// repeated `failed to spawn TypeScript Language Server: Could not find a
     /// valid TypeScript installation` lines per edit.
     ///
@@ -1083,6 +1104,7 @@ pub struct LspManager {
     /// Server/root pairs for which we already logged that watched-file
     /// notifications are skipped because the capability is absent.
     watched_file_skip_logged: HashSet<ServerKey>,
+    pending_watched_changes: HashMap<ServerKey, PendingWatchedChanges>,
     /// rust-analyzer instances with a workspace reload running on a helper
     /// thread because the file watcher saw a Cargo manifest change (see
     /// [`spawn_watcher_rust_workspace_reload`]). The value collects the
@@ -1329,10 +1351,17 @@ impl LspManager {
     pub fn new() -> Self {
         let (event_tx, event_rx) = unbounded();
         Self {
+            #[cfg(test)]
+            spawn_hook: None,
+            #[cfg(test)]
+            spawned_hook: None,
             retired_events_dropped: 0,
             rust_cargo_disabled_for_worker: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             quiesced: std::sync::atomic::AtomicBool::new(false),
             clients: HashMap::new(),
+            #[cfg(test)]
+            startup_finished_hook: None,
+            startup_owner: Weak::new(),
             background_pull_owner: Weak::new(),
             background_pull_pending: HashSet::new(),
             background_pull_running: false,
@@ -1344,6 +1373,7 @@ impl LspManager {
             documents: HashMap::new(),
             diagnostics: DiagnosticsStore::new(),
             pending_diagnostic_observations: Vec::new(),
+            ready_startup_events: Default::default(),
             event_tx,
             event_rx,
             post_edit_waiters: HashMap::new(),
@@ -1354,6 +1384,7 @@ impl LspManager {
             failed_spawns: HashMap::new(),
             transient_backoff: HashMap::new(),
             watched_file_skip_logged: HashSet::new(),
+            pending_watched_changes: HashMap::new(),
             watcher_rust_reloads: HashMap::new(),
             #[cfg(windows)]
             last_watched_file_notification_trace: "no watched-file notification attempted"
@@ -1386,10 +1417,15 @@ impl LspManager {
         &mut self,
         owner: Weak<parking_lot::Mutex<LspManager>>,
     ) {
+        self.startup_owner = owner.clone();
         self.background_pull_owner = owner;
     }
 
     fn queue_background_document_pull(&mut self, key: &ServerKey, file: &Path) {
+        // Reserved document versions are not queryable until replay finishes.
+        if self.starting.contains_key(key) {
+            return;
+        }
         let eligible = self.clients.get(key).is_some_and(|client| {
             client.uses_analysis_progress()
                 && client.state() == ServerState::Ready
@@ -1529,9 +1565,12 @@ impl LspManager {
         result: ServerAttemptResult,
         durability: FailureDurability,
     ) -> ServerAttemptResult {
-        // Closing a route is not a failed executable. Reopening the project
-        // must permit an immediate start rather than replay a retry backoff.
-        if matches!(result, ServerAttemptResult::ProjectClosed) {
+        // Closing a route or joining a reserved start is not an executable
+        // failure and must not fabricate a retry backoff.
+        if matches!(
+            result,
+            ServerAttemptResult::ProjectClosed | ServerAttemptResult::InProgress { .. }
+        ) {
             return result;
         }
         let now = self.retry_clock.now();
@@ -1880,196 +1919,34 @@ impl LspManager {
         &mut self,
         snapshot: &ApplicableServerSnapshot,
         config: &Config,
-        deadline: Option<std::time::Instant>,
+        deadline: Option<Instant>,
     ) -> ApplicableServerStartOutcomes {
         let mut outcomes = ApplicableServerStartOutcomes {
             failures: snapshot.producer_failures.clone(),
             ..ApplicableServerStartOutcomes::default()
         };
         for candidate in &snapshot.candidates {
-            let initialize_timeout = deadline
-                .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
-            if initialize_timeout.is_some_and(|remaining| remaining.is_zero()) {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 outcomes.deadline_exceeded = Some(candidate.key.clone());
                 break;
             }
-            if self.clients.contains_key(&candidate.key) {
-                outcomes.successful.push(candidate.key.clone());
-                continue;
-            }
-            self.log_transient_retry(&candidate.key);
-            match self.spawn_server_with_timeout(
+            match self.start_server(
                 &candidate.definition,
-                &candidate.key.root,
+                &candidate.key,
                 &candidate.source_file,
                 config,
-                initialize_timeout,
             ) {
-                Ok(client) => {
-                    self.note_start_succeeded(&candidate.key);
-                    self.clients.insert(candidate.key.clone(), client);
-                    self.server_binaries
-                        .insert(candidate.key.clone(), candidate.definition.binary.clone());
-                    self.documents.entry(candidate.key.clone()).or_default();
-                    outcomes.successful.push(candidate.key.clone());
+                ServerAttemptResult::Ok { server_key } => outcomes.successful.push(server_key),
+                ServerAttemptResult::InProgress { server_key } => {
+                    outcomes.in_progress.push(server_key)
                 }
-                Err(failure) => {
-                    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-                        // A request-owned timeout says nothing durable about the
-                        // producer; a later call with a fresh budget may retry it.
-                        outcomes.deadline_exceeded = Some(candidate.key.clone());
-                        break;
-                    }
-                    let result = classify_spawn_error(&candidate.definition.binary, &failure.error);
-                    let result =
-                        self.record_failed_spawn(&candidate.key, result, failure.durability);
-                    outcomes.failures.push(ApplicableServerFailure {
-                        server_key: candidate.key.clone(),
-                        result,
-                    });
-                }
+                result => outcomes.failures.push(ApplicableServerFailure {
+                    server_key: candidate.key.clone(),
+                    result,
+                }),
             }
         }
         outcomes
-    }
-
-    /// First step of [`start_applicable_server_unlocked`], under the lock.
-    /// Returns `None` once `outcomes` holds this server's result; otherwise
-    /// says whether to wait for another thread's start or spawn unlocked. A
-    /// start that follows a wait reports the other thread's cached failure
-    /// instead of retrying it.
-    fn begin_unlocked_start(
-        &mut self,
-        candidate: &ApplicableServerCandidate,
-        config: &Config,
-        after_wait: bool,
-        deadline: Instant,
-        outcomes: &mut ApplicableServerStartOutcomes,
-    ) -> Option<StartNext> {
-        let key = &candidate.key;
-        if self.is_quiesced() {
-            outcomes.failures.push(ApplicableServerFailure {
-                server_key: key.clone(),
-                result: ServerAttemptResult::ProjectClosed,
-            });
-            return None;
-        }
-        if self.clients.contains_key(key) {
-            outcomes.successful.push(key.clone());
-            return None;
-        }
-        if let Some(reservation) = self.starting.get(key) {
-            return Some(StartNext::Wait(Arc::clone(&reservation.signal)));
-        }
-        if after_wait {
-            if let Some(result) = self.failure_to_replay(key) {
-                outcomes.failures.push(ApplicableServerFailure {
-                    server_key: key.clone(),
-                    result,
-                });
-                return None;
-            }
-        }
-        match self.prepare_spawn(
-            &candidate.definition,
-            &key.root,
-            &candidate.source_file,
-            config,
-        ) {
-            Ok(prepared) => {
-                self.log_transient_retry(key);
-                self.starting.insert(
-                    key.clone(),
-                    StartReservation {
-                        instance: prepared.instance,
-                        deferred_events: Vec::new(),
-                        clients_generation: self.clients_generation,
-                        signal: Arc::new(StartSignal::default()),
-                    },
-                );
-                Some(StartNext::Spawn(prepared))
-            }
-            Err(error) => {
-                self.record_start_error(candidate, &prepare_failure(error), deadline, outcomes);
-                None
-            }
-        }
-    }
-
-    /// Last step of [`start_applicable_server_unlocked`], under the lock:
-    /// publish the client or record the failure, then release the reservation.
-    fn finish_unlocked_start(
-        &mut self,
-        candidate: &ApplicableServerCandidate,
-        result: Result<LspClient, SpawnFailure>,
-        deadline: Instant,
-        outcomes: &mut ApplicableServerStartOutcomes,
-    ) {
-        let key = &candidate.key;
-        let started_generation = self
-            .starting
-            .get(key)
-            .map(|reservation| reservation.clients_generation);
-        match result {
-            Ok(client)
-                if self.rust_cargo_disabled_for_worker()
-                    && key.kind == ServerKind::Rust
-                    && !client.rust_cargo_disabled_for_worker =>
-            {
-                outcomes.failures.push(ApplicableServerFailure {
-                    server_key: key.clone(),
-                    result: ServerAttemptResult::SpawnFailed {
-                        binary: candidate.definition.binary.clone(),
-                        reason: RUST_WORKER_POLICY_CHANGED.into(),
-                    },
-                });
-            }
-            // A start through another path (an edit's diagnostics, say) won
-            // the race; keep that client and let this one's drop stop its
-            // process.
-            Ok(_) if self.clients.contains_key(key) => {
-                slog_info!(
-                    "lsp start discarded server={} root={} reason=duplicate start; stopping redundant client",
-                    key.kind.id_str(),
-                    key.root.display()
-                );
-                outcomes.successful.push(key.clone());
-            }
-            // Every client was taken away while this one was starting
-            // (shutdown, idle reap, unbind); do not revive the manager.
-            Ok(_) if started_generation != Some(self.clients_generation) => {
-                slog_info!(
-                    "lsp start discarded server={} root={} reason=shutdown during initialize; stopping client",
-                    key.kind.id_str(),
-                    key.root.display()
-                );
-                outcomes.failures.push(ApplicableServerFailure {
-                    server_key: key.clone(),
-                    result: ServerAttemptResult::SpawnFailed {
-                        binary: candidate.definition.binary.clone(),
-                        reason: "language servers were shut down while this one was starting"
-                            .to_string(),
-                    },
-                });
-            }
-            Ok(client) => {
-                self.note_start_succeeded(key);
-                self.clients.insert(key.clone(), client);
-                self.server_binaries
-                    .insert(key.clone(), candidate.definition.binary.clone());
-                self.documents.entry(key.clone()).or_default();
-                outcomes.successful.push(key.clone());
-            }
-            Err(failure) => {
-                let failure = self.absorb_spawn_failure(failure);
-                if self.clients.contains_key(key) {
-                    outcomes.successful.push(key.clone());
-                } else {
-                    self.record_start_error(candidate, &failure, deadline, outcomes);
-                }
-            }
-        }
-        self.release_start_reservation(key);
     }
 
     /// Drop a start reservation, handle the events held back for it, and wake
@@ -2078,32 +1955,44 @@ impl LspManager {
         let Some(reservation) = self.starting.remove(key) else {
             return;
         };
-        for event in &reservation.deferred_events {
-            let _ = self.handle_event(event);
-        }
-        reservation.signal.finish();
-    }
-
-    /// Report a start that produced no client, as the locked start path does:
-    /// a failure caused by the request deadline is not cached, any other one
-    /// is, so later file events skip the server.
-    fn record_start_error(
-        &mut self,
-        candidate: &ApplicableServerCandidate,
-        failure: &StartFailure,
-        deadline: Instant,
-        outcomes: &mut ApplicableServerStartOutcomes,
-    ) {
-        if Instant::now() >= deadline {
-            outcomes.deadline_exceeded = Some(candidate.key.clone());
+        if reservation
+            .signal
+            .cancelled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.pending_watched_changes.remove(key);
+            reservation.signal.finish();
+            self.wake_post_edit_waiters();
             return;
         }
-        let result = classify_spawn_error(&candidate.definition.binary, &failure.error);
-        let result = self.record_failed_spawn(&candidate.key, result, failure.durability);
-        outcomes.failures.push(ApplicableServerFailure {
-            server_key: candidate.key.clone(),
-            result,
-        });
+        for event in reservation.deferred_events {
+            // A receipt from a reader that no longer owns the key was dropped
+            // by `handle_event`; like the normal drain, it is not delivered.
+            let Ok(published_file) = self.handle_event(&event) else {
+                continue;
+            };
+            let published = published_file.map(|file| {
+                let version = self
+                    .documents
+                    .get(key)
+                    .and_then(|store| store.version(&file));
+                let epoch = self.diagnostic_epoch(key, &file);
+                let pid = self.clients.get(key).map(LspClient::child_pid);
+                StartupPublished {
+                    key: key.clone(),
+                    file,
+                    version,
+                    epoch,
+                    pid,
+                }
+            });
+            self.ready_startup_events
+                .push_back(StartupEventDelivery { event, published });
+        }
+        reservation.signal.finish();
+        // A post-edit wait parked on this start must re-check: the server
+        // is now either running or gone.
+        self.wake_post_edit_waiters();
     }
 
     /// First step of [`ensure_server_for_file_detailed_unlocked`] for one
@@ -2117,14 +2006,15 @@ impl LspManager {
         file_path: &Path,
         config: &Config,
     ) -> FileServerStart {
+        self.publish_completed_starts();
         if self.is_quiesced() {
             return FileServerStart::Failed(ServerAttemptResult::ProjectClosed);
         }
+        if self.starting.contains_key(key) {
+            return FileServerStart::Wait;
+        }
         if self.clients.contains_key(key) {
             return FileServerStart::Running;
-        }
-        if let Some(reservation) = self.starting.get(key) {
-            return FileServerStart::Wait(Arc::clone(&reservation.signal));
         }
         if let Some(cached) = self.failure_to_replay(key) {
             return FileServerStart::Failed(cached);
@@ -2136,10 +2026,15 @@ impl LspManager {
                 self.starting.insert(
                     key.clone(),
                     StartReservation {
+                        definition: Some(def.clone()),
+                        source_file: Some(file_path.to_path_buf()),
                         instance: prepared.instance,
                         deferred_events: Vec::new(),
                         clients_generation: self.clients_generation,
                         signal: Arc::new(StartSignal::default()),
+                        notification_versions: HashMap::new(),
+                        pending_notifications: HashSet::new(),
+                        replay_pid: None,
                     },
                 );
                 FileServerStart::Spawn(Box::new(prepared))
@@ -2150,6 +2045,350 @@ impl LspManager {
                 prepare_failure(error),
             )),
         }
+    }
+
+    /// Reserve under mutable manager access, but create the process only on a
+    /// startup worker. This method cannot release a caller's MutexGuard over
+    /// LspManager, so it must not run the spawn or handshake inline.
+    fn start_server(
+        &mut self,
+        def: &ServerDef,
+        key: &ServerKey,
+        file: &Path,
+        config: &Config,
+    ) -> ServerAttemptResult {
+        match self.begin_file_server_start(def, key, file, config) {
+            FileServerStart::Running => ServerAttemptResult::Ok {
+                server_key: key.clone(),
+            },
+            FileServerStart::Failed(result) => result,
+            FileServerStart::Wait => ServerAttemptResult::InProgress {
+                server_key: key.clone(),
+            },
+            FileServerStart::Spawn(mut prepared) => {
+                let signal = Arc::clone(&self.starting[key].signal);
+                prepared.start_signal = Some(Arc::clone(&signal));
+                let owner = self.startup_owner.clone();
+                #[cfg(test)]
+                let finished_hook = self.startup_finished_hook.clone();
+                let worker_signal = Arc::clone(&signal);
+                let worker = std::thread::Builder::new()
+                    .name("lsp-startup".into())
+                    .spawn(move || {
+                        let guard = StartupWorkerGuard::new(Arc::clone(&worker_signal));
+                        let timeout = prepared.inspect_initialize_timeout();
+                        let result = prepared.run(Some(timeout));
+                        guard.publish(|signal| signal.complete(result));
+                        if let Some(manager) = owner.upgrade() {
+                            manager.lock().publish_completed_starts();
+                        }
+                        #[cfg(test)]
+                        if let Some(hook) = finished_hook {
+                            hook();
+                        }
+                    });
+                if let Err(error) = worker {
+                    signal.complete(Err(SpawnFailure::NotStarted {
+                        exit_log_line: error.to_string(),
+                        error: error.into(),
+                    }));
+                }
+                ServerAttemptResult::InProgress {
+                    server_key: key.clone(),
+                }
+            }
+        }
+    }
+
+    /// Publish each completed startup phase under the manager lock. Notification
+    /// replay uses a cloned writer on its own worker, never this lock.
+    fn publish_completed_starts(&mut self) {
+        let keys: Vec<_> = self.starting.keys().cloned().collect();
+        for key in keys {
+            let Some(reservation) = self.starting.get(&key) else {
+                continue;
+            };
+            let signal = Arc::clone(&reservation.signal);
+            if !signal.wait_until(Instant::now()) {
+                continue;
+            }
+            let cancelled = self.is_quiesced()
+                || reservation.clients_generation != self.clients_generation
+                || signal.cancelled.load(std::sync::atomic::Ordering::Acquire);
+            let replay_pid = reservation.replay_pid;
+            let definition = reservation.definition.clone();
+            if cancelled {
+                signal.cancel();
+                if replay_pid.is_some_and(|pid| {
+                    self.clients
+                        .get(&key)
+                        .is_some_and(|client| client.child_pid() == pid)
+                }) {
+                    self.clients.remove(&key);
+                    self.forget_server_state(Some(&key));
+                }
+                self.release_start_reservation(&key);
+            } else if replay_pid.is_some() {
+                let completed = signal.replay_completion.lock().take();
+                if let Some(result) = completed {
+                    self.finish_notification_replay(&key, result);
+                }
+            } else {
+                let completed = signal.completion.lock().take();
+                if let (Some(result), Some(definition)) = (completed, definition) {
+                    self.finish_file_server_start(&definition, &key, result);
+                }
+            }
+        }
+        self.flush_pending_watched_changes();
+    }
+
+    /// Wait for starts admitted by a locked call, including queued document
+    /// replay. A standalone manager publishes its own completed worker phases.
+    /// Shared-manager callers should prefer the unlocked startup helpers.
+    pub fn wait_for_startups(&mut self, deadline: Instant) -> bool {
+        let signals: Vec<_> = self
+            .starting
+            .values()
+            .map(|r| Arc::clone(&r.signal))
+            .collect();
+        self.wait_for_startup_signals(signals, deadline)
+    }
+
+    fn wait_for_file_startups(&mut self, file: &Path, config: &Config, deadline: Instant) -> bool {
+        // Accepted notifications identify their owner even if a later root or
+        // definition lookup no longer finds the same reservation.
+        let expected = expected_server_keys_for_file(file, config);
+        let signals = self
+            .starting
+            .iter()
+            .filter(|(key, reservation)| {
+                expected.contains(key) || reservation.notification_versions.contains_key(file)
+            })
+            .map(|(_, reservation)| Arc::clone(&reservation.signal))
+            .collect();
+        self.wait_for_startup_signals(signals, deadline)
+    }
+
+    fn wait_for_startup_signals(
+        &mut self,
+        signals: Vec<Arc<StartSignal>>,
+        deadline: Instant,
+    ) -> bool {
+        for signal in signals {
+            loop {
+                self.publish_completed_starts();
+                if signal.outcome.lock().is_some() {
+                    break;
+                }
+                if !signal.wait_until(deadline) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    pub fn has_pending_startups(&self) -> bool {
+        !self.starting.is_empty()
+    }
+
+    fn queue_startup_notification(
+        &mut self,
+        key: &ServerKey,
+        path: &Path,
+    ) -> Result<i32, LspError> {
+        self.mark_pulled_report_stale(key, path);
+        let reservation = self
+            .starting
+            .get_mut(key)
+            .expect("startup reservation exists");
+        if !reservation.notification_versions.contains_key(path)
+            && reservation.notification_versions.len() >= STARTUP_NOTIFICATION_PATH_CAP
+        {
+            return Err(LspError::ServerNotReady(
+                STARTUP_NOTIFICATION_QUEUE_FULL.into(),
+            ));
+        }
+        let version = reservation
+            .notification_versions
+            .get(path)
+            .copied()
+            .or_else(|| {
+                self.documents
+                    .get(key)
+                    .and_then(|store| store.version(path))
+            })
+            .map_or(0, |version| version + 1);
+        reservation
+            .notification_versions
+            .insert(path.to_path_buf(), version);
+        reservation.pending_notifications.insert(path.to_path_buf());
+        Ok(version)
+    }
+
+    /// Snapshot paths and reserve their versions under the manager lock. The
+    /// worker reads current disk contents and sends through this client's writer.
+    fn start_notification_replay(&mut self, key: &ServerKey) {
+        let sender = self
+            .clients
+            .get(key)
+            .ok_or_else(|| LspError::ServerNotReady("server not found".into()))
+            .and_then(|client| {
+                Ok((
+                    client.startup_notification_writer()?,
+                    client.save_notification(),
+                    client.child_pid(),
+                ))
+            });
+        let ((writer, begins_read), save, pid) = match sender {
+            Ok(sender) => sender,
+            Err(error) => {
+                self.complete_startup_outcome(
+                    key,
+                    Some(ServerAttemptResult::SpawnFailed {
+                        binary: self.server_binaries.get(key).cloned().unwrap_or_default(),
+                        reason: error.to_string(),
+                    }),
+                );
+                return;
+            }
+        };
+        let reservation = self
+            .starting
+            .get_mut(key)
+            .expect("startup reservation exists");
+        let paths = std::mem::take(&mut reservation.pending_notifications);
+        let mut jobs: Vec<_> = paths
+            .into_iter()
+            .map(|path| {
+                let version = reservation.notification_versions[&path];
+                let opened = !self
+                    .documents
+                    .get(key)
+                    .is_some_and(|store| store.is_open(&path));
+                (path, version, opened)
+            })
+            .collect();
+        jobs.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+        reservation.replay_pid = Some(pid);
+        let signal = Arc::clone(&reservation.signal);
+        *signal
+            .finished
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        let owner = self.startup_owner.clone();
+        let worker_signal = Arc::clone(&signal);
+        let worker = std::thread::Builder::new()
+            .name("lsp-startup-sync".into())
+            .spawn(move || {
+                let guard = StartupWorkerGuard::new(Arc::clone(&worker_signal));
+                let result = replay_startup_notifications(
+                    writer,
+                    save,
+                    begins_read,
+                    pid,
+                    &worker_signal,
+                    jobs,
+                );
+                guard.publish(|signal| {
+                    *signal.replay_completion.lock() = Some(result);
+                    signal.finish();
+                });
+                if let Some(manager) = owner.upgrade() {
+                    manager.lock().publish_completed_starts();
+                }
+            });
+        if let Err(error) = worker {
+            *signal.replay_completion.lock() = Some(StartupReplayResult {
+                pid,
+                documents: Vec::new(),
+                error: Some(error.into()),
+            });
+            signal.finish();
+        }
+    }
+
+    fn finish_notification_replay(&mut self, key: &ServerKey, result: StartupReplayResult) {
+        if !self
+            .clients
+            .get(key)
+            .is_some_and(|client| client.child_pid() == result.pid)
+        {
+            self.complete_startup_outcome(
+                key,
+                Some(ServerAttemptResult::SpawnFailed {
+                    binary: self.server_binaries.get(key).cloned().unwrap_or_default(),
+                    reason: "server not found".into(),
+                }),
+            );
+            return;
+        }
+        for document in result.documents {
+            self.documents
+                .entry(key.clone())
+                .or_default()
+                .sync_at_version(document.path.clone(), document.version, &document.disk);
+            if let Ok(uri) = uri_for_path(&document.path) {
+                if let Some(client) = self.clients.get_mut(key) {
+                    client.record_startup_sync(&uri, document.opened, document.saved);
+                }
+            }
+        }
+        if let Some(error) = result.error {
+            self.complete_startup_outcome(
+                key,
+                Some(ServerAttemptResult::SpawnFailed {
+                    binary: self.server_binaries.get(key).cloned().unwrap_or_default(),
+                    reason: error.to_string(),
+                }),
+            );
+        } else if self
+            .starting
+            .get(key)
+            .is_some_and(|r| !r.pending_notifications.is_empty())
+        {
+            self.start_notification_replay(key);
+        } else {
+            self.complete_startup_outcome(key, None);
+        }
+    }
+
+    /// Publish the final startup outcome for all waiters before releasing the reservation.
+    fn complete_startup_outcome(&mut self, key: &ServerKey, outcome: Option<ServerAttemptResult>) {
+        let ready = outcome.is_none();
+        if !ready {
+            self.pending_watched_changes.remove(key);
+        }
+        if let Some(reservation) = self.starting.get(key) {
+            *reservation.signal.outcome.lock() =
+                Some(outcome.unwrap_or_else(|| ServerAttemptResult::Ok {
+                    server_key: key.clone(),
+                }));
+        }
+        self.release_start_reservation(key);
+        if ready {
+            self.queue_open_document_pulls(key);
+        }
+    }
+
+    pub(crate) fn pending_startup_files(&self) -> Vec<(ServerKey, PathBuf)> {
+        let mut pending: Vec<_> = self
+            .starting
+            .iter()
+            .filter(|(_, r)| {
+                !r.signal
+                    .cancelled
+                    .load(std::sync::atomic::Ordering::Acquire)
+            })
+            .filter_map(|(key, r)| {
+                r.source_file
+                    .as_ref()
+                    .map(|file| (key.clone(), file.clone()))
+            })
+            .collect();
+        pending.sort_by(|(left, _), (right, _)| server_key_sort(left, right));
+        pending
     }
 
     /// Remember a failed start the way [`Self::ensure_server_for_file_detailed`]
@@ -2192,8 +2431,7 @@ impl LspManager {
                     reason: RUST_WORKER_POLICY_CHANGED.into(),
                 })
             }
-            // Another path started the same server meanwhile; keep that
-            // client and let this one's drop stop its process.
+            // Keep an already-published client if a completion is replayed.
             Ok(_) if self.clients.contains_key(key) => {
                 slog_info!(
                     "lsp start discarded server={} root={} reason=duplicate start; stopping redundant client",
@@ -2228,11 +2466,30 @@ impl LspManager {
                 if self.clients.contains_key(key) {
                     None
                 } else {
-                    Some(self.record_file_start_failure(def, key, failure))
+                    Some(
+                        if self.starting.get(key).is_some_and(|r| {
+                            r.signal
+                                .request_deadline_exceeded
+                                .load(std::sync::atomic::Ordering::Acquire)
+                        }) {
+                            classify_spawn_error(&def.binary, &failure.error)
+                        } else {
+                            self.record_file_start_failure(def, key, failure)
+                        },
+                    )
                 }
             }
         };
-        self.release_start_reservation(key);
+        if outcome.is_none()
+            && self
+                .starting
+                .get(key)
+                .is_some_and(|r| !r.pending_notifications.is_empty())
+        {
+            self.start_notification_replay(key);
+        } else {
+            self.complete_startup_outcome(key, outcome.clone());
+        }
         outcome
     }
 
@@ -2251,7 +2508,7 @@ impl LspManager {
         servers_for_file(file_path, config)
             .into_iter()
             .filter_map(|def| server_key_for_definition(&def, file_path, config))
-            .filter(|key| self.clients.contains_key(key))
+            .filter(|key| self.clients.contains_key(key) || self.starting.contains_key(key))
             .collect()
     }
 
@@ -2274,6 +2531,9 @@ impl LspManager {
                 Some((definition, key))
             })
             .any(|(definition, key)| {
+                if self.starting.contains_key(&key) {
+                    return true;
+                }
                 if let Some(client) = self.clients.get(&key) {
                     return client.state() != ServerState::Ready;
                 }
@@ -2282,95 +2542,32 @@ impl LspManager {
             })
     }
 
-    /// Detailed version of [`ensure_server_for_file`] that records every
-    /// matching server's outcome (`Ok` / `NoRootMarker` / `BinaryNotInstalled`
-    /// / `SpawnFailed`).
-    ///
-    /// Use this when the caller wants to honestly report _why_ a file has no
-    /// active server (e.g., to surface "bash-language-server not on PATH" to
-    /// the agent instead of silently returning `total: 0`).
+    /// Ensure matching servers are admitted without blocking the caller's
+    /// manager guard. A cold start returns `InProgress`; use
+    /// [`ensure_server_for_file_detailed_unlocked`] to wait without holding a
+    /// shared manager mutex.
     pub fn ensure_server_for_file_detailed(
         &mut self,
         file_path: &Path,
         config: &Config,
     ) -> EnsureServerOutcomes {
-        let defs = servers_for_file(file_path, config);
         let mut outcomes = EnsureServerOutcomes::default();
-
-        for def in defs {
-            let server_id = def.kind.id_str().to_string();
-            let server_name = def.name.to_string();
-
-            let Some(key) = server_key_for_definition(&def, file_path, config) else {
-                outcomes.attempts.push(ServerAttempt {
-                    server_id,
-                    server_name,
-                    result: ServerAttemptResult::NoRootMarker {
-                        looked_for: def.root_markers.iter().map(|s| s.to_string()).collect(),
-                    },
-                });
-                continue;
-            };
-
-            if !self.clients.contains_key(&key) {
-                // If this server already failed to start for this root,
-                // return the remembered failure without retrying or
-                // re-logging. This prevents per-edit ERROR spam when the
-                // user's environment is missing a dependency the LSP needs
-                // (the typescript-language-server "Could not find a valid
-                // TypeScript installation" case is the canonical example).
-                // A transient failure is retried once its backoff window has
-                // passed.
-                if let Some(cached) = self.failure_to_replay(&key) {
-                    outcomes.attempts.push(ServerAttempt {
-                        server_id,
-                        server_name,
-                        result: cached,
-                    });
-                    continue;
-                }
-
-                // A spurious ServerExited can drop the client without killing
-                // the child. Reap any still-tracked processes for this pair
-                // before spawning a replacement, otherwise leaked servers
-                // accumulate on a live worktree.
-                self.reap_unreferenced_children_for(&key);
-                self.log_transient_retry(&key);
-
-                match self.spawn_server(&def, &key.root, file_path, config) {
-                    Ok(client) => {
-                        self.note_start_succeeded(&key);
-                        self.clients.insert(key.clone(), client);
-                        self.server_binaries.insert(key.clone(), def.binary.clone());
-                        self.documents.entry(key.clone()).or_default();
-                    }
-                    Err(failure) => {
-                        slog_error!("failed to spawn {}: {}", def.name, failure.error);
-                        let result = classify_spawn_error(&def.binary, &failure.error);
-                        // Remember the failure so subsequent file events skip
-                        // this (kind, root) pair instead of producing a fresh
-                        // spawn attempt + ERROR log per request.
-                        let result = self.record_failed_spawn(&key, result, failure.durability);
-                        outcomes.attempts.push(ServerAttempt {
-                            server_id,
-                            server_name,
-                            result,
-                        });
-                        continue;
-                    }
-                }
-            }
-
-            outcomes.attempts.push(ServerAttempt {
-                server_id,
-                server_name,
-                result: ServerAttemptResult::Ok {
-                    server_key: key.clone(),
+        for def in servers_for_file(file_path, config) {
+            let result = match server_key_for_definition(&def, file_path, config) {
+                Some(key) => self.start_server(&def, &key, file_path, config),
+                None => ServerAttemptResult::NoRootMarker {
+                    looked_for: def.root_markers.iter().map(|s| s.to_string()).collect(),
                 },
+            };
+            if let ServerAttemptResult::Ok { server_key } = &result {
+                outcomes.successful.push(server_key.clone());
+            }
+            outcomes.attempts.push(ServerAttempt {
+                server_id: def.kind.id_str().to_string(),
+                server_name: def.name.to_string(),
+                result,
             });
-            outcomes.successful.push(key);
         }
-
         outcomes
     }
 
@@ -2559,12 +2756,14 @@ impl LspManager {
     /// per server so the post-edit waiter can match `publishDiagnostics`
     /// against the exact version that this notification carried.
     ///
-    /// Returns: `Vec<(ServerKey, target_version)>`. `target_version` is the
-    /// `version` field on the `VersionedTextDocumentIdentifier` we just sent
-    /// (post-bump). For freshly-opened documents (`didOpen`) the version is
-    /// `0`. Servers that do not echo a document version cannot prove a report
-    /// describes this edit, so post-edit observation leaves them pending rather
-    /// than accepting a report merely because it arrived after the edit.
+    /// Returns `Vec<(ServerKey, target_version)>` for sent notifications or
+    /// versions reserved for startup replay. New documents start at version 0;
+    /// coalesced startup edits can make the first didOpen carry a later version.
+    /// A reserved version is not evidence of analysis: post-edit observation
+    /// still requires diagnostics matching that version. Servers that do not
+    /// echo a document version cannot prove a report describes this edit, so
+    /// observation leaves them pending rather than accepting a report merely
+    /// because it arrived after the edit.
     pub fn notify_file_changed_versioned(
         &mut self,
         file_path: &Path,
@@ -2572,7 +2771,16 @@ impl LspManager {
         config: &Config,
     ) -> Result<Vec<(ServerKey, i32)>, LspError> {
         let canonical_path = canonicalize_for_lsp(file_path)?;
-        let server_keys = self.ensure_server_for_file(&canonical_path, config);
+        let outcomes = self.ensure_server_for_file_detailed(&canonical_path, config);
+        let server_keys = outcomes
+            .attempts
+            .into_iter()
+            .filter_map(|attempt| match attempt.result {
+                ServerAttemptResult::Ok { server_key }
+                | ServerAttemptResult::InProgress { server_key } => Some(server_key),
+                _ => None,
+            })
+            .collect();
         self.notify_file_changed_for_server_keys(canonical_path, content, server_keys)
     }
 
@@ -2630,6 +2838,11 @@ impl LspManager {
         let disk = DiskSnapshot::read(&canonical_path);
 
         for key in server_keys {
+            if self.starting.contains_key(&key) {
+                let version = self.queue_startup_notification(&key, &canonical_path)?;
+                versions.push((key, version));
+                continue;
+            }
             // The server is about to hold text its pulled report may not
             // describe. A pull-only server publishes nothing after the
             // change, so without this a scoped inspect would keep certifying
@@ -2814,16 +3027,133 @@ impl LspManager {
         self.notify_file_changed(file_path, content, &Config::default())
     }
 
-    /// Notify every active server whose workspace contains at least one changed
-    /// path that watched files changed. This is intentionally workspace-scoped
-    /// rather than extension-scoped: configuration edits such as `package.json`
-    /// or `tsconfig.json` affect a server's project graph even though those
-    /// files may not be documents handled by the server itself.
+    /// Keep only the latest event for each path. Explicit LSP change kinds are
+    /// retained; inferring them again would turn CREATED into CHANGED.
+    fn queue_watched_change(
+        &mut self,
+        key: &ServerKey,
+        path: PathBuf,
+        kind: FileChangeType,
+        raw: Option<PathBuf>,
+        extra_config_markers: Vec<String>,
+    ) -> Result<(), LspError> {
+        let pid = self.clients.get(key).map(LspClient::child_pid);
+        let pending = self
+            .pending_watched_changes
+            .entry(key.clone())
+            .or_insert_with(|| PendingWatchedChanges {
+                generation: self.clients_generation,
+                pid,
+                changes: HashMap::new(),
+            });
+        if pending.generation != self.clients_generation
+            || pending.pid.is_some_and(|old| Some(old) != pid)
+        {
+            *pending = PendingWatchedChanges {
+                generation: self.clients_generation,
+                pid,
+                changes: HashMap::new(),
+            };
+        }
+        if !pending.changes.contains_key(&path)
+            && pending.changes.len() >= STARTUP_NOTIFICATION_PATH_CAP
+        {
+            return Err(LspError::ServerNotReady(
+                STARTUP_NOTIFICATION_QUEUE_FULL.into(),
+            ));
+        }
+        pending.changes.insert(
+            path,
+            PendingWatchedChange {
+                kind,
+                raw,
+                extra_config_markers,
+            },
+        );
+        Ok(())
+    }
+
+    /// Replay through the existing watched-file send paths only after the
+    /// client and its dynamic subscription are ready. Each batch stays bound
+    /// to its workspace, generation and client rather than broadcasting twice.
+    fn flush_pending_watched_changes(&mut self) {
+        if self.is_quiesced() {
+            return;
+        }
+        let keys: Vec<_> = self
+            .pending_watched_changes
+            .keys()
+            .filter(|key| {
+                !self.starting.contains_key(*key)
+                    && self
+                        .clients
+                        .get(*key)
+                        .is_some_and(LspClient::has_watched_file_registration)
+            })
+            .cloned()
+            .collect();
+        let mut reloads = Vec::new();
+        for key in keys {
+            let Some(pending) = self.pending_watched_changes.remove(&key) else {
+                continue;
+            };
+            let pid = self.clients.get(&key).map(LspClient::child_pid);
+            if pending.generation != self.clients_generation
+                || pending.pid.is_some_and(|old| Some(old) != pid)
+            {
+                continue;
+            }
+            let mut direct = Vec::new();
+            let mut forwarded: HashMap<Vec<String>, Vec<(PathBuf, FileChangeType)>> =
+                HashMap::new();
+            for (path, change) in pending.changes {
+                if let Some(raw) = change.raw {
+                    forwarded
+                        .entry(change.extra_config_markers)
+                        .or_default()
+                        .push((raw, change.kind));
+                } else {
+                    direct.push((path, change.kind));
+                }
+            }
+            if !direct.is_empty() {
+                if let Err(error) =
+                    self.notify_files_watched_changed_for_server(&direct, Some(&key))
+                {
+                    crate::slog_warn!("queued watched-file sync failed for {key:?}: {error}");
+                }
+            }
+            for (markers, changes) in forwarded {
+                reloads.extend(self.forward_watcher_file_events_for_server(
+                    &changes,
+                    &markers,
+                    Some(&key),
+                ));
+            }
+        }
+        if let Some(manager) = self.startup_owner.upgrade() {
+            spawn_watcher_rust_workspace_reloads(&manager, reloads);
+        }
+    }
+
+    /// Notify every active or starting server whose workspace contains a changed
+    /// path. Pending startup or registration retains the event's explicit kind.
     pub fn notify_files_watched_changed(
         &mut self,
         paths: &[(PathBuf, FileChangeType)],
         _config: &Config,
     ) -> Result<(), LspError> {
+        self.notify_files_watched_changed_for_server(paths, None)
+    }
+
+    fn notify_files_watched_changed_for_server(
+        &mut self,
+        paths: &[(PathBuf, FileChangeType)],
+        only_server: Option<&ServerKey>,
+    ) -> Result<(), LspError> {
+        if self.is_quiesced() {
+            return Err(LspError::ProjectClosed);
+        }
         #[cfg(windows)]
         let mut trace = vec![format!(
             "input_paths={paths:?}; active_keys={:?}",
@@ -2848,12 +3178,41 @@ impl LspManager {
         trace.push(format!("resolved_events={canonical_events:?}"));
 
         let mut first_error = None;
-        let keys: Vec<ServerKey> = self.clients.keys().cloned().collect();
+        let keys: Vec<ServerKey> = self
+            .clients
+            .keys()
+            .chain(self.starting.keys())
+            .filter(|key| only_server.is_none_or(|only| only == *key))
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         #[cfg(windows)]
         if keys.is_empty() {
             trace.push("outcome=no-active-client".to_string());
         }
         for key in keys {
+            if self.starting.contains_key(&key)
+                || !self
+                    .clients
+                    .get(&key)
+                    .is_some_and(LspClient::has_watched_file_registration)
+            {
+                for (path, typ) in &canonical_events {
+                    if path.starts_with(&key.root) {
+                        if let Err(error) =
+                            self.queue_watched_change(&key, path.clone(), *typ, None, Vec::new())
+                        {
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                }
+                #[cfg(windows)]
+                trace.push(format!(
+                    "key={key:?}; outcome=queued-until-ready-registration"
+                ));
+                continue;
+            }
             let mut changes = Vec::new();
             for (path, typ) in &canonical_events {
                 if !path.starts_with(&key.root) {
@@ -2956,8 +3315,20 @@ impl LspManager {
         events: &[(PathBuf, FileChangeType)],
         extra_config_markers: &[String],
     ) -> Vec<(ServerKey, Vec<PathBuf>)> {
+        self.forward_watcher_file_events_for_server(events, extra_config_markers, None)
+    }
+
+    fn forward_watcher_file_events_for_server(
+        &mut self,
+        events: &[(PathBuf, FileChangeType)],
+        extra_config_markers: &[String],
+        only_server: Option<&ServerKey>,
+    ) -> Vec<(ServerKey, Vec<PathBuf>)> {
         let mut rust_manifest_changes = Vec::new();
-        if events.is_empty() || self.clients.is_empty() {
+        if self.is_quiesced() {
+            return rust_manifest_changes;
+        }
+        if events.is_empty() || (self.clients.is_empty() && self.starting.is_empty()) {
             return rust_manifest_changes;
         }
         // A server's root and globs may spell a path either the way the
@@ -2971,7 +3342,15 @@ impl LspManager {
                 (path.as_path(), resolve_for_lsp_uri(path), *typ)
             })
             .collect();
-        let keys: Vec<ServerKey> = self.clients.keys().cloned().collect();
+        let keys: Vec<ServerKey> = self
+            .clients
+            .keys()
+            .chain(self.starting.keys())
+            .filter(|key| only_server.is_none_or(|only| only == *key))
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         for key in keys {
             let in_root: Vec<&(&Path, PathBuf, FileChangeType)> = events
                 .iter()
@@ -2994,7 +3373,28 @@ impl LspManager {
             let mut overflowed = false;
             let mut sent_to_registered_watcher: Vec<PathBuf> = Vec::new();
 
-            if let Some(client) = self.clients.get(&key) {
+            let waiting = self.starting.contains_key(&key)
+                || !self
+                    .clients
+                    .get(&key)
+                    .is_some_and(LspClient::has_watched_file_registration);
+            if waiting {
+                for (raw, resolved, typ) in &in_root {
+                    if let Err(error) = self.queue_watched_change(
+                        &key,
+                        resolved.clone(),
+                        *typ,
+                        Some(raw.to_path_buf()),
+                        extra_config_markers.to_vec(),
+                    ) {
+                        crate::slog_warn!(
+                            "queued watched-file forward failed for {key:?}: {error}"
+                        );
+                    }
+                }
+            }
+
+            if let Some(client) = self.clients.get(&key).filter(|_| !waiting) {
                 if client.has_watched_file_registration() {
                     let watchers = client.registered_file_watchers();
                     let is_config =
@@ -3494,7 +3894,7 @@ impl LspManager {
             .find_map(|(key, entry)| (key == server_key).then_some(entry.epoch))
     }
 
-    /// Whether this server is a running client.
+    /// Whether this server has a running client, including pending startup replay.
     pub(crate) fn has_client(&self, server_key: &ServerKey) -> bool {
         self.clients.contains_key(server_key)
     }
@@ -3661,6 +4061,9 @@ impl LspManager {
     /// Get an active client for a file path, if one exists.
     pub fn client_for_file(&self, file_path: &Path, config: &Config) -> Option<&LspClient> {
         let key = self.server_key_for_file(file_path, config)?;
+        if self.starting.contains_key(&key) {
+            return None;
+        }
         self.clients.get(&key)
     }
 
@@ -3675,6 +4078,9 @@ impl LspManager {
         config: &Config,
     ) -> Option<&mut LspClient> {
         let key = self.server_key_for_file(file_path, config)?;
+        if self.starting.contains_key(&key) {
+            return None;
+        }
         self.clients.get_mut(&key)
     }
 
@@ -3695,7 +4101,17 @@ impl LspManager {
     /// Whether LSP events are waiting to be drained. Cheap channel peek for
     /// the maintenance scheduler's skip probe.
     pub fn has_pending_events(&self) -> bool {
-        !self.event_rx.is_empty() || !self.pending_diagnostic_observations.is_empty()
+        !self.event_rx.is_empty()
+            || !self.pending_diagnostic_observations.is_empty()
+            || !self.ready_startup_events.is_empty()
+            || (!self.is_quiesced()
+                && self.pending_watched_changes.keys().any(|key| {
+                    !self.starting.contains_key(key)
+                        && self
+                            .clients
+                            .get(key)
+                            .is_some_and(LspClient::has_watched_file_registration)
+                }))
     }
 
     pub fn drain_events_bounded(&mut self, max_events: usize) -> DrainedLspEvents {
@@ -3707,6 +4123,7 @@ impl LspManager {
         max_events: usize,
         preserve_pull_observations: bool,
     ) -> DrainedLspEvents {
+        self.publish_completed_starts();
         let mut events = Vec::new();
         let mut instances = Vec::new();
         let mut processed = 0;
@@ -3718,6 +4135,24 @@ impl LspManager {
         };
         let mut diagnostics_changed = !accepted_snapshots.is_empty();
         while processed < max_events {
+            if !preserve_pull_observations {
+                if let Some(delivery) = self.ready_startup_events.pop_front() {
+                    processed += 1;
+                    diagnostics_changed |= delivery.published.is_some();
+                    if let Some(ref published) = delivery.published {
+                        if self.startup_publish_is_current(published) {
+                            if let Some(snapshot) =
+                                self.accepted_snapshot_for_file(&published.key, &published.file)
+                            {
+                                accepted_snapshots.push(snapshot);
+                            }
+                        }
+                    }
+                    instances.push(delivery.event.instance);
+                    events.push(delivery.event.event);
+                    continue;
+                }
+            }
             let Ok(event) = self.event_rx.try_recv() else {
                 break;
             };
@@ -3730,12 +4165,15 @@ impl LspManager {
                 }
                 continue;
             }
-            // `handle_event` returns the file of a stored publish; the
-            // snapshot reuses it instead of parsing the payload again.
-            let Ok(published_file) = self.handle_event(&event) else {
+            if !self.admit_event(&event) {
                 continue;
-            };
-            if let Some(file) = published_file {
+            }
+            if self.defer_startup_event(&event) {
+                continue;
+            }
+            // `handle_ready_event` returns the file of a stored publish; the
+            // snapshot reuses it instead of parsing the payload again.
+            if let Some(file) = self.handle_ready_event(&event) {
                 diagnostics_changed = true;
                 if let Some(snapshot) = self.accepted_live_publish_snapshot(&event.event, &file) {
                     accepted_snapshots.push(snapshot);
@@ -3747,7 +4185,9 @@ impl LspManager {
         for event in deferred_pull_events {
             let _ = self.event_tx.send(event);
         }
-        let has_more = processed >= max_events && !self.event_rx.is_empty();
+        let has_more = processed >= max_events
+            && (!self.event_rx.is_empty()
+                || (!preserve_pull_observations && !self.ready_startup_events.is_empty()));
         self.send_due_rust_saves();
         let mut promoted_reports = Vec::new();
         for (key, client) in &mut self.clients {
@@ -3847,6 +4287,15 @@ impl LspManager {
         config: &Config,
         timeout: std::time::Duration,
     ) -> Vec<StoredDiagnostic> {
+        // Notification startup used to finish before this relative observation
+        // timeout began. Preserve that separation when startup is asynchronous;
+        // callers with an absolute deadline still use wait_for_file_diagnostics.
+        let lookup_path = normalize_lookup_path(file_path);
+        self.wait_for_file_startups(
+            &lookup_path,
+            config,
+            Instant::now() + super::client::HANDSHAKE_REQUEST_TIMEOUT + INITIALIZE_EXIT_WAIT,
+        );
         let deadline = std::time::Instant::now() + timeout;
         self.wait_for_file_diagnostics(file_path, config, deadline)
     }
@@ -3944,7 +4393,7 @@ impl LspManager {
 
     #[doc(hidden)]
     pub fn pending_event_count_for_test(&self) -> usize {
-        self.event_rx.len()
+        self.event_rx.len() + self.ready_startup_events.len()
     }
 
     #[doc(hidden)]
@@ -4141,7 +4590,11 @@ impl LspManager {
                 continue;
             }
             if !self.clients.contains_key(key) {
-                wait.exited.push(key.clone());
+                // A start still in flight has no client yet. It is pending,
+                // not exited; releasing its reservation wakes this waiter.
+                if !self.starting.contains_key(key) {
+                    wait.exited.push(key.clone());
+                }
                 continue;
             }
             if self
@@ -4366,7 +4819,23 @@ impl LspManager {
     ) -> Vec<StoredDiagnostic> {
         let lookup_path = normalize_lookup_path(file_path);
 
-        if self.server_key_for_file(&lookup_path, config).is_none() {
+        // A locked notification may have admitted startup without waiting. An
+        // explicit diagnostics wait must drive both startup and replay phases.
+        self.wait_for_file_startups(&lookup_path, config, deadline);
+
+        if self.server_key_for_file(&lookup_path, config).is_none()
+            && !servers_for_file(&lookup_path, config)
+                .iter()
+                .any(|definition| {
+                    self.clients.keys().any(|key| {
+                        key.kind == definition.kind
+                            && self
+                                .documents
+                                .get(key)
+                                .is_some_and(|store| store.is_open(&lookup_path))
+                    })
+                })
+        {
             return Vec::new();
         }
 
@@ -4453,6 +4922,14 @@ impl LspManager {
         config: &Config,
         deadline: Option<Instant>,
     ) -> Result<Vec<PullFileResult>, LspError> {
+        self.ensure_server_for_file_detailed(file_path, config);
+        self.wait_for_file_startups(
+            file_path,
+            config,
+            deadline.unwrap_or_else(|| {
+                Instant::now() + super::client::HANDSHAKE_REQUEST_TIMEOUT + INITIALIZE_EXIT_WAIT
+            }),
+        );
         let pulls = self.begin_file_pulls(file_path, config, deadline)?;
         Ok(pulls
             .into_iter()
@@ -4544,6 +5021,12 @@ impl LspManager {
             opened_for_pull: false,
             state: DocumentPullState::Done(PullFileOutcome::PullNotSupported),
         };
+        if self.starting.contains_key(&pull.key) {
+            pull.state = DocumentPullState::Replied(Err(LspError::ServerNotReady(
+                START_IN_PROGRESS_REASON.into(),
+            )));
+            return pull;
+        }
         let supports_pull = self
             .clients
             .get(&pull.key)
@@ -4613,6 +5096,9 @@ impl LspManager {
         file: &Path,
         deadline: Instant,
     ) -> Result<super::typescript_diagnostics::TypescriptDiagnosticsRequest, LspError> {
+        if self.starting.contains_key(key) {
+            return Err(LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()));
+        }
         let file = canonicalize_for_lsp(file)?;
         let uri = uri_for_path(&file)?;
         let version = self
@@ -4790,6 +5276,9 @@ impl LspManager {
         &mut self,
         server_key: &ServerKey,
     ) -> Result<Option<PendingWorkspacePull>, LspError> {
+        if self.starting.contains_key(server_key) {
+            return Err(LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()));
+        }
         let supports_workspace = self
             .clients
             .get(server_key)
@@ -5098,6 +5587,10 @@ impl LspManager {
     /// waiting on child processes. The caller owns graceful shutdown so the
     /// manager lock is not held across a Shutdown handshake.
     pub fn take_all_clients(&mut self) -> Vec<(ServerKey, LspClient)> {
+        self.cancel_startups();
+        self.starting.clear();
+        self.ready_startup_events.clear();
+        self.pending_diagnostic_observations.clear();
         let clients: Vec<_> = self.clients.drain().collect();
         self.clients_generation = self.clients_generation.wrapping_add(1);
         self.forget_server_state(None);
@@ -5112,6 +5605,8 @@ impl LspManager {
         self.server_binaries.retain(|server, _| keep(server));
         self.documents.retain(|server, _| keep(server));
         self.watched_file_skip_logged.retain(keep);
+        self.pending_watched_changes
+            .retain(|server, _| keep(server));
         self.latest_push_for_pull_servers
             .retain(|(server, _), _| keep(server));
         self.latest_pull_for_rust
@@ -5144,6 +5639,15 @@ impl LspManager {
     pub(crate) fn close_start_admission(&self) {
         self.quiesced
             .store(true, std::sync::atomic::Ordering::Release);
+        self.cancel_startups();
+    }
+
+    fn cancel_startups(&self) {
+        for (key, reservation) in &self.starting {
+            reservation.signal.cancel();
+            let pids = self.child_registry.pids_for_server(&key.root, &key.kind);
+            self.child_registry.force_kill_pids(&pids);
+        }
     }
 
     pub(crate) fn resume(&self) {
@@ -5363,10 +5867,14 @@ impl LspManager {
         notes
     }
 
-    /// Active server keys (running clients). Used by `lsp_diagnostics`
+    /// Server keys whose startup synchronization has finished. Used by `lsp_diagnostics`
     /// directory mode to know which servers to ask for workspace pull.
     pub fn active_server_keys(&self) -> Vec<ServerKey> {
-        self.clients.keys().cloned().collect()
+        self.clients
+            .keys()
+            .filter(|key| !self.starting.contains_key(*key))
+            .cloned()
+            .collect()
     }
 
     /// Return the last watched-file routing decision for Windows CI timeout
@@ -5633,6 +6141,9 @@ impl LspManager {
     /// diagnostics freshness gate both use this predicate so a complete
     /// producer set cannot be judged incomplete by a second, stricter check.
     pub fn producer_has_settled(&self, server: &ServerKey) -> bool {
+        if self.starting.contains_key(server) {
+            return false;
+        }
         if self
             .clients
             .get(server)
@@ -5670,7 +6181,11 @@ impl LspManager {
     }
 
     fn drain_events_for_file(&mut self, file_path: &Path) -> bool {
-        let mut saw_file_diagnostics = false;
+        let mut saw_file_diagnostics = self.ready_startup_events.iter().any(|delivery| {
+            delivery.published.as_ref().is_some_and(|published| {
+                published.file.as_path() == file_path && self.startup_publish_is_current(published)
+            })
+        });
         while let Ok(event) = self.event_rx.try_recv() {
             if matches!(
                 self.handle_event(&event).ok().flatten(),
@@ -5680,6 +6195,21 @@ impl LspManager {
             }
         }
         saw_file_diagnostics
+    }
+
+    // Outward delivery may follow another edit or restart. Only the same
+    // client's still-current document and report can contribute an observation.
+    fn startup_publish_is_current(&self, published: &StartupPublished) -> bool {
+        !self.is_quiesced()
+            && published.pid.is_some()
+            && self.clients.get(&published.key).map(LspClient::child_pid) == published.pid
+            && self
+                .documents
+                .get(&published.key)
+                .and_then(|store| store.version(&published.file))
+                == published.version
+            && published.epoch.is_some()
+            && self.diagnostic_epoch(&published.key, &published.file) == published.epoch
     }
 
     /// The snapshot of a publish `handle_event` just stored for `file`, when
@@ -5839,12 +6369,17 @@ impl LspManager {
         accepted
     }
 
-    fn handle_event(&mut self, receipt: &ReceivedLspEvent) -> Result<Option<PathBuf>, ()> {
-        if !self.accept_event_instance(&receipt.event, receipt.instance) {
-            self.consume_pending_exit_report(receipt);
-            return Err(());
+    /// Reject a receipt from a reader that no longer owns its key, keeping
+    /// only the exit report that receipt was meant to log.
+    fn admit_event(&mut self, receipt: &ReceivedLspEvent) -> bool {
+        if self.accept_event_instance(&receipt.event, receipt.instance) {
+            return true;
         }
-        let event = &receipt.event;
+        self.consume_pending_exit_report(receipt);
+        false
+    }
+
+    fn defer_startup_event(&mut self, receipt: &ReceivedLspEvent) -> bool {
         let (LspEvent::Notification {
             server_kind, root, ..
         }
@@ -5856,17 +6391,37 @@ impl LspManager {
         }
         | LspEvent::DocumentDiagnosticsPulled {
             server_kind, root, ..
-        }) = event;
+        }) = &receipt.event;
         let event_key = ServerKey {
             kind: server_kind.clone(),
             root: root.clone(),
         };
-        if !self.clients.contains_key(&event_key) {
-            if let Some(reservation) = self.starting.get_mut(&event_key) {
-                reservation.deferred_events.push(receipt.clone());
-                return Ok(None);
-            }
+        // Replay sends run on a worker outside the manager lock. Defer LSP
+        // events until replay commits document versions, save write times,
+        // and rust-analyzer check-begin counts.
+        if let Some(reservation) = self.starting.get_mut(&event_key) {
+            reservation.deferred_events.push(receipt.clone());
+            true
+        } else {
+            false
         }
+    }
+
+    /// `Err` means the receipt came from a retired reader and was dropped;
+    /// `Ok(None)` covers both a deferred startup event and one that stored
+    /// no publish.
+    fn handle_event(&mut self, receipt: &ReceivedLspEvent) -> Result<Option<PathBuf>, ()> {
+        if !self.admit_event(receipt) {
+            return Err(());
+        }
+        if self.defer_startup_event(receipt) {
+            return Ok(None);
+        }
+        Ok(self.handle_ready_event(receipt))
+    }
+
+    fn handle_ready_event(&mut self, receipt: &ReceivedLspEvent) -> Option<PathBuf> {
+        let event = &receipt.event;
         let published_file = match event {
             LspEvent::DocumentDiagnosticsPulled {
                 server_kind,
@@ -6010,8 +6565,12 @@ impl LspManager {
             }
             _ => None,
         };
+        if matches!(event, LspEvent::ServerRequest { method, .. } if method == "client/registerCapability")
+        {
+            self.flush_pending_watched_changes();
+        }
         self.wake_post_edit_waiters();
-        Ok(published_file)
+        published_file
     }
 
     fn wake_post_edit_waiters(&mut self) {
@@ -6525,32 +7084,6 @@ impl LspManager {
         }
     }
 
-    fn spawn_server(
-        &mut self,
-        def: &ServerDef,
-        root: &Path,
-        source_file: &Path,
-        config: &Config,
-    ) -> Result<LspClient, StartFailure> {
-        self.spawn_server_with_timeout(def, root, source_file, config, None)
-    }
-
-    fn spawn_server_with_timeout(
-        &mut self,
-        def: &ServerDef,
-        root: &Path,
-        source_file: &Path,
-        config: &Config,
-        initialize_timeout: Option<std::time::Duration>,
-    ) -> Result<LspClient, StartFailure> {
-        let prepared = self
-            .prepare_spawn(def, root, source_file, config)
-            .map_err(prepare_failure)?;
-        prepared
-            .run(initialize_timeout)
-            .map_err(|failure| self.absorb_spawn_failure(failure))
-    }
-
     /// Gather everything a spawn needs from manager state, so the spawn and
     /// its `initialize` handshake can run without the manager lock.
     fn prepare_spawn(
@@ -6653,6 +7186,11 @@ impl LspManager {
             .unwrap_or_else(|| root.to_path_buf());
 
         Ok(PreparedSpawn {
+            start_signal: None,
+            #[cfg(test)]
+            spawn_hook: self.spawn_hook.clone(),
+            #[cfg(test)]
+            spawned_hook: self.spawned_hook.clone(),
             instance: ServerInstanceId::next(),
             rust_worker_policy: self.rust_worker_policy(),
             kind: def.kind.clone(),
@@ -6781,12 +7319,21 @@ impl LspManager {
 
     fn server_key_for_file(&self, file_path: &Path, config: &Config) -> Option<ServerKey> {
         for def in servers_for_file(file_path, config) {
-            let key = server_key_for_definition(&def, file_path, config)?;
+            // One inapplicable definition must not hide another live server.
+            let Some(key) = server_key_for_definition(&def, file_path, config) else {
+                continue;
+            };
             if self.clients.contains_key(&key) {
                 return Some(key);
             }
         }
         None
+    }
+}
+
+impl Drop for LspManager {
+    fn drop(&mut self) {
+        self.cancel_startups();
     }
 }
 
@@ -7093,6 +7640,7 @@ fn recoverable_pull_rejection(err: &LspError) -> bool {
 
 fn server_attempt_result_reason(result: &ServerAttemptResult) -> String {
     match result {
+        ServerAttemptResult::InProgress { .. } => START_IN_PROGRESS_STATUS.into(),
         ServerAttemptResult::ProjectClosed => "project closed; reopen the project and retry".into(),
         ServerAttemptResult::SpawnFailed { binary, reason } => {
             format!("spawn_failed: {binary} ({reason})")
@@ -7400,6 +7948,11 @@ fn diagnostic_path_candidates(file: &Path) -> Vec<PathBuf> {
 /// Everything needed to spawn and initialize one language server, gathered
 /// from `LspManager` state so the slow part can run without the manager lock.
 struct PreparedSpawn {
+    start_signal: Option<Arc<StartSignal>>,
+    #[cfg(test)]
+    spawn_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    spawned_hook: Option<Arc<dyn Fn(u32) + Send + Sync>>,
     instance: ServerInstanceId,
     rust_worker_policy: Arc<std::sync::atomic::AtomicBool>,
     kind: ServerKind,
@@ -7469,6 +8022,20 @@ impl PreparedSpawn {
     /// Start the process and run the `initialize` handshake. Touches no
     /// manager state, so it runs without the manager lock.
     fn run(mut self, initialize_timeout: Option<Duration>) -> Result<LspClient, SpawnFailure> {
+        #[cfg(test)]
+        if let Some(hook) = &self.spawn_hook {
+            hook();
+        }
+        if self
+            .start_signal
+            .as_ref()
+            .is_some_and(|s| s.cancelled.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Err(SpawnFailure::NotStarted {
+                error: LspError::ProjectClosed,
+                exit_log_line: String::new(),
+            });
+        }
         let initialize_timeout = initialize_timeout.or_else(|| self.test_initialize_timeout());
         let worker = self.kind == ServerKind::Rust
             && self
@@ -7535,6 +8102,21 @@ impl PreparedSpawn {
                 });
             }
         };
+        #[cfg(test)]
+        if let Some(hook) = &self.spawned_hook {
+            hook(client.child_pid());
+        }
+        if self
+            .start_signal
+            .as_ref()
+            .is_some_and(|s| s.cancelled.load(std::sync::atomic::Ordering::Acquire))
+        {
+            drop(client);
+            return Err(SpawnFailure::NotStarted {
+                error: LspError::ProjectClosed,
+                exit_log_line: String::new(),
+            });
+        }
         client.runtime_note = self.runtime_note;
         client.completed_rust_check = completed_rust_check;
         // A worker can arrive while spawn runs without the manager lock.
@@ -7652,15 +8234,156 @@ impl PreparedSpawn {
     }
 }
 
+struct StartupReplayDocument {
+    path: PathBuf,
+    version: i32,
+    opened: bool,
+    disk: DiskSnapshot,
+    /// Save-notification write time and rust-analyzer check-begin count.
+    saved: Option<(Instant, u64)>,
+}
+
+struct StartupEventDelivery {
+    event: ReceivedLspEvent,
+    published: Option<StartupPublished>,
+}
+
+struct StartupPublished {
+    key: ServerKey,
+    file: PathBuf,
+    version: Option<i32>,
+    epoch: Option<u64>,
+    pid: Option<u32>,
+}
+
+struct StartupReplayResult {
+    pid: u32,
+    documents: Vec<StartupReplayDocument>,
+    error: Option<LspError>,
+}
+
+/// Read each queued path only when its client is installed. The writer belongs
+/// to that exact client. Cancellation prevents later replay sends from starting;
+/// the child registry terminates the process for already queued writer jobs.
+fn replay_startup_notifications(
+    writer: super::writer::LspWriter,
+    save: Option<SaveNotification>,
+    begins_read: Arc<std::sync::atomic::AtomicU64>,
+    pid: u32,
+    signal: &StartSignal,
+    jobs: Vec<(PathBuf, i32, bool)>,
+) -> StartupReplayResult {
+    let mut result = StartupReplayResult {
+        pid,
+        documents: Vec::new(),
+        error: None,
+    };
+    for (path, version, opened) in jobs {
+        let mut write_attempted = false;
+        let mut document_written = false;
+        let sent = (|| -> Result<(DiskSnapshot, Option<(Instant, u64)>), LspError> {
+            let disk = DiskSnapshot::read(&path);
+            let content = std::fs::read_to_string(&path)?;
+            let uri = uri_for_path(&path)?;
+            #[cfg(test)]
+            if let Some(hook) = signal.replay_hook.lock().clone() {
+                hook();
+            }
+            let _send = signal.replay_gate.lock();
+            if signal.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(LspError::ProjectClosed);
+            }
+            let payload = if opened {
+                let language = language_id_for_extension(
+                    path.extension()
+                        .and_then(|ext| ext.to_str())
+                        .unwrap_or_default(),
+                );
+                serde_json::to_string(
+                    &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": uri.as_str(), "languageId": language, "version": version, "text": content}}}),
+                )?
+            } else {
+                super::client::full_did_change_message(&uri, version, &content)?
+            };
+            write_attempted = true;
+            writer.send(payload)?;
+            document_written = true;
+            let saved = if let Some(save) = save {
+                writer.send(super::client::did_save_message(
+                    &uri,
+                    (save == SaveNotification::IncludeText).then_some(content.as_str()),
+                )?)?;
+                Some((
+                    Instant::now(),
+                    begins_read.load(std::sync::atomic::Ordering::SeqCst),
+                ))
+            } else {
+                None
+            };
+            Ok((disk, saved))
+        })();
+        match sent {
+            Ok((disk, saved)) => result.documents.push(StartupReplayDocument {
+                path,
+                version,
+                opened,
+                disk,
+                saved,
+            }),
+            Err(error) => {
+                if document_written
+                    || (write_attempted && (!opened || matches!(error, LspError::Timeout(_))))
+                {
+                    result.documents.push(StartupReplayDocument {
+                        path,
+                        version,
+                        opened,
+                        disk: DiskSnapshot::default(),
+                        saved: None,
+                    });
+                }
+                result.error = Some(error);
+                break;
+            }
+        }
+    }
+    result
+}
+
 /// Completion flag for a server start running without the manager lock. A
 /// second start of the same server waits on it instead of spawning a twin.
 #[derive(Default)]
 struct StartSignal {
     finished: std::sync::Mutex<bool>,
     changed: std::sync::Condvar,
+    completion: parking_lot::Mutex<Option<Result<LspClient, SpawnFailure>>>,
+    outcome: parking_lot::Mutex<Option<ServerAttemptResult>>,
+    replay_completion: parking_lot::Mutex<Option<StartupReplayResult>>,
+    replay_gate: parking_lot::Mutex<()>,
+    cancelled: std::sync::atomic::AtomicBool,
+    request_deadline_exceeded: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    replay_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl StartSignal {
+    fn complete(&self, result: Result<LspClient, SpawnFailure>) {
+        let mut completion = self.completion.lock();
+        if !self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            *completion = Some(result);
+        }
+        drop(completion);
+        self.finish();
+    }
+
+    fn cancel(&self) {
+        let _replay = self.replay_gate.lock();
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        *self.outcome.lock() = Some(ServerAttemptResult::ProjectClosed);
+        self.completion.lock().take();
+        self.finish();
+    }
     fn finish(&self) {
         *self
             .finished
@@ -7694,6 +8417,8 @@ impl StartSignal {
 
 /// A server whose start is running without the manager lock.
 struct StartReservation {
+    definition: Option<ServerDef>,
+    source_file: Option<PathBuf>,
     instance: ServerInstanceId,
     /// Events from this server that arrived before its client was published.
     /// Handling them earlier would find no client for the key, so a
@@ -7703,28 +8428,76 @@ struct StartReservation {
     /// `LspManager::clients_generation` when the start began.
     clients_generation: u64,
     signal: Arc<StartSignal>,
+    /// Keep assigned versions until replay ends, including paths already sent,
+    /// so an edit arriving during replay cannot reset the document version.
+    notification_versions: HashMap<PathBuf, i32>,
+    /// Paths only: replay reads current disk text rather than retaining edits.
+    /// New distinct paths are rejected at the cap, never silently evicted.
+    pending_notifications: HashSet<PathBuf>,
+    /// The installed client instance whose writer is replaying these paths.
+    replay_pid: Option<u32>,
 }
 
-/// What an unlocked start does next, decided under the manager lock.
-enum StartNext {
-    /// Another thread is starting this server; wait for it, then look again.
-    Wait(Arc<StartSignal>),
-    /// This thread reserved the server and spawns it without the lock.
-    Spawn(PreparedSpawn),
+/// Watched changes wait for an initialized client and its subscription without
+/// starting a server or changing an already-running client's readiness state.
+struct PendingWatchedChanges {
+    generation: u64,
+    pid: Option<u32>,
+    changes: HashMap<PathBuf, PendingWatchedChange>,
 }
 
-/// Start one inspect producer without holding the manager lock across the
-/// spawn and the `initialize` handshake.
-///
-/// The handshake can take seconds (rust-analyzer on a large workspace), and
-/// while it held the lock every other manager user waited, including the
-/// standalone request loop, which drains LSP events and renders the status
-/// bar under that lock; a sibling `read` then waited for the handshake. The
-/// start reserves the server under the lock, spawns and initializes it
-/// unlocked, and publishes the client under the lock. A concurrent start of
-/// the same server waits for the reservation instead of spawning a second
-/// process. Outcomes match [`LspManager::start_applicable_servers`] for one
-/// server under a request deadline.
+struct PendingWatchedChange {
+    kind: FileChangeType,
+    raw: Option<PathBuf>,
+    extra_config_markers: Vec<String>,
+}
+
+/// Wait through spawn and replay until a final startup outcome or the deadline.
+fn wait_for_startup_outcome<G>(
+    lock: impl Fn() -> G,
+    signal: &StartSignal,
+    deadline: Instant,
+) -> Option<ServerAttemptResult>
+where
+    G: std::ops::DerefMut<Target = LspManager>,
+{
+    loop {
+        lock().publish_completed_starts();
+        if let Some(outcome) = signal.outcome.lock().clone() {
+            return Some(outcome);
+        }
+        if !signal.wait_until(deadline) {
+            return None;
+        }
+    }
+}
+
+/// Join existing startups for a workspace diagnostics request without
+/// starting servers for files the request has not opened.
+pub(crate) fn wait_for_pending_startups_unlocked<G>(
+    lock: impl Fn() -> G,
+    scope: Option<&Path>,
+) -> bool
+where
+    G: std::ops::DerefMut<Target = LspManager>,
+{
+    let deadline = Instant::now() + super::client::HANDSHAKE_REQUEST_TIMEOUT + INITIALIZE_EXIT_WAIT;
+    let signals: Vec<_> = lock()
+        .starting
+        .iter()
+        .filter(|(key, _)| {
+            scope.is_none_or(|scope| key.root.starts_with(scope) || scope.starts_with(&key.root))
+        })
+        .map(|(_, reservation)| Arc::clone(&reservation.signal))
+        .collect();
+    signals
+        .iter()
+        .all(|signal| wait_for_startup_outcome(&lock, signal, deadline).is_some())
+}
+
+/// Start or join one producer's reserved startup without holding the manager
+/// mutex across process creation, initialization, or waiting for completion.
+/// The request deadline limits waiting, not the worker's initialize handshake.
 pub fn start_applicable_server_unlocked(
     manager: &Arc<parking_lot::Mutex<LspManager>>,
     snapshot: &ApplicableServerSnapshot,
@@ -7736,87 +8509,109 @@ pub fn start_applicable_server_unlocked(
         failures: snapshot
             .producer_failures
             .iter()
-            .filter(|failure| failure.server_key == *server)
+            .filter(|f| f.server_key == *server)
             .cloned()
             .collect(),
         ..ApplicableServerStartOutcomes::default()
     };
-    let Some(candidate) = snapshot
-        .candidates
-        .iter()
-        .find(|candidate| candidate.key == *server)
-    else {
+    let Some(candidate) = snapshot.candidates.iter().find(|c| c.key == *server) else {
         return outcomes;
     };
-
-    let mut waited = false;
-    loop {
+    let mut retried_abandoned = false;
+    let result = loop {
         if Instant::now() >= deadline {
-            outcomes.deadline_exceeded = Some(candidate.key.clone());
+            outcomes.deadline_exceeded = Some(server.clone());
             return outcomes;
         }
-        let next =
-            manager
-                .lock()
-                .begin_unlocked_start(candidate, config, waited, deadline, &mut outcomes);
-        match next {
-            None => return outcomes,
-            Some(StartNext::Wait(signal)) => {
-                if !signal.wait_until(deadline) {
-                    outcomes.deadline_exceeded = Some(candidate.key.clone());
-                    return outcomes;
-                }
-                waited = true;
-            }
-            Some(StartNext::Spawn(prepared)) => {
-                // The inspect wait budget is not an initialize cancellation. Keep
-                // the reserved start alive after the caller's deadline, so a
-                // slow handshake can finish without being killed by AFT.
-                let (tx, rx) = std::sync::mpsc::sync_channel(1);
-                let initialize_timeout = prepared.inspect_initialize_timeout();
-                let manager = Arc::clone(manager);
-                let candidate = candidate.clone();
-                std::thread::spawn(move || {
-                    let mut reservation = ReservationGuard {
-                        manager: &manager,
-                        key: Some(candidate.key.clone()),
-                    };
-                    let result = prepared.run(Some(initialize_timeout));
-                    let mut completed = ApplicableServerStartOutcomes::default();
-                    manager.lock().finish_unlocked_start(
-                        &candidate,
-                        result,
-                        deadline,
-                        &mut completed,
-                    );
-                    reservation.key = None;
-                    let _ = tx.send(completed);
-                });
-                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                    Ok(completed) => {
-                        outcomes.successful.extend(completed.successful);
-                        outcomes.failures.extend(completed.failures);
-                        outcomes.deadline_exceeded = completed.deadline_exceeded;
-                    }
-                    Err(_) => outcomes.deadline_exceeded = Some(server.clone()),
-                }
-                return outcomes;
+        let (initial, signal) = {
+            let mut lsp = manager.lock();
+            lsp.startup_owner = Arc::downgrade(manager);
+            let result = lsp.start_server(
+                &candidate.definition,
+                server,
+                &candidate.source_file,
+                config,
+            );
+            let signal = lsp.starting.get(server).map(|r| Arc::clone(&r.signal));
+            (result, signal)
+        };
+        let abandoned_before_join = signal.as_ref().is_some_and(|signal| {
+            signal
+                .request_deadline_exceeded
+                .load(std::sync::atomic::Ordering::Acquire)
+        });
+        let result = if let (ServerAttemptResult::InProgress { .. }, Some(signal)) =
+            (&initial, signal)
+        {
+            wait_for_startup_outcome(|| manager.lock(), &signal, deadline).unwrap_or_else(|| {
+                signal
+                    .request_deadline_exceeded
+                    .store(true, std::sync::atomic::Ordering::Release);
+                initial
+            })
+        } else {
+            initial
+        };
+        // A new request can overlap cleanup of an earlier timed-out request.
+        // Observe its result, then retry once with the new request's budget and
+        // configuration instead of returning that abandoned attempt's failure.
+        if abandoned_before_join
+            && !retried_abandoned
+            && matches!(
+                result,
+                ServerAttemptResult::SpawnFailed { .. }
+                    | ServerAttemptResult::BinaryNotInstalled { .. }
+            )
+            && Instant::now() < deadline
+        {
+            let lsp = manager.lock();
+            if !lsp.is_quiesced() && lsp.failure_to_replay(server).is_none() {
+                retried_abandoned = true;
+                continue;
             }
         }
+        break result;
+    };
+    match result {
+        ServerAttemptResult::Ok { server_key } => outcomes.successful.push(server_key),
+        ServerAttemptResult::InProgress { server_key } => {
+            outcomes.in_progress.push(server_key.clone());
+            outcomes.deadline_exceeded = Some(server_key);
+        }
+        result => outcomes.failures.push(ApplicableServerFailure {
+            server_key: server.clone(),
+            result,
+        }),
+    }
+    outcomes
+}
+
+/// Wake waiters if a startup worker unwinds before publishing a result.
+struct StartupWorkerGuard {
+    signal: Arc<StartSignal>,
+    armed: bool,
+}
+
+impl StartupWorkerGuard {
+    fn new(signal: Arc<StartSignal>) -> Self {
+        Self {
+            signal,
+            armed: true,
+        }
+    }
+
+    fn publish(mut self, publish: impl FnOnce(&StartSignal)) {
+        // Waking a waiter can advance this signal to the next replay phase.
+        // Disarm before publication instead of inferring ownership from that
+        // phase's shared completion flag when this worker is dropped.
+        self.armed = false;
+        publish(&self.signal);
     }
 }
-
-/// Releases a reservation whose start unwound before publishing, so waiters
-/// are not left blocked on a start that will never finish.
-struct ReservationGuard<'a> {
-    manager: &'a parking_lot::Mutex<LspManager>,
-    key: Option<ServerKey>,
-}
-
-impl Drop for ReservationGuard<'_> {
+impl Drop for StartupWorkerGuard {
     fn drop(&mut self) {
-        if let Some(key) = self.key.take() {
-            self.manager.lock().release_start_reservation(&key);
+        if self.armed {
+            self.signal.cancel();
         }
     }
 }
@@ -7829,47 +8624,13 @@ enum FileServerStart {
     /// The server cannot start; report this.
     Failed(ServerAttemptResult),
     /// Another thread is starting this server; wait for it, then look again.
-    Wait(Arc<StartSignal>),
+    Wait,
     /// This thread reserved the server and starts it without the lock.
     Spawn(Box<PreparedSpawn>),
 }
 
-/// How long one wait for another thread's start of the same server lasts
-/// before the waiter looks at the manager again. A start ends on its own
-/// within the `initialize` budget; this only bounds a wait whose signal was
-/// lost to a start that unwound.
-const FILE_START_WAIT_SLICE: Duration = Duration::from_secs(5);
-
-/// Releases a reservation taken by [`ensure_server_for_file_detailed_unlocked`]
-/// if its start unwinds before publishing, so waiters are not left blocked.
-struct FileStartGuard<'a, L, G>
-where
-    L: Fn() -> G,
-    G: std::ops::DerefMut<Target = LspManager>,
-{
-    lock: &'a L,
-    key: Option<ServerKey>,
-}
-
-impl<L, G> Drop for FileStartGuard<'_, L, G>
-where
-    L: Fn() -> G,
-    G: std::ops::DerefMut<Target = LspManager>,
-{
-    fn drop(&mut self) {
-        if let Some(key) = self.key.take() {
-            (self.lock)().release_start_reservation(&key);
-        }
-    }
-}
-
-/// [`LspManager::ensure_server_for_file_detailed`] with the server spawn and
-/// its `initialize` handshake (up to 30 seconds) run without the manager
-/// lock. Each server to start is reserved under the lock; a concurrent caller
-/// for the same server waits on that one reservation rather than on the
-/// whole manager, and callers for other servers or for no server at all are
-/// not held up. Outcomes, failure caching and the retry backoff match the
-/// locked method. `lock` acquires the manager (for example `|| ctx.lsp()`).
+/// Start or join matching servers, releasing the manager mutex while waiting
+/// for the shared startup completion. Cold locked callers use the same worker.
 pub fn ensure_server_for_file_detailed_unlocked<G>(
     lock: impl Fn() -> G,
     file_path: &Path,
@@ -7880,54 +8641,38 @@ where
 {
     let mut outcomes = EnsureServerOutcomes::default();
     for def in servers_for_file(file_path, config) {
-        let server_id = def.kind.id_str().to_string();
-        let server_name = def.name.to_string();
-        let Some(key) = server_key_for_definition(&def, file_path, config) else {
-            outcomes.attempts.push(ServerAttempt {
-                server_id,
-                server_name,
-                result: ServerAttemptResult::NoRootMarker {
-                    looked_for: def.root_markers.iter().map(|s| s.to_string()).collect(),
-                },
-            });
-            continue;
-        };
-        let failure = loop {
-            let next = lock().begin_file_server_start(&def, &key, file_path, config);
-            match next {
-                FileServerStart::Running => break None,
-                FileServerStart::Failed(result) => break Some(result),
-                FileServerStart::Wait(signal) => {
-                    signal.wait_until(Instant::now() + FILE_START_WAIT_SLICE);
-                }
-                FileServerStart::Spawn(prepared) => {
-                    let mut guard = FileStartGuard {
-                        lock: &lock,
-                        key: Some(key.clone()),
-                    };
-                    let result = prepared.run(None);
-                    guard.key = None;
-                    break lock().finish_file_server_start(&def, &key, result);
-                }
+        let result = if let Some(key) = server_key_for_definition(&def, file_path, config) {
+            let (initial, signal) = {
+                let mut manager = lock();
+                let result = manager.start_server(&def, &key, file_path, config);
+                let signal = manager.starting.get(&key).map(|r| Arc::clone(&r.signal));
+                (result, signal)
+            };
+            if let (ServerAttemptResult::InProgress { .. }, Some(signal)) = (&initial, signal) {
+                wait_for_startup_outcome(
+                    &lock,
+                    &signal,
+                    Instant::now()
+                        + super::client::HANDSHAKE_REQUEST_TIMEOUT
+                        + INITIALIZE_EXIT_WAIT,
+                )
+                .unwrap_or(initial)
+            } else {
+                initial
+            }
+        } else {
+            ServerAttemptResult::NoRootMarker {
+                looked_for: def.root_markers.iter().map(|s| s.to_string()).collect(),
             }
         };
-        match failure {
-            Some(result) => outcomes.attempts.push(ServerAttempt {
-                server_id,
-                server_name,
-                result,
-            }),
-            None => {
-                outcomes.attempts.push(ServerAttempt {
-                    server_id,
-                    server_name,
-                    result: ServerAttemptResult::Ok {
-                        server_key: key.clone(),
-                    },
-                });
-                outcomes.successful.push(key);
-            }
+        if let ServerAttemptResult::Ok { server_key } = &result {
+            outcomes.successful.push(server_key.clone());
         }
+        outcomes.attempts.push(ServerAttempt {
+            server_id: def.kind.id_str().to_string(),
+            server_name: def.name.to_string(),
+            result,
+        });
     }
     outcomes
 }
@@ -7970,7 +8715,14 @@ where
     G: std::ops::DerefMut<Target = LspManager>,
 {
     let canonical_path = canonicalize_for_lsp(file_path)?;
-    ensure_server_for_file_detailed_unlocked(&lock, &canonical_path, config);
+    let outcomes = ensure_server_for_file_detailed_unlocked(&lock, &canonical_path, config);
+    if outcomes
+        .attempts
+        .iter()
+        .any(|attempt| matches!(attempt.result, ServerAttemptResult::InProgress { .. }))
+    {
+        return Err(LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()));
+    }
     // Every server is now running or has a remembered failure, so this
     // starts nothing under the lock unless a client vanished in between.
     lock().ensure_file_open(&canonical_path, config)
@@ -8618,7 +9370,7 @@ fn delay_applicability_walk_for_test() {
     }
 }
 
-/// Classify an error returned by `spawn_server` into a structured
+/// Classify a startup error into a structured
 /// `ServerAttemptResult`. The two interesting cases for callers are:
 /// - `BinaryNotInstalled` — the server's binary couldn't be resolved on PATH
 ///   or via override. The agent can be told "install bash-language-server".
@@ -8726,6 +9478,10 @@ fn env_binary_override_from(
 #[cfg(test)]
 #[path = "manager_regression_tests.rs"]
 mod regression_tests;
+
+#[cfg(all(test, unix))]
+#[path = "startup_regression_tests.rs"]
+mod startup_regression_tests;
 
 #[cfg(all(test, unix))]
 #[path = "instance_regression_tests.rs"]
@@ -9456,6 +10212,11 @@ mod unlocked_start_tests {
         manager.starting.insert(
             key.clone(),
             StartReservation {
+                definition: None,
+                source_file: None,
+                notification_versions: Default::default(),
+                pending_notifications: Default::default(),
+                replay_pid: None,
                 instance: super::ServerInstanceId::next(),
                 deferred_events: Vec::new(),
                 clients_generation: manager.clients_generation,
@@ -10064,7 +10825,9 @@ mod server_exit_reap_tests {
             2,
             "both orphans must be registered under the spawn key"
         );
-        let _ = manager.ensure_server_for_file(&main_rs, &config);
+        let _ = crate::lsp::manager::settled_lsp(&mut manager, |startup_manager| {
+            startup_manager.ensure_server_for_file(&main_rs, &config)
+        });
 
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -10270,7 +11033,9 @@ exit 1
         let snapshot = manager
             .resolve_applicable_servers_for_root(&root, &config)
             .unwrap();
-        let outcomes = manager.start_applicable_servers(&snapshot, &config);
+        let outcomes = crate::lsp::manager::settled_lsp(&mut manager, |startup_manager| {
+            startup_manager.start_applicable_servers(&snapshot, &config)
+        });
         let root_failure = outcomes
             .failures
             .iter()
@@ -10708,5 +11473,50 @@ mod document_pull_certificate_tests {
         let entry = manager.diagnostics.entries_for_file(&file)[0].1;
         assert!(entry.from_document_pull);
         assert_eq!(entry.diagnostics[0].message, "checked error");
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn settled_lsp<R>(
+    manager: &mut LspManager,
+    operation: impl Fn(&mut LspManager) -> R,
+) -> R {
+    let initial = operation(manager);
+    if !manager.has_pending_startups() {
+        return initial;
+    }
+    assert!(manager.wait_for_startups(Instant::now() + Duration::from_secs(30)));
+    operation(manager)
+}
+
+#[cfg(test)]
+mod startup_worker_guard_tests {
+    use super::*;
+
+    #[test]
+    fn published_worker_cannot_cancel_the_next_replay_phase() {
+        let signal = Arc::new(StartSignal::default());
+        let guard = StartupWorkerGuard::new(Arc::clone(&signal));
+        guard.publish(|signal| {
+            signal.finish();
+            // A woken manager can consume completion and start another batch
+            // before the publishing worker's scope ends.
+            *signal.finished.lock().unwrap() = false;
+        });
+        assert!(!signal.cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(signal.outcome.lock().is_none());
+        assert!(!signal.wait_until(Instant::now()));
+    }
+
+    #[test]
+    fn unpublished_worker_releases_its_reservation_on_drop() {
+        let signal = Arc::new(StartSignal::default());
+        drop(StartupWorkerGuard::new(Arc::clone(&signal)));
+        assert!(signal.cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(signal.wait_until(Instant::now()));
+        assert!(matches!(
+            *signal.outcome.lock(),
+            Some(ServerAttemptResult::ProjectClosed)
+        ));
     }
 }

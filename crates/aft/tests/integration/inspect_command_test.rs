@@ -4480,9 +4480,9 @@ fn rust_worker_inspect_capacity_refusal_is_partial_and_names_cap() {
         manager.override_binary(ServerKind::Rust, fake_server_path());
         manager.disable_rust_cargo_for_worker();
         assert_eq!(
-            manager
-                .ensure_server_for_file(file, &Config::default())
-                .len(),
+            crate::test_helpers::settled_lsp(&mut manager, |startup_manager| startup_manager
+                .ensure_server_for_file(file, &Config::default()))
+            .len(),
             1
         );
         occupied.push(manager);
@@ -4947,14 +4947,14 @@ fn review_python_background_pull_preserves_queued_rust_alert_once() {
     std::fs::write(&rust, "pub fn broken() {}\n").unwrap();
     configure_fake_rust_lsp(&ctx);
     let config = ctx.config();
-    let rust_key = ctx
-        .lsp()
-        .ensure_file_open(&rust, &config)
-        .unwrap()
-        .server_keys
-        .into_iter()
-        .find(|key| key.kind == ServerKind::Rust)
-        .unwrap();
+    let rust_key = crate::test_helpers::settled_lsp(&mut ctx.lsp(), |manager| {
+        manager.ensure_file_open(&rust, &config)
+    })
+    .unwrap()
+    .server_keys
+    .into_iter()
+    .find(|key| key.kind == ServerKind::Rust)
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         ctx.lsp().drain_events();
@@ -4969,7 +4969,10 @@ fn review_python_background_pull_preserves_queued_rust_alert_once() {
         .set_extra_env("AFT_FAKE_LSP_PULL_DELAY_SIGNAL", signal.to_str().unwrap());
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL_DELAY_MS", "500");
     let python = root.join("broken.py");
-    ctx.lsp().ensure_file_open(&python, &config).unwrap();
+    crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_file_open(&python, &config)
+    })
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     while !signal.exists() {
         ctx.lsp().drain_events();
@@ -5046,7 +5049,10 @@ fn python_dynamic_pull_populates_status_and_alert_source_without_inspect() {
     let (dir, ctx, log) = dynamic_python_pull_fixture();
     let file = std::fs::canonicalize(dir.path()).unwrap().join("broken.py");
     let config = ctx.config();
-    ctx.lsp().ensure_file_open(&file, &config).unwrap();
+    crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_file_open(&file, &config)
+    })
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut snapshots = Vec::new();
     loop {
@@ -5113,7 +5119,10 @@ fn open_dynamic_python(
     expected: usize,
 ) -> Vec<aft::alert_state::AcceptedDiagnosticSnapshot> {
     let config = ctx.config();
-    ctx.lsp().ensure_file_open(file, &config).unwrap();
+    crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_file_open(file, &config)
+    })
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut accepted = Vec::new();
     loop {
@@ -5421,7 +5430,10 @@ fn scoped_python_progress_second_file_after_idle_without_new_run_settles() {
     std::fs::write(dir.path().join("second.py"), "value: int = 'wrong'\n").unwrap();
     let first = std::fs::canonicalize(dir.path()).unwrap().join("broken.py");
     let config = ctx.config();
-    ctx.lsp().ensure_file_open(&first, &config).unwrap();
+    crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_file_open(&first, &config)
+    })
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut ended = false;
     loop {
@@ -5616,7 +5628,10 @@ fn scoped_python_progress_reanalysis_keeps_warm_counts_and_alert_episode() {
         .diagnostics_store_mut_for_test()
         .mark_stale_for_file(&file);
     let config = ctx.config();
-    ctx.lsp().ensure_file_open(&file, &config).unwrap();
+    crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_file_open(&file, &config)
+    })
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let drained = ctx.lsp().drain_events();
@@ -7733,10 +7748,10 @@ fn scoped_diagnostics_open_no_documents_and_close_none() {
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
 
     let config = ctx.config().clone();
-    let open_result = ctx
-        .lsp()
-        .ensure_file_open(&pre_opened, &config)
-        .expect("pre-open document");
+    let open_result = crate::test_helpers::settled_lsp(&mut ctx.lsp(), |manager| {
+        manager.ensure_file_open(&pre_opened, &config)
+    })
+    .expect("pre-open document");
     assert_eq!(open_result.newly_opened.len(), 1);
     let pre_open_events = collect_lsp_notifications(&ctx, "custom/documentOpened", 1);
     assert_eq!(pre_open_events[0]["uri"], file_uri(&pre_opened));
@@ -7796,9 +7811,10 @@ fn scoped_inspect_without_diagnostics_does_no_producer_work() {
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
-    ctx.lsp()
-        .ensure_file_open(&pre_opened, &ctx.config())
-        .unwrap();
+    crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_file_open(&pre_opened, &ctx.config())
+    })
+    .unwrap();
     collect_lsp_notifications(&ctx, "custom/documentOpened", 1);
     ctx.update_status_bar_tier2(Some(11), Some(12), Some(13), Some(14), false);
 
@@ -9797,7 +9813,9 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
     let ctx = new_context();
     let config = ctx.config();
     let file = root.join("src/lib.rs");
-    ctx.lsp().ensure_server_for_file(&file, &config);
+    crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_server_for_file(&file, &config)
+    });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
     loop {
         ctx.lsp().drain_events();
@@ -10099,7 +10117,9 @@ fn scoped_rust_inspect_does_not_take_a_check_announced_before_a_save_for_the_sav
     // a request round trip prove it ran and the reader queued its events,
     // without draining those events through the manager before the save.
     let config = ctx.config().clone();
-    let started = ctx.lsp().ensure_server_for_file(&lib, &config);
+    let started = crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_server_for_file(&lib, &config)
+    });
     assert!(!started.is_empty(), "the fake rust server must start");
     wait_for_path_event(&completed, "initial check completed");
     ctx.lsp()

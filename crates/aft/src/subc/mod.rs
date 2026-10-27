@@ -16973,7 +16973,12 @@ mod tests {
         );
         ctx.lsp()
             .set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN".into(), "1".into());
-        assert_eq!(ctx.lsp().ensure_server_for_file(&file, &config).len(), 1);
+        assert_eq!(
+            crate::lsp::manager::settled_lsp(&mut ctx.lsp(), |startup_manager| startup_manager
+                .ensure_server_for_file(&file, &config))
+            .len(),
+            1
+        );
         assert_eq!(ctx.lsp().active_client_count(), 1);
         let executor = Arc::new(Executor::new());
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
@@ -17000,7 +17005,9 @@ mod tests {
             .any(|failure| matches!(failure.result, ServerAttemptResult::ProjectClosed)));
         assert_eq!(ctx.lsp().active_client_count(), 0);
 
-        let file_denied = ctx.lsp().ensure_server_for_file_detailed(&file, &config);
+        let file_denied = crate::lsp::manager::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+            startup_manager.ensure_server_for_file_detailed(&file, &config)
+        });
         assert!(file_denied
             .attempts
             .iter()
@@ -17030,7 +17037,12 @@ mod tests {
         ctx.mark_subc_bound();
         ctx.lsp()
             .set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN".into(), "0".into());
-        assert_eq!(ctx.lsp().ensure_server_for_file(&file, &config).len(), 1);
+        assert_eq!(
+            crate::lsp::manager::settled_lsp(&mut ctx.lsp(), |startup_manager| startup_manager
+                .ensure_server_for_file(&file, &config))
+            .len(),
+            1
+        );
         let deadline = Instant::now() + Duration::from_secs(10);
         while ctx.lsp_child_registry().health_snapshot().children_total > 1 {
             assert!(Instant::now() < deadline, "old client must be reaped");
@@ -17080,7 +17092,12 @@ mod tests {
             "AFT_FAKE_LSP_CWD",
             &root.as_path().parent().unwrap().to_string_lossy(),
         );
-        assert_eq!(ctx.lsp().ensure_server_for_file(&file, &config).len(), 1);
+        assert_eq!(
+            crate::lsp::manager::settled_lsp(&mut ctx.lsp(), |startup_manager| startup_manager
+                .ensure_server_for_file(&file, &config))
+            .len(),
+            1
+        );
         assert_eq!(ctx.lsp().active_client_count(), 1);
         let pids = ctx.lsp_child_registry().pids();
         assert_eq!(pids.len(), 1, "one tracked server child: {pids:?}");
