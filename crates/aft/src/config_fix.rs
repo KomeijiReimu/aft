@@ -377,7 +377,8 @@ pub fn fix_files(targets: &[(PathBuf, FixTier)]) -> Vec<FixOutcome> {
     targets
         .iter()
         .map(|(path, tier)| {
-            let result = std::fs::read_to_string(path)
+            let result = crate::config::open_config_file(path)
+                .and_then(|file| std::io::read_to_string(file))
                 .map_err(|error| format!("could not read: {error}"))
                 .and_then(|text| {
                     let migration = migrate_config_text(&text, *tier)?;
@@ -613,7 +614,7 @@ pub(crate) fn auto_migrate_user_config_bounded(
         jsonc_edit::write_atomic_with_sync_warning,
         |path| {
             let read = (|| {
-                let file = std::fs::File::open(path)?;
+                let file = crate::config::open_config_file(path)?;
                 crate::subc_config::read_bounded_config(file, limit)
             })();
             if let Err(error) = &read {

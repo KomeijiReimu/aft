@@ -36,6 +36,10 @@ pub const CONFIG_RELOAD_DEBOUNCE: Duration = Duration::from_millis(150);
 /// File name both config tiers use.
 const CONFIG_FILE_NAME: &str = "aft.jsonc";
 
+/// Largest config file a live reload accepts, the same bound the bind-time
+/// read applies. An oversized or invalid file is reported instead of applied.
+const CONFIG_READ_LIMIT: usize = 1024 * 1024;
+
 fn process_epoch() -> Instant {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     *EPOCH.get_or_init(Instant::now)
@@ -479,15 +483,16 @@ fn read_tier(recorded: &TierSource) -> TierRead {
     let Some(path) = recorded.path.as_ref() else {
         return TierRead::Use(recorded.clone());
     };
-    match std::fs::read(path) {
-        Ok(bytes) => match String::from_utf8(bytes) {
-            Ok(text) => TierRead::Use(TierSource {
-                text: Some(text),
-                from_file: true,
-                ..recorded.clone()
-            }),
-            Err(_) => TierRead::Error(format!("{} is not valid UTF-8", path.display())),
-        },
+    // Shared open plus a bounded read, so a file that a tool or editor is
+    // replacing is never held against that replacement on Windows.
+    let read = crate::config::open_config_file(path)
+        .and_then(|file| crate::subc_config::read_bounded_config(file, CONFIG_READ_LIMIT));
+    match read {
+        Ok(text) => TierRead::Use(TierSource {
+            text: Some(text),
+            from_file: true,
+            ..recorded.clone()
+        }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if recorded.tier == "project" && recorded.from_file && recorded.text.is_some() {
                 // A successfully absent project file removes that tier. The
