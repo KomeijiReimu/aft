@@ -257,13 +257,6 @@ fn expand_legacy_project_paths(value: Value, project: &Path) -> Value {
     }
 }
 
-fn canonical_fixture_project(project: &Path) -> PathBuf {
-    let project = std::fs::canonicalize(project).unwrap();
-    #[cfg(windows)]
-    let project = aft::windows_path::normalize_windows_path(&project);
-    project
-}
-
 #[test]
 fn legacy_project_expansion_changes_only_marked_paths() {
     let project = Path::new("fixture").join("project");
@@ -924,7 +917,9 @@ impl Harness for Subject {
     }
     async fn spawn(&self, root: &Path) -> Result<Process, HarnessError> {
         prepare_provider_project(root)?;
-        *self.project.lock().unwrap() = Some(canonical_fixture_project(&root.join("project")));
+        // Replies echo the spelling sent in BindIdentity. Canonical aliases name
+        // the same files, but substituting them would change the expected bytes.
+        *self.project.lock().unwrap() = Some(root.join("project"));
         *self.served_tools.lock().unwrap() = None;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -4065,15 +4060,41 @@ async fn real_legacy_probe_wire_bytes_match_pre_flip_baselines() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn legacy_oracle_preserves_supplied_symlink_root() {
+    let fixture = tempfile::tempdir().unwrap();
+    let physical = fixture.path().join("physical-root");
+    let supplied = fixture.path().join("supplied-root");
+    std::fs::create_dir(&physical).unwrap();
+    std::os::unix::fs::symlink(&physical, &supplied).unwrap();
+    assert_ne!(
+        supplied,
+        std::fs::canonicalize(&supplied).unwrap(),
+        "the regression must exercise two spellings of the same root"
+    );
+    assert_legacy_probe_wire_bytes_at(Subject::head(), &supplied).await;
+}
+
 async fn assert_legacy_probe_wire_bytes(subject: Subject) {
+    let root = tempfile::tempdir().unwrap();
+    assert_legacy_probe_wire_bytes_at(subject, root.path()).await;
+}
+
+async fn assert_legacy_probe_wire_bytes_at(subject: Subject, root: &Path) {
     let fixtures = legacy_fixtures();
     assert_eq!(
         fixtures["source_commit"],
         "a209fc15f4ac5866ad3afe5ea111d7ca44ae74e9"
     );
     let preset = subject.preset.unwrap_or("head");
-    let root = tempfile::tempdir().unwrap();
-    let process = subject.spawn(root.path()).await.unwrap();
+    let process = subject.spawn(root).await.unwrap();
+    let project = subject.project.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        project,
+        process.root.join("project"),
+        "the oracle must use the exact project spelling sent on the route"
+    );
     let route = subject
         .route(&process, &subject.plain_stamp())
         .await
@@ -4105,10 +4126,7 @@ async fn assert_legacy_probe_wire_bytes(subject: Subject) {
             expected["wire_body"].as_str().unwrap(),
             "pinned legacy JSON and bytes must describe the same reply"
         );
-        let expected_reply = expand_legacy_project_paths(
-            expected["reply"].clone(),
-            &canonical_fixture_project(&root.path().join("project")),
-        );
+        let expected_reply = expand_legacy_project_paths(expected["reply"].clone(), &project);
         let expected_wire_body = serde_json::to_string(&expected_reply).unwrap();
         let diagnostic = serde_json::from_str::<Value>(&actual)
             .ok()
