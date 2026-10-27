@@ -27409,7 +27409,7 @@ mod tests {
         // update the fixture to the new live frame printed below.
         let live = serde_json::to_value(&each_line_terminal_frame()).unwrap();
         let pinned: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../packages/opencode-plugin/src/__tests__/fixtures/each-line-terminal-frame.json"
+            "../../../../packages/opencode-plugin/src/__tests__/fixtures/each-line-terminal-frame.json"
         ))
         .unwrap();
         assert_eq!(live, pinned);
