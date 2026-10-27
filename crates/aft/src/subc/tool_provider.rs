@@ -5696,7 +5696,9 @@ mod route_tests {
 
     #[tokio::test]
     async fn occipital_task_observation_is_limited_to_bound_session() {
-        use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
+        use crate::bash_background::persistence::{
+            create_task_layout, write_task_at, PersistedTask,
+        };
         use crate::bash_background::BgTaskStatus;
 
         let (dir, root) = test_support::test_root("occipital-tasks");
@@ -5710,7 +5712,13 @@ mod route_tests {
                 "foreign-output-marker",
             ),
         ] {
-            let paths = task_paths(&storage, session, id).unwrap();
+            // Allocate the bundle through the locked production path so the
+            // session directory is non-empty before the detached persisted-task
+            // GC from the first replay can see it. A bare task_paths +
+            // write_task leaves an empty session directory that the sweep can
+            // remove between creation and the first file write.
+            let task = create_task_layout(&storage, session, id).unwrap();
+            let paths = &task.paths;
             let mut metadata = PersistedTask::starting(
                 id.into(),
                 session.into(),
@@ -5722,7 +5730,7 @@ mod route_tests {
                 false,
             );
             metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
-            write_task(&paths.json, &metadata).unwrap();
+            write_task_at(&task, &metadata).unwrap();
             std::fs::write(&paths.stdout, output).unwrap();
             std::fs::write(&paths.stderr, "").unwrap();
             std::fs::write(&paths.exit, "0\n").unwrap();
