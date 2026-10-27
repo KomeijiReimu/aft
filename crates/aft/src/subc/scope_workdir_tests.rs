@@ -77,6 +77,7 @@ fn bind_observed(
     let (reply, lines) = crate::logging::capture_log_lines(|| {
         runtime.block_on(async {
             let app = App::default_shared();
+            let storage = tempfile::tempdir().unwrap();
             let executor = Arc::new(Executor::new());
             let metrics = Arc::new(DispatchPathMetrics::new());
             let (writer_tx, mut writer_rx) = mpsc::channel(8);
@@ -160,6 +161,7 @@ fn bind_observed(
                 Some(&test_support::bind_config_without_indexes(&root)),
                 usize::MAX,
                 None,
+                storage.path(),
             )
             .await
             .unwrap();

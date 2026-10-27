@@ -2354,6 +2354,85 @@ fn subc_bridge_same_root_rebind_is_acked_while_a_read_is_held() {
     );
 }
 
+/// The SQLite main file the first bind's actor opened, recorded by the driver
+/// and checked once the run has finished.
+static FRESH_ACTOR_DB_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// The fixture starts the module with an explicit storage path. The actor a
+/// first bind creates must open its aft.db there, not in the default data
+/// home, so the module and every actor keep one storage root.
+#[test]
+fn subc_bridge_fresh_bind_actor_opens_aft_db_in_the_module_storage_root() {
+    *FRESH_ACTOR_DB_PATH.lock().unwrap() = None;
+    run_subc_bridge_test_inner(
+        "subc_bridge_fresh_bind_actor_opens_aft_db_in_the_module_storage_root",
+        Duration::from_secs(45),
+        // AFT_STORAGE_DIR outranks an explicit path for the module and its
+        // actors alike, which would hide where the actor's own choice lands.
+        || vec![remove_test_env("AFT_STORAGE_DIR")],
+        drive_fresh_actor_database_daemon,
+        |_, _, roots| {
+            let opened = FRESH_ACTOR_DB_PATH
+                .lock()
+                .unwrap()
+                .take()
+                .expect("driver recorded the actor's database");
+            let expected = roots.storage.path().join("aft.db");
+            assert_eq!(
+                std::fs::canonicalize(&opened).expect("opened database exists"),
+                std::fs::canonicalize(&expected).expect("module storage database exists"),
+                "actor opened {} instead of the module's {}",
+                opened.display(),
+                expected.display()
+            );
+        },
+        true,
+        None,
+        real_configure_bridge_dispatch,
+        bridge_executor_config(),
+        false,
+        None,
+        None,
+    );
+}
+
+async fn drive_fresh_actor_database_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        executor,
+        ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    let root_id = ProjectRootId::from_path(&root1).expect("root1 id");
+    let actor = executor.actor_context(&root_id).expect("bound actor");
+    // The database opens after the bind is acknowledged; wait until the actor
+    // would admit a persistence-requiring tool.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let db = loop {
+        if actor.database_runtime_refusal("probe", "bash").is_none() {
+            if let Some(db) = actor.db() {
+                break db;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the bound actor never opened its database"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let opened = db
+        .lock()
+        .unwrap()
+        .path()
+        .map(std::path::PathBuf::from)
+        .expect("aft.db is a file-backed database");
+    *FRESH_ACTOR_DB_PATH.lock().unwrap() = Some(opened);
+    drop(db);
+    drop(actor);
+    send_connection_goodbye(&mut stream).await;
+}
+
 #[test]
 fn subc_bridge_configure_warning_pushes_are_session_scoped() {
     run_subc_bridge_test(

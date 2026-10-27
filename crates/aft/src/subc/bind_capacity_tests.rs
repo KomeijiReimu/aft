@@ -74,6 +74,7 @@ async fn exhausted_bind(tool: bool, completion_capacity: bool) {
     let mut live = HashMap::new();
     let mut pending = HashMap::new();
     let mut installed = HashMap::new();
+    let storage = tempfile::tempdir().unwrap();
     handle_control_request(
         &writer,
         &writer,
@@ -107,6 +108,7 @@ async fn exhausted_bind(tool: bool, completion_capacity: bool) {
         Some(&user),
         usize::MAX,
         None,
+        storage.path(),
     )
     .await
     .unwrap();

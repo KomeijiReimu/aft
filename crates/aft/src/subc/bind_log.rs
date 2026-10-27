@@ -98,6 +98,8 @@ mod tests {
                 None,
                 usize::MAX,
                 None,
+                // A management bind creates no actor, so no storage is opened.
+                Path::new("unused-management-storage"),
             )
             .await
             .unwrap();

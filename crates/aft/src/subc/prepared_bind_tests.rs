@@ -173,6 +173,7 @@ async fn real_bind_dispatch_scope_survives_config_edits_before_executor_admissio
         Some(&user),
         usize::MAX,
         None,
+        &dir.path().join("storage"),
     )
     .await;
     std::fs::write(&user, r#"{"url_fetch_allow_private":false}"#).unwrap();
