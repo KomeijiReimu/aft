@@ -45,6 +45,7 @@ pub struct PhaseTrace {
     launch_restore_wait: std::time::Duration,
     executor_submitted: Option<Instant>,
     job_admitted: Option<Instant>,
+    setup_done: Option<Instant>,
     translate_done: Option<Instant>,
     execute_done: Option<Instant>,
     format_done: Option<Instant>,
@@ -74,6 +75,7 @@ pub struct ToolCallEgressTiming {
 #[derive(Debug, Default)]
 struct PhaseCpuTrace {
     job_admitted: Option<ThreadCpuSample>,
+    setup_done: Option<ThreadCpuSample>,
     translate_done: Option<ThreadCpuSample>,
     execute_done: Option<ThreadCpuSample>,
     format_done: Option<ThreadCpuSample>,
@@ -86,6 +88,7 @@ struct PhaseCpuTrace {
 /// Platforms without a sufficiently fine thread clock always report unknown.
 #[derive(Debug, Clone, Default)]
 pub struct ToolCallPhaseCpu {
+    pub setup: Option<Duration>,
     pub translate: Option<Duration>,
     pub execute: Option<Duration>,
     pub format: Option<Duration>,
@@ -120,6 +123,15 @@ impl WaitingOn {
 pub struct ToolCallPhaseDurations {
     pub cpu: ToolCallPhaseCpu,
     pub queue: Duration,
+    /// From executor admission to the start of argument translation: the
+    /// route's call policy (confinement admission, access-policy scope, the
+    /// formatter launch-policy handle) and repeat-breaker capture. Kept apart
+    /// from `translate` so per-call policy work is not mistaken for argument
+    /// translation.
+    pub setup: Duration,
+    /// From the start of argument translation to a dispatchable request:
+    /// disabled-tool and database gates, hashline registration, and the
+    /// translation itself.
     pub translate: Duration,
     pub execute: Duration,
     pub format: Duration,
@@ -165,6 +177,7 @@ impl PhaseTrace {
             launch_restore_wait: std::time::Duration::ZERO,
             executor_submitted: None,
             job_admitted: None,
+            setup_done: None,
             translate_done: None,
             execute_done: None,
             format_done: None,
@@ -197,6 +210,13 @@ impl PhaseTrace {
         }
     }
 
+    /// The call reached argument translation; everything since admission was
+    /// call-policy setup.
+    fn mark_setup_done(&mut self) {
+        self.setup_done = Some(Instant::now());
+        self.cpu.setup_done = ThreadCpuSample::now();
+    }
+
     fn mark_translate_done(&mut self) {
         self.translate_done = Some(Instant::now());
         self.cpu.translate_done = ThreadCpuSample::now();
@@ -227,6 +247,8 @@ impl PhaseTrace {
     pub(crate) fn mark_provider_read_done(&mut self) {
         // Provider reads have no tool translation, formatting, or finalization
         // phases; keep their executor wait and operation time in the shared trace.
+        self.setup_done = self.job_admitted;
+        self.cpu.setup_done = self.cpu.job_admitted;
         self.translate_done = self.job_admitted;
         self.cpu.translate_done = self.cpu.job_admitted;
         self.mark_execute_done();
@@ -253,9 +275,16 @@ impl PhaseTrace {
         let execute_done = self.execute_done?;
         let format_done = self.format_done?;
         let finalize_done = self.finalize_done?;
+        // A call refused before argument translation started has no setup
+        // mark; all of its pre-dispatch time then counts as translate.
+        let (setup_done, cpu_setup_done) = match self.setup_done {
+            Some(setup_done) => (setup_done, self.cpu.setup_done),
+            None => (job_admitted, self.cpu.job_admitted),
+        };
         Some(ToolCallPhaseDurations {
             cpu: ToolCallPhaseCpu {
-                translate: ThreadCpuSample::elapsed(self.cpu.job_admitted, self.cpu.translate_done),
+                setup: ThreadCpuSample::elapsed(self.cpu.job_admitted, cpu_setup_done),
+                translate: ThreadCpuSample::elapsed(cpu_setup_done, self.cpu.translate_done),
                 execute: if self.cpu.execute_suspended {
                     None
                 } else {
@@ -266,7 +295,8 @@ impl PhaseTrace {
                 egress_prepare: egress.prepare_cpu,
             },
             queue: job_admitted.duration_since(executor_submitted),
-            translate: translate_done.duration_since(job_admitted),
+            setup: setup_done.duration_since(job_admitted),
+            translate: translate_done.saturating_duration_since(setup_done),
             execute: execute_done.duration_since(translate_done),
             format: format_done.duration_since(execute_done),
             finalize: finalize_done.duration_since(format_done),
@@ -414,6 +444,9 @@ pub(crate) fn prepare_tool_call(
     app_ctx: &AppContext,
     mut phase_trace: Option<&mut PhaseTrace>,
 ) -> Result<PreparedToolCall, ToolCallResult> {
+    if let Some(trace) = phase_trace.as_mut() {
+        trace.mark_setup_done();
+    }
     // A tool the user disabled is refused before anything else happens: no
     // hashline registration, translation, permission preflight or backup.
     let refusal = match ctx.disabled_tools.as_deref() {
@@ -457,7 +490,7 @@ pub(crate) fn prepare_tool_call(
         ));
     }
     if ctx.worker_session {
-        app_ctx.lsp().disable_rust_cargo_for_worker();
+        app_ctx.disable_rust_cargo_for_worker();
     }
     let sanitized_args = strip_agent_preview_arg_owned(args);
     let binding_root = app_ctx
@@ -1543,6 +1576,7 @@ mod tests {
             launch_restore_wait: Duration::ZERO,
             executor_submitted: Some(t0 + Duration::from_millis(1)),
             job_admitted: Some(t0 + Duration::from_millis(3)),
+            setup_done: None,
             translate_done: Some(t0 + Duration::from_millis(6)),
             execute_done: Some(t0 + Duration::from_millis(10)),
             format_done: Some(t0 + Duration::from_millis(15)),
@@ -1571,6 +1605,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(phases.queue, Duration::from_millis(2));
+        assert_eq!(phases.setup, Duration::ZERO);
         assert_eq!(phases.translate, Duration::from_millis(3));
         assert_eq!(phases.execute, Duration::from_millis(4));
         assert_eq!(phases.format, Duration::from_millis(5));
@@ -1587,6 +1622,28 @@ mod tests {
         assert!(phases.writer_queue_was_full);
         assert_eq!(phases.writer_reserve_timeouts, 2);
         assert_eq!(phases.total, Duration::from_millis(48));
+    }
+
+    /// Call-policy work between executor admission and argument translation
+    /// is its own `setup` phase. It used to be reported as `translate`, which
+    /// sent a slow worker policy build looking like slow argument translation.
+    #[test]
+    fn phase_trace_reports_call_policy_setup_apart_from_translation() {
+        let mut trace = PhaseTrace::new(Instant::now());
+        trace.mark_executor_submitted();
+        trace.mark_job_admitted();
+        std::thread::sleep(Duration::from_millis(30));
+        trace.mark_setup_done();
+        trace.mark_translate_done();
+        let phases = finish_cpu_phase(trace);
+        assert!(phases.setup >= Duration::from_millis(30), "{phases:?}");
+        assert!(phases.translate < Duration::from_millis(30), "{phases:?}");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(
+            phases.cpu.setup.is_some() && phases.cpu.translate.is_some(),
+            "{:?}",
+            phases.cpu
+        );
     }
 
     #[test]

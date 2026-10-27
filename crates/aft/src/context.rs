@@ -4661,6 +4661,9 @@ pub struct AppContext {
     watcher_runtime_identity: parking_lot::Mutex<Option<WatcherRuntimeIdentity>>,
     watcher_counters: RwLock<Arc<WatcherCounters>>,
     lsp_manager: Arc<parking_lot::Mutex<LspManager>>,
+    /// The LSP manager's "a worker used this root" flag, readable without the
+    /// manager lock (see [`AppContext::disable_rust_cargo_for_worker`]).
+    lsp_rust_worker_policy: Arc<std::sync::atomic::AtomicBool>,
     /// Advances with every configuration publication; a background
     /// language-server applicability walk stores its result only while it
     /// still matches (see `refresh_project_applicability`).
@@ -5468,6 +5471,7 @@ impl AppContext {
             watcher_thread: parking_lot::Mutex::new(None),
             watcher_runtime_identity: parking_lot::Mutex::new(None),
             watcher_counters: RwLock::new(watcher_counters),
+            lsp_rust_worker_policy: lsp_manager.rust_worker_policy(),
             lsp_manager: Arc::new(parking_lot::Mutex::new(lsp_manager)),
             project_applicability_epoch: Arc::new(AtomicU64::new(0)),
             project_applicability_progress: Arc::default(),
@@ -14293,6 +14297,23 @@ impl AppContext {
     /// Access the LSP manager.
     pub fn lsp(&self) -> parking_lot::MutexGuard<'_, LspManager> {
         self.lsp_manager.lock()
+    }
+
+    /// Keep Cargo-driven rust-analyzer checks off for this root from the first
+    /// worker call on (see [`LspManager::disable_rust_cargo_for_worker`]).
+    ///
+    /// Every worker tool call asks for this, so the flag is read without the
+    /// manager lock first: once it is set the call returns at once instead of
+    /// waiting behind a language-server start or a diagnostics request that
+    /// holds the lock. Only the first worker call on a root takes the lock.
+    pub fn disable_rust_cargo_for_worker(&self) {
+        if self
+            .lsp_rust_worker_policy
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        self.lsp_manager.lock().disable_rust_cargo_for_worker();
     }
 
     /// The LSP manager if no other thread holds it right now. For callers on
@@ -24048,5 +24069,41 @@ mod semantic_probe_tests {
         assert!(!ctx.semantic_refresh_probe_ready());
         assert!(!ctx.semantic_refresh_probe_is_scheduled());
         assert!(!ctx.completion_drains_have_work());
+    }
+}
+
+#[cfg(test)]
+mod worker_rust_cargo_policy_tests {
+    use super::*;
+
+    /// Every worker tool call asks to keep Cargo checks off. Once the flag is
+    /// set, asking again must not wait for the LSP manager lock, which a
+    /// language-server start or a diagnostics request can hold for seconds.
+    #[test]
+    fn worker_rust_cargo_policy_is_answered_without_the_lsp_lock_once_set() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config::default(),
+        );
+        assert!(!ctx.lsp().rust_cargo_disabled_for_worker());
+        ctx.disable_rust_cargo_for_worker();
+        assert!(ctx.lsp().rust_cargo_disabled_for_worker());
+
+        let held = ctx.lsp();
+        let (answered_tx, answered_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                ctx.disable_rust_cargo_for_worker();
+                let _ = answered_tx.send(());
+            });
+            let answered = answered_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok();
+            drop(held);
+            assert!(
+                answered,
+                "a repeated worker call waited for the LSP manager lock"
+            );
+        });
     }
 }
