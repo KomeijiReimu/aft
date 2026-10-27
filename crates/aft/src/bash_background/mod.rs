@@ -1681,6 +1681,10 @@ pub(crate) fn note_storage_root(storage_root: &std::path::Path) {
 }
 
 pub fn storage_dir(configured: Option<&std::path::Path>) -> PathBuf {
+    // Test hook for the health-rollup path cache: one tick over many contexts
+    // sharing a storage root must resolve it once, not once per context.
+    #[cfg(test)]
+    STORAGE_DIR_CALLS.with(|calls| calls.set(calls.get() + 1));
     let lookup = |name: &str| std::env::var_os(name);
     let fallback_home = std::env::home_dir();
     let current_dir = std::env::current_dir().ok();
@@ -1714,6 +1718,28 @@ pub fn cache_artifact_root(cache_root: Option<&std::path::Path>) -> PathBuf {
         }
         None => storage_dir(None),
     }
+}
+
+// Test hook counting storage_dir resolutions on this thread. Reset
+// before a health tick and read after it to prove the tick resolved shared
+// roots once instead of once per context.
+#[cfg(test)]
+thread_local! {
+    static STORAGE_DIR_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test hook counting [`storage_dir`] resolutions on this thread. Reset
+/// before a health tick and read after it to prove the tick resolved shared
+/// roots once instead of once per context.
+#[cfg(test)]
+pub(crate) fn storage_dir_calls_for_test() -> u64 {
+    STORAGE_DIR_CALLS.with(|calls| calls.get())
+}
+
+/// Test hook resetting [`storage_dir_calls_for_test`].
+#[cfg(test)]
+pub(crate) fn reset_storage_dir_calls_for_test() {
+    STORAGE_DIR_CALLS.with(|calls| calls.set(0));
 }
 
 /// Resolve the current test environment's default, excluding AFT-specific
