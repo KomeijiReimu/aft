@@ -453,7 +453,7 @@ fn audit_natural_completion_and_timeout_remove_proxy() {
     isolated("audit_natural_completion_and_timeout_remove_proxy", || {
         for timeout in [false, true] {
             let f = Fixture::new();
-            let command = format!("printf '%s' \"$TMPDIR\" > scratch-path; {}; : > first; while [ ! -f finish ]; do sleep 0.05; done", f.curl());
+            let command = format!("printf '%s' \"${{SSL_CERT_FILE%/*}}\" > scratch-path; {}; : > first; while [ ! -f finish ]; do sleep 0.05; done", f.curl());
             let extra = if timeout {
                 json!({"timeout":2500})
             } else {
