@@ -163,7 +163,7 @@ async fn route_cancel_test_tool(
     corr: u64,
     name: &str,
     arguments: Value,
-) -> mpsc::Receiver<Frame> {
+) -> mpsc::Receiver<wire::WriterFrame> {
     let identity = RouteIdentity(Arc::new(RouteIdentityData {
         root: root.clone(),
         project_root: root.as_path().into(),
@@ -254,12 +254,13 @@ async fn next_bash_reply(
 }
 
 #[cfg(unix)]
-async fn next_cancel_test_tool_reply(replies: &mut mpsc::Receiver<Frame>) -> String {
-    let reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+async fn next_cancel_test_tool_reply(replies: &mut mpsc::Receiver<wire::WriterFrame>) -> String {
+    let mut reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
         .await
         .expect("tool call settles")
         .expect("tool call reply");
-    let body: Value = serde_json::from_slice(&reply.payload).unwrap();
+    reply.project_tool_result().unwrap();
+    let body: Value = serde_json::from_slice(reply.body()).unwrap();
     body["content"][0]["text"]
         .as_str()
         .unwrap_or_else(|| panic!("tool reply has no text: {body}"))
