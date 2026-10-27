@@ -27,6 +27,24 @@ use super::segment_store::{rel_path_to_os, SegmentReader, TrigramFlag, TrigramPa
 use super::snapshot::{DiskState, Snapshot, Source, WatcherState};
 use super::RelPath;
 
+/// `root` joined with a checkout-relative path in the platform's own
+/// separators. `RelPath` stores `/`; on Windows a `/` left inside the result
+/// gives a mixed spelling unlike the legacy index's paths, and under a `\\?\`
+/// root (the canonical form of checkout roots there) Windows reads it
+/// literally, so the file is not found. Each component is pushed separately.
+fn absolute_member_path(
+    root: &Path,
+    path: &RelPath,
+) -> super::segment_store::SegmentResult<PathBuf> {
+    let relative = rel_path_to_os(path)?;
+    #[cfg(windows)]
+    if let Some(text) = relative.to_str().filter(|text| text.contains('/')) {
+        let mut absolute = root.to_path_buf();
+        absolute.extend(text.split('/'));
+        return Ok(absolute);
+    }
+    Ok(root.join(relative))
+}
 /// Checkout-local lexical authority, independent of the semantic worker's
 /// lifetime and model availability. Queries serialize reconciliation so an
 /// installed membership and its payloads always come from the same snapshot.
@@ -233,9 +251,8 @@ impl LexicalView {
             let DiskState::Present { content, size } = disk else {
                 continue;
             };
-            let absolute = self
-                .root
-                .join(rel_path_to_os(&path).map_err(|error| error.to_string())?);
+            let absolute =
+                absolute_member_path(&self.root, &path).map_err(|error| error.to_string())?;
             let key = crate::blob_store::v2::TrigramKey {
                 content,
                 policy: self.policy,
@@ -637,8 +654,8 @@ impl GenerationIndex {
             relative_gaps: Vec::new(),
         };
         for path in candidates.indexed.union(&candidates.direct) {
-            let absolute = match rel_path_to_os(path) {
-                Ok(relative) => root.join(relative),
+            let absolute = match absolute_member_path(root, path) {
+                Ok(absolute) => absolute,
                 Err(_) => {
                     record_conversion_gap(&mut result, path);
                     continue;
@@ -925,7 +942,7 @@ impl TrigramDriver {
         let resident = self.resident.lock().unwrap_or_else(|e| e.into_inner());
         let mut gaps = snapshot
             .pending_intent()
-            .filter_map(|path| rel_path_to_os(path).ok().map(|path| self.root.join(path)))
+            .filter_map(|path| absolute_member_path(&self.root, path).ok())
             .collect::<Vec<_>>();
         if plane != FamilyPlane::Trigram
             || access.scope() != self.scope
@@ -941,15 +958,15 @@ impl TrigramDriver {
                     .candidates(&snapshot, &members, "")
                     .direct
                     .iter()
-                    .filter_map(|path| rel_path_to_os(path).ok().map(|path| self.root.join(path))),
+                    .filter_map(|path| absolute_member_path(&self.root, path).ok()),
             );
         }
         for (path, entry) in snapshot.live_entries() {
             if entry.disk != DiskState::Absent
                 && !entry.attachments.contains_key(&FamilyPlane::Trigram)
             {
-                if let Ok(path) = rel_path_to_os(path) {
-                    gaps.push(self.root.join(path));
+                if let Ok(path) = absolute_member_path(&self.root, path) {
+                    gaps.push(path);
                 }
             }
         }
@@ -1025,8 +1042,9 @@ pub fn materialize(
         let payload = if let Some(attachment) = attachment {
             attachment.payload.clone()
         } else {
-            let relative = rel_path_to_os(path).map_err(|e| plane_error(e.to_string()))?;
-            let bytes = fs::read(root.join(relative)).map_err(|e| plane_error(e.to_string()))?;
+            let absolute =
+                absolute_member_path(root, path).map_err(|e| plane_error(e.to_string()))?;
+            let bytes = fs::read(absolute).map_err(|e| plane_error(e.to_string()))?;
             if ContentHash::of(&bytes) != *content || bytes.len() as u64 != *size {
                 return Err(plane_error("source changed during trigram construction"));
             }
@@ -1150,9 +1168,9 @@ pub fn materialize_v3_observed(
         let payload = match attachment {
             Some(attachment) => attachment.payload.clone(),
             None => {
-                let relative = rel_path_to_os(path).map_err(|e| plane_error(e.to_string()))?;
-                let bytes =
-                    fs::read(root.join(relative)).map_err(|e| plane_error(e.to_string()))?;
+                let absolute =
+                    absolute_member_path(root, path).map_err(|e| plane_error(e.to_string()))?;
+                let bytes = fs::read(absolute).map_err(|e| plane_error(e.to_string()))?;
                 if ContentHash::of(&bytes) != *content || bytes.len() as u64 != *size {
                     return Err(plane_error("source changed during trigram construction"));
                 }
@@ -1555,6 +1573,26 @@ mod tests {
         .snapshot()
         .unwrap_err()
         .contains("not ready"));
+    }
+
+    /// Windows reads a `\\?\` path literally, so a `/` left in a joined
+    /// member path names a file that does not exist; plain roots must also
+    /// come out in native separators to match the legacy index's spelling.
+    #[cfg(windows)]
+    #[test]
+    fn member_paths_use_native_separators_under_plain_and_verbatim_roots() {
+        let path = RelPath::new(b"src/nested/a.rs".to_vec()).unwrap();
+        for (root, expected) in [
+            (r"\\?\C:\checkout", r"\\?\C:\checkout\src\nested\a.rs"),
+            (r"C:\checkout", r"C:\checkout\src\nested\a.rs"),
+        ] {
+            assert_eq!(
+                absolute_member_path(Path::new(root), &path)
+                    .unwrap()
+                    .as_os_str(),
+                std::ffi::OsStr::new(expected)
+            );
+        }
     }
 
     #[test]
