@@ -833,7 +833,10 @@ mod tests {
         assert_eq!(record_count(&conn), 0);
         assert_eq!(template_count(&conn), 0);
         // A terminal call with a published pin records, with both digests.
+        // The parent row is written first, as the production wrapper does.
         let metadata = terminal_task_metadata_for_test(Some(&pin));
+        let row = task_row_for_test(&metadata, "harness", "completed", Some(7), true);
+        super::super::bash_tasks::upsert_bash_task(&conn, &row).unwrap();
         assert!(write_view_record(
             &conn,
             "harness",
@@ -919,6 +922,8 @@ mod tests {
         let _writing = enable_test_view_writing_for_test(manifest.clone());
         let conn = migrated_memory_conn();
         let metadata = terminal_task_metadata_for_test(Some(&pin));
+        let row = task_row_for_test(&metadata, "harness", "completed", Some(7), true);
+        super::super::bash_tasks::upsert_bash_task(&conn, &row).unwrap();
         assert!(write_view_record(
             &conn,
             "harness",
