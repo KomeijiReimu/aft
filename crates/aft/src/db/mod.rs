@@ -58,7 +58,6 @@ const MIGRATION_VERSIONS: &[u32] = &[
     19,
     rich_ui::SCHEMA_VERSION,
     21,
-]
 ];
 
 // Performance-only indexes do not change the table format or reader floor.
@@ -1456,24 +1455,24 @@ mod tests {
     }
 
     #[test]
-    fn migration_v20_opens_v19_with_default_first_match_and_new_reader_floor() {
+    fn migration_v21_opens_v20_with_default_first_match_and_new_reader_floor() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("aft.db");
         let conn = Connection::open(&path).unwrap();
-        for version in 1..=19 {
+        for version in 1..=20 {
             apply_migration_statements(&conn, version).unwrap();
         }
-        conn.execute("INSERT INTO schema_version(version) VALUES (19)", [])
+        conn.execute("INSERT INTO schema_version(version) VALUES (20)", [])
             .unwrap();
         drop(conn);
         crate::reader_floor::raise(
             dir.path(),
-            &[(crate::persisted_format::PersistedStore::AftDb, 19)],
+            &[(crate::persisted_format::PersistedStore::AftDb, 20)],
         )
         .unwrap();
         assert!(crate::reader_floor::prepare(dir.path()).is_empty());
         let conn = open(&path).unwrap();
-        assert_eq!(schema_version(&conn), 20);
+        assert_eq!(schema_version(&conn), 21);
         let columns = conn
             .prepare("PRAGMA table_info(bash_pattern_watches)")
             .unwrap()
@@ -1500,7 +1499,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .get(crate::persisted_format::PersistedStore::AftDb),
-            Some(20)
+            Some(21)
         );
     }
 
