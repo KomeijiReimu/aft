@@ -1399,5 +1399,202 @@ mod url_tests {
                 "a folder adopted with no scope must not be kept"
             );
         }
+
+        impl Run {
+            /// Every string the response carries, unescaped, one per line.
+            fn strings(&self) -> String {
+                fn walk(value: &serde_json::Value, out: &mut String) {
+                    match value {
+                        serde_json::Value::String(text) => {
+                            out.push_str(text);
+                            out.push('\n');
+                        }
+                        serde_json::Value::Array(items) => {
+                            items.iter().for_each(|item| walk(item, out))
+                        }
+                        serde_json::Value::Object(fields) => {
+                            fields.values().for_each(|item| walk(item, out))
+                        }
+                        _ => {}
+                    }
+                }
+                let mut out = String::new();
+                walk(&self.response.data, &mut out);
+                out
+            }
+        }
+
+        fn granted_vault_with(rule: LabelRule, key: &[u8]) -> FakeVault {
+            let vault = FakeVault::new();
+            vault.set_resolution("test", crate::secret::granted(rule, "grant-1"));
+            vault.set_material("test", vec![key.to_vec()]);
+            vault
+        }
+
+        /// Like [`run`] with a stamped identity, plus an extra change to the
+        /// fetch options (a name lookup observer, for example). Also returns
+        /// the bytes of each private document while it still existed.
+        fn run_with(
+            fixture: &Fixture,
+            vault: &FakeVault,
+            servers: &[(&str, SocketAddr)],
+            req: &RawRequest,
+            extra: impl Fn(&mut UrlFetchOptions) + 'static,
+        ) -> (Run, Vec<Vec<u8>>) {
+            struct Restore;
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    TEST_FETCH_VAULT.with(|slot| slot.replace(None));
+                    TEST_FETCH_OPTIONS.with(|slot| slot.replace(None));
+                    TEST_DOCUMENT_OBSERVER.with(|slot| slot.replace(None));
+                }
+            }
+            let _restore = Restore;
+            let vault: Arc<dyn SecretVault> = Arc::new(vault.clone());
+            TEST_FETCH_VAULT.with(|slot| slot.replace(Some(vault)));
+            let client = fixture.tls.client.clone();
+            let routes: Vec<(String, SocketAddr)> = servers
+                .iter()
+                .map(|(host, addr)| (host.to_string(), *addr))
+                .collect();
+            TEST_FETCH_OPTIONS.with(|slot| {
+                slot.replace(Some(Box::new(move |options: &mut UrlFetchOptions| {
+                    options.tls_config = Some(client.clone());
+                    for (host, addr) in &routes {
+                        options.public_host_overrides.push((
+                            host.clone(),
+                            vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+                        ));
+                        options.connect_overrides.push((host.clone(), *addr));
+                    }
+                    extra(options);
+                })))
+            });
+            let documents = Rc::new(RefCell::new(Vec::new()));
+            let contents = Rc::new(RefCell::new(Vec::new()));
+            let (seen, read) = (Rc::clone(&documents), Rc::clone(&contents));
+            TEST_DOCUMENT_OBSERVER.with(|slot| {
+                slot.replace(Some(Box::new(move |path: &Path| {
+                    seen.borrow_mut().push((path.to_path_buf(), path.exists()));
+                    read.borrow_mut()
+                        .push(std::fs::read(path).unwrap_or_default());
+                })))
+            });
+            let call = || match req.command.as_str() {
+                "outline" => super::super::super::outline::handle_outline(req, &fixture.ctx),
+                _ => super::super::super::zoom::handle_zoom(req, &fixture.ctx),
+            };
+            let response = crate::subc::with_secret_identity_for_test(&fixture.root, stamp(), call);
+            let documents = documents.borrow().clone();
+            let contents = contents.borrow().clone();
+            (
+                Run {
+                    response,
+                    documents,
+                },
+                contents,
+            )
+        }
+
+        fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+            !needle.is_empty()
+                && haystack
+                    .windows(needle.len())
+                    .any(|window| window == needle)
+        }
+
+        fn assert_absent(run: &Run, documents: &[Vec<u8>], needles: &[&[u8]]) {
+            let strings = run.strings();
+            for needle in needles {
+                let shown = String::from_utf8_lossy(needle);
+                assert!(
+                    !contains(strings.as_bytes(), needle),
+                    "{shown} reached the response: {strings}"
+                );
+                for document in documents {
+                    assert!(
+                        !contains(document, needle),
+                        "{shown} reached the document: {}",
+                        String::from_utf8_lossy(document)
+                    );
+                }
+            }
+        }
+
+        fn no_extra(_: &mut UrlFetchOptions) {}
+
+        /// A redirect whose Location spells the key only after URL parsing
+        /// has normalized it (a tab the parser drops, a dot segment it
+        /// collapses, a host name it lowercases, a second layer of percent
+        /// encoding) is refused before the next hop is looked up or sent.
+        #[test]
+        fn redirect_locations_that_reassemble_the_key_after_parsing_are_refused() {
+            let fixture = fixture(Default::default());
+            let other = serve(&fixture.tls, |_| Some(markdown(b"# Other\n")));
+            let op = other.addr.port();
+            let cases: Vec<(&'static [u8], String)> = vec![
+                (
+                    KEY,
+                    format!("https://other.secret.test:{op}/v1/doc.md?leaked=fetch-\tsecret-key/0123456789+abc"),
+                ),
+                (
+                    KEY,
+                    format!("https://other.secret.test:{op}/fetch-secret-key/./0123456789+abc"),
+                ),
+                (
+                    b"abcdefghijklmnop",
+                    "https://ABCDEFGHIJKLMNOP.attacker.test/x".to_string(),
+                ),
+                (
+                    b"0123456789abcdef",
+                    format!("https://other.secret.test:{op}/collect?v=%2530%2531%2532%2533%2534%2535%2536%2537%2538%2539%2561%2562%2563%2564%2565%2566"),
+                ),
+            ];
+            for (key, location) in cases {
+                let shown = location.clone();
+                let api = serve(&fixture.tls, move |_| {
+                    Some(http("302 Found", &[("Location", location.as_str())], b""))
+                });
+                let port = api.addr.port();
+                let url = format!("https://api.secret.test:{port}/v1/doc.md?key={PLACEHOLDER}");
+                let vault = granted_vault_with(rule("api.secret.test", port, "/v1"), key);
+                let lookups = Arc::new(Mutex::new(Vec::<String>::new()));
+                let seen = Arc::clone(&lookups);
+                let routes = [
+                    ("api.secret.test", api.addr),
+                    ("other.secret.test", other.addr),
+                ];
+                let (run, documents) = run_with(
+                    &fixture,
+                    &vault,
+                    &routes,
+                    &request("outline", &url, serde_json::json!({})),
+                    move |options| {
+                        let seen = Arc::clone(&seen);
+                        options.lookup_override = Some(Arc::new(move |host: &str| {
+                            seen.lock().unwrap().push(host.to_string());
+                            Ok(vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))])
+                        }));
+                    },
+                );
+                assert!(!run.response.success, "{shown:?}: {:?}", run.response.data);
+                assert_absent(&run, &documents, &[key]);
+                assert_eq!(api.targets().len(), 1, "{shown:?}");
+                let raw = String::from_utf8_lossy(key).into_owned();
+                assert!(
+                    lookups
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|host| !host.contains(&raw)),
+                    "{shown:?}: a key-bearing host name was looked up"
+                );
+            }
+            assert_eq!(
+                other.connections.load(Ordering::SeqCst),
+                0,
+                "a reassembled key reached the off-rule host"
+            );
+        }
     }
 }

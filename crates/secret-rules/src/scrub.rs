@@ -952,6 +952,93 @@ pub fn scrub_bytes(key: &[u8], label: &str, input: &[u8]) -> Result<Vec<u8>, Scr
     Ok(out)
 }
 
+/// The most decoded views [`reveals_key`] examines for one text, the text
+/// itself included. Each layer of percent-encoding is one view, so this also
+/// bounds how many nested layers are undone.
+const MAX_REVEAL_VIEWS: usize = 16;
+
+/// True when `text` spells `key` in a form the scrubber recognises, either as
+/// it stands or after a recipient undoes the changes a URL parser or a reader
+/// makes without being asked: dropping control bytes such as a tab, and
+/// decoding percent-encoding any number of times (up to [`MAX_REVEAL_VIEWS`]
+/// views).
+///
+/// The scrubber replaces a key only where it finds one, so text it passed
+/// can still carry a key that one of these changes reassembles. A caller that
+/// is about to send or show text it cannot scrub again (a redirect target, a
+/// finished document) checks it here and refuses it rather than trusting the
+/// earlier scrub.
+pub fn reveals_key(text: &[u8], key: &[u8]) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+    let literals = KeyPatterns::derive(key)
+        .map(|patterns| patterns.patterns)
+        .unwrap_or_default();
+    let mut views: Vec<Zeroizing<Vec<u8>>> = vec![Zeroizing::new(text.to_vec())];
+    let mut index = 0;
+    while index < views.len() {
+        if !find_key_spans(&views[index], key, &literals).is_empty() {
+            return true;
+        }
+        for transform in REVEAL_TRANSFORMS {
+            if views.len() >= MAX_REVEAL_VIEWS {
+                break;
+            }
+            if let Some(next) = transform(&views[index]) {
+                if !views.iter().any(|view| view.as_slice() == next.as_slice()) {
+                    views.push(next);
+                }
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
+/// One change [`reveals_key`] undoes; `None` when it would change nothing.
+type RevealTransform = fn(&[u8]) -> Option<Zeroizing<Vec<u8>>>;
+
+const REVEAL_TRANSFORMS: &[RevealTransform] = &[without_control_bytes, percent_decoded];
+
+/// `text` without ASCII control bytes, which a URL parser drops (a tab or a
+/// line break inside a URL) or a reader skips.
+fn without_control_bytes(text: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    let is_control = |byte: &u8| *byte < 0x20 || *byte == 0x7f;
+    text.iter().any(is_control).then(|| {
+        Zeroizing::new(
+            text.iter()
+                .copied()
+                .filter(|byte| !is_control(byte))
+                .collect(),
+        )
+    })
+}
+
+/// `text` with one layer of `%XX` escapes decoded; a malformed escape stays
+/// as it is.
+fn percent_decoded(text: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    if !text.contains(&b'%') {
+        return None;
+    }
+    let mut out = Zeroizing::new(Vec::with_capacity(text.len()));
+    let mut index = 0;
+    let mut changed = false;
+    while index < text.len() {
+        if text[index] == b'%' {
+            if let Some((value, len)) = decode_percent(text, index) {
+                out.push(value);
+                index += len;
+                changed = true;
+                continue;
+            }
+        }
+        out.push(text[index]);
+        index += 1;
+    }
+    changed.then_some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

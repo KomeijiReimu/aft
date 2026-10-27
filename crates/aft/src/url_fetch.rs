@@ -839,6 +839,15 @@ impl HeldKeys {
     fn keys(&self) -> Vec<&[u8]> {
         self.0.iter().map(|(_, key)| key.as_slice()).collect()
     }
+
+    /// True when `bytes` still spell a held key, as they stand or after a
+    /// URL parser or reader normalizes them (see
+    /// [`secret_rules::reveals_key`]).
+    fn reveals(&self, bytes: &[u8]) -> bool {
+        self.0
+            .iter()
+            .any(|(_, key)| secret_rules::reveals_key(bytes, key))
+    }
 }
 
 fn secret_fetch_refused(reason: &str, url: &str) -> UrlFetchError {
@@ -902,25 +911,39 @@ pub fn fetch_url_with_secrets(
                 "Too many redirects fetching {logical_url}"
             )));
         }
+        // A control byte never belongs in a Location, and URL parsing would
+        // drop some of them (a tab), joining text the scrubber saw apart.
+        if response.headers().get_all(LOCATION).iter().any(|value| {
+            value
+                .as_bytes()
+                .iter()
+                .any(|byte| *byte < 0x20 || *byte == 0x7f)
+        }) {
+            return Err(secret_fetch_refused("redirect_control_byte", logical_url));
+        }
         let location = scrubbed_header(&response, LOCATION, &held, logical_url)?
-            .filter(|value| {
-                value
-                    .bytes()
-                    .all(|byte| byte == b'\t' || (0x20..0x7f).contains(&byte))
-            })
+            .filter(|value| value.bytes().all(|byte| (0x20..0x7f).contains(&byte)))
             .ok_or_else(|| {
                 UrlFetchError::new(format!(
                     "Redirect from {} missing Location header",
                     current.as_str()
                 ))
             })?;
-        current = current.join(&location).map_err(|error| {
+        let mut next = current.join(&location).map_err(|error| {
             UrlFetchError::new(format!(
                 "Invalid redirect Location '{location}' from {}: {error}",
                 current.as_str()
             ))
         })?;
-        current.set_fragment(None);
+        next.set_fragment(None);
+        // Joining normalizes the URL (dot segments collapse, the host is
+        // lowercased, escapes are kept), which can reassemble a key the
+        // header scrub did not see. Check the URL exactly as it will be
+        // looked up, sent and named, before any of that happens.
+        if held.reveals(next.as_str().as_bytes()) {
+            return Err(secret_fetch_refused("redirect_discloses_key", logical_url));
+        }
+        current = next;
         hop += 1;
     };
 
@@ -1026,6 +1049,11 @@ fn scrubbed_header(
         return Ok(None);
     };
     let clean = held.scrub(value.as_bytes()).map_err(scrub_refusal(url))?;
+    // The scrubbed value is read, joined or quoted next; a key it still
+    // spells in a form the scrub missed refuses the response instead.
+    if held.reveals(&clean) {
+        return Err(secret_fetch_refused("header_discloses_key", url));
+    }
     Ok(String::from_utf8(clean).ok())
 }
 
