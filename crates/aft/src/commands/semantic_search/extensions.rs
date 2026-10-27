@@ -292,6 +292,11 @@ pub struct Readiness<'a> {
     retained: RetainedReadinessSnapshots<'a>,
     #[serde(skip)]
     cancelled: bool,
+    /// Why the sampled semantic source could not serve, when the sample saw
+    /// it fail although the shared semantic status may still read ready (a
+    /// views-on checkout view whose index could not be built).
+    #[serde(skip)]
+    semantic_failure: Option<String>,
 }
 
 impl PartialEq for Readiness<'_> {
@@ -343,7 +348,20 @@ impl<'a> Readiness<'a> {
             reasons,
             retained,
             cancelled,
+            semantic_failure: None,
         }
+    }
+
+    /// Records why the sampled semantic source failed; see `semantic_failure`.
+    pub fn with_semantic_failure(mut self, reason: Option<String>) -> Self {
+        self.semantic_failure = reason;
+        self
+    }
+
+    /// Why the sampled semantic source could not serve this search, if the
+    /// sample saw it fail.
+    pub fn semantic_failure(&self) -> Option<&str> {
+        self.semantic_failure.as_deref()
     }
 
     pub fn retained(&self) -> &RetainedReadinessSnapshots<'a> {

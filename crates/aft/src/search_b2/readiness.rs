@@ -37,7 +37,8 @@ pub fn sample<'a>(root: &Root<'a>) -> Readiness<'a> {
             first.reasons.clone(),
             first.retained().clone(),
             true,
-        ),
+        )
+        .with_semantic_failure(first.semantic_failure().map(str::to_owned)),
     }
 }
 
@@ -66,6 +67,10 @@ fn sample_once<'a>(observation: ReadinessObservation<'a>) -> Readiness<'a> {
         ));
     }
 
+    let semantic_failure = match &observation.semantic.status {
+        SemanticIndexStatus::Failed(reason) => Some(reason.clone()),
+        _ => None,
+    };
     let retained = RetainedReadinessSnapshots::new(
         semantic_ready
             .then(|| observation.semantic.snapshot)
@@ -83,6 +88,7 @@ fn sample_once<'a>(observation: ReadinessObservation<'a>) -> Readiness<'a> {
         retained,
         false,
     )
+    .with_semantic_failure(semantic_failure)
 }
 
 fn semantic_ready(state: &SemanticReadiness<'_>) -> bool {

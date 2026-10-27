@@ -532,16 +532,24 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                 // reason, never served from the legacy index, which a
                 // views-on root does not build. Views-off roots never have a
                 // checkout view.
-                let checkout_index = matches!(status, SemanticIndexStatus::Ready { .. })
+                let checkout = matches!(status, SemanticIndexStatus::Ready { .. })
                     .then(|| self.ctx.checkout_semantic_runtime())
                     .flatten()
-                    .and_then(|runtime| runtime.serving_index().ok());
-                if let Some(index) = checkout_index {
-                    SemanticReadiness {
-                        status,
-                        snapshot: Some(SemanticSnapshot::from_borrowed(index)),
-                        evicted: false,
-                        lock_contended: false,
+                    .map(|runtime| runtime.serving_index());
+                if let Some(served) = checkout {
+                    match served {
+                        Ok(index) => SemanticReadiness {
+                            status,
+                            snapshot: Some(SemanticSnapshot::from_borrowed(index)),
+                            evicted: false,
+                            lock_contended: false,
+                        },
+                        Err(reason) => SemanticReadiness {
+                            status: SemanticIndexStatus::Failed(reason),
+                            snapshot: None,
+                            evicted: false,
+                            lock_contended: false,
+                        },
                     }
                 } else if matches!(status, SemanticIndexStatus::Ready { .. }) {
                     match try_read_with_budget(
@@ -2285,6 +2293,19 @@ fn handle_semantic_search_inner(
             );
         }
     };
+    // The shared status can read ready while this search's readiness sample
+    // found the semantic source unable to serve (a views-on checkout view
+    // whose index could not be built). The plan then has no semantic lane, so
+    // the reply carries the sample's failure, not the shared `ready`, and its
+    // lane footer says the lane was unavailable for this query.
+    let checkout_failure = matches!(semantic_status_snapshot, SemanticIndexStatus::Ready { .. })
+        .then(|| engine_plan.readiness.semantic_failure())
+        .flatten()
+        .map(str::to_owned);
+    let semantic_status_snapshot = match &checkout_failure {
+        Some(reason) => SemanticIndexStatus::Failed(reason.clone()),
+        None => semantic_status_snapshot,
+    };
     let semantic_status = semantic_status_label(&semantic_status_snapshot);
     let mut warnings = Vec::new();
 
@@ -2315,9 +2336,11 @@ fn handle_semantic_search_inner(
         }
     }
     let mode = choose_mode(&params.query, &shape, lexical_ready, &mut warnings);
-    if lexical_ready && mode != SearchMode::Regex && !engine_plan.contains(SearchLaneKind::Semantic)
+    let response = if lexical_ready
+        && mode != SearchMode::Regex
+        && !engine_plan.contains(SearchLaneKind::Semantic)
     {
-        return handle_engine_only_search(
+        handle_engine_only_search(
             req,
             ctx,
             &params,
@@ -2329,44 +2352,48 @@ fn handle_semantic_search_inner(
             page_request,
             extensions,
             engine_plan,
-        );
-    }
-
-    match mode {
-        SearchMode::Regex | SearchMode::Literal => handle_grep_search(
-            req,
-            ctx,
-            &params.query,
-            params.offset,
-            top_k,
-            &shape,
-            mode,
-            semantic_status,
-            warnings,
-            &project_root,
-            params.include_tests,
-            page_request,
-            extensions,
-            engine_plan,
-            false,
-            None,
-        ),
-        SearchMode::Semantic | SearchMode::Hybrid => handle_semantic_or_hybrid_search(
-            req,
-            ctx,
-            params,
-            top_k,
-            shape,
-            mode,
-            lexical_ready,
-            semantic_status_snapshot,
-            semantic_status,
-            warnings,
-            &project_root,
-            page_request,
-            extensions,
-            engine_plan,
-        ),
+        )
+    } else {
+        match mode {
+            SearchMode::Regex | SearchMode::Literal => handle_grep_search(
+                req,
+                ctx,
+                &params.query,
+                params.offset,
+                top_k,
+                &shape,
+                mode,
+                semantic_status,
+                warnings,
+                &project_root,
+                params.include_tests,
+                page_request,
+                extensions,
+                engine_plan,
+                false,
+                None,
+            ),
+            SearchMode::Semantic | SearchMode::Hybrid => handle_semantic_or_hybrid_search(
+                req,
+                ctx,
+                params,
+                top_k,
+                shape,
+                mode,
+                lexical_ready,
+                semantic_status_snapshot,
+                semantic_status,
+                warnings,
+                &project_root,
+                page_request,
+                extensions,
+                engine_plan,
+            ),
+        }
+    };
+    match checkout_failure {
+        Some(reason) => with_semantic_query_failure(response, reason),
+        None => response,
     }
 }
 
@@ -10108,6 +10135,10 @@ mod tests {
         assert!(
             !text.contains("semantic: ready"),
             "the reply must not claim a ready semantic lane: {text}"
+        );
+        assert!(
+            text.contains(&format!("semantic: unavailable for this query ({reason})")),
+            "the lane footer must name the reason: {text}"
         );
     }
 
