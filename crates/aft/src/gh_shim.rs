@@ -49,6 +49,10 @@ use v22_rows::{
 mod security_audit_tests;
 
 #[cfg(test)]
+#[path = "gh_shim/plexus_contract_judge.rs"]
+mod plexus_contract_judge;
+
+#[cfg(test)]
 #[path = "gh_shim/v19_compat_tests.rs"]
 mod v19_compat_tests;
 
@@ -5487,12 +5491,22 @@ fn canonicalize_governed_from<R: Read>(
     let url_repository = positional
         .iter()
         .find_map(|value| thread_url_repository(value));
+    // ... and its own number: the route holder routes on the bare thread
+    // number, so a URL positional contributes its digits, not the URL.
+    // Anything else (a bare number, a non-URL) passes through unchanged.
     let target = canonical
         .target_fields
         .iter()
         .cloned()
         .zip(positional)
-        .map(|(field, value)| (field, Value::String(value)))
+        .map(|(field, value)| {
+            let value = if field == "number" {
+                thread_url_number(&value).unwrap_or(value)
+            } else {
+                value
+            };
+            (field, Value::String(value))
+        })
         .collect::<Map<_, _>>();
     // A global `--repo` may precede the command head, so inspect the original
     // argv before a command-local flag. The shared resolver then falls back
@@ -6250,10 +6264,11 @@ impl TargetRepository {
     }
 }
 
-/// Canonical `owner/name` of a `https://github.com/<owner>/<repo>/issues/<n>`
-/// or `.../pull/<n>` URL. Trailing path segments, a query, or a fragment
-/// (`#issuecomment-1`) do not change which repository the URL names.
-fn thread_url_repository(value: &str) -> Option<String> {
+/// The repository and thread number named by a
+/// `https://github.com/<owner>/<repo>/issues/<n>` or `.../pull/<n>` URL.
+/// Trailing path segments, a query, or a fragment (`#issuecomment-1`) do not
+/// change which repository or thread the URL names; they are not forwarded.
+fn thread_url_parts(value: &str) -> Option<(String, String)> {
     let path = ["https://github.com/", "http://github.com/"]
         .iter()
         .find_map(|prefix| value.strip_prefix(prefix))?;
@@ -6268,7 +6283,25 @@ fn thread_url_repository(value: &str) -> Option<String> {
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    canonical_repository_key(&format!("{owner}/{name}"))
+    Some((
+        canonical_repository_key(&format!("{owner}/{name}"))?,
+        digits.to_string(),
+    ))
+}
+
+/// Canonical `owner/name` of a `https://github.com/<owner>/<repo>/issues/<n>`
+/// or `.../pull/<n>` URL. Trailing path segments, a query, or a fragment
+/// (`#issuecomment-1`) do not change which repository the URL names.
+fn thread_url_repository(value: &str) -> Option<String> {
+    thread_url_parts(value).map(|(repository, _)| repository)
+}
+
+/// The bare thread number of a GitHub issue/pull URL, for the
+/// `target.number` the route holder routes on. Anything that is not such a
+/// URL (a bare number, a non-GitHub host, a malformed URL) returns `None`
+/// and is left to the existing handling unchanged.
+fn thread_url_number(value: &str) -> Option<String> {
+    thread_url_parts(value).map(|(_, number)| number)
 }
 
 /// Canonical `owner/name` of a `/repos/<owner>/<repo>/...` API endpoint. The
@@ -13132,6 +13165,47 @@ INHERITED FLAGS
             ..TargetRepository::default()
         };
         assert_eq!(foreign.repository_key(Path::new(".")), None);
+    }
+
+    #[test]
+    fn thread_url_number_extracts_the_bare_thread_number() {
+        // Issues and pull forms, with and without trailing path, query and
+        // fragment: the route holder routes on the digits, not the URL.
+        for (url, number) in [
+            ("https://github.com/o/r/issues/42", "42"),
+            ("https://github.com/o/r/pull/7", "7"),
+            ("http://github.com/o/r/issues/42", "42"),
+            ("https://github.com/o/r/pull/7/files/abc", "7"),
+            ("https://github.com/o/r/issues/42?foo=bar", "42"),
+            ("https://github.com/o/r/pull/7#issuecomment-123", "7"),
+            ("https://github.com/Owner/Repo/issues/5#issuecomment-1", "5"),
+        ] {
+            assert_eq!(thread_url_number(url).as_deref(), Some(number), "{url}");
+            // The repository half still resolves from the same URL.
+            assert!(thread_url_repository(url).is_some(), "{url}");
+        }
+        assert_eq!(
+            thread_url_parts("https://github.com/Owner/Repo/pull/7#issuecomment-123"),
+            Some(("owner/repo".to_string(), "7".to_string()))
+        );
+        // Anything else is left alone: a bare number, a non-GitHub host, a
+        // malformed URL, a non-thread path, or a non-numeric segment.
+        for value in [
+            "42",
+            "#42",
+            "o/r",
+            "https://example.com/o/r/issues/42",
+            "https://github.com/o/r",
+            "https://github.com/o/r/issues",
+            "https://github.com/o/r/issues/",
+            "https://github.com/o/r/issues/abc",
+            "https://github.com/o/r/issues/0x2a",
+            "https://github.com/o/r/blob/main/README.md",
+            "https://github.com/o/r/pull",
+            "ghe.example.com/o/r/issues/42",
+        ] {
+            assert_eq!(thread_url_number(value), None, "{value}");
+        }
     }
 
     #[test]
