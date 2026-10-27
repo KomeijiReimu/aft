@@ -599,6 +599,35 @@ fn linux_proc_entry(pid: u32, expected_pgid: i32) -> ProcEntry {
     }
 }
 
+/// Whether `pid` has exited while its parent has not reaped it: the kernel
+/// reports it as a zombie, and `kill(pid, 0)` still succeeds for it.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn child_is_zombie_for_test(pid: u32) -> bool {
+    let zombie = macos_kinfo(pid).is_some_and(|info| info.state == SZOMB);
+    zombie && unsafe { libc::kill(pid as i32, 0) } == 0
+}
+
+/// A child that has exited and waits to be reaped, as a zombie. Returns the
+/// unreaped child so a caller can read its record from the kernel. Do not call
+/// `wait` on it before that check, and drop it afterwards to reap it. A
+/// short-lived `/usr/bin/true` is used because a shell can stay visible as
+/// running for a moment after its exit.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn spawn_unreaped_zombie_for_test() -> Child {
+    let child = std::process::Command::new("/usr/bin/true")
+        .spawn()
+        .expect("spawn zombie stand-in");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !child_is_zombie_for_test(child.id()) {
+        assert!(
+            Instant::now() < deadline,
+            "the child did not become a zombie"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child
+}
+
 /// The command name, state and process group from `/proc/<pid>/stat`.
 #[cfg(target_os = "linux")]
 fn parse_proc_stat(stat: &str) -> Option<(String, &str, i32)> {
@@ -681,25 +710,35 @@ fn macos_process_group_members(pgid: i32) -> Result<GroupListing, LiveDescendant
     // it fails with EPERM for another user's process, and dropping the member
     // on that failure hid exactly the processes a kill cannot reach. Only a
     // process that is gone, a zombie, or in another group is left out.
-    let mut zombies = 0_usize;
-    let candidates: Vec<_> = pids
-        .into_iter()
-        .filter(|pid| *pid != 0)
-        .filter_map(|pid| {
-            let info = macos_kinfo(pid);
-            match &info {
-                Some(info) if info.pgid != pgid => None,
-                Some(info) if info.zombie => {
-                    zombies += 1;
-                    None
-                }
-                None if !macos_pid_exists(pid) => None,
-                _ => Some((pid, info)),
+    //
+    //
+    // A process that has exited but is not reaped yet keeps its pid, its group
+    // and a working signal 0, and `kern.proc.pid` still answers for it. Only
+    // its own record says it is gone, so that record decides.
+    let mut exited = 0_usize;
+    let mut candidates = Vec::new();
+    for pid in pids.into_iter().filter(|pid| *pid != 0) {
+        let Some(info) = macos_kinfo(pid) else {
+            // Signal 0 that fails with ESRCH is the only proof it is gone; any
+            // other answer leaves a process that may still run, so it stays in
+            // the listing for the group check to settle.
+            if macos_pid_exists(pid) {
+                candidates.push((pid, None));
             }
-        })
-        .collect();
-    // A group the probe finds alive must show at least one member or zombie.
-    let incomplete = candidates.is_empty() && zombies == 0;
+            continue;
+        };
+        if info.pgid != pgid {
+            continue;
+        }
+        if info.has_exited() {
+            exited += 1;
+            continue;
+        }
+        candidates.push((pid, Some(info)));
+    }
+    // A group the probe finds alive must show at least one member, and a
+    // process that has exited counts as one it saw.
+    let incomplete = candidates.is_empty() && exited == 0;
     Ok(group_listing(pgid, candidates, incomplete, |pid, info| {
         let mut name = [0 as c_char; 1024];
         let name_len =
@@ -727,12 +766,41 @@ fn macos_process_group_members(pgid: i32) -> Result<GroupListing, LiveDescendant
 
 /// The fields AFT reads from a macOS `struct kinfo_proc`.
 #[cfg(target_os = "macos")]
+#[derive(Clone)]
 struct MacosKinfo {
     comm: String,
     ruid: u32,
     pgid: i32,
-    zombie: bool,
+    /// `kp_proc.p_stat`: running, sleeping, stopped or a zombie (`SZOMB`).
+    state: u8,
+    /// `kp_proc.p_flag`: the kernel's process flags, including `P_WEXIT`.
+    flags: u32,
 }
+
+#[cfg(target_os = "macos")]
+impl MacosKinfo {
+    /// Whether the process has exited or is on its way out, so it can neither
+    /// run nor hold the task's output open. `kill(pid, 0)` and `killpg(pgid, 0)`
+    /// still succeed for such a process, so only this reading tells it apart
+    /// from a survivor.
+    ///
+    /// Exiting takes two steps in the kernel: `exit1` marks the process with
+    /// `P_LEXIT` while it is still running (state `SRUN`), and only later, once
+    /// the last thread has run `proc_exit`, does its state become `SZOMB`.
+    /// `kern.proc.pid` publishes that first step as `P_WEXIT` in
+    /// `kp_proc.p_flag`, which is why neither state alone is enough.
+    fn has_exited(&self) -> bool {
+        self.state == SZOMB || self.flags & P_WEXIT != 0
+    }
+}
+
+/// `kp_proc.p_stat` for a process that has exited and waits to be reaped.
+#[cfg(target_os = "macos")]
+const SZOMB: u8 = 5;
+/// `kp_proc.p_flag` for a process whose exit has started but whose state is not
+/// `SZOMB` yet (`bsd/sys/proc.h`).
+#[cfg(target_os = "macos")]
+const P_WEXIT: u32 = 0x0000_2000;
 
 /// Read `kern.proc.pid.<pid>`. `None` when the process no longer exists or
 /// the answer does not have the expected layout.
@@ -744,9 +812,9 @@ struct MacosKinfo {
 #[cfg(target_os = "macos")]
 fn macos_kinfo(pid: u32) -> Option<MacosKinfo> {
     const KINFO_PROC_SIZE: usize = 648;
-    // kp_proc.p_stat (char); SZOMB marks a zombie.
+    // kp_proc.p_flag (int) and kp_proc.p_stat (char).
+    const P_FLAG_OFFSET: usize = 32;
     const P_STAT_OFFSET: usize = 36;
-    const SZOMB: u8 = 5;
     // kp_proc.p_comm[MAXCOMLEN + 1]
     const P_COMM_OFFSET: usize = 243;
     const P_COMM_LEN: usize = 17;
@@ -790,7 +858,8 @@ fn macos_kinfo(pid: u32) -> Option<MacosKinfo> {
         comm: String::from_utf8_lossy(&comm_bytes[..comm_len]).into_owned(),
         ruid: read_u32(P_RUID_OFFSET),
         pgid: read_u32(E_PGID_OFFSET) as i32,
-        zombie: bytes[P_STAT_OFFSET] == SZOMB,
+        state: bytes[P_STAT_OFFSET],
+        flags: read_u32(P_FLAG_OFFSET),
     })
 }
 
@@ -1504,6 +1573,66 @@ fn lifecycle_scope_probe_deadline_falls_back() {
     );
 }
 
+/// A stale reading of a process that has exited is recognised by its zombie
+/// state, which is what keeps a kill from waiting for a process that is
+/// already gone. The helper it needs reads `kinfo_proc`, so it lives in a
+/// module of its own that is left out on other targets.
+#[cfg(all(test, target_os = "macos"))]
+mod macos_zombie_tests {
+    use super::*;
+
+    #[test]
+    fn macos_kinfo_reports_a_zombie_as_exited() {
+        let child = spawn_unreaped_zombie_for_test();
+        let info = macos_kinfo(child.id()).expect("a zombie is still readable");
+        assert_eq!(info.state, SZOMB, "the killed child must read as a zombie");
+        assert!(info.has_exited(), "a zombie has exited");
+        assert_ne!(
+            info.flags & P_WEXIT,
+            0,
+            "a zombie's record still carries P_WEXIT, the bit the listing relies on"
+        );
+        let listing = live_process_group_members(child.id() as i32).expect("a listable group");
+        assert!(
+            listing.members.is_empty(),
+            "a group of one zombie was reported live: {:?}",
+            listing.members
+        );
+        drop(child);
+    }
+}
+
+/// A process whose exit has started but which is not a zombie yet is not a
+/// survivor. The kernel marks it with `P_WEXIT` first and only makes it a
+/// zombie (`SZOMB`) later, and for a while its record still shows a running
+/// state while `kill(pid, 0)` and `killpg(pgid, 0)` still succeed for it. The
+/// listing must tell that process from a running one, or a kill keeps waiting
+/// for a process that has already gone.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_exiting_process_counts_as_exited_before_it_is_a_zombie() {
+    let exiting = MacosKinfo {
+        comm: "sleep".into(),
+        ruid: 0,
+        pgid: 1,
+        state: 2, // SRUN
+        flags: P_WEXIT,
+    };
+    let running = MacosKinfo {
+        state: 2,
+        flags: 0,
+        ..exiting.clone()
+    };
+    assert!(
+        exiting.has_exited(),
+        "a record with P_WEXIT reports the process as gone"
+    );
+    assert!(
+        !running.has_exited(),
+        "a running process without P_WEXIT is a survivor"
+    );
+}
+
 /// The `struct kinfo_proc` offsets AFT reads must match this process's own
 /// command name, real user and process group.
 #[cfg(target_os = "macos")]
@@ -1512,7 +1641,13 @@ fn macos_kinfo_reads_this_process() {
     let info = macos_kinfo(std::process::id()).expect("own process info");
     assert_eq!(info.ruid, unsafe { libc::getuid() });
     assert_eq!(info.pgid, unsafe { libc::getpgrp() });
-    assert!(!info.zombie);
+    assert_ne!(info.state, SZOMB, "the test process cannot be a zombie");
+    assert!(!info.has_exited(), "the test process has not exited");
+    assert_eq!(
+        info.flags & P_WEXIT,
+        0,
+        "a running process carries no P_WEXIT"
+    );
     let exe = std::env::current_exe().unwrap();
     let name = exe.file_name().unwrap().to_string_lossy();
     assert!(
