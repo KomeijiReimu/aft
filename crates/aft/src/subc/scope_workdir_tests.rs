@@ -166,7 +166,11 @@ fn bind_observed(
                     }
                     Response::success(request.id, request.params)
                 },
-                Some(&test_support::bind_config_without_indexes(&root)),
+                // The bind identity folder may not exist (stamp-only binds), so the
+                // user config file goes in the project folder the route resolves to.
+                Some(&test_support::bind_config_without_indexes(
+                    expected_project_root,
+                )),
                 usize::MAX,
                 None,
             )
