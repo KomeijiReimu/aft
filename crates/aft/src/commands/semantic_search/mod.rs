@@ -13074,16 +13074,25 @@ mod tests {
         let mut rebuilt = SearchIndex::build(&external_root);
         rebuilt.write_to_disk(&cache_dir, None);
 
-        let started = Instant::now();
+        // The churned generation holds 64 files, far above the 10-entry
+        // budget below. The time budget is generous on purpose: with time
+        // unable to stop the reload, reading at most 10 records proves the
+        // entry budget is what stopped it. Elapsed time cannot show that on
+        // a loaded runner, where the whole search can exceed 1 s even when
+        // the reload itself stopped immediately.
+        let records =
+            crate::search_index::observe_borrowed_load_records_read_for_test(&external_root);
         let degraded = crate::readonly_artifacts::with_borrowed_search_load_limits_for_test(
             10,
-            Duration::from_secs(5),
+            Duration::from_secs(60),
             || response_value(handle_semantic_search(&req, &ctx)),
         );
+        crate::search_index::unobserve_borrowed_load_records_read_for_test(&external_root);
 
         assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "churned generation must stop at the borrowed-load budget"
+            records.load(Ordering::SeqCst) <= 10,
+            "churned generation must stop at the borrowed-load entry budget, read {} records",
+            records.load(Ordering::SeqCst)
         );
         assert_eq!(degraded["success"], true);
         assert_ne!(degraded["fully_degraded"], true);

@@ -314,6 +314,47 @@ impl<'a> BorrowedIndexLoadBudget<'a> {
     }
 }
 
+/// Borrowed-load record reads observed per fixture root. A borrowed reload
+/// parses on a background thread, so a thread-local counter on the searching
+/// thread cannot see it; each test registers its own temporary root and the
+/// read loop bumps only that root's counter. Asserting the count stayed at or
+/// below the entry budget proves the reload stopped at the entry budget,
+/// which a wall-clock bound cannot show on a loaded machine.
+#[cfg(test)]
+static BORROWED_LOAD_RECORDS_READ_PROBES: OnceLock<Mutex<HashMap<PathBuf, Arc<AtomicUsize>>>> =
+    OnceLock::new();
+
+/// Register `root` for borrowed-load record observation and return its
+/// counter. Callers remove the probe with
+/// [`unobserve_borrowed_load_records_read_for_test`] after the assertion.
+#[cfg(test)]
+pub(crate) fn observe_borrowed_load_records_read_for_test(root: &Path) -> Arc<AtomicUsize> {
+    let counter = Arc::new(AtomicUsize::new(0));
+    BORROWED_LOAD_RECORDS_READ_PROBES
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap()
+        .insert(root.to_path_buf(), Arc::clone(&counter));
+    counter
+}
+
+/// Stop observing borrowed-load record reads for `root`.
+#[cfg(test)]
+pub(crate) fn unobserve_borrowed_load_records_read_for_test(root: &Path) {
+    if let Some(probes) = BORROWED_LOAD_RECORDS_READ_PROBES.get() {
+        probes.lock().unwrap().remove(root);
+    }
+}
+
+#[cfg(test)]
+fn note_borrowed_load_record_read_for_test(project_root: &Path) {
+    if let Some(probes) = BORROWED_LOAD_RECORDS_READ_PROBES.get() {
+        if let Some(counter) = probes.lock().unwrap().get(project_root) {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Read an artifact pointer without allowing a writer to strand an interactive request.
 ///
 /// Index refreshes publish through `RwLock`s and can legitimately hold a write guard while
@@ -2680,6 +2721,10 @@ impl SearchIndex {
             if unindexed[0] == 1 {
                 unindexed_files.insert(file_id_u32);
             }
+            #[cfg(test)]
+            if borrowed_load_budget.is_some() {
+                note_borrowed_load_record_read_for_test(&project_root);
+            }
         }
 
         if !reader_has_remaining(&mut reader, postings_body_end, 8).ok()? {
@@ -2764,6 +2809,10 @@ impl SearchIndex {
                 offset,
                 count,
             });
+            #[cfg(test)]
+            if borrowed_load_budget.is_some() {
+                note_borrowed_load_record_read_for_test(&project_root);
+            }
         }
 
         let base = BasePostings {
