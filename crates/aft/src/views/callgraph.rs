@@ -133,9 +133,11 @@ pub fn project_manifest(
                 let key = match manifest.plane_readiness(path, FamilyPlane::Callgraph) {
                     Some(PlaneState::Ready { key }) => Some(key.clone()),
                     None => None,
-                    // A member no graph is extracted for needs no key. A base
-                    // built without a registered graph producer still lists
-                    // its call-graph state as pending.
+                    // Members no call graph is extracted for (Markdown, for
+                    // example) need no key, so their state is ignored rather
+                    // than reported as not ready. A composed generation can
+                    // inherit them as pending from a base the lexical view
+                    // built without a graph producer.
                     Some(_) if !applies_to(path) => None,
                     Some(_) => {
                         return Err(error(format!("callgraph member is not ready: {path:?}")))
