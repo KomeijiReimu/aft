@@ -10,8 +10,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "b72d9ca1a119835ce0a26c136c52da81e5d5ee9d8b160fb1555bf61f238e2e7b",
-      "catalog_digest": "b72d9ca1a119835ce0a26c136c52da81e5d5ee9d8b160fb1555bf61f238e2e7b",
+      "generation": "7fffbe19c43f8d672e5bb502c276c7ac43cf3500c0038f2a3f47fc7d1762d694",
+      "catalog_digest": "7fffbe19c43f8d672e5bb502c276c7ac43cf3500c0038f2a3f47fc7d1762d694",
       "tools": [
         {
           "name": "status",
@@ -1061,7 +1061,7 @@
         },
         {
           "name": "bash_watch",
-          "schema_digest": "ef95a7f8b48971965f988186737cac47c1f88c1a246468a2cf924b62bfbc594e",
+          "schema_digest": "f311ed43521271004ef01a1c1a87c8bb7b0bb38985b3bf02410061681f7dc935",
           "semantics": 2,
           "capabilities": [
             "shell.exec/v1"
@@ -1110,9 +1110,7 @@
               "deliver": {
                 "description": "Rejected: this watch always waits synchronously; deliver requires background:true with an async notification channel.",
                 "type": "string",
-                "enum": [
-                  "each_line"
-                ]
+                "const": "each_line"
               },
               "once": {
                 "description": "Accepted for compatibility; only an async watch reads it.",
@@ -1255,8 +1253,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "1385f78c9c4b26deea68c370e4c3c0c522e36f8cf4137c3916f2ee850a7db0c2",
-      "catalog_digest": "1385f78c9c4b26deea68c370e4c3c0c522e36f8cf4137c3916f2ee850a7db0c2",
+      "generation": "7a8e06762dab18cfb8e532fe5b194714af424fc17f98186d2ecb81a427fc239a",
+      "catalog_digest": "7a8e06762dab18cfb8e532fe5b194714af424fc17f98186d2ecb81a427fc239a",
       "tools": [
         {
           "name": "status",
@@ -2379,7 +2377,7 @@
         },
         {
           "name": "bash_watch",
-          "schema_digest": "ef95a7f8b48971965f988186737cac47c1f88c1a246468a2cf924b62bfbc594e",
+          "schema_digest": "f311ed43521271004ef01a1c1a87c8bb7b0bb38985b3bf02410061681f7dc935",
           "semantics": 2,
           "capabilities": [
             "shell.exec/v1"
@@ -2428,9 +2426,7 @@
               "deliver": {
                 "description": "Rejected: this watch always waits synchronously; deliver requires background:true with an async notification channel.",
                 "type": "string",
-                "enum": [
-                  "each_line"
-                ]
+                "const": "each_line"
               },
               "once": {
                 "description": "Accepted for compatibility; only an async watch reads it.",
@@ -3465,8 +3461,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "9df500ec0a2a304a10a869e05894016e5ef20053dcc752e20b841eb58be3223f",
-      "catalog_digest": "9df500ec0a2a304a10a869e05894016e5ef20053dcc752e20b841eb58be3223f",
+      "generation": "a2c3c971952943f8154cd186c3e5bfa9589bd2e97d32e42a0762423beb98fbdc",
+      "catalog_digest": "a2c3c971952943f8154cd186c3e5bfa9589bd2e97d32e42a0762423beb98fbdc",
       "tools": [
         {
           "name": "status",
@@ -4520,7 +4516,7 @@
         },
         {
           "name": "bash_watch",
-          "schema_digest": "ef95a7f8b48971965f988186737cac47c1f88c1a246468a2cf924b62bfbc594e",
+          "schema_digest": "f311ed43521271004ef01a1c1a87c8bb7b0bb38985b3bf02410061681f7dc935",
           "semantics": 2,
           "capabilities": [
             "shell.exec/v1"
@@ -4569,9 +4565,7 @@
               "deliver": {
                 "description": "Rejected: this watch always waits synchronously; deliver requires background:true with an async notification channel.",
                 "type": "string",
-                "enum": [
-                  "each_line"
-                ]
+                "const": "each_line"
               },
               "once": {
                 "description": "Accepted for compatibility; only an async watch reads it.",
@@ -4715,8 +4709,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "cffd704ddb1c1685097625acf1df5d76c57e555722ffa784193c50de67b40058",
-      "catalog_digest": "cffd704ddb1c1685097625acf1df5d76c57e555722ffa784193c50de67b40058",
+      "generation": "e2c94ff20b64a6c8ee850ae1f49da2ba4fb72dc25e61607ebb478a8c177c7a37",
+      "catalog_digest": "e2c94ff20b64a6c8ee850ae1f49da2ba4fb72dc25e61607ebb478a8c177c7a37",
       "tools": [
         {
           "name": "status",
@@ -5843,7 +5837,7 @@
         },
         {
           "name": "bash_watch",
-          "schema_digest": "ef95a7f8b48971965f988186737cac47c1f88c1a246468a2cf924b62bfbc594e",
+          "schema_digest": "f311ed43521271004ef01a1c1a87c8bb7b0bb38985b3bf02410061681f7dc935",
           "semantics": 2,
           "capabilities": [
             "shell.exec/v1"
@@ -5892,9 +5886,7 @@
               "deliver": {
                 "description": "Rejected: this watch always waits synchronously; deliver requires background:true with an async notification channel.",
                 "type": "string",
-                "enum": [
-                  "each_line"
-                ]
+                "const": "each_line"
               },
               "once": {
                 "description": "Accepted for compatibility; only an async watch reads it.",
