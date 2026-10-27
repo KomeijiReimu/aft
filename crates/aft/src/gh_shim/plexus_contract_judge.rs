@@ -191,8 +191,7 @@ fn check_nested(object: &Map<String, Value>, kind: &str) -> Result<(), String> {
         }
     }
     for (field, value) in fields {
-        if !allowed.contains(&field.as_str()) || (field != "pull_requests" && !value.is_string())
-        {
+        if !allowed.contains(&field.as_str()) || (field != "pull_requests" && !value.is_string()) {
             return Err(forbidden(field));
         }
     }
@@ -521,8 +520,7 @@ pub fn load_vectors() -> Vec<ContractVector> {
                 );
             }
             let expect = &vector["expect"];
-            let expect_keys: Vec<&String> =
-                expect.as_object().unwrap().keys().collect();
+            let expect_keys: Vec<&String> = expect.as_object().unwrap().keys().collect();
             assert_eq!(expect_keys.len(), 1, "{file}: expect names one outcome");
             let expect = if let Some(code) = expect.get("refused") {
                 ContractExpect::Refused(
@@ -589,9 +587,7 @@ fn contract_vectors_judge_to_their_pinned_outcomes() {
         let outcome = judge(&vector.request);
         match &vector.expect {
             ContractExpect::Accepted => {
-                let kind = outcome.unwrap_or_else(|code| {
-                    panic!("{}: refused {code}", vector.name)
-                });
+                let kind = outcome.unwrap_or_else(|code| panic!("{}: refused {code}", vector.name));
                 assert!(
                     REQUEST_KINDS.contains(&kind),
                     "{}: {kind} is not a routed kind",
@@ -600,12 +596,7 @@ fn contract_vectors_judge_to_their_pinned_outcomes() {
                 accepted_kinds.insert(kind.to_string());
             }
             ContractExpect::Refused(code) => {
-                assert_eq!(
-                    &outcome.unwrap_err(),
-                    code,
-                    "{}",
-                    vector.name
-                );
+                assert_eq!(&outcome.unwrap_err(), code, "{}", vector.name);
             }
         }
     }
@@ -645,7 +636,12 @@ fn closed_shape_allowances_come_from_the_accepted_vectors() {
             .iter()
             .flat_map(|request| {
                 if pointer.is_empty() {
-                    request.as_object().unwrap().keys().cloned().collect::<Vec<_>>()
+                    request
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
                 } else {
                     request
                         .pointer(pointer)
@@ -656,8 +652,10 @@ fn closed_shape_allowances_come_from_the_accepted_vectors() {
             })
             .collect()
     };
-    let envelope: BTreeSet<String> =
-        SHIM_ENVELOPE_FIELDS.iter().map(|value| value.to_string()).collect();
+    let envelope: BTreeSet<String> = SHIM_ENVELOPE_FIELDS
+        .iter()
+        .map(|value| value.to_string())
+        .collect();
     // The nested closed kinds plus the `pr ready` verb shape: every one of
     // them has unknown-field refused vectors at each closed position.
     let nested: Vec<(&str, (Option<String>, Option<String>, bool))> = vec![
@@ -684,11 +682,7 @@ fn closed_shape_allowances_come_from_the_accepted_vectors() {
         ),
         (
             "stack_add",
-            (
-                Some("api:POST:/repos/*/*/stacks/*/add".into()),
-                None,
-                false,
-            ),
+            (Some("api:POST:/repos/*/*/stacks/*/add".into()), None, false),
         ),
         (
             "stack_unstack",
@@ -700,9 +694,9 @@ fn closed_shape_allowances_come_from_the_accepted_vectors() {
         ),
     ];
     for (kind, key) in &nested {
-        let requests = by_discriminant.get(key).unwrap_or_else(|| {
-            panic!("{kind}: no accepted vector for its discriminant")
-        });
+        let requests = by_discriminant
+            .get(key)
+            .unwrap_or_else(|| panic!("{kind}: no accepted vector for its discriminant"));
         let carriers: BTreeSet<String> = ["action", "repository", "target", "body"]
             .iter()
             .map(|value| value.to_string())
@@ -716,18 +710,27 @@ fn closed_shape_allowances_come_from_the_accepted_vectors() {
             .collect();
         assert_eq!(
             top_extra,
-            nested_top_extra(kind).iter().map(|value| value.to_string()).collect::<BTreeSet<_>>(),
+            nested_top_extra(kind)
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<BTreeSet<_>>(),
             "{kind}: top-level allowance differs from the accepted vectors"
         );
         let (targets, allowed) = nested_shape(kind);
         assert_eq!(
             key_union(requests, "/target"),
-            targets.iter().map(|value| value.to_string()).collect::<BTreeSet<_>>(),
+            targets
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<BTreeSet<_>>(),
             "{kind}: target allowance differs from the accepted vectors"
         );
         assert_eq!(
             key_union(requests, "/body"),
-            allowed.iter().map(|value| value.to_string()).collect::<BTreeSet<_>>(),
+            allowed
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<BTreeSet<_>>(),
             "{kind}: body allowance differs from the accepted vectors"
         );
     }
@@ -777,9 +780,9 @@ fn universal_selectors_are_the_any_kind_fields() {
         let ContractExpect::Refused(code) = &vector.expect else {
             panic!("{}: any-kind vectors refuse", vector.name);
         };
-        let exemplar = accepted.get(&discriminant(&vector.request)).unwrap_or_else(|| {
-            panic!("{}: no accepted vector for its discriminant", vector.name)
-        });
+        let exemplar = accepted
+            .get(&discriminant(&vector.request))
+            .unwrap_or_else(|| panic!("{}: no accepted vector for its discriminant", vector.name));
         let added: Vec<&String> = vector
             .request
             .as_object()
@@ -793,12 +796,7 @@ fn universal_selectors_are_the_any_kind_fields() {
             "{}: an any-kind vector adds exactly one field",
             vector.name
         );
-        assert_eq!(
-            *code,
-            forbidden(added[0]),
-            "{}",
-            vector.name
-        );
+        assert_eq!(*code, forbidden(added[0]), "{}", vector.name);
         derived.insert((*added[0]).clone());
     }
     assert_eq!(

@@ -719,77 +719,197 @@ fn plexus_contract_accepts_every_governed_wire_request_the_shim_builds() {
     // them as leaked strings the way `speech_rows` does. GraphQL rows go
     // through `canonicalize_governed_from` like the other plain rows: the
     // review-thread canonicalizer is dispatched by tuple, not by api rule.
-    let resolve_query: &str =
-        Box::leak(format!("query={RESOLVE_LITERAL}").into_boxed_str());
-    let unresolve_query: &str =
-        Box::leak(format!("query={UNRESOLVE_VARIABLE}").into_boxed_str());
+    let resolve_query: &str = Box::leak(format!("query={RESOLVE_LITERAL}").into_boxed_str());
+    let unresolve_query: &str = Box::leak(format!("query={UNRESOLVE_VARIABLE}").into_boxed_str());
     let plain: Vec<(&str, Vec<&str>, &str)> = vec![
         (
             "issue comment",
-            vec!["issue", "comment", "42", "--body", "A governed issue comment.", "--repo", "cortexkit/aft"],
+            vec![
+                "issue",
+                "comment",
+                "42",
+                "--body",
+                "A governed issue comment.",
+                "--repo",
+                "cortexkit/aft",
+            ],
             "comment",
         ),
         (
             "issue comment edit-last",
-            vec!["issue", "comment", "42", "--edit-last", "--body", "Replacement text.", "--repo", "cortexkit/aft"],
+            vec![
+                "issue",
+                "comment",
+                "42",
+                "--edit-last",
+                "--body",
+                "Replacement text.",
+                "--repo",
+                "cortexkit/aft",
+            ],
             "comment_edit_last",
         ),
         (
             "pr comment",
-            vec!["pr", "comment", "7", "--body", "A governed pull-request comment.", "--repo", "cortexkit/aft"],
+            vec![
+                "pr",
+                "comment",
+                "7",
+                "--body",
+                "A governed pull-request comment.",
+                "--repo",
+                "cortexkit/aft",
+            ],
             "comment",
         ),
         (
             "pr comment edit-last",
-            vec!["pr", "comment", "7", "--edit-last", "--body", "Replacement text.", "--repo", "cortexkit/aft"],
+            vec![
+                "pr",
+                "comment",
+                "7",
+                "--edit-last",
+                "--body",
+                "Replacement text.",
+                "--repo",
+                "cortexkit/aft",
+            ],
             "comment_edit_last",
         ),
         (
             "pr review",
-            vec!["pr", "review", "7", "--comment", "--body", "A governed review comment.", "--repo", "cortexkit/aft"],
+            vec![
+                "pr",
+                "review",
+                "7",
+                "--comment",
+                "--body",
+                "A governed review comment.",
+                "--repo",
+                "cortexkit/aft",
+            ],
             "pr_review",
         ),
         (
             "issue reaction",
-            vec!["issue", "reaction", "42", "--reaction", "+1", "--repo", "cortexkit/aft"],
+            vec![
+                "issue",
+                "reaction",
+                "42",
+                "--reaction",
+                "+1",
+                "--repo",
+                "cortexkit/aft",
+            ],
             "reaction",
         ),
         (
             "issue create",
-            vec!["issue", "create", "--title", "A governed issue", "--body", "Filed by the bot.", "--label", "bug", "--repo", "cortexkit/aft"],
+            vec![
+                "issue",
+                "create",
+                "--title",
+                "A governed issue",
+                "--body",
+                "Filed by the bot.",
+                "--label",
+                "bug",
+                "--repo",
+                "cortexkit/aft",
+            ],
             "issue_create",
         ),
         (
             "issue edit title-body",
-            vec!["issue", "edit", "42", "--title", "A retitled issue", "--body", "Edited by the bot.", "--repo", "cortexkit/aft"],
+            vec![
+                "issue",
+                "edit",
+                "42",
+                "--title",
+                "A retitled issue",
+                "--body",
+                "Edited by the bot.",
+                "--repo",
+                "cortexkit/aft",
+            ],
             "issue_edit",
         ),
         (
             "issue edit labels",
-            vec!["issue", "edit", "42", "--add-label", "triaged", "--remove-label", "needs-triage", "--repo", "cortexkit/aft"],
+            vec![
+                "issue",
+                "edit",
+                "42",
+                "--add-label",
+                "triaged",
+                "--remove-label",
+                "needs-triage",
+                "--repo",
+                "cortexkit/aft",
+            ],
             "issue_edit",
         ),
         (
             "pr edit",
-            vec!["pr", "edit", "7", "--title", "New title", "--body", "Edited by the bot.", "--repo", "cortexkit/aft"],
+            vec![
+                "pr",
+                "edit",
+                "7",
+                "--title",
+                "New title",
+                "--body",
+                "Edited by the bot.",
+                "--repo",
+                "cortexkit/aft",
+            ],
             "pr_edit",
         ),
         (
             "issue close",
-            vec!["issue", "close", "42", "--reason", "not planned", "--comment", "Closing as not planned.", "--repo", "cortexkit/aft"],
+            vec![
+                "issue",
+                "close",
+                "42",
+                "--reason",
+                "not planned",
+                "--comment",
+                "Closing as not planned.",
+                "--repo",
+                "cortexkit/aft",
+            ],
             "close",
         ),
         (
             "pr close",
-            vec!["pr", "close", "7", "--comment", "Superseded by a newer pull request.", "--repo", "cortexkit/aft"],
+            vec![
+                "pr",
+                "close",
+                "7",
+                "--comment",
+                "Superseded by a newer pull request.",
+                "--repo",
+                "cortexkit/aft",
+            ],
             "close",
         ),
         (
             "issue reopen",
-            vec!["issue", "reopen", "42", "--comment", "Reopening for another pass.", "--repo", "cortexkit/aft"],
+            vec![
+                "issue",
+                "reopen",
+                "42",
+                "--comment",
+                "Reopening for another pass.",
+                "--repo",
+                "cortexkit/aft",
+            ],
             "reopen",
         ),
-        ("pr reopen", vec!["pr", "reopen", "7", "--repo", "cortexkit/aft"], "reopen"),
+        (
+            "pr reopen",
+            vec!["pr", "reopen", "7", "--repo", "cortexkit/aft"],
+            "reopen",
+        ),
         (
             "pr ready",
             vec!["pr", "ready", "7", "--repo", "cortexkit/aft"],
@@ -800,28 +920,76 @@ fn plexus_contract_accepts_every_governed_wire_request_the_shim_builds() {
             vec!["pr", "ready", "7", "--undo", "--repo", "cortexkit/aft"],
             "pr_draft",
         ),
-        ("resolve thread", vec!["api", "graphql", "-f", resolve_query], "resolve_thread"),
+        (
+            "resolve thread",
+            vec!["api", "graphql", "-f", resolve_query],
+            "resolve_thread",
+        ),
         (
             "unresolve thread",
-            vec!["api", "graphql", "-f", unresolve_query, "-f", "id=PRRT_kwDOAbc123"],
+            vec![
+                "api",
+                "graphql",
+                "-f",
+                unresolve_query,
+                "-f",
+                "id=PRRT_kwDOAbc123",
+            ],
             "unresolve_thread",
         ),
         // A thread URL positional names its number and repository: the wire
         // carries the bare digits (the holder routes on numbers, not URLs).
-        ("issue comment url",
-            vec!["issue", "comment", "https://github.com/cortexkit/aft/issues/42", "--body", "Via a URL.", "--repo", "cortexkit/aft"],
+        (
+            "issue comment url",
+            vec![
+                "issue",
+                "comment",
+                "https://github.com/cortexkit/aft/issues/42",
+                "--body",
+                "Via a URL.",
+                "--repo",
+                "cortexkit/aft",
+            ],
             "comment",
         ),
-        ("pr comment url",
-            vec!["pr", "comment", "https://github.com/cortexkit/aft/pull/7", "--body", "Via a URL.", "--repo", "cortexkit/aft"],
+        (
+            "pr comment url",
+            vec![
+                "pr",
+                "comment",
+                "https://github.com/cortexkit/aft/pull/7",
+                "--body",
+                "Via a URL.",
+                "--repo",
+                "cortexkit/aft",
+            ],
             "comment",
         ),
-        ("pr edit url",
-            vec!["pr", "edit", "https://github.com/cortexkit/aft/pull/7", "--title", "Via a URL.", "--repo", "cortexkit/aft"],
+        (
+            "pr edit url",
+            vec![
+                "pr",
+                "edit",
+                "https://github.com/cortexkit/aft/pull/7",
+                "--title",
+                "Via a URL.",
+                "--repo",
+                "cortexkit/aft",
+            ],
             "pr_edit",
         ),
-        ("pr review url",
-            vec!["pr", "review", "https://github.com/cortexkit/aft/pull/7#issuecomment-123", "--comment", "--body", "Via a URL.", "--repo", "cortexkit/aft"],
+        (
+            "pr review url",
+            vec![
+                "pr",
+                "review",
+                "https://github.com/cortexkit/aft/pull/7#issuecomment-123",
+                "--comment",
+                "--body",
+                "Via a URL.",
+                "--repo",
+                "cortexkit/aft",
+            ],
             "pr_review",
         ),
     ];
@@ -830,31 +998,68 @@ fn plexus_contract_accepts_every_governed_wire_request_the_shim_builds() {
     let api: Vec<(&str, Vec<&str>, &str, &str)> = vec![
         (
             "review reply",
-            vec!["api", "-X", "POST", "repos/cortexkit/aft/pulls/7/comments/99/replies", "-f", "body=Fixed in the next push"],
+            vec![
+                "api",
+                "-X",
+                "POST",
+                "repos/cortexkit/aft/pulls/7/comments/99/replies",
+                "-f",
+                "body=Fixed in the next push",
+            ],
             "review_reply",
             "",
         ),
         (
             "comment edit patch",
-            vec!["api", "-X", "PATCH", "/repos/cortexkit/aft/issues/comments/123", "-f", "body=Edited comment text."],
+            vec![
+                "api",
+                "-X",
+                "PATCH",
+                "/repos/cortexkit/aft/issues/comments/123",
+                "-f",
+                "body=Edited comment text.",
+            ],
             "comment_edit",
             "",
         ),
         (
             "pull patch",
-            vec!["api", "-X", "PATCH", "repos/cortexkit/aft/pulls/7", "-f", "title=New title"],
+            vec![
+                "api",
+                "-X",
+                "PATCH",
+                "repos/cortexkit/aft/pulls/7",
+                "-f",
+                "title=New title",
+            ],
             "pr_edit",
             "",
         ),
         (
             "stack create",
-            vec!["api", "-X", "POST", "repos/cortexkit/aft/stacks", "-F", "pull_requests[]=7", "-F", "pull_requests[]=8"],
+            vec![
+                "api",
+                "-X",
+                "POST",
+                "repos/cortexkit/aft/stacks",
+                "-F",
+                "pull_requests[]=7",
+                "-F",
+                "pull_requests[]=8",
+            ],
             "stack_create",
             "",
         ),
         (
             "stack add",
-            vec!["api", "-X", "POST", "repos/cortexkit/aft/stacks/3/add", "-F", "pull_requests[]=9"],
+            vec![
+                "api",
+                "-X",
+                "POST",
+                "repos/cortexkit/aft/stacks/3/add",
+                "-F",
+                "pull_requests[]=9",
+            ],
             "stack_add",
             "",
         ),
@@ -868,8 +1073,7 @@ fn plexus_contract_accepts_every_governed_wire_request_the_shim_builds() {
     let mut judged = Vec::new();
     for (name, raw, expected_kind) in plain {
         let argv = args(&raw);
-        let Classification::Governed { tuple, canonical } =
-            classify(&argv, &manifest, "linux")
+        let Classification::Governed { tuple, canonical } = classify(&argv, &manifest, "linux")
         else {
             panic!("{name}: must be governed bot speech");
         };
@@ -888,14 +1092,20 @@ fn plexus_contract_accepts_every_governed_wire_request_the_shim_builds() {
                 .split(['#', '?'])
                 .next()
                 .unwrap_or("");
-            assert_eq!(wire["target"]["number"], json!(digits), "{name}: bare thread number");
+            assert_eq!(
+                wire["target"]["number"],
+                json!(digits),
+                "{name}: bare thread number"
+            );
         }
         match plexus_contract_judge::judge(&wire) {
             Ok(kind) => {
                 assert_eq!(kind, expected_kind, "{name}: routed kind");
                 judged.push((name, kind.to_string()));
             }
-            Err(code) => panic!("{name}: the shim's request is refused by the contract: {code}\n{wire}"),
+            Err(code) => {
+                panic!("{name}: the shim's request is refused by the contract: {code}\n{wire}")
+            }
         }
     }
     for (name, raw, expected_kind, stdin) in api {
@@ -907,7 +1117,9 @@ fn plexus_contract_accepts_every_governed_wire_request_the_shim_builds() {
                 assert_eq!(kind, expected_kind, "{name}: routed kind");
                 judged.push((name, kind.to_string()));
             }
-            Err(code) => panic!("{name}: the shim's request is refused by the contract: {code}\n{wire}"),
+            Err(code) => {
+                panic!("{name}: the shim's request is refused by the contract: {code}\n{wire}")
+            }
         }
     }
     // `pr create` reads its body file from disk, so its argv carries a
@@ -917,12 +1129,22 @@ fn plexus_contract_accepts_every_governed_wire_request_the_shim_builds() {
         let body_file = directory.path().join("pr-body.md");
         fs::write(&body_file, "Opened by the bot.\n").unwrap();
         let raw = [
-            "pr", "create", "-R", "cortexkit/aft", "--base", "main", "--head", "feature",
-            "--title", "Add the thing", "--body-file", body_file.to_str().unwrap(), "--draft",
+            "pr",
+            "create",
+            "-R",
+            "cortexkit/aft",
+            "--base",
+            "main",
+            "--head",
+            "feature",
+            "--title",
+            "Add the thing",
+            "--body-file",
+            body_file.to_str().unwrap(),
+            "--draft",
         ];
         let argv = args(&raw);
-        let Classification::Governed { tuple, canonical } =
-            classify(&argv, &manifest, "linux")
+        let Classification::Governed { tuple, canonical } = classify(&argv, &manifest, "linux")
         else {
             panic!("pr create: must be governed bot speech");
         };
@@ -936,7 +1158,9 @@ fn plexus_contract_accepts_every_governed_wire_request_the_shim_builds() {
                 assert_eq!(kind, "pr_create");
                 judged.push(("pr create", kind.to_string()));
             }
-            Err(code) => panic!("pr create: the shim's request is refused by the contract: {code}\n{wire}"),
+            Err(code) => {
+                panic!("pr create: the shim's request is refused by the contract: {code}\n{wire}")
+            }
         }
     }
     // Every routed kind the shim can emit is judged here: the shim's
