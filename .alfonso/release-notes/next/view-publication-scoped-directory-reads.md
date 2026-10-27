@@ -1,0 +1,1 @@
+- Views publication in a worker checkout now re-reads only the files under a changed directory (including after an agent's temporary-file-then-rename write) instead of every tracked file, and a periodic verification reads the checkout once instead of twice.
