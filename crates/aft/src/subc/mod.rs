@@ -1546,8 +1546,10 @@ struct RouteIdentityData {
     /// `owner` publishes work under a stable `ref`; `scope_epoch` distinguishes
     /// a new generation of that work from obsolete routes. Optional
     /// `attributes.agent_id` and `attributes.run_id` identify the agent and its
-    /// codemode run. The GitHub CLI relay uses this identity for delegated bot
-    /// writes; lifetime controls confirm the run ended before terminating processes.
+    /// codemode run; a worker run carries `attributes.on_behalf_of_agent`
+    /// instead of `agent_id`, as attribution only. The GitHub CLI relay uses
+    /// this identity for delegated bot writes; lifetime controls confirm the
+    /// run ended before terminating processes.
     /// Absent on routes opened without a scope or by a daemon predating scopes.
     scope: Option<subc_protocol::scope::ScopeStamp>,
     call_mode: subc_protocol::call_mode::CallMode,
@@ -1556,9 +1558,10 @@ struct RouteIdentityData {
     /// Set by the route's first tool call, so the health counter of scoped
     /// routes that make tool calls counts each route once.
     made_tool_call: AtomicBool,
-    /// Present only on the identity a codemode tool call runs under: the head
-    /// agent the call acts for (see `codemode`). Routes in the route table
-    /// never carry it.
+    /// Present only on the identity a codemode tool call runs under: the owner
+    /// route the call takes its access from, the head agent's for an agent run
+    /// or the worker's own for a worker run (see `codemode`). Routes in the
+    /// route table never carry it.
     run_owner: Option<Arc<codemode::RunOwner>>,
 }
 
@@ -5765,8 +5768,9 @@ where
                                 continue;
                             }
                         }
-                        // A codemode program's tool call runs with its head agent's
-                        // access: every step below sees the head-derived identity.
+                        // A codemode program's tool call runs with its owner route's
+                        // access (the head agent's, or a worker run's own worker's):
+                        // every step below sees the owner-derived identity.
                         let codemode_routes;
                         let (routes_for_call, codemode_call) = match codemode::admit(&routes, route, decoded.body().ok(), |identity| {
                             let Some(ctx) = executor.actor_context(&identity.root) else {

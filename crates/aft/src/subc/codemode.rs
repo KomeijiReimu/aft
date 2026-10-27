@@ -1,36 +1,59 @@
-//! Codemode runs: a program that BASAL runs for a head agent calls AFT tools
-//! over its own run route. The daemon stamps that route with the run's scope:
-//! `attributes.agent_id`, `attributes.run_id`, a `parent` link to the head
-//! scope that started the run, and `parent_state`.
+//! Codemode runs: a program that BASAL runs calls AFT tools over its own run
+//! route. The daemon stamps that route with the run's scope: `attributes.run_id`,
+//! a `parent` link to the scope that started the run, and `parent_state`. The
+//! run is one of two kinds:
 //!
-//! Every tool call on a run route runs with the head agent's own access and
-//! never more. The stamped parent link is used only to find the head scope.
-//! AFT then finds its own live route bound under that scope, requires that
-//! route's stamp to carry the same `agent_id` as the run, and runs the call
-//! with that route's root, session, policy, grants, config, disabled tools,
-//! sandbox profile and confinement. The run route's own bind root and session
-//! are configuration, never authority, and so are the call's arguments.
+//! - An *agent run* carries `attributes.agent_id`. Its parent is the head
+//!   agent's scope, and every tool call runs with the head agent's own access
+//!   and never more.
+//! - A *worker run* (`worker-runs/v1`) carries `attributes.on_behalf_of_agent`
+//!   and no `agent_id`. Its parent is the worker's own task scope, and every
+//!   tool call runs with that worker's access only. `on_behalf_of_agent` names
+//!   the head the worker works for, for attribution in logs; it never grants
+//!   that agent's authority, consent, secrets, tasks or handles.
 //!
-//! A run with no such head route, a parent link that is not `linked`, or a
-//! different `agent_id` is refused with `run_owner_not_bound`.
+//! The stamped parent link is used only to find the owning scope. AFT then
+//! finds its own live route bound under that scope (for an agent run, one whose
+//! stamp carries the same `agent_id` as the run; for a worker run, one whose
+//! scope is a worker's) and runs the call with that route's root, session,
+//! policy, grants, config, disabled tools, sandbox profile and confinement. The
+//! run route's own bind root and session are configuration, never authority,
+//! and so are the call's arguments.
+//!
+//! A run whose owning route can't be found this way is refused with
+//! `run_owner_not_bound`, and the refusal's `detail.reason` names why. A worker
+//! run is never served from a head's route and never falls back to its own
+//! bind.
 
 use super::*;
 
-/// Refusal for a codemode call whose head agent's access can't be located.
+/// Refusal for a codemode call whose owning route can't be located.
 pub(super) const RUN_OWNER_NOT_BOUND: &str = "run_owner_not_bound";
 
-/// The head agent a codemode call acts for, resolved from the run's stamp.
+/// Which kind of run a codemode call belongs to, and who it is attributed to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RunKind {
+    /// The run acts as `agent_id`, with that agent's head route's access.
+    Agent { agent_id: String },
+    /// The run acts as a worker, with the worker route's access only.
+    /// `on_behalf_of_agent` is attribution: it is logged and grants nothing.
+    Worker { on_behalf_of_agent: String },
+}
+
+/// The route a codemode call takes its access from, resolved from the run's stamp.
 #[derive(Debug)]
 pub(super) struct RunOwner {
-    pub(super) agent_id: String,
+    pub(super) kind: RunKind,
     pub(super) run_id: String,
-    /// The head agent's own route. Authority keyed by route identity (grant
-    /// scope, confinement key) is read from it, never from the run route.
-    pub(super) head: RouteIdentity,
+    /// The live route whose access the call runs with: the head agent's route
+    /// for an agent run, the worker's own route for a worker run. Authority
+    /// keyed by route identity (grant scope, confinement key, frozen worker
+    /// params) is read from it, never from the run route.
+    pub(super) owner_route: RouteIdentity,
     /// The run route the call arrived on, for audit lines.
     pub(super) run_route: RouteChannel,
     /// The run route's own principal. It grants nothing: the call runs with
-    /// the head route's principal. It only names the call-ledger carrier, so
+    /// the owner route's principal. It only names the call-ledger carrier, so
     /// the call's ledger rows are found again by `late_results` and
     /// `tool.withdraw` on the run route, which answer for that principal.
     pub(super) run_principal: AuthenticatedPrincipal,
@@ -38,18 +61,35 @@ pub(super) struct RunOwner {
 
 impl RunOwner {
     /// The carrier this call's call-ledger rows and shell tasks are recorded
-    /// under: the run route's, never the head's.
+    /// under: the run route's, never the owner route's.
     pub(super) fn ledger_carrier(&self) -> String {
         tool_provider::ledger_carrier(&self.run_principal)
     }
+
+    /// Whether this is a worker run, which carries only its worker's access.
+    pub(super) fn is_worker_run(&self) -> bool {
+        matches!(self.kind, RunKind::Worker { .. })
+    }
+}
+
+/// The route whose stored worker authority (launch grants, frozen worker
+/// params) applies to calls on `identity`: a worker run's own worker route,
+/// otherwise `identity` itself. An agent run's head route has no worker
+/// authority to restore, so it is not substituted here.
+pub(super) fn worker_authority_route(identity: &RouteIdentity) -> &RouteIdentity {
+    identity
+        .run_owner
+        .as_ref()
+        .filter(|owner| owner.is_worker_run())
+        .map_or(identity, |owner| &owner.owner_route)
 }
 
 /// How a request on a route is admitted with respect to codemode runs.
 pub(super) enum Admission {
     /// Not a codemode tool call: the route's own identity applies.
     Unchanged,
-    /// A codemode tool call, to run with this identity built from the head
-    /// agent's route.
+    /// A codemode tool call, to run with this identity built from the owner
+    /// route (the head agent's, or a worker run's own worker route).
     Owner(RouteIdentity),
     /// Candidate policies need a bounded read off the frame loop.
     AwaitPolicies(Vec<RouteIdentity>),
@@ -57,17 +97,34 @@ pub(super) enum Admission {
     Refused(subc_protocol::ErrorBody),
 }
 
+/// Who a refused run names in the refusal's detail: an agent run its
+/// `agent_id` (possibly absent from an incomplete stamp), a worker run the
+/// agent it is attributed to.
+#[derive(Clone, Copy)]
+enum Named<'a> {
+    Agent(Option<&'a str>),
+    Worker(&'a str),
+}
+
 fn not_bound(
     reason: &str,
     message: impl Into<String>,
-    agent_id: Option<&str>,
+    named: Named<'_>,
     run_id: Option<&str>,
 ) -> subc_protocol::ErrorBody {
-    subc_protocol::ErrorBody::new(RUN_OWNER_NOT_BOUND, message).with_detail(json!({
-        "reason": reason,
-        "agent_id": agent_id,
-        "run_id": run_id,
-    }))
+    let detail = match named {
+        Named::Agent(agent_id) => json!({
+            "reason": reason,
+            "agent_id": agent_id,
+            "run_id": run_id,
+        }),
+        Named::Worker(on_behalf_of_agent) => json!({
+            "reason": reason,
+            "on_behalf_of_agent": on_behalf_of_agent,
+            "run_id": run_id,
+        }),
+    };
+    subc_protocol::ErrorBody::new(RUN_OWNER_NOT_BOUND, message).with_detail(detail)
 }
 
 /// Whether a request body is a tool call rather than a provider operation
@@ -87,8 +144,8 @@ fn tool_call_name(body: &Value) -> Option<&str> {
 
 /// Decide how the request on `route` is admitted. Only codemode tool calls
 /// are affected. The order follows the contract: whether the tool serves
-/// codemode at all, then whether the run's stamp names a live head route for
-/// the same agent.
+/// codemode at all, then whether the run's stamp names a live owner route (the
+/// same agent's head route, or a worker run's own worker route).
 pub(super) fn admit(
     routes: &HashMap<RouteChannel, RouteIdentity>,
     route: RouteChannel,
@@ -122,8 +179,8 @@ pub(super) fn admit(
     }
 }
 
-/// Copy of `routes` in which `route` carries the head-derived identity, so
-/// every admission step after this one sees the head agent's access.
+/// Copy of `routes` in which `route` carries the owner-derived identity, so
+/// every admission step after this one sees the owner route's access.
 pub(super) fn overlay(
     routes: &HashMap<RouteChannel, RouteIdentity>,
     route: RouteChannel,
@@ -145,46 +202,86 @@ fn resolve_owner(
         return Err(not_bound(
             "run_scope_missing",
             "codemode route carries no run scope",
-            None,
+            Named::Agent(None),
             None,
         ));
     };
-    let agent_id = stamp
-        .attributes
-        .agent_id
-        .as_deref()
-        .filter(|id| !id.is_empty());
-    let run_id = stamp
-        .attributes
-        .run_id
-        .as_deref()
-        .filter(|id| !id.is_empty());
-    let (Some(agent_id), Some(run_id)) = (agent_id, run_id) else {
-        return Err(not_bound(
-            "run_stamp_incomplete",
-            "the run's stamp does not name both its agent and its run",
-            agent_id,
+    fn present(value: &Option<String>) -> Option<&str> {
+        value.as_deref().filter(|value| !value.is_empty())
+    }
+    let agent_id = present(&stamp.attributes.agent_id);
+    let on_behalf_of_agent = present(&stamp.attributes.on_behalf_of_agent);
+    let run_id = present(&stamp.attributes.run_id);
+    let (kind, named, run_id) = match (agent_id, on_behalf_of_agent, run_id) {
+        (Some(agent_id), None, Some(run_id)) => (
+            RunKind::Agent {
+                agent_id: agent_id.to_owned(),
+            },
+            Named::Agent(Some(agent_id)),
             run_id,
-        ));
+        ),
+        (None, Some(on_behalf_of_agent), Some(run_id)) => (
+            RunKind::Worker {
+                on_behalf_of_agent: on_behalf_of_agent.to_owned(),
+            },
+            Named::Worker(on_behalf_of_agent),
+            run_id,
+        ),
+        // The daemon refuses a record naming both; a run must never borrow
+        // an agent's authority while claiming to only work for it.
+        (Some(agent_id), Some(_), run_id) => {
+            return Err(not_bound(
+                "run_attribution_conflict",
+                "the run's stamp names both an agent to act as and an agent it works for",
+                Named::Agent(Some(agent_id)),
+                run_id,
+            ));
+        }
+        (agent_id, _, run_id) => {
+            return Err(not_bound(
+                "run_stamp_incomplete",
+                "the run's stamp does not name both its agent and its run",
+                Named::Agent(agent_id),
+                run_id,
+            ));
+        }
     };
+    let refuse = |reason: &str, message: &str| not_bound(reason, message, named, Some(run_id));
+    let worker_run = matches!(kind, RunKind::Worker { .. });
+    if worker_run {
+        // The daemon refuses both on a worker run already. A worker run has no
+        // agent authority to delegate, and a run is never a flow.
+        if stamp.attributes.delegates {
+            return Err(refuse(
+                "worker_run_delegates",
+                "a worker run cannot delegate an agent's authority",
+            ));
+        }
+        if stamp.attributes.flow_id.is_some() {
+            return Err(refuse(
+                "worker_run_flow",
+                "a worker run cannot carry a flow",
+            ));
+        }
+    }
     if !stamp.owner_authorized {
-        return Err(not_bound(
+        return Err(refuse(
             "run_owner_unauthorized",
             "the run scope's owner is not authorized to open runs",
-            Some(agent_id),
-            Some(run_id),
         ));
     }
     let Some(parent) = stamp.parent.as_ref() else {
-        return Err(not_bound(
+        return Err(refuse(
             "parent_missing",
-            "the run's stamp carries no parent link to a head scope",
-            Some(agent_id),
-            Some(run_id),
+            if worker_run {
+                "the worker run's stamp carries no parent link to its worker's scope"
+            } else {
+                "the run's stamp carries no parent link to a head scope"
+            },
         ));
     };
     // A pending link is unverified and grants nothing; an ended one is final.
-    // Neither may locate the head, so no new call runs on them.
+    // Neither may locate the owning scope, so no new call runs on them.
     match stamp.parent_state {
         Some(ParentState::Linked) => {}
         state => {
@@ -193,91 +290,125 @@ fn resolve_owner(
                 Some(ParentState::Ended) => "parent_ended",
                 _ => "parent_state_missing",
             };
-            return Err(not_bound(
+            return Err(refuse(
                 reason,
-                "the run's parent link is not linked to a live head scope",
-                Some(agent_id),
-                Some(run_id),
+                if worker_run {
+                    "the worker run's parent link is not linked to a live worker scope"
+                } else {
+                    "the run's parent link is not linked to a live head scope"
+                },
             ));
         }
     }
-    let mut heads: Vec<(&RouteChannel, &RouteIdentity)> = routes
-        .iter()
-        .filter(|(channel, identity)| {
-            **channel != route
-                && identity.run_owner.is_none()
-                && identity.call_mode == subc_protocol::call_mode::CallMode::Classic
-                && identity.scope.as_ref().is_some_and(|head| {
-                    head.kind == ScopeKind::Head
-                        && head.owner_authorized
-                        && head.owner == parent.owner
-                        && head.scope_ref == parent.scope_ref
-                        && head.scope_epoch == parent.scope_epoch
-                })
-        })
-        .collect();
-    if heads.is_empty() {
-        return Err(not_bound(
-            "head_route_not_bound",
-            "no live route of the run's head scope is bound to AFT",
-            Some(agent_id),
-            Some(run_id),
-        ));
-    }
-    heads.retain(|(_, identity)| {
-        identity
-            .scope
-            .as_ref()
-            .and_then(|head| head.attributes.agent_id.as_deref())
-            == Some(agent_id)
+    // Every live classic route bound under the parent scope. Neither a route
+    // acting for a run nor a codemode route is ever an owner.
+    let under_parent = routes.iter().filter(|(channel, identity)| {
+        **channel != route
+            && identity.run_owner.is_none()
+            && identity.call_mode == subc_protocol::call_mode::CallMode::Classic
+            && identity.scope.as_ref().is_some_and(|scope| {
+                scope.owner_authorized
+                    && scope.owner == parent.owner
+                    && scope.scope_ref == parent.scope_ref
+                    && scope.scope_epoch == parent.scope_epoch
+            })
     });
-    // Plugins cache a session's routes per project root. Prefer the head routes
+    let of_kind = |kind: ScopeKind| {
+        move |(_, identity): &(&RouteChannel, &RouteIdentity)| {
+            identity
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.kind == kind)
+        }
+    };
+    let mut owners: Vec<(&RouteChannel, &RouteIdentity)> = match &kind {
+        RunKind::Agent { agent_id } => {
+            let heads: Vec<_> = under_parent.filter(of_kind(ScopeKind::Head)).collect();
+            if heads.is_empty() {
+                return Err(refuse(
+                    "head_route_not_bound",
+                    "no live route of the run's head scope is bound to AFT",
+                ));
+            }
+            heads
+                .into_iter()
+                .filter(|(_, identity)| {
+                    identity
+                        .scope
+                        .as_ref()
+                        .and_then(|head| head.attributes.agent_id.as_deref())
+                        == Some(agent_id.as_str())
+                })
+                .collect()
+        }
+        RunKind::Worker { .. } => {
+            let candidates: Vec<_> = under_parent.collect();
+            if candidates.is_empty() {
+                return Err(refuse(
+                    "worker_route_not_bound",
+                    "no live route of the worker run's parent scope is bound to AFT",
+                ));
+            }
+            // A worker run under a head (or any non-worker) scope would run
+            // with that scope's authority, which a worker run never carries.
+            let workers: Vec<_> = candidates
+                .into_iter()
+                .filter(of_kind(ScopeKind::Worker))
+                .collect();
+            if workers.is_empty() {
+                return Err(refuse(
+                    "parent_not_worker",
+                    "the worker run's parent scope is not a worker's scope",
+                ));
+            }
+            workers
+        }
+    };
+    // Plugins cache a session's routes per project root. Prefer the owner routes
     // at the run's root, so a route opened while working in another checkout
-    // does not compete with this checkout's head. A run may also bind elsewhere:
-    // without a matching root, all head candidates must still agree on access.
+    // does not compete with this checkout's owner. A run may also bind elsewhere:
+    // without a matching root, all owner candidates must still agree on access.
     // Neither provider role nor channel order establishes authority. Compare
     // every eligible route, then inherit one complete identity, never a union.
-    if heads.iter().any(|(_, head)| head.root == run.root) {
-        heads.retain(|(_, head)| head.root == run.root);
+    if owners.iter().any(|(_, owner)| owner.root == run.root) {
+        owners.retain(|(_, owner)| owner.root == run.root);
     }
-    heads.sort_by_key(|(channel, _)| (channel.channel, channel.epoch));
-    let Some((head_channel, head)) = heads.first() else {
-        return Err(not_bound(
+    owners.sort_by_key(|(channel, _)| (channel.channel, channel.epoch));
+    let Some((owner_channel, owner)) = owners.first() else {
+        return Err(refuse(
             "agent_mismatch",
             "the head route's agent is not the agent the run is on",
-            Some(agent_id),
-            Some(run_id),
         ));
     };
     let mut policies = Vec::new();
-    for (other_channel, other) in &heads {
-        let fields = head_access_differences(head, other);
+    for (other_channel, other) in &owners {
+        let fields = head_access_differences(owner, other);
         if !fields.is_empty() {
-            return Err(ambiguous_head(
-                agent_id,
+            return Err(ambiguous_owner(
+                named,
                 run_id,
-                head_channel,
+                owner_channel,
                 other_channel,
                 &fields,
             ));
         }
         policies.push(saved_policy(other));
     }
-    if heads.len() > 1 {
+    if owners.len() > 1 {
         let Some(policies) = policies.into_iter().collect::<Option<Vec<_>>>() else {
             return Ok(Admission::AwaitPolicies(
-                heads.iter().map(|(_, head)| (*head).clone()).collect(),
+                owners.iter().map(|(_, owner)| (*owner).clone()).collect(),
             ));
         };
         let policies = policies.into_iter().collect::<Result<Vec<_>, _>>()?;
         // Keep comparing saved policies: genuinely different access settings
         // must refuse admission rather than select a more permissive route.
-        for ((other_channel, _), policy) in heads.iter().zip(&policies) {
+        for ((other_channel, _), policy) in owners.iter().zip(&policies) {
             if policy != &policies[0] {
-                return Err(ambiguous_head(
-                    agent_id,
+                return Err(ambiguous_owner(
+                    named,
                     run_id,
-                    head_channel,
+                    owner_channel,
                     other_channel,
                     &["saved_policy"],
                 ));
@@ -285,37 +416,44 @@ fn resolve_owner(
         }
     }
     Ok(Admission::Owner(effective_identity(
-        run, head, agent_id, run_id, route,
+        run, owner, kind, run_id, route,
     )))
 }
 
-fn ambiguous_head(
-    agent_id: &str,
+fn ambiguous_owner(
+    named: Named<'_>,
     run_id: &str,
-    head: &RouteChannel,
+    owner: &RouteChannel,
     other: &RouteChannel,
     fields: &[&str],
 ) -> subc_protocol::ErrorBody {
-    let channels = [head.channel, other.channel];
+    let channels = [owner.channel, other.channel];
+    let (scope, reason) = match named {
+        Named::Agent(_) => ("head", "head_route_ambiguous"),
+        Named::Worker(_) => ("worker", "worker_route_ambiguous"),
+    };
     crate::slog_info!(
-        "codemode head route ambiguity: run_id={run_id} fields={} channels={},{}",
+        "codemode {scope} route ambiguity: run_id={run_id} fields={} channels={},{}",
         fields.join(","),
         channels[0],
         channels[1]
     );
-    subc_protocol::ErrorBody::new(
-        RUN_OWNER_NOT_BOUND,
+    let mut error = not_bound(
+        reason,
         format!(
-            "the head scope's routes {} and {} disagree on access settings: {}",
+            "the {scope} scope's routes {} and {} disagree on access settings: {}",
             channels[0],
             channels[1],
             fields.join(", ")
         ),
-    )
-    .with_detail(json!({
-        "reason": "head_route_ambiguous", "agent_id": agent_id, "run_id": run_id,
-        "fields": fields, "channels": channels,
-    }))
+        named,
+        Some(run_id),
+    );
+    if let Some(Value::Object(detail)) = error.detail.as_mut() {
+        detail.insert("fields".into(), json!(fields));
+        detail.insert("channels".into(), json!(channels));
+    }
+    error
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -474,15 +612,16 @@ fn same_principal_access(a: &AuthenticatedPrincipal, b: &AuthenticatedPrincipal)
 }
 
 /// The identity a codemode call runs under. Root, session, harness, trust,
-/// disabled tools and sandbox principal (its id included) are the head
-/// route's. The scope stays the run's, so the run's lifetime controls
-/// (deadline, scope-end kill, call ledger settlement) keep applying to the
-/// work the program starts; only the call-ledger carrier is the run route's
-/// (see [`RunOwner::ledger_carrier`]).
+/// disabled tools and sandbox principal (its id included) are the owner
+/// route's: the head's for an agent run, the worker's for a worker run. The
+/// scope stays the run's, so the run's lifetime controls (deadline, scope-end
+/// kill, call ledger settlement) keep applying to the work the program starts;
+/// only the call-ledger carrier is the run route's (see
+/// [`RunOwner::ledger_carrier`]).
 fn effective_identity(
     run: &RouteIdentity,
-    head: &RouteIdentity,
-    agent_id: &str,
+    owner: &RouteIdentity,
+    kind: RunKind,
     run_id: &str,
     route: RouteChannel,
 ) -> RouteIdentity {
@@ -491,30 +630,30 @@ fn effective_identity(
         let _ = run_scope.set(Arc::clone(scope));
     }
     RouteIdentity(Arc::new(RouteIdentityData {
-        root: head.root.clone(),
-        project_root: head.project_root.clone(),
-        harness: head.harness.clone(),
-        session: head.session.clone(),
+        root: owner.root.clone(),
+        project_root: owner.project_root.clone(),
+        harness: owner.harness.clone(),
+        session: owner.session.clone(),
         // The reply is framed for the route the call arrived on.
         role: run.role,
-        trust: head.trust,
-        spawn_principal: head.spawn_principal.clone(),
-        // Kept so an untrusted head's shell call reaches the same approval
-        // step as the head's direct call, which then refuses it because a run
+        trust: owner.trust,
+        spawn_principal: owner.spawn_principal.clone(),
+        // Kept so an untrusted owner's shell call reaches the same approval
+        // step as the owner's direct call, which then refuses it because a run
         // route has nobody to answer.
-        consumer_elicitation_capable: head.consumer_elicitation_capable,
+        consumer_elicitation_capable: owner.consumer_elicitation_capable,
         // Format negotiation belongs to the consumer receiving this reply.
         tool_result_body: run.tool_result_body,
-        disabled_tools: Arc::clone(&head.disabled_tools),
+        disabled_tools: Arc::clone(&owner.disabled_tools),
         scope: run.scope.clone(),
         call_mode: run.call_mode.clone(),
         run_scope,
         // The run route's own counter already noted this call.
         made_tool_call: AtomicBool::new(true),
         run_owner: Some(Arc::new(RunOwner {
-            agent_id: agent_id.to_owned(),
+            kind,
             run_id: run_id.to_owned(),
-            head: head.clone(),
+            owner_route: owner.clone(),
             run_route: route,
             run_principal: run.spawn_principal.clone(),
         })),
@@ -522,17 +661,29 @@ fn effective_identity(
 }
 
 /// Record who a codemode call ran for. Every admitted call writes one line.
+/// A worker run's line names the agent it works for as `on_behalf_of_agent`,
+/// never as `agent_id`, and the worker's own session and root.
 pub(super) fn audit_call(identity: &RouteIdentity, tool: &str, corr: u64) {
-    if let Some(owner) = identity.run_owner.as_ref() {
-        crate::slog_info!(
-            "codemode call: tool={tool} agent_id={} run_id={} head_session={} head_root={} run_route={}/{} corr={corr}",
-            owner.agent_id,
+    let Some(owner) = identity.run_owner.as_ref() else {
+        return;
+    };
+    match &owner.kind {
+        RunKind::Agent { agent_id } => crate::slog_info!(
+            "codemode call: tool={tool} agent_id={agent_id} run_id={} head_session={} head_root={} run_route={}/{} corr={corr}",
             owner.run_id,
             identity.session,
             identity.project_root.display(),
             owner.run_route.channel,
             owner.run_route.epoch,
-        );
+        ),
+        RunKind::Worker { on_behalf_of_agent } => crate::slog_info!(
+            "codemode call: tool={tool} worker_run on_behalf_of_agent={on_behalf_of_agent} run_id={} worker_session={} worker_root={} run_route={}/{} corr={corr}",
+            owner.run_id,
+            identity.session,
+            identity.project_root.display(),
+            owner.run_route.channel,
+            owner.run_route.epoch,
+        ),
     }
 }
 
