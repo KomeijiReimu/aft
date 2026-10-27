@@ -12335,7 +12335,8 @@ impl BgTaskRegistry {
                                 .match_batch
                                 .as_deref()
                                 .and_then(|batch| serde_json::from_str(batch).ok()),
-                            // Rendered before it was saved.
+                            // The saved match text and context were rendered
+                            // before this row was reloaded.
                             literal_pattern: false,
                         });
                     }

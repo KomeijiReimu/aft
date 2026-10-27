@@ -997,7 +997,7 @@ fn bash_background_completion_repeated_hex_edged_lines_keep_preview() {
     assert_eq!(preview, "done\ndone\n");
 }
 
-/// The queue-watcher line from the field report: ordinary output, no secret.
+/// A queue-watcher output line: ordinary output, no secret.
 const RESTART_WATCH_LINE: &str = "09:37:38Z #1039 head 03b92ca085 failed: checks\n";
 
 /// A finished piped task whose secret flags are recorded at launch from the
