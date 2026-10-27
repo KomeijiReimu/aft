@@ -222,6 +222,7 @@ fn tool_result_images_are_ordered_and_kept_in_structured_content() {
 
 #[tokio::test]
 async fn tool_result_ast_search_t6_complete_and_budget_cut_on_negotiated_route() {
+    let _watcher_disabled = crate::test_env::without_project_watcher();
     let (project, root_id) = test_support::test_root("ast-search-t6");
     let root = project.path().to_path_buf();
     std::fs::write(root.join("small.js"), "console.log(1);\n".repeat(3)).unwrap();
@@ -356,6 +357,10 @@ async fn tool_result_ast_search_t6_complete_and_budget_cut_on_negotiated_route()
         .unwrap();
         replies.push(receive(&mut daemon, 1, corr).await);
     }
+    assert!(
+        !ctx.watcher_runtime_active(),
+        "transport fixture started a project watcher"
+    );
     drop(daemon);
     module_thread.join().unwrap().unwrap();
     for (frame, total) in replies.iter().zip([3, 24000]) {
@@ -506,6 +511,7 @@ fn tool_result_catalog_switch_preserves_schemas_digests_and_pins() {
 
 #[tokio::test]
 async fn tool_result_capability_is_selected_per_bind_not_per_call() {
+    let _watcher_disabled = crate::test_env::without_project_watcher();
     let project = scratch_project();
     let root = project.path().to_path_buf();
     let module_root = root.clone();
