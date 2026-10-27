@@ -6100,8 +6100,16 @@ mod tests {
         assert!(read_task_at(&resolved).unwrap().schema_pin.is_none());
         // The dispatch pin is recorded at spawn when the call carried one.
         let pinned = crate::bash_background::with_schema_pin(Some("sha256:pin".into()), || {
-            let (_, task) = counted_task(directory.path());
-            task
+            PersistedTask::starting(
+                "bash-0000000000000043".into(),
+                "counted".into(),
+                "true".into(),
+                directory.path().to_path_buf(),
+                None,
+                None,
+                true,
+                false,
+            )
         });
         assert_eq!(pinned.schema_pin.as_deref(), Some("sha256:pin"));
         // A pin survives a disk round trip.
