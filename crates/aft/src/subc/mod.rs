@@ -3437,6 +3437,9 @@ async fn handle_bash_elicitation_reply(
                 pending.spawn_principal,
                 pending.edit_slot_survives,
                 pending.call_key,
+                // A permission-prompt resume carries no pin through the
+                // pending ask; only the direct production caller passes one.
+                None,
                 Some(pending.grants),
                 pending.repeat,
                 pending.worker_session,
@@ -10318,6 +10321,9 @@ async fn handle_tool_call(
         log::debug!("subc tool call {}: schema_pin={pin}", call.name);
     }
     let call_key = call.call_key;
+    // The pin travels with the deferred bash path so the spawned task can
+    // record it; every other tool drops it after this log line.
+    let schema_pin = call.schema_pin.clone();
     let ledger_key = call_key
         .as_deref()
         .filter(|_| identity.role == tool_provider::RouteRole::ToolProviderV1)
@@ -10705,6 +10711,7 @@ async fn handle_tool_call(
             identity.spawn_principal.clone(),
             call.edit_slot_survives,
             call_key,
+            schema_pin,
             None,
             repeat,
             role.is_worker(),

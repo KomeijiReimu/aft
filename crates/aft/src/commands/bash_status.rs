@@ -246,7 +246,12 @@ pub(crate) fn handle_with_observation_only(
                     .append_db_hint(&task_id, &mut snapshot.output_preview);
             }
             let response = if let Some(refusal) = &snapshot.remote_refusal {
-                Response::error_with_data(&req.id, refusal.code, &refusal.message, json!(snapshot))
+                let mut extra = json!(snapshot);
+                if !observation_only {
+                    ctx.bash_background()
+                        .attach_terminal_view(&mut extra, task_session);
+                }
+                Response::error_with_data(&req.id, refusal.code, &refusal.message, extra)
             } else if snapshot.sandbox_native
                 && snapshot.sandbox_unavailable
                 && snapshot.exit_code
@@ -339,6 +344,10 @@ pub(crate) fn handle_with_observation_only(
                             }
                         }
                     }
+                }
+                if !observation_only {
+                    ctx.bash_background()
+                        .attach_terminal_view(&mut data, task_session);
                 }
                 Response::success(&req.id, data)
             };

@@ -1682,6 +1682,12 @@ pub struct PersistedTask {
     /// written before AFT recorded it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_key: Option<super::TaskCallKey>,
+    /// The v1 `bash` schema pin the call carried, if any. Absent on pinless
+    /// calls and on records written before AFT recorded it. An absent pin
+    /// means the task gets no view record. The task-record format keeps its
+    /// version: older JSON without this field still reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_pin: Option<String>,
     /// The daemon's scope owner, reference and epoch at spawn. A reconnect
     /// must not relabel a running command as belonging to the new route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1787,6 +1793,7 @@ impl PersistedTask {
             status_reason: None,
             output_incomplete: false,
             call_key,
+            schema_pin: super::current_schema_pin(),
             scope: super::registry::scope_for_spawn(),
             remote: None,
             execution_note: None,
@@ -1948,6 +1955,7 @@ impl From<BashTaskRow> for PersistedTask {
             status_reason: None,
             output_incomplete: false,
             call_key: None,
+            schema_pin: None,
             scope: None,
             remote: None,
             execution_note: None,

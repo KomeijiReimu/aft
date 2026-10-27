@@ -731,6 +731,9 @@ impl WatchJob {
             }
         }
         data["output"] = json!(text);
+        if !self.observation_only {
+            self.registry.attach_terminal_view(&mut data, &self.session);
+        }
         Response::success(id, data)
     }
 

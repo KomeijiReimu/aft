@@ -1,6 +1,10 @@
 //! Durable rich-UI assets and catalog attestations in the process's shared aft.db.
 
-use rusqlite::{params, Connection};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::json;
 
 pub use super::remote_exec::PolicyKey as PresetKey;
 
@@ -87,6 +91,336 @@ pub(crate) fn prune_presets(conn: &Connection, now_ms: i64) -> rusqlite::Result<
         "DELETE FROM rich_ui_session_presets WHERE recorded_at < ?1",
         [now_ms.saturating_sub(RETENTION_MS)],
     )
+}
+
+/// View-record writing stays off in production until the publication slice
+/// turns it on together with the rest of the publication gate. Tests enable
+/// it through [`enable_test_view_writing_for_test`]. The flag is checked
+/// first, before any database work, so a disabled writer never touches aft.db.
+static VIEW_RECORD_WRITING: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn view_record_writing_enabled() -> bool {
+    VIEW_RECORD_WRITING.load(Ordering::SeqCst)
+}
+
+/// A test manifest's published pins and row/page template bytes, standing in
+/// for the publication slice's shipped manifest until it lands.
+#[derive(Debug, Clone)]
+pub(crate) struct ViewManifest {
+    pub pins: Vec<String>,
+    pub row_digest: String,
+    pub row_bytes: Vec<u8>,
+    pub page_digest: String,
+    pub page_bytes: Vec<u8>,
+}
+
+#[cfg(test)]
+static TEST_VIEW_MANIFEST: Mutex<Option<ViewManifest>> = Mutex::new(None);
+
+#[cfg(test)]
+static TEST_VIEW_SERIAL: Mutex<()> = Mutex::new(());
+
+/// The manifest [`write_view_record`] validates pins against. Production has
+/// no manifest until the publication slice ships one, so this is `None`
+/// outside tests; with writing disabled that already means no record.
+fn view_manifest_for_writing() -> Option<ViewManifest> {
+    #[cfg(test)]
+    {
+        return TEST_VIEW_MANIFEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+    }
+    #[cfg(not(test))]
+    {
+        None
+    }
+}
+
+/// Test-only failure injection: when set, the next [`write_view_record`]
+/// fails at the template insert, after the record insert, so the savepoint
+/// rolls both back while the outer task-row upsert still commits.
+#[cfg(test)]
+static FAIL_VIEW_TEMPLATE_INSERT: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+fn fail_view_template_insert() -> bool {
+    FAIL_VIEW_TEMPLATE_INSERT.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+pub(crate) fn set_fail_view_template_insert_for_test(fail: bool) {
+    FAIL_VIEW_TEMPLATE_INSERT.store(fail, Ordering::SeqCst);
+}
+
+/// Hold while any test enables view writing: the writing flag and the test
+/// manifest are process-global, so parallel tests must not interleave them.
+/// Dropping the guard disables writing and clears the manifest again.
+#[cfg(test)]
+pub(crate) struct TestViewWritingGuard {
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for TestViewWritingGuard {
+    fn drop(&mut self) {
+        VIEW_RECORD_WRITING.store(false, Ordering::SeqCst);
+        *TEST_VIEW_MANIFEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        set_fail_view_template_insert_for_test(false);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn enable_test_view_writing_for_test(manifest: ViewManifest) -> TestViewWritingGuard {
+    let serial = TEST_VIEW_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *TEST_VIEW_MANIFEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(manifest);
+    FAIL_VIEW_TEMPLATE_INSERT.store(false, Ordering::SeqCst);
+    VIEW_RECORD_WRITING.store(true, Ordering::SeqCst);
+    TestViewWritingGuard { _serial: serial }
+}
+
+/// Digests the binary ships. No template ships until the publication slice,
+/// so every stored template counts as unshipped and is eligible for the
+/// retention tick once no record references it.
+pub(crate) fn shipped_template_digests() -> Vec<String> {
+    Vec::new()
+}
+
+fn terminal_end_reason(status: &crate::bash_background::BgTaskStatus) -> Option<&'static str> {
+    use crate::bash_background::BgTaskStatus;
+    match status {
+        BgTaskStatus::Completed => Some("completed"),
+        BgTaskStatus::Failed => Some("failed"),
+        BgTaskStatus::Killed => Some("killed"),
+        BgTaskStatus::TimedOut => Some("timed_out"),
+        BgTaskStatus::FateUnknown => Some("fate_unknown"),
+        _ => None,
+    }
+}
+
+fn view_record_value(
+    task_id: &str,
+    pin: &str,
+    metadata: &crate::bash_background::persistence::PersistedTask,
+    output_bytes: Option<i64>,
+    row_digest: &str,
+    page_digest: &str,
+) -> serde_json::Value {
+    let end_reason = terminal_end_reason(&metadata.status);
+    json!({
+        "schema": "aft.bash.view",
+        "version": 1,
+        "task_id": task_id,
+        "schema_pin": pin,
+        "phase": "finished",
+        "exitCode": metadata.exit_code,
+        "durationMs": metadata.duration_ms,
+        "outputBytes": output_bytes,
+        "endReason": end_reason,
+        "templates": {"row": row_digest, "page": page_digest},
+    })
+}
+
+/// Record a terminal pinned task's view record and its template bytes.
+///
+/// Runs in a savepoint nested in the task-row transaction, with `INSERT OR
+/// IGNORE` for the record (on its task key) and for the template bytes (on
+/// digest). The first terminal write fixes the record: later re-upserts of
+/// the same task never change its pin or digests. A failed savepoint rolls
+/// back and is logged, and the caller still commits the `bash_tasks` upsert.
+///
+/// Returns whether the stored record matches this write: false when writing
+/// is disabled, the task is not terminal, the call carried no pin, no
+/// manifest is available, the pin is not published, or an older record for
+/// another pin already stands.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_view_record(
+    conn: &Connection,
+    harness: &str,
+    session_id: &str,
+    task_id: &str,
+    metadata: &crate::bash_background::persistence::PersistedTask,
+    output_bytes: Option<i64>,
+) -> rusqlite::Result<bool> {
+    if !view_record_writing_enabled() {
+        return Ok(false);
+    }
+    if !metadata.status.is_terminal() {
+        return Ok(false);
+    }
+    let Some(pin) = metadata.schema_pin.as_deref() else {
+        return Ok(false);
+    };
+    let Some(manifest) = view_manifest_for_writing() else {
+        return Ok(false);
+    };
+    if !manifest.pins.iter().any(|published| published == pin) {
+        return Ok(false);
+    }
+    let record = view_record_value(
+        task_id,
+        pin,
+        metadata,
+        output_bytes,
+        &manifest.row_digest,
+        &manifest.page_digest,
+    );
+    let record_text =
+        serde_json::to_string(&record).map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?;
+    conn.execute_batch("SAVEPOINT view_record")?;
+    let outcome = (|| -> rusqlite::Result<bool> {
+        conn.execute(
+            "INSERT OR IGNORE INTO bash_view_records
+              (harness, session_id, task_id, record, row_template_digest, page_template_digest)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                harness,
+                session_id,
+                task_id,
+                record_text,
+                manifest.row_digest,
+                manifest.page_digest
+            ],
+        )?;
+        #[cfg(test)]
+        if fail_view_template_insert() {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "forced template-insert error".to_string(),
+            ));
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO rich_ui_templates(digest, bytes) VALUES (?1, ?2)",
+            params![manifest.row_digest, manifest.row_bytes],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO rich_ui_templates(digest, bytes) VALUES (?1, ?2)",
+            params![manifest.page_digest, manifest.page_bytes],
+        )?;
+        let stored: (String, String, String) = conn.query_row(
+            "SELECT record, row_template_digest, page_template_digest FROM bash_view_records
+              WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3",
+            params![harness, session_id, task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let stored_record: serde_json::Value = serde_json::from_str(&stored.0)
+            .map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, error.into()))?;
+        Ok(stored_record.get("schema_pin").and_then(|value| value.as_str()) == Some(pin)
+            && stored.1 == manifest.row_digest
+            && stored.2 == manifest.page_digest)
+    })();
+    match outcome {
+        Ok(created) => {
+            conn.execute_batch("RELEASE view_record")?;
+            Ok(created)
+        }
+        Err(error) => {
+            let _ =
+                conn.execute_batch("ROLLBACK TO view_record; RELEASE view_record;");
+            crate::slog_warn!(
+                "view record write failed for {task_id}: {error}; bash_tasks upsert still commits"
+            );
+            Ok(false)
+        }
+    }
+}
+
+/// The task-row upsert both production write paths share, followed by its
+/// view record in the same transaction. A view failure never fails the row.
+pub(crate) fn upsert_task_row_with_view(
+    conn: &Connection,
+    row: &super::bash_tasks::BashTaskRow,
+    metadata: &crate::bash_background::persistence::PersistedTask,
+) -> rusqlite::Result<()> {
+    super::bash_tasks::upsert_bash_task(conn, row)?;
+    if let Err(error) = write_view_record(
+        conn,
+        &row.harness,
+        &row.session_id,
+        &row.task_id,
+        metadata,
+        row.output_bytes,
+    ) {
+        crate::slog_warn!(
+            "view record write failed for {}: {error}; bash_tasks upsert still commits",
+            row.task_id
+        );
+    }
+    Ok(())
+}
+
+/// A task's stored view record, if any, as parsed JSON.
+pub(crate) fn view_record_json(
+    conn: &Connection,
+    harness: &str,
+    session_id: &str,
+    task_id: &str,
+) -> rusqlite::Result<Option<serde_json::Value>> {
+    let text: Option<String> = conn
+        .query_row(
+            "SELECT record FROM bash_view_records
+              WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3",
+            params![harness, session_id, task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    text.map(|text| {
+        serde_json::from_str(&text).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, error.into())
+        })
+    })
+    .transpose()
+}
+
+/// Stored bytes for one template digest, if any.
+pub(crate) fn template_bytes(
+    conn: &Connection,
+    digest: &str,
+) -> rusqlite::Result<Option<Vec<u8>>> {
+    conn.query_row(
+        "SELECT bytes FROM rich_ui_templates WHERE digest = ?1",
+        [digest],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// Delete every stored template no record references and the binary does not
+/// ship. Records in every project share digest-keyed bytes, so a template
+/// stays while any record references it.
+pub(crate) fn prune_orphaned_templates(
+    conn: &Connection,
+    shipped: &[String],
+) -> rusqlite::Result<usize> {
+    if shipped.is_empty() {
+        return conn.execute(
+            "DELETE FROM rich_ui_templates
+              WHERE digest NOT IN (
+                SELECT row_template_digest FROM bash_view_records
+                UNION
+                SELECT page_template_digest FROM bash_view_records
+              )",
+            [],
+        );
+    }
+    let placeholders = shipped.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "DELETE FROM rich_ui_templates
+          WHERE digest NOT IN (
+            SELECT row_template_digest FROM bash_view_records
+            UNION
+            SELECT page_template_digest FROM bash_view_records
+          )
+          AND digest NOT IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params = shipped.iter().map(|digest| digest as &dyn rusqlite::ToSql).collect::<Vec<_>>();
+    stmt.execute(rusqlite::params_from_iter(params)).map(|count| count as usize)
 }
 
 #[cfg(test)]

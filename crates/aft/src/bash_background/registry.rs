@@ -3278,7 +3278,7 @@ impl BgTaskRegistry {
         // together. Recovery must never infer a task from a reusable call key.
         let persisted = (|| -> rusqlite::Result<()> {
             let tx = conn.unchecked_transaction()?;
-            crate::db::bash_tasks::upsert_bash_task(&tx, &row)?;
+            crate::db::rich_ui::upsert_task_row_with_view(&tx, &row, metadata)?;
             if let Some(key) = LEDGER_SPAWN.with(|slot| slot.borrow().clone()) {
                 if metadata.call_key.as_ref().is_some_and(|task_key| {
                     !task_key.minted
@@ -3616,6 +3616,82 @@ impl BgTaskRegistry {
         Some((self.db_harness_for_task(task)?, pool))
     }
 
+    /// A task's stored view record, if any, read by the observed task's own
+    /// row key. A head observing its worker's task passes the worker task's
+    /// session, so the lookup carries the worker task's stored record. The
+    /// record is never rebuilt from the running manifest: after an upgrade
+    /// the stored pin and digests keep being served.
+    pub(crate) fn terminal_view_record(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Option<serde_json::Value> {
+        let (harness, pool) = self.db_harness_and_pool_for_session(session_id)?;
+        let conn = pool.lock().ok()?;
+        match crate::db::rich_ui::view_record_json(&conn, &harness, session_id, task_id) {
+            Ok(record) => record,
+            Err(error) => {
+                crate::slog_warn!(
+                    "view record read failed for {task_id}: {error}"
+                );
+                None
+            }
+        }
+    }
+
+    /// Whether a response-data status names a finished task. Kept next to the
+    /// attach point so every delivery path agrees on which replies may carry
+    /// a record: terminal snapshots only, never a running reply.
+    fn response_status_is_terminal(status: Option<&str>) -> bool {
+        matches!(
+            status,
+            Some("completed" | "failed" | "killed" | "timed_out" | "fate_unknown")
+        )
+    }
+
+    /// Attach the task's stored view record to terminal response data, for
+    /// routes whose bind declared `tool-result/v1`. Legacy-envelope routes
+    /// never receive it: the writer only runs there when the active result
+    /// body is the versioned one, and the model-visible text rendering reads
+    /// named fields only, so the extra member leaves `content` bytes
+    /// unchanged. Replies that would reach the 3 MiB wire cap with the
+    /// record omit it instead; the phone falls back to its pinned template.
+    /// Carrier reads never call this: observation-only handlers skip it, so
+    /// carried calls keep their ordinary result shape without `view`.
+    pub(crate) fn attach_terminal_view(
+        &self,
+        data: &mut serde_json::Value,
+        session_id: &str,
+    ) {
+        let view = (|| -> Option<serde_json::Value> {
+            let map = data.as_object()?;
+            if !Self::response_status_is_terminal(
+                map.get("status").and_then(|value| value.as_str()),
+            ) {
+                return None;
+            }
+            if !crate::subc::result_body::active() {
+                return None;
+            }
+            let task_id = map
+                .get("task_id")
+                .and_then(|value| value.as_str())?;
+            self.terminal_view_record(session_id, task_id)
+        })();
+        let Some(view) = view else {
+            return;
+        };
+        let Some(map) = data.as_object_mut() else {
+            return;
+        };
+        map.insert("view".to_string(), view);
+        if serde_json::to_vec(&*data).is_ok_and(|body| {
+            body.len() >= crate::subc::result_body::MAX_RESULT_BYTES
+        }) {
+            map.remove("view");
+        }
+    }
+
     /// Writes the task's row from its in-memory metadata when aft.db has no
     /// row for it, and reports whether the row exists afterwards.
     ///
@@ -3656,7 +3732,13 @@ impl BgTaskRegistry {
                 &task.task_id,
             ) {
                 Ok(Some(_)) => true,
-                Ok(None) => match crate::db::bash_tasks::upsert_bash_task(&conn, &row) {
+                Ok(None) => match (|| -> rusqlite::Result<()> {
+                    // The missing-row rewrite commits the row and its view
+                    // record together, like every other terminal upsert.
+                    let tx = conn.unchecked_transaction()?;
+                    crate::db::rich_ui::upsert_task_row_with_view(&tx, &row, &metadata)?;
+                    tx.commit()
+                })() {
                     Ok(()) => {
                         crate::slog_warn!(
                             "bash_task row for {} was missing under harness {harness}; rewrote it from the live task",

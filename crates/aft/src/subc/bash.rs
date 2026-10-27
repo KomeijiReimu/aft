@@ -993,6 +993,12 @@ fn finalized_bash_result(
     allow_bg_completions: bool,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
 ) -> ToolCallResult {
+    // A terminal task's stored view record rides `structuredContent` on
+    // tool-result/v1 routes only; the bash text renderer reads `output`, so
+    // the extra member leaves the model-visible content bytes unchanged.
+    // Running replies and legacy routes are skipped inside the attach.
+    ctx.bash_background()
+        .attach_terminal_view(&mut response.data, session_id);
     // The bash formatter never renders `bg_completions`, so formatting before finalization
     // yields the same text and lets the finalizer append the status bar to it.
     let mut text =
@@ -1590,6 +1596,10 @@ pub(super) fn submit_deferred_bash(
     spawn_principal: crate::sandbox_spawn::AuthenticatedPrincipal,
     edit_slot_survives: Option<bool>,
     call_key: Option<String>,
+    /// The v1 `bash` schema pin the call carried, if any. It is installed
+    /// around the dispatch (see `with_schema_pin`) so the spawned task
+    /// records it; a pinless call leaves no view record.
+    schema_pin: Option<String>,
     permissions_granted: Option<Vec<String>>,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
     worker_session: bool,
@@ -2035,9 +2045,9 @@ pub(super) fn submit_deferred_bash(
                                                                       })
                                                                   };
                                                                   #[cfg(not(test))]
-                                                                  let response = run_dispatch();
+                                                                  let response = crate::bash_background::with_schema_pin(schema_pin, run_dispatch);
                                                                   #[cfg(test)]
-                                                                  let response = with_bash_timing_for_test(spawn_timing_for_test.clone(), run_dispatch);
+                                                                  let response = with_bash_timing_for_test(spawn_timing_for_test.clone(), || crate::bash_background::with_schema_pin(schema_pin, run_dispatch));
                                                                   let response = refuse_run_permission_ask(response, run_scoped);
                                                                   // Registration and revocation can race across actors.
                                                                   // Recheck after dispatch so neither ordering loses the task.
@@ -4028,6 +4038,7 @@ mod grant_path_tests {
                 None,
                 None,
                 None,
+                None,
                 false,
                 false,
                 false,
@@ -4477,6 +4488,7 @@ mod grant_path_tests {
             Some("program-shell".into()),
             None,
             None,
+            None,
             false,
             false,
             false,
@@ -4540,6 +4552,7 @@ mod grant_path_tests {
                     },
                     BindTrust::FirstParty,
                     crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+                    None,
                     None,
                     None,
                     None,
@@ -4617,6 +4630,7 @@ mod grant_path_tests {
             },
             BindTrust::FirstParty,
             crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+            None,
             None,
             None,
             None,
@@ -4706,6 +4720,7 @@ mod grant_path_tests {
                 },
                 BindTrust::FirstParty,
                 crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+                None,
                 None,
                 None,
                 None,
@@ -4910,6 +4925,7 @@ mod grant_path_tests {
             cancel,
             BindTrust::FirstParty,
             crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+            None,
             None,
             None,
             None,
@@ -8917,6 +8933,7 @@ mod grant_path_tests {
                 None,
                 None,
                 None,
+                None,
                 false,
                 false,
                 false,
@@ -9090,6 +9107,7 @@ mod grant_path_tests {
             None,
             None,
             None,
+            None,
             false,
             false,
             false,
@@ -9194,6 +9212,7 @@ mod run_tests {
             },
             BindTrust::FirstParty,
             AuthenticatedPrincipal::FirstParty,
+            None,
             None,
             None,
             None,
