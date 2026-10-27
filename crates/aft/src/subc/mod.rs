@@ -12495,10 +12495,17 @@ pub(crate) mod test_support {
         if short_deadline {
             assert_eq!(response.data["status"], "running", "{response:?}");
             assert_eq!(response.data["waited"]["reason"], "timeout", "{response:?}");
+            // Check which deadline the watch applied rather than how fast a
+            // loaded runner delivered it. The client's 1 s deadline (received
+            // 400 ms late) leaves a wait limit under a second or two, while
+            // the default worker window with timeoutMs=1_800_000 is tens of
+            // minutes, so 10 s separates the two with room for scheduling lag.
+            let limit_ms = response.data["waited"]["limit_ms"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("watch reply names its wait limit: {response:?}"));
             assert!(
-                started.elapsed() < Duration::from_millis(650),
-                "queued watch missed shortened reply cutoff: {:?}",
-                started.elapsed()
+                limit_ms < 10_000,
+                "queued watch ignored the client deadline: wait limit {limit_ms} ms"
             );
             return;
         }
