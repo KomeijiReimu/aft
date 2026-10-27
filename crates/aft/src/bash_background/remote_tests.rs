@@ -5738,6 +5738,26 @@ async fn runon_sends_the_whole_compound_line_remote_exactly_as_written() {
 }
 
 #[tokio::test]
+async fn runon_macos_reaches_the_wire_request_as_macos_platform() {
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({"command": "uname -a", "runon": "macos", "compressed": false}),
+    );
+    assert!(response.success, "{response:?}");
+    let task_id = response.data["task_id"].as_str().unwrap().to_string();
+    let _done = terminal(ctx.bash_background(), &task_id).await;
+    let runs = exec_runs(&daemon);
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0]["platform"], "macos");
+    assert!(runs[0].get("weight_hint").is_none(), "{runs:?}");
+    assert!(runs[0].get("network").is_none(), "{runs:?}");
+}
+
+#[tokio::test]
 async fn runon_vcpu_count_is_sent_as_weight_hint_on_the_wire() {
     let daemon = daemon(Script::Plain, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
@@ -5798,6 +5818,9 @@ async fn malformed_runon_vcpu_requests_are_refused_before_dispatch() {
         "windows,4c",
         "windows,net",
         "windows,wat",
+        "macos,4c",
+        "macos,net",
+        "macos,wat",
     ] {
         let response = handle_with_policy(
             &restarted_context(dir.path()),
@@ -5807,9 +5830,9 @@ async fn malformed_runon_vcpu_requests_are_refused_before_dispatch() {
         assert!(!response.success, "{runon}: {response:?}");
         let message = response.data["message"].as_str().unwrap_or_default();
         assert!(message.contains(runon), "{runon}: {response:?}");
-        let reason = if runon == "windows,4c" {
+        let reason = if runon == "windows,4c" || runon == "macos,4c" {
             "fixed at 4 vCPUs"
-        } else if runon == "windows,net" {
+        } else if runon == "windows,net" || runon == "macos,net" {
             "no network"
         } else {
             "not valid"
