@@ -1071,22 +1071,32 @@ mod storage_retention_tests {
         assert_eq!(fs::metadata(path).unwrap().len(), before);
     }
     #[test]
-    fn query_pin_marking_reuses_shared_parents_once_per_view() {
-        use crate::bash_background::persistence::work_counts;
-        use crate::root_cache::{ReadMarker, ReadMarkerSweepContext};
+    struct QueryPinFixture {
+        _temp: tempfile::TempDir,
+        view_dir: PathBuf,
+        generations: Vec<String>,
+        live_markers: Vec<crate::root_cache::ReadMarker>,
+        generation_keys: BTreeMap<String, BTreeSet<[u8; 32]>>,
+        marker_files: usize,
+    }
 
-        // Four generations with a live reader plus dead and malformed
-        // markers, and one generation with only dead markers that protects
-        // nothing.
+    // Four generations with a live reader plus dead and malformed markers,
+    // and one generation with only dead markers that protects nothing.
+    fn query_pin_fixture() -> QueryPinFixture {
+        use crate::root_cache::ReadMarker;
+
         let temp = tempfile::tempdir().unwrap();
         let view_dir = temp.path().join("view");
-        let generations = ["gen-a", "gen-b", "gen-c", "gen-d", "gen-e"];
+        let generations = ["gen-a", "gen-b", "gen-c", "gen-d", "gen-e"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
         let mut live_markers = Vec::new();
         let mut marker_files = 0usize;
         let mut generation_keys = BTreeMap::new();
         for (index, generation) in generations.iter().enumerate() {
             generation_keys.insert(
-                generation.to_string(),
+                generation.clone(),
                 BTreeSet::from([[index as u8 + 1; 32]]),
             );
             let readers = crate::root_cache::read_marker_dir(&view_dir, generation);
@@ -1113,16 +1123,31 @@ mod storage_retention_tests {
                 marker_files += 2;
             }
         }
+        QueryPinFixture {
+            _temp: temp,
+            view_dir,
+            generations,
+            live_markers,
+            generation_keys,
+            marker_files,
+        }
+    }
+
+    fn query_pin_marking_reuses_shared_parents_once_per_view() {
+        use crate::bash_background::persistence::work_counts;
+        use crate::root_cache::ReadMarkerSweepContext;
+
+        let fixture = query_pin_fixture();
         let request = SweepRequest {
-            durable_storage: temp.path(),
-            storage: temp.path(),
+            durable_storage: fixture._temp.path(),
+            storage: fixture._temp.path(),
             family: "family",
-            view_dir: &view_dir,
+            view_dir: &fixture.view_dir,
             byte_budget: 0,
             now_ms: 0,
             references: SweepReferences {
                 retained_keys: BTreeSet::new(),
-                generation_keys,
+                generation_keys: fixture.generation_keys.clone(),
             },
         };
         let mut keys = BTreeSet::new();
@@ -1137,8 +1162,8 @@ mod storage_retention_tests {
         let expected: BTreeSet<[u8; 32]> = (0..4).map(|index| [index as u8 + 1; 32]).collect();
         assert_eq!(keys, expected);
         assert_eq!(report.reclaimed_read_markers, 10);
-        for (index, generation) in generations.iter().enumerate() {
-            let dir = view_dir.join("readers").join(generation);
+        for (index, generation) in fixture.generations.iter().enumerate() {
+            let dir = fixture.view_dir.join("readers").join(generation);
             assert!(
                 !dir.join("dead.json").exists(),
                 "stale marker kept in {generation}"
@@ -1149,7 +1174,7 @@ mod storage_retention_tests {
             );
             if *generation != "gen-e" {
                 assert!(
-                    live_markers[index].path().exists(),
+                    fixture.live_markers[index].path().exists(),
                     "live marker reaped in {generation}"
                 );
             }
@@ -1161,11 +1186,12 @@ mod storage_retention_tests {
         let hostnames = crate::root_cache::hostname_resolutions_for_test();
         let starts = crate::root_cache::process_start_resolutions_for_test();
         println!(
-            "query pin marking over {} generations and {marker_files} markers: {opens} opens, {hostnames} hostname resolutions, {starts} process-start resolutions",
-            generations.len(),
+            "query pin marking over {} generations and {} markers: {opens} opens, {hostnames} hostname resolutions, {starts} process-start resolutions",
+            fixture.generations.len(),
+            fixture.marker_files,
         );
         assert!(
-            opens <= 2 + generations.len() + marker_files,
+            opens <= 2 + fixture.generations.len() + fixture.marker_files,
             "query pin marking re-opened shared parents: {opens}",
         );
         // The pass resolves the hostname once and each live pid's start time
@@ -1174,6 +1200,29 @@ mod storage_retention_tests {
         assert_eq!(
             starts, 1,
             "one process start time resolved once per marker"
+        );
+    }
+
+    // TEMPORARY before-run probe: the pre-fix per-generation path on the same
+    // fixture, to record its open count. Deleted after the before-run.
+    #[test]
+    fn tmp_old_path_pin_marking_opens() {
+        use crate::bash_background::persistence::work_counts;
+
+        let fixture = query_pin_fixture();
+        work_counts::reset();
+        for generation in &fixture.generations {
+            let _ = crate::root_cache::sweep_read_markers(&fixture.view_dir, generation);
+        }
+        let opens = work_counts::get().opens;
+        println!(
+            "OLD pin marking over {} generations and {} markers: {opens} opens",
+            fixture.generations.len(),
+            fixture.marker_files,
+        );
+        assert!(
+            opens > 2 + fixture.generations.len() + fixture.marker_files,
+            "old path unexpectedly within new bound: {opens}",
         );
     }
 }
