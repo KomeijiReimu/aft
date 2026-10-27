@@ -1474,7 +1474,12 @@ describe("bash tool adapter", () => {
   });
 
   test("secret placeholders refuse host fallback before confirmation", async () => {
-    for (const command of ["printf '{{ck-secret:test}}'", "printf '{{ck-secret:unfinished'"]) {
+    for (const [command, effective] of [
+      ["printf '{{ck-secret:test}}'", undefined],
+      ["printf '{{ck-secret:unfinished'", undefined],
+      ["printf clean", "printf '{{ck-secret:test}}'"],
+      ["printf '{{ck-secret:test}}'", "printf clean"],
+    ] as const) {
       const tools = new Map<string, MockToolDef>();
       let confirmations = 0;
       const bridge = {
@@ -1482,8 +1487,16 @@ describe("bash tool adapter", () => {
           throw new BridgeTransportUnavailableError("offline");
         },
       } as unknown as BinaryBridge;
+      const api =
+        effective === undefined
+          ? makeMockApi(tools)
+          : ({
+              registerTool: (tool: MockToolDef) => tools.set(tool.name, tool),
+              getHook: (name: string) =>
+                name === "bashSpawn" ? async () => ({ command: effective }) : undefined,
+            } as unknown as ExtensionAPI);
       registerBashTool(
-        makeMockApi(tools),
+        api,
         makeMockContext(bridge, { bash: { host_fallback: true } } as PluginContext["config"]),
       );
       await expect(

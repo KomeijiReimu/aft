@@ -136,6 +136,8 @@ function resolveForegroundWaitMs(configured: number): number {
 // orchestrated bash tool overrides this per request because Rust may hold the
 // final response until the foreground wait window or hard-kill cap elapses.
 const BASH_TRANSPORT_TIMEOUT_MS = 30_000;
+const BASH_SECRET_HOST_FALLBACK_REFUSAL =
+  "Secret placeholder commands cannot run through the host fallback.";
 const DEFAULT_HARD_TIMEOUT_MS = 30 * 60 * 1000;
 // The margin gives Rust time to promote or finalize the task and deliver the
 // final response after the server's foreground wait window or hard kill timeout.
@@ -929,6 +931,9 @@ export function registerBashTool(
       } catch (error) {
         const fallbackCause = classifyBashHostFallbackError(error);
         if (fallbackCause === undefined) throw error;
+        if (params.command.includes("{{ck-secret:") || bridgeCommand.includes("{{ck-secret:")) {
+          throw new Error(BASH_SECRET_HOST_FALLBACK_REFUSAL);
+        }
         if (isPowerShell) {
           throw refuseAftModuleOptionWithoutFallback(
             error,
