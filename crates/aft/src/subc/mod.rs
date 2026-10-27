@@ -312,6 +312,16 @@ pub enum SubcLifecycleEvent {
         counts: Vec<(String, usize)>,
         line: String,
     },
+    /// A foreground bash call reached its wait loop and published the detach
+    /// target the drain uses to answer it, so its census kind is no longer
+    /// `bash:spawning`. `phase` is the census label (`bash:wait`,
+    /// `bash:block` or `bash:foreground`).
+    BashForegroundWait {
+        route_channel: u16,
+        route_epoch: u32,
+        corr: u64,
+        phase: String,
+    },
 }
 
 /// Test-only observer and rendezvous for the frame-loop lifecycle.
@@ -443,6 +453,15 @@ impl SubcTestLifecycleProbe {
             held: census.held(phase),
             counts: census.counts(),
             line: line.to_string(),
+        });
+    }
+
+    fn bash_foreground_wait(&self, route: RouteChannel, corr: u64, phase: &str) {
+        let _ = self.events_tx.send(SubcLifecycleEvent::BashForegroundWait {
+            route_channel: route.channel,
+            route_epoch: route.epoch,
+            corr,
+            phase: phase.to_string(),
         });
     }
 
@@ -5003,6 +5022,12 @@ where
     };
 
     let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
+    if let Some(probe) = lifecycle_probe.clone() {
+        *dispatch_path_metrics
+            .lifecycle_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(probe);
+    }
     shared_app.set_subc_connection_file(connection_file_path.to_path_buf());
     #[cfg(test)]
     let dispatch_path_metrics = watchdog_test

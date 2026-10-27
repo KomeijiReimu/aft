@@ -118,7 +118,7 @@ impl BashHoldPhase {
         matches!(self, Self::Foreground | Self::Block | Self::Wait)
     }
 
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             Self::Spawning => "bash:spawning",
             Self::Foreground => "bash:foreground",
@@ -331,6 +331,13 @@ impl HeldBashCalls {
         if let Some(call) = self.lock().get_mut(&(route, corr)) {
             call.detach = Some(target);
         }
+    }
+
+    /// The phase a held call was last set to, if it is still tracked. The
+    /// foreground-wait event reports this same phase so a test waiting on the
+    /// event sees exactly what a drain census taken next would report.
+    pub(super) fn phase(&self, route: RouteChannel, corr: u64) -> Option<BashHoldPhase> {
+        self.lock().get(&(route, corr)).map(|call| call.phase)
     }
 
     pub(super) fn remove(&self, route: RouteChannel, corr: u64) {
