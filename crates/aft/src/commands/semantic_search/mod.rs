@@ -10154,6 +10154,69 @@ mod tests {
         );
     }
 
+    /// A started views-on lane with no loaded view yet answers for the state
+    /// its slot is in, even when something rewrote the shared status to ready
+    /// (watcher-gap invalidation does): a loading lane reads as building with
+    /// the building disclosure, a failed lane as unavailable with its reason.
+    /// Neither may answer lexical hits under `semantic: ready`.
+    #[test]
+    fn views_on_search_reports_a_loading_or_failed_lane_under_a_ready_status() {
+        let project = tempfile::tempdir().expect("project");
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        std::fs::write(
+            root.join("lib.rs"),
+            "pub fn watchdog_needle() -> u8 {\n    1\n}\n",
+        )
+        .unwrap();
+        let ctx = test_context(&root);
+        install_ready_search_index(&ctx, &root);
+        let slot = ctx.checkout_semantic();
+        let query = "where is the watchdog needle defined";
+        let footer = |text: &str| {
+            text.lines()
+                .find(|line| line.starts_with("semantic:"))
+                .unwrap_or_default()
+                .to_owned()
+        };
+
+        let (_loading, _wake) = slot.begin();
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
+        let response = response_value(handle_semantic_search(&semantic_request(query, 5), &ctx));
+        assert_eq!(response["success"], true, "{response:#}");
+        assert_eq!(response["semantic_status"], "building", "{response:#}");
+        assert_eq!(response["complete"], false, "{response:#}");
+        assert_eq!(response["lexical_only_fallback"], true, "{response:#}");
+        let text = response["text"].as_str().expect("text");
+        assert!(
+            text.starts_with("Semantic index is building"),
+            "a loading lane must open with the building disclosure: {text}"
+        );
+        assert_eq!(footer(text), "semantic: building", "{text}");
+
+        let (failed, _wake) = slot.begin();
+        let reason = "view load: semantic plane: semantic generation not resident";
+        assert!(slot.fail(failed, reason.to_string()));
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
+        let response = response_value(handle_semantic_search(&semantic_request(query, 5), &ctx));
+        assert_eq!(response["success"], true, "{response:#}");
+        assert_eq!(response["semantic_status"], "unavailable", "{response:#}");
+        assert_eq!(response["complete"], false, "{response:#}");
+        assert_eq!(response["lexical_only_fallback"], true, "{response:#}");
+        let text = response["text"].as_str().expect("text");
+        assert!(
+            text.starts_with(&format!("Semantic search unavailable: {reason}")),
+            "a failed lane must open with its reason: {text}"
+        );
+        assert_eq!(
+            footer(text),
+            format!(
+                "semantic: unavailable: {}",
+                crate::feature_status::cause::SEMANTIC_BUILD_FAILED
+            ),
+            "{text}"
+        );
+    }
+
     /// Mark the semantic lane ready with an empty resident index, so a test
     /// can exercise the walk routes aft_search takes while the trigram lane
     /// is not ready.
