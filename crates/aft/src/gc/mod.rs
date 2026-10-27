@@ -1202,27 +1202,4 @@ mod storage_retention_tests {
             "one process start time resolved once per marker"
         );
     }
-
-    // TEMPORARY before-run probe: the pre-fix per-generation path on the same
-    // fixture, to record its open count. Deleted after the before-run.
-    #[test]
-    fn tmp_old_path_pin_marking_opens() {
-        use crate::bash_background::persistence::work_counts;
-
-        let fixture = query_pin_fixture();
-        work_counts::reset();
-        for generation in &fixture.generations {
-            let _ = crate::root_cache::sweep_read_markers(&fixture.view_dir, generation);
-        }
-        let opens = work_counts::get().opens;
-        println!(
-            "OLD pin marking over {} generations and {} markers: {opens} opens",
-            fixture.generations.len(),
-            fixture.marker_files,
-        );
-        assert!(
-            opens > 2 + fixture.generations.len() + fixture.marker_files,
-            "old path unexpectedly within new bound: {opens}",
-        );
-    }
 }
