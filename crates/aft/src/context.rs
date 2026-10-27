@@ -10336,7 +10336,10 @@ impl AppContext {
             return Ok(None);
         }
         self.revalidate_callgraph_store_generation();
-        self.start_pending_callgraph_reconcile();
+        // A pending watcher-gap comparison opens this same store on its own
+        // thread. Every open below therefore finishes before that thread
+        // starts, so the two never race as concurrent first opens inside
+        // SQLite recovery, where the loser reports SQLITE_BUSY.
         let force_token = self.callgraph_force_token_for_build();
         if force_token.is_none() {
             if let Some(store) = {
@@ -10346,6 +10349,9 @@ impl AppContext {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 guard.as_ref().map(Arc::clone)
             } {
+                // A reader is already resident, so starting the pending
+                // comparison here cannot race a first open.
+                self.start_pending_callgraph_reconcile();
                 self.schedule_legacy_callgraph_migration_if_needed(
                     store.as_ref(),
                     store.project_root().to_path_buf(),
@@ -10364,9 +10370,16 @@ impl AppContext {
         // migrate it on the cold-build lane. Opening before the writer path is
         // also the cheap fast path for an already-published root generation.
         if force_token.is_none() {
-            if let Some(store) =
-                CallGraphStore::open_readonly(callgraph_dir.clone(), project_root.clone())?
-            {
+            let reopened =
+                CallGraphStore::open_readonly(callgraph_dir.clone(), project_root.clone());
+            // This thread's first open finished before the reconcile thread
+            // starts, so the comparison opens as a second reader. The
+            // test-only count lets the ordering test observe this.
+            #[cfg(test)]
+            self.callgraph_reconcile
+                .note_ensure_open_completed_for_test();
+            self.start_pending_callgraph_reconcile();
+            if let Some(store) = reopened? {
                 let store = Arc::new(store);
                 {
                     let mut guard = self
@@ -10421,7 +10434,10 @@ impl AppContext {
         )?;
         drop(store);
 
-        let Some(store) = CallGraphStore::open_readonly(callgraph_dir, project_root)? else {
+        let reopened = CallGraphStore::open_readonly(callgraph_dir, project_root);
+        // As above: the comparison starts only after this open completed.
+        self.start_pending_callgraph_reconcile();
+        let Some(store) = reopened? else {
             return Ok(None);
         };
         let store = Arc::new(store);
@@ -18365,6 +18381,72 @@ mod callgraph_store_for_ops_tests {
         assert_eq!(response.data["total_callers"], 2, "{response:?}");
         assert_ne!(response.data["complete"], false, "{response:?}");
         assert_eq!(ctx.callgraph_cold_build_spawn_count_for_test(), 0);
+    }
+
+    #[test]
+    fn ensure_reopens_before_starting_pending_reconcile() {
+        let project = TempDir::new().expect("project tempdir");
+        let storage = TempDir::new().expect("storage tempdir");
+        std::fs::write(
+            project.path().join("main.rs"),
+            "fn entry() { leaf(); }\nfn leaf() {}\n",
+        )
+        .expect("source file");
+        let root = std::fs::canonicalize(project.path()).expect("canonical project root");
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        ));
+        ctx.set_canonical_cache_root(root.clone());
+        let key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &key, false);
+        // Publish a ready store, then drop the resident the way idle eviction
+        // does, leaving a watcher gap behind for the next reopen to compare.
+        assert!(ctx
+            .ensure_callgraph_store()
+            .expect("publish callgraph store")
+            .is_some());
+        ctx.invalidate_artifacts_after_watcher_gap();
+        assert_eq!(
+            ctx.pending_callgraph_reconcile_reason().as_deref(),
+            Some("watcher gap"),
+            "the reopen must service the gap left by the eviction"
+        );
+        let completed_before = ctx.callgraph_reconcile.completed();
+        let opens_before = ctx.callgraph_reconcile.ensure_open_completed_for_test();
+        let (entered, release) = ctx.callgraph_reconcile.hold_next_for_test();
+        // Single-shot: the caller's first open completes before the reconcile
+        // thread starts, so the two never race inside SQLite recovery.
+        let store = ctx
+            .ensure_callgraph_store()
+            .expect("reopen callgraph store");
+        assert!(store.is_some(), "reopen callgraph store");
+        // The entry hold captured how many of the caller's opens had finished
+        // when the reconcile thread started: exactly this reopen. With the old
+        // spawn-first order the parked thread enters before the caller's open
+        // and the count is still the previous one.
+        assert_eq!(
+            entered
+                .recv_timeout(Duration::from_secs(10))
+                .expect("reconcile started after the caller's open"),
+            opens_before + 1,
+            "the caller's open completed before the reconcile thread started"
+        );
+        drop(release);
+        assert!(
+            ctx.callgraph_reconcile
+                .wait_for_idle_for_test(Duration::from_secs(30)),
+            "pending comparison settled"
+        );
+        assert_eq!(
+            ctx.callgraph_reconcile.completed(),
+            completed_before + 1,
+            "the pending comparison still ran"
+        );
     }
 
     #[test]
