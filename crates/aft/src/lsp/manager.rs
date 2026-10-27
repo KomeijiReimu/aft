@@ -919,8 +919,9 @@ pub struct DrainedLspEvents {
     pub events: Vec<LspEvent>,
     /// Reader identities in the same order as `events`, retained for dispatch.
     pub(crate) instances: Vec<Option<ServerInstanceId>>,
-    /// Channel receipts consumed, including events rejected as retired and
-    /// startup events withheld from outward delivery.
+    /// Events this drain worked through: channel receipts (including ones
+    /// rejected as retired or held back for a server still starting) plus
+    /// startup events released from the ready queue.
     pub processed: usize,
     pub diagnostics_changed: bool,
     /// Complete snapshots accepted from document-version-verified publishes
