@@ -3492,8 +3492,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "f7bbfc0444c825786c41e4e6987f3beb43912b0d210f756147dd2a46dfc3d499",
-      "catalog_digest": "f7bbfc0444c825786c41e4e6987f3beb43912b0d210f756147dd2a46dfc3d499",
+      "generation": "bd64527bddcaa6bf8faf6a884faba123a50d86f6cac19ed17174d14fc6a11104",
+      "catalog_digest": "bd64527bddcaa6bf8faf6a884faba123a50d86f6cac19ed17174d14fc6a11104",
       "tools": [
         {
           "name": "status",
@@ -3514,7 +3514,7 @@
         },
         {
           "name": "bash",
-          "schema_digest": "029ddfaa46f2b46b773e15231b41cf5c86acd1ed1668068236039c1edb978aca",
+          "schema_digest": "019128a28f9f2724d2c086f93a1c74222b294ad95fee8b255fa799b257397a4f",
           "semantics": 2,
           "modes": [
             "classic",
@@ -3590,6 +3590,14 @@
               "runon": {
                 "type": "string",
                 "description": "Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add \",net\" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options). `macos` sends the command to a macOS machine for builds and tests that need macOS (no vCPU or network options)."
+              },
+              "return_paths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "description": "With runon: up to 64 files to copy back from the build server after the command, as paths relative to workdir inside the project (10 MiB in total). Each verified file replaces the local file at the same path; the result lists every path as returned or not returned, with the reason."
               }
             },
             "required": [
@@ -4747,8 +4755,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "4fde4f16b2b373fe3432f98aa732b65a53877cd9b050eff28ad20765fac1eacb",
-      "catalog_digest": "4fde4f16b2b373fe3432f98aa732b65a53877cd9b050eff28ad20765fac1eacb",
+      "generation": "e3d5b309182b2e65fdd660b8b14c48bfbb669b0ca6c469e5a61556776536af94",
+      "catalog_digest": "e3d5b309182b2e65fdd660b8b14c48bfbb669b0ca6c469e5a61556776536af94",
       "tools": [
         {
           "name": "status",
@@ -4769,7 +4777,7 @@
         },
         {
           "name": "bash",
-          "schema_digest": "029ddfaa46f2b46b773e15231b41cf5c86acd1ed1668068236039c1edb978aca",
+          "schema_digest": "019128a28f9f2724d2c086f93a1c74222b294ad95fee8b255fa799b257397a4f",
           "semantics": 2,
           "modes": [
             "classic",
@@ -4845,6 +4853,14 @@
               "runon": {
                 "type": "string",
                 "description": "Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add \",net\" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options). `macos` sends the command to a macOS machine for builds and tests that need macOS (no vCPU or network options)."
+              },
+              "return_paths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "description": "With runon: up to 64 files to copy back from the build server after the command, as paths relative to workdir inside the project (10 MiB in total). Each verified file replaces the local file at the same path; the result lists every path as returned or not returned, with the reason."
               }
             },
             "required": [
