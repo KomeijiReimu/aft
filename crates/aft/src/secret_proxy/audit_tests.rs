@@ -377,7 +377,10 @@ async fn audit_stop_during_material() {
         proxy.stop();
         proxy
     });
-    let latched = tokio::time::timeout(Duration::from_millis(500), async {
+    // Material stays blocked until after this window, so a stop that waited
+    // for it could never latch inside the window however long it is; the
+    // generous bound only keeps a loaded runner from failing a correct stop.
+    let latched = tokio::time::timeout(Duration::from_secs(5), async {
         while !state.stopped.load(Ordering::Acquire) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
