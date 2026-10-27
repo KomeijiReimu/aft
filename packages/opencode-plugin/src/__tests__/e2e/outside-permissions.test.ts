@@ -20,7 +20,16 @@ async function stdoutPath(storage: string, id: string): Promise<string> {
   while (pending.length) {
     const directory = pending.pop();
     if (!directory) break;
-    for (const entry of await readdir(directory, { withFileTypes: true })) {
+    // The engine's index builders create and remove temporary folders under
+    // the same storage root while this walk runs, so a listed folder can be
+    // gone by the time it is read; skip it.
+    const entries = await readdir(directory, { withFileTypes: true }).catch(
+      (error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return [];
+        throw error;
+      },
+    );
+    for (const entry of entries) {
       const path = join(directory, entry.name);
       if (entry.isDirectory()) pending.push(path);
       else if (entry.name === `${id}.stdout` || (entry.name === "stdout" && path.includes(id)))
