@@ -724,7 +724,7 @@ describe("OpenCode bash adapter", () => {
         { bash: { host_fallback: true } } as PluginContext["config"],
       );
       await expect(bash.execute({ command }, createMockSdkContext({ ask }))).rejects.toThrow(
-        "Secret placeholder commands cannot run through the host fallback.",
+        "Secret placeholder commands need AFT's shell; OpenCode's built-in shell cannot run them.",
       );
       expect(ask).not.toHaveBeenCalled();
     }

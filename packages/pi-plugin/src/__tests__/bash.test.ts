@@ -1510,7 +1510,9 @@ describe("bash tool adapter", () => {
             },
           },
         }),
-      ).rejects.toThrow("Secret placeholder commands cannot run through the host fallback.");
+      ).rejects.toThrow(
+        "Secret placeholder commands need AFT's shell; Pi's built-in shell cannot run them.",
+      );
       expect(confirmations).toBe(0);
     }
   });
