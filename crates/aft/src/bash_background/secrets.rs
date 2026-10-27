@@ -108,7 +108,12 @@ pub(crate) fn preflight(
     background: bool,
 ) -> Result<Preflight, ()> {
     let task = super::persistence::allocate_task_layout(&super::task_storage_dir(ctx), session)
-        .map_err(|_| ())?;
+        .map_err(|error| {
+            #[cfg(test)]
+            eprintln!("secret preflight layout refused: {error}");
+            #[cfg(not(test))]
+            let _ = error;
+        })?;
     let principal = crate::sandbox_spawn::current_authenticated_principal();
     let plan = crate::sandbox_spawn::resolve_sandbox_spawn(
         ctx,
@@ -129,6 +134,13 @@ pub(crate) fn preflight(
         task: Some(task),
     };
     if !preflight.plan.protects_secret_memory() {
+        #[cfg(test)]
+        eprintln!(
+            "secret preflight refused: code={:?}, message={:?}, scratch={:?}",
+            preflight.plan.refusal_code(),
+            preflight.plan.refusal_message(),
+            preflight.plan.temp_dir()
+        );
         return Err(());
     }
     Ok(preflight)
