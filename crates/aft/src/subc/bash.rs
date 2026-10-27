@@ -2288,17 +2288,21 @@ pub(super) fn submit_deferred_bash(
             task_metrics
                 .held_bash_calls
                 .set_detach_target(route, corr, target.clone());
-            task_metrics.held_bash_calls.set_phase(
-                route,
-                corr,
-                if capture_wait_mode {
-                    drain::BashHoldPhase::Wait
-                } else if blocking_intent {
-                    drain::BashHoldPhase::Block
-                } else {
-                    drain::BashHoldPhase::Foreground
-                },
-            );
+            let capture_phase = if capture_wait_mode {
+                drain::BashHoldPhase::Wait
+            } else if blocking_intent {
+                drain::BashHoldPhase::Block
+            } else {
+                drain::BashHoldPhase::Foreground
+            };
+            task_metrics
+                .held_bash_calls
+                .set_phase(route, corr, capture_phase);
+            if let Ok(guard) = task_metrics.lifecycle_probe.lock() {
+                if let Some(probe) = guard.as_ref() {
+                    probe.bash_foreground_wait(route, corr, capture_phase.label());
+                }
+            }
             #[cfg(test)]
             if let Some(timing) = &timing_for_test {
                 timing.capture_registered.notify_one();
@@ -2892,6 +2896,24 @@ async fn run_deferred_bash_wait(
             format_context: format_context.clone(),
         },
     );
+    // The phase was set when the spawn reported its foreground control; the
+    // detach target above is what moves the census off `bash:spawning`.
+    // Publish both together so a test waiting on this event sees exactly what
+    // a drain census taken next would report for this call.
+    {
+        let foreground_phase = if detach_on_user_message {
+            drain::BashHoldPhase::Wait
+        } else if block_to_completion {
+            drain::BashHoldPhase::Block
+        } else {
+            drain::BashHoldPhase::Foreground
+        };
+        if let Ok(guard) = metrics.lifecycle_probe.lock() {
+            if let Some(probe) = guard.as_ref() {
+                probe.bash_foreground_wait(route, corr, foreground_phase.label());
+            }
+        }
+    }
     loop {
         tokio::select! {
             _ = claim.module_loop_claimed() => {
