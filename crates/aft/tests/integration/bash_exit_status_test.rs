@@ -224,8 +224,19 @@ fn bash_waiter_kill_terminates_shell_and_descendants() {
     }
 }
 
+/// Runs `command` in a PowerShell PTY task, types `input` once after the task
+/// prints `ready`, and checks the exit code and output.
+///
+/// The wait has two separate budgets. PowerShell startup under a busy test
+/// runner can take most of a single shared budget (it was seen taking 9-17 s
+/// on a 4-CPU Windows runner with 16 tasks in parallel), which used to leave
+/// almost no time for the read, echo and exit after a late `ready` and made
+/// a slow start look like lost input. Failure messages name the phase and
+/// the moments `ready` was seen and the write returned.
 #[cfg(windows)]
 fn pty_console_round_trip(command: &str, input: &str, expected_code: i32, expected_output: &str) {
+    const STARTUP_BUDGET: Duration = Duration::from_secs(120);
+    const ROUND_TRIP_BUDGET: Duration = Duration::from_secs(30);
     let project = tempfile::tempdir().unwrap();
     let mut aft = AftProcess::spawn();
     let configured = aft.send(&json!({
@@ -239,27 +250,39 @@ fn pty_console_round_trip(command: &str, input: &str, expected_code: i32, expect
     }).to_string());
     assert_eq!(spawned["success"], true, "{spawned}");
     let task_id = &spawned["task_id"];
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut sent = false;
+    let started = Instant::now();
+    let mut deadline = started + STARTUP_BUDGET;
+    // Moments since spawn when `ready` was first seen and when the single
+    // bash_write returned; `Some` on the latter also means the input was sent.
+    let mut ready_seen = None;
+    let mut write_returned = None;
     loop {
         let status = aft.send(&json!({
             "id":"stdin-status", "command":"bash_status", "params":{"task_id":task_id,"output_mode":"raw"},
         }).to_string());
         assert_eq!(status["success"], true, "{status}");
         let output = status["pty_raw"].as_str().unwrap_or_default();
-        if !sent && output.contains("ready") {
+        if write_returned.is_none() && output.contains("ready") {
+            ready_seen = Some(started.elapsed());
             let written = aft.send(&json!({
                 "id":"stdin-write", "command":"bash_write", "params":{"task_id":task_id,"input":input},
             }).to_string());
             assert_eq!(written["success"], true, "{written}");
-            sent = true;
+            write_returned = Some(started.elapsed());
+            deadline = Instant::now() + ROUND_TRIP_BUDGET;
         }
+        let timing = format!("ready_seen={ready_seen:?} write_returned={write_returned:?}");
         if status["status"] != "running" {
-            assert_eq!(status["exit_code"], expected_code, "{status}");
-            assert!(output.contains(expected_output), "{status}");
+            assert_eq!(status["exit_code"], expected_code, "{timing} {status}");
+            assert!(output.contains(expected_output), "{timing} {status}");
             break;
         }
-        assert!(Instant::now() < deadline, "{status}");
+        let phase = if write_returned.is_some() {
+            "no exit within the round-trip budget after the write"
+        } else {
+            "no `ready` within the startup budget"
+        };
+        assert!(Instant::now() < deadline, "{phase}: {timing} {status}");
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(aft.shutdown().success());
