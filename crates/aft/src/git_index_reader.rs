@@ -1199,7 +1199,11 @@ mod tests {
         line.push(b'\t');
         line.extend_from_slice(name);
         line.push(b'\n');
-        git(dir.path(), &["update-index", "--add", "--index-info"], &line);
+        git(
+            dir.path(),
+            &["update-index", "--add", "--index-info"],
+            &line,
+        );
         git(dir.path(), &["update-index", "--index-version", "4"], &[]);
         assert!(snapshot(dir.path(), ObjectFormat::Sha1)
             .entries
