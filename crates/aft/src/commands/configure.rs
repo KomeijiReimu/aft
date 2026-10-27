@@ -14755,6 +14755,66 @@ mod tests {
         assert!(!off.views_route_root());
     }
 
+    /// Idle eviction releases a routed root's lexical and call-graph views,
+    /// and the next query binds them again and answers.
+    #[test]
+    fn views_routed_idle_eviction_releases_views_and_the_next_query_rebinds() {
+        // Holds the process environment lock: these views resolve storage and
+        // the Git conversion policy through the process environment.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("a.ts"),
+            "export function target() { return 1; }\nexport function caller() { return target(); }\n",
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        let grep = || crate::commands::grep::handle_grep(&grep_request("target"), &ctx);
+        let callers = || {
+            crate::commands::callers::handle_callers(
+                &RawRequest {
+                    id: "evicted-callers".into(),
+                    command: "callers".into(),
+                    lsp_hints: None,
+                    session_id: None,
+                    params: json!({"file": root.join("a.ts"), "symbol": "target", "depth": 1}),
+                },
+                &ctx,
+            )
+        };
+        assert!(grep().success);
+        assert!(callers().success);
+        assert!(ctx.lexical_view_is_ready() && ctx.callgraph_view_is_ready());
+
+        assert!(ctx.evict_idle_artifacts());
+        assert!(!ctx.lexical_view_is_ready() && !ctx.callgraph_view_is_ready());
+        let before = (
+            ctx.lexical_view_route_counts()[0],
+            ctx.callgraph_view_route_count(),
+        );
+        let answer = grep();
+        assert!(answer.success, "{:?}", answer.data);
+        assert_eq!(answer.data["index_status"], "Ready", "{:?}", answer.data);
+        let answer = callers();
+        assert!(answer.success, "{:?}", answer.data);
+        assert_eq!(
+            (
+                ctx.lexical_view_route_counts()[0],
+                ctx.callgraph_view_route_count()
+            ),
+            (before.0 + 1, before.1 + 1)
+        );
+        assert!(ctx.lexical_view_is_ready() && ctx.callgraph_view_is_ready());
+    }
+
     #[test]
     fn views_routed_symbol_prewarm_stores_then_reuses_v3_symbol_rows() {
         // Holds the process environment lock for the whole test. These views

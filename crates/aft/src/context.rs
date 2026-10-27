@@ -14312,6 +14312,12 @@ impl AppContext {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        // A views-routed root's lexical and call-graph views hold their
+        // installed snapshots and the call graph's open reader. The next query
+        // binds a fresh view, which verifies the checkout from its published
+        // generation.
+        self.lexical_view.lock().take();
+        self.callgraph_view.lock().take();
         self.borrowed_index_cache.lock().clear();
         self.clear_semantic_refresh_worker();
         *self.semantic_embedding_model.lock() = None;
