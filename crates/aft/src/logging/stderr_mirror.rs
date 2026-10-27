@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 pub(super) const QUEUE_CAPACITY: usize = 256;
 const MAX_RECORD_BYTES: usize = 64 * 1024;
@@ -35,7 +36,7 @@ impl MirrorHealth {
                 self.dropped_lines
                     .fetch_add(super::log_line_count(bytes), Ordering::Relaxed);
             }
-            Message::Flush => {
+            Message::Flush | Message::Drain(_) => {
                 self.dropped_flushes.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -45,6 +46,7 @@ impl MirrorHealth {
 enum Message {
     Record(Vec<u8>),
     Flush,
+    Drain(SyncSender<bool>),
 }
 
 #[derive(Clone)]
@@ -68,18 +70,21 @@ impl Mirror {
                     // No channel or file-sink lock is held during stderr I/O.
                     let result = match &message {
                         Message::Record(bytes) => sink.write_all(bytes),
-                        Message::Flush => sink.flush(),
+                        Message::Flush | Message::Drain(_) => sink.flush(),
                     };
                     if result.is_err() {
                         match &message {
                             Message::Record(_) => {
                                 worker_health.write_errors.fetch_add(1, Ordering::Relaxed);
                             }
-                            Message::Flush => {
+                            Message::Flush | Message::Drain(_) => {
                                 worker_health.flush_errors.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                         worker_health.drop_message(&message);
+                    }
+                    if let Message::Drain(done) = &message {
+                        let _ = done.send(result.is_ok());
                     }
                 }
             })?;
@@ -111,6 +116,36 @@ impl Mirror {
 
     pub(super) fn flush(&self) {
         self.enqueue(Message::Flush);
+    }
+
+    // Only process teardown waits for this fence. Ordinary logger flushes stay
+    // nonblocking, including when stderr is full or its sink is wedged.
+    pub(super) fn drain_on_exit(&self, timeout: Duration) -> bool {
+        let Some(tx) = self.tx.as_ref() else {
+            return false;
+        };
+        let deadline = Instant::now() + timeout;
+        let (done, received) = mpsc::sync_channel(1);
+        let mut message = Message::Drain(done);
+        loop {
+            match tx.try_send(message) {
+                Ok(()) => break,
+                Err(TrySendError::Disconnected(message)) => {
+                    self.health.drop_message(&message);
+                    return false;
+                }
+                Err(TrySendError::Full(returned)) => message = returned,
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.health.drop_message(&message);
+                return false;
+            }
+            thread::sleep(remaining.min(Duration::from_millis(1)));
+        }
+        received
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(false)
     }
 
     fn enqueue(&self, message: Message) {
@@ -156,6 +191,40 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn exit_drain_confirms_accepted_records_and_has_a_bounded_wait() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (entered, entering) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (mirror, worker) = Mirror::spawn(
+            GateWriter {
+                bytes: bytes.clone(),
+                write_gate: Some((entered, released)),
+                flush_gate: None,
+            },
+            8,
+            Arc::new(MirrorHealth::default()),
+        )
+        .unwrap();
+        mirror.record(b"shutdown reason\n");
+        entering.recv_timeout(Duration::from_secs(1)).unwrap();
+        let probe = mirror.clone();
+        let (done, received) = mpsc::channel();
+        let drainer = thread::spawn(move || {
+            let _ = done.send(probe.drain_on_exit(Duration::from_millis(20)));
+        });
+        let bounded = received.recv_timeout(Duration::from_secs(1));
+        // Release the sink before asserting, so even a broken fence cannot leave
+        // the worker blocked behind the test's gate after a failure.
+        release.send(()).unwrap();
+        drainer.join().unwrap();
+        assert!(!bounded.expect("exit drain exceeded its wait budget"));
+        assert!(mirror.drain_on_exit(Duration::from_secs(1)));
+        assert_eq!(&*bytes.lock().unwrap(), b"shutdown reason\n");
+        drop(mirror);
+        worker.join().unwrap();
     }
 
     #[test]

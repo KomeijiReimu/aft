@@ -94,14 +94,16 @@ mod stderr_mode_tests {
     }
 }
 
-/// Upper bound on how long an exit waits for the durable log to catch up.
+/// Shared wait budget for durable-file and stderr flushing on error exits.
 const DURABLE_LOG_EXIT_FLUSH: Duration = Duration::from_secs(2);
 
-/// Flush the durable log before `process::exit`, which skips every destructor
+/// Flush the logs before `process::exit`, which skips every destructor
 /// and would otherwise drop the lines still queued for the log writer: the
 /// ones that explain the exit.
 fn exit_after_log_flush(code: i32) -> i32 {
+    let started = Instant::now();
     aft::logging::flush_durable_log(DURABLE_LOG_EXIT_FLUSH);
+    aft::logging::flush_stderr_on_exit(DURABLE_LOG_EXIT_FLUSH.saturating_sub(started.elapsed()));
     code
 }
 
@@ -428,6 +430,9 @@ fn main() {
                 }
                 #[cfg(debug_assertions)]
                 storage_lease_exit_probe();
+                // The stderr mirror has its own queue: a durable-file flush does
+                // not deliver the shutdown reason to redirected module stderr.
+                aft::logging::flush_stderr_on_exit(aft::subc::exit_log_flush_wait());
                 if !native_idle {
                     aft::ort_lifecycle::exit_without_native_teardown(0);
                 }

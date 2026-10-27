@@ -1430,6 +1430,19 @@ fn tool_result_fixtures_release_descriptors() {
             .collect();
         println!("FD_CENSUS SUMMARY {name} before={before} after={after} retained={retained:?}");
         if after > before {
+            let mut threads: Vec<_> = std::fs::read_dir("/proc/self/task")
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    std::fs::read_to_string(entry.path().join("comm"))
+                        .ok()
+                        .map(|name| {
+                            format!("{}:{}", entry.file_name().to_string_lossy(), name.trim())
+                        })
+                })
+                .collect();
+            threads.sort();
+            println!("FD_CENSUS_THREADS {name} {threads:?}");
             leaks.push(format!("{name}: {before} -> {after}; {retained:?}"));
         }
     }

@@ -1,0 +1,1 @@
+- Supervised shutdowns now give final stderr messages a short, bounded flush, so the exit reason is not left queued when the process stops.
