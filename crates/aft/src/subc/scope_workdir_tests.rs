@@ -274,6 +274,9 @@ fn bind_observed(
 #[test]
 fn scope_workdir_held_lookup_does_not_delay_bind_ack() {
     let _serial = serial();
+    // Taken before the clock starts: waiting for another test to release the
+    // environment is not bind latency. `bind_observed` takes it again.
+    let _env = crate::test_env::process_env_lock();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let workdir = root.join("held-workdir");
