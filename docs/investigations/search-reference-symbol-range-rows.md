@@ -64,10 +64,9 @@ included). Two separate remote jobs gave identical ranks for each engine.
 - **940004 / 940005** paraphrase the `///` lines above two `format_test.rs` tests.
   The answer misses in every engine.
 
-On the pinned tree, B changes exactly those three chunks. The controlled-corpus
-rows drafted in the symbol-range audit (Rust detached doc, C trailing comment,
-license banner, Ruby magic comment, and A's alternate cross-declaration row)
-cannot be gate rows: every included row must share the single pinned evidence
+On the pinned tree, B changes exactly those three chunks. Rows built on synthetic
+fixture files (a detached Rust doc, a C trailing comment, a license banner, a Ruby
+magic comment, and a cross-declaration occurrence decoy for A) cannot be gate rows: every included row must share the single pinned evidence
 tree digest, and those fixtures are not in it.
 
 ## Recording
