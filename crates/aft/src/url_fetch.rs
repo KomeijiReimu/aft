@@ -960,6 +960,12 @@ pub fn fetch_url_with_secrets(
     }
     let content_type = scrubbed_header(&response, CONTENT_TYPE, &held, logical_url)?
         .unwrap_or_else(|| "text/plain".to_string());
+    // `HeaderMap::get` reads only the first field. A second Content-Encoding
+    // field could name a coding behind an `identity` first one, so repeated
+    // fields refuse the response rather than being read in part.
+    if response.headers().get_all(CONTENT_ENCODING).iter().count() > 1 {
+        return Err(secret_fetch_refused("content_encoding", logical_url));
+    }
     let codings = match scrubbed_header(&response, CONTENT_ENCODING, &held, logical_url)? {
         Some(value) => secret_content_codings(&value, logical_url)?,
         None if response.headers().contains_key(CONTENT_ENCODING) => {
@@ -1069,7 +1075,9 @@ enum SecretCoding {
 /// The codings a response declares, in the order they were applied. A server
 /// may encode the body although the request asked for `identity`; any coding
 /// this function cannot undo refuses the document, because an encoded key
-/// cannot be scrubbed.
+/// cannot be scrubbed. A coding named twice refuses it too: no ordinary server
+/// encodes a body twice the same way, and the limit on stacked codings stays
+/// meaningful.
 fn secret_content_codings(value: &str, url: &str) -> Result<Vec<SecretCoding>, UrlFetchError> {
     let mut codings = Vec::new();
     for token in value.split(',').map(str::trim) {
@@ -1084,7 +1092,7 @@ fn secret_content_codings(value: &str, url: &str) -> Result<Vec<SecretCoding>, U
         } else {
             return Err(secret_fetch_refused("content_encoding", url));
         };
-        if codings.len() >= MAX_SECRET_CODINGS {
+        if codings.len() >= MAX_SECRET_CODINGS || codings.contains(&coding) {
             return Err(secret_fetch_refused("content_encoding", url));
         }
         codings.push(coding);

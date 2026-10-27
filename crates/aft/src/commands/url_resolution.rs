@@ -1668,5 +1668,35 @@ mod url_tests {
             );
             assert_absent(&run, &documents, &[K]);
         }
+
+        /// A second Content-Encoding field must not hide a coding the fetch
+        /// cannot undo behind an `identity` first field.
+        #[test]
+        fn repeated_content_encoding_fields_are_refused() {
+            let fixture = fixture(Default::default());
+            let server = serve(&fixture.tls, |_| {
+                Some(http(
+                    "200 OK",
+                    &[
+                        ("Content-Type", "text/markdown"),
+                        ("Content-Encoding", "identity"),
+                        ("Content-Encoding", "x-rot13"),
+                    ],
+                    b"# Gvgyr\n",
+                ))
+            });
+            let port = server.addr.port();
+            let url = format!("https://api.secret.test:{port}/v1/doc.md?key={PLACEHOLDER}");
+            let vault = granted_vault(rule("api.secret.test", port, "/v1"));
+            let (run, documents) = run_with(
+                &fixture,
+                &vault,
+                &[("api.secret.test", server.addr)],
+                &request("outline", &url, serde_json::json!({})),
+                no_extra,
+            );
+            assert!(!run.response.success, "{:?}", run.response.data);
+            assert_absent(&run, &documents, &[b"Gvgyr"]);
+        }
     }
 }
