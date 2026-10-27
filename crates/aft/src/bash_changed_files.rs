@@ -834,7 +834,9 @@ impl GitStart {
             .map(Duration::from_millis)
             .unwrap_or(budget);
         #[cfg(test)]
-        let budget = TEST_GIT_CAPTURE_BUDGET.with(|slot| slot.get()).unwrap_or(budget);
+        let budget = TEST_GIT_CAPTURE_BUDGET
+            .with(|slot| slot.get())
+            .unwrap_or(budget);
         Self::read_with_git(root, budget, |directory, args, deadline| {
             crate::revision_read::bounded_git_bytes(directory, args, deadline, MAX_REPORT_BYTES)
         })
