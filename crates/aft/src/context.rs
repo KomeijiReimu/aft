@@ -10861,11 +10861,6 @@ impl AppContext {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn lazy_callgraph_builds_scheduled_for_test(&self) -> usize {
-        self.lazy_callgraph.builds_scheduled.load(Ordering::Acquire)
-    }
-
     /// A root actor or the standalone scope now publishes for this context.
     pub(crate) fn note_publication_scope(&self) {
         self.lazy_callgraph

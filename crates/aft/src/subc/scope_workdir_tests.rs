@@ -70,6 +70,11 @@ fn bind_observed(
     scope: Option<ScopeStamp>,
     after_ack: impl FnOnce(&mut Option<oneshot::Receiver<()>>),
 ) -> (Vec<String>, Vec<u8>) {
+    // The bind resolves its storage root through the process environment,
+    // where AFT_STORAGE_DIR overrides the configured root. A test that sets
+    // it holds this lock; binding meanwhile would open that test's storage
+    // (and wait on its live databases) before acknowledging.
+    let _env = crate::test_env::process_env_lock();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
