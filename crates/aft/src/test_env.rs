@@ -13,12 +13,17 @@ use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// Return inherited credential-shaped names so test child processes can omit them.
+/// AFT's co-author setting is not a secret, but it is dropped too so a test
+/// child never adds the operator's co-author trailer to fixture commits.
 pub(crate) fn secret_named_environment_keys(
     is_secret_environment_key: fn(&str) -> bool,
 ) -> Vec<OsString> {
     std::env::vars_os()
         .map(|(key, _)| key)
-        .filter(|key| key.to_str().is_some_and(is_secret_environment_key))
+        .filter(|key| {
+            key.to_str()
+                .is_some_and(|key| is_secret_environment_key(key) || key == "AFT_GIT_CO_AUTHOR")
+        })
         .collect()
 }
 

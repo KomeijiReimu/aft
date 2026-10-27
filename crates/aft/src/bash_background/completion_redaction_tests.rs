@@ -1119,3 +1119,26 @@ fn bash_background_restart_watch_withholds_output_of_a_task_launched_with_secret
         .context
         .starts_with(completion_preview::RESTART_WATCH_PREVIEW_WITHHELD));
 }
+
+#[test]
+fn bash_background_restart_watch_previews_a_task_launched_with_aft_co_author() {
+    // AFT gives governed children its co-author trailer. It names a person,
+    // not a credential, so it must not make the task's output withheld.
+    let environment = [(
+        "AFT_GIT_CO_AUTHOR",
+        "Co-Authored-By: Agent <agent@example.com>",
+    )];
+    let (matched, status, _) =
+        restarted_watch_match(&environment, WatchPattern::regex("failed: .*").unwrap());
+    assert_eq!(matched.match_text, "failed: checks");
+    assert!(
+        matched
+            .context
+            .contains("#1039 head 03b92ca085 failed: checks"),
+        "{:?}",
+        matched.context
+    );
+    assert!(status
+        .output_preview
+        .contains(RESTART_WATCH_LINE.trim_end()));
+}
