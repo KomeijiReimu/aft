@@ -9740,7 +9740,8 @@ impl PlainToolRun {
                 // Both the tool's run and the reply's finishing use the trace.
                 let phase_trace = std::cell::RefCell::new(Some(phase_trace));
                 // Classify before translation changes an agent's taskId to native task_id.
-                let agent_visible = !manifest::is_native_plumbing_call(&bare_name, &arguments);
+                let agent_visible = !tool_call_context.preview
+                    && !manifest::is_native_plumbing_call(&bare_name, &arguments);
                 let finalizer = |response: &mut Response, text: &mut String| {
                     // A UI copy must leave completions and cancellation notices
                     // available to the session that actually owns the command.

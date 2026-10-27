@@ -149,6 +149,7 @@ async fn route_bash(
         corr,
         "bash",
         arguments,
+        false,
     )
     .await;
 }
@@ -163,6 +164,7 @@ async fn route_cancel_test_tool(
     corr: u64,
     name: &str,
     arguments: Value,
+    preview: bool,
 ) -> mpsc::Receiver<wire::WriterFrame> {
     let identity = RouteIdentity(Arc::new(RouteIdentityData {
         root: root.clone(),
@@ -188,7 +190,8 @@ async fn route_cancel_test_tool(
         41,
         1,
         corr,
-        serde_json::to_vec(&json!({"name": name, "arguments": arguments})).unwrap(),
+        serde_json::to_vec(&json!({"name": name, "arguments": arguments, "preview": preview}))
+            .unwrap(),
     )
     .unwrap();
     let (writer, replies) = mpsc::channel(8);
@@ -270,17 +273,36 @@ async fn next_cancel_test_tool_reply(replies: &mut mpsc::Receiver<wire::WriterFr
 #[cfg(unix)]
 #[tokio::test]
 async fn cancelled_call_notice_appears_on_read_once() {
-    cancelled_call_notice_read_case(false).await;
+    cancelled_call_notice_read_case(NoticeInterveningCall::None, false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn cancelled_call_notice_survives_native_status_and_appears_on_read_once() {
-    cancelled_call_notice_read_case(true).await;
+    cancelled_call_notice_read_case(NoticeInterveningCall::NativeStatus, false).await;
 }
 
 #[cfg(unix)]
-async fn cancelled_call_notice_read_case(poll_native: bool) {
+#[tokio::test]
+async fn cancelled_call_notice_appears_on_standalone_read_once() {
+    cancelled_call_notice_read_case(NoticeInterveningCall::None, true).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelled_call_notice_survives_argument_refusal_and_appears_on_read_once() {
+    cancelled_call_notice_read_case(NoticeInterveningCall::ArgumentRefusal, false).await;
+}
+
+#[cfg(unix)]
+enum NoticeInterveningCall {
+    None,
+    NativeStatus,
+    ArgumentRefusal,
+}
+
+#[cfg(unix)]
+async fn cancelled_call_notice_read_case(intervening: NoticeInterveningCall, standalone: bool) {
     struct Shutdown(Arc<AppContext>);
     impl Drop for Shutdown {
         fn drop(&mut self) {
@@ -317,34 +339,91 @@ async fn cancelled_call_notice_read_case(poll_native: bool) {
         .note_cancelled_call(&task_id, CANCEL_SESSION);
     let notice = format!("task {task_id} from your cancelled call is still running; check it with bash_status or stop it with bash_kill");
 
-    if poll_native {
+    let arguments = match intervening {
+        NoticeInterveningCall::None => None,
+        NoticeInterveningCall::NativeStatus => Some(("bash_status", json!({"task_id": task_id}))),
+        NoticeInterveningCall::ArgumentRefusal => Some(("read", json!([]))),
+    };
+    if let Some((name, arguments)) = arguments {
         let mut plumbing = route_cancel_test_tool(
             &executor,
             &root,
             &connection,
             &bash_tx,
             2,
-            "bash_status",
-            json!({"task_id": task_id}),
+            name,
+            arguments,
+            false,
         )
         .await;
         let text = next_cancel_test_tool_reply(&mut plumbing).await;
         assert!(!text.contains("cancelled call"), "{text}");
+        if name == "read" {
+            assert!(text.contains("tool arguments must be an object"), "{text}");
+        }
     }
 
     let path = root.as_path().join("notice.txt");
     std::fs::write(&path, "file contents").unwrap();
-    let mut read = route_cancel_test_tool(
+    let mut held = Response::error("held", crate::access_policy::ACCESS_ASK_REQUIRED, "ask");
+    let mut text = String::new();
+    crate::response_finalize::finalize_tool_response(
+        &mut held,
+        &mut text,
+        &ctx,
+        CANCEL_SESSION,
+        "read",
+        false,
+    );
+    assert!(!text.contains("cancelled call"), "{text}");
+
+    let mut preview = route_cancel_test_tool(
         &executor,
         &root,
         &connection,
         &bash_tx,
-        3,
+        6,
         "read",
         json!({"path": path}),
+        true,
     )
     .await;
-    let text = next_cancel_test_tool_reply(&mut read).await;
+    let text = next_cancel_test_tool_reply(&mut preview).await;
+    assert!(!text.contains("cancelled call"), "{text}");
+
+    let text = if standalone {
+        let mut request = RawRequest {
+            id: "standalone".into(),
+            command: "tool_call".into(),
+            params: json!({"name": "read", "arguments": {"path": path}, "preview": true}),
+            session_id: Some(CANCEL_SESSION.into()),
+            lsp_hints: None,
+        };
+        let dispatch = |request: RawRequest, ctx: &AppContext| {
+            crate::commands::read::handle_read(&request, ctx)
+        };
+        let preview = crate::commands::tool_call::handle_with_dispatch(&request, &ctx, &dispatch);
+        assert!(!preview.data["text"]
+            .as_str()
+            .unwrap()
+            .contains("cancelled call"));
+        request.params["preview"] = json!(false);
+        let read = crate::commands::tool_call::handle_with_dispatch(&request, &ctx, &dispatch);
+        read.data["text"].as_str().unwrap().to_string()
+    } else {
+        let mut read = route_cancel_test_tool(
+            &executor,
+            &root,
+            &connection,
+            &bash_tx,
+            3,
+            "read",
+            json!({"path": path}),
+            false,
+        )
+        .await;
+        next_cancel_test_tool_reply(&mut read).await
+    };
     assert!(text.contains("file contents"), "{text}");
     assert_eq!(text.matches(&notice).count(), 1, "{text}");
 
@@ -356,6 +435,7 @@ async fn cancelled_call_notice_read_case(poll_native: bool) {
         4,
         "bash_status",
         json!({"taskId": task_id}),
+        false,
     )
     .await;
     let text = next_cancel_test_tool_reply(&mut status).await;
@@ -372,6 +452,7 @@ async fn cancelled_call_notice_read_case(poll_native: bool) {
         5,
         "bash_status",
         json!({"taskId": task_id}),
+        false,
     )
     .await;
     let text = next_cancel_test_tool_reply(&mut status).await;

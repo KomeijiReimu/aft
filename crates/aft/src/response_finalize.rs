@@ -182,7 +182,7 @@ pub(crate) fn finalize_tool_response_with_visibility(
         allow_bg_completions,
     );
     if agent_visible {
-        append_cancelled_call_notices(text, ctx, session_id);
+        append_cancelled_call_notices(response, text, ctx, session_id);
     }
     if let Some(line) = status_bar_line(ctx, publish, attach_command, session_id, counts) {
         append_trailing_line(text, &line);
@@ -237,7 +237,18 @@ fn acknowledge_terminal_bash_reply(
 /// An agent-visible reply names tasks the session has not heard about: commands
 /// still running after their waiting call was cancelled, and commands stopped
 /// by an owner cancellation. The registry supplies the appropriate status for each.
-fn append_cancelled_call_notices(text: &mut String, ctx: &AppContext, session_id: &str) {
+pub(crate) fn append_cancelled_call_notices(
+    response: &Response,
+    text: &mut String,
+    ctx: &AppContext,
+    session_id: &str,
+) {
+    // An internal access ask is held for consent and replaced by a later tool reply.
+    if response.data.get("code").and_then(Value::as_str)
+        == Some(crate::access_policy::ACCESS_ASK_REQUIRED)
+    {
+        return;
+    }
     for line in ctx
         .bash_background()
         .take_cancelled_call_notices(session_id)
