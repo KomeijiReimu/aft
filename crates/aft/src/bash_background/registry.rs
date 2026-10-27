@@ -6333,7 +6333,11 @@ impl BgTaskRegistry {
                 continue;
             }
             let session_dir = session_tasks_dir(storage_dir, &metadata.session_id);
-            let resolved = match resolve_task_layout(&session_dir, &metadata.task_id) {
+            let resolved = match retry_replay_after_metadata_replacement(
+                &metadata.session_id,
+                &metadata.task_id,
+                || resolve_task_layout(&session_dir, &metadata.task_id),
+            ) {
                 Ok(task) => task,
                 Err(error) => {
                     if skip_refused_task(&metadata.task_id, "replay", &error) {
@@ -6381,7 +6385,11 @@ impl BgTaskRegistry {
                     continue;
                 }
             };
-            match read_task_at(&resolved) {
+            match retry_replay_after_metadata_replacement(
+                &metadata.session_id,
+                &metadata.task_id,
+                || read_task_at(&resolved),
+            ) {
                 Ok(disk)
                     if disk.task_id == metadata.task_id
                         && disk.session_id == metadata.session_id =>
@@ -6504,12 +6512,17 @@ impl BgTaskRegistry {
         }
         let _recovering = self.begin_session_recovery(storage_dir, session_id);
         let session_dir = session_tasks_dir(storage_dir, session_id);
-        let resolved = match resolve_task_layout(&session_dir, task_id) {
+        let resolved = match retry_replay_after_metadata_replacement(session_id, task_id, || {
+            resolve_task_layout(&session_dir, task_id)
+        }) {
             Ok(resolved) => resolved,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(format!("background task record could not be read: {error}")),
         };
-        let metadata = read_task_at(&resolved).map_err(|error| error.to_string())?;
+        let metadata = retry_replay_after_metadata_replacement(session_id, task_id, || {
+            read_task_at(&resolved)
+        })
+        .map_err(|error| error.to_string())?;
         if metadata.task_id != task_id
             || metadata.session_id != session_id
             || metadata
@@ -6875,7 +6888,9 @@ impl BgTaskRegistry {
 
         let mut tasks = Vec::new();
         for task_id in task_ids {
-            let task = match resolve_task_layout(&dir, &task_id) {
+            let task = match retry_replay_after_metadata_replacement(session_id, &task_id, || {
+                resolve_task_layout(&dir, &task_id)
+            }) {
                 Ok(task) => task,
                 Err(error)
                     if error.kind() == std::io::ErrorKind::NotFound
@@ -6915,7 +6930,9 @@ impl BgTaskRegistry {
                     continue;
                 }
             };
-            match read_task_at(&task) {
+            match retry_replay_after_metadata_replacement(session_id, &task_id, || {
+                read_task_at(&task)
+            }) {
                 Ok(metadata) if metadata.session_id == session_id => tasks.push(metadata),
                 Ok(_) => {
                     crate::slog_warn!(
@@ -7224,21 +7241,27 @@ impl BgTaskRegistry {
             {
                 continue;
             }
-            let resolved = match resolve_uninitialized_task_layout(&session_dir, task_id) {
-                Ok(resolved) => resolved,
-                Err(_) => continue,
-            };
+            let resolved =
+                match retry_replay_after_metadata_replacement(&session_id, task_id, || {
+                    resolve_uninitialized_task_layout(&session_dir, task_id)
+                }) {
+                    Ok(resolved) => resolved,
+                    Err(_) => continue,
+                };
             #[cfg(test)]
             bundle_reads.push(task_id.to_string());
-            let metadata = match read_task_at(&resolved) {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    crate::slog_warn!(
-                        "failed to read Bash task {task_id} during project replay: {error}"
-                    );
-                    continue;
-                }
-            };
+            let metadata =
+                match retry_replay_after_metadata_replacement(&session_id, task_id, || {
+                    read_task_at(&resolved)
+                }) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        crate::slog_warn!(
+                            "failed to read Bash task {task_id} during project replay: {error}"
+                        );
+                        continue;
+                    }
+                };
             if metadata.task_id != task_id
                 || metadata.session_id != session_id
                 || session_tasks_dir(storage_dir, &metadata.session_id) != session_dir
@@ -14500,6 +14523,27 @@ fn saved_scope_task_records(
         }
     }
     records
+}
+
+/// A live task can replace its metadata during every optimistic open attempt.
+/// Retry that read while excluding registered metadata writers instead of
+/// treating their progress as corruption and quarantining or skipping the task.
+/// Callers hold no task state or claim lock. The retry's json_writes mutex
+/// guard is dropped before returning, so registration and notice publication
+/// never run under that mutex.
+fn retry_replay_after_metadata_replacement<T>(
+    session_id: &str,
+    task_id: &str,
+    mut read: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    match read() {
+        Err(error) if concurrently_replaced(&error) => {
+            let order = DbWriteOrder::for_task(session_id, task_id);
+            let _writes = order.lock_json_writes();
+            read()
+        }
+        result => result,
+    }
 }
 
 /// True when a validated open lost its race against an atomic replacement
