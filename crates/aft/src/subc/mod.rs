@@ -1498,6 +1498,10 @@ struct PendingBind {
     /// removed, running configures return at their next checkpoint) instead of
     /// only marking bookkeeping.
     cancellation: crate::executor::JobCancellation,
+    /// Session that requested this bind. Periodic warnings about the bind run
+    /// on the frame loop, which serves every session, so they log inside this
+    /// session's scope to carry the right session tag.
+    session: Option<String>,
 }
 
 struct RouteBindCompletion {
@@ -8326,6 +8330,7 @@ async fn handle_control_request(
                 scopes.bind(&route_identity);
             }
             let configure_session = route_identity.session.clone();
+            let bind_session = configure_session.clone();
             let root_was_live = live_roots.contains_key(&bind_root_id);
             metrics.mark_frame_loop_wait(
                 "executor.scheduler/register_actor",
@@ -8415,6 +8420,7 @@ async fn handle_control_request(
                     ver: frame.header.ver,
                     flags: frame.header.flags,
                     cancellation: configure_cancellation,
+                    session: Some(bind_session),
                 },
             );
 
@@ -19546,6 +19552,7 @@ mod tests {
                 ver: PROTOCOL_VERSION,
                 flags: control_flags(),
                 cancellation: crate::executor::JobCancellation::new(),
+                session: None,
             },
         )]);
         let mut installed_route_epochs = HashMap::from([(route.channel, route.epoch)]);
@@ -19679,6 +19686,7 @@ mod tests {
                 ver: PROTOCOL_VERSION,
                 flags: control_flags(),
                 cancellation: crate::executor::JobCancellation::new(),
+                session: None,
             },
         )]);
         let mut installed_route_epochs = HashMap::from([(route.channel, route.epoch)]);
@@ -19734,6 +19742,7 @@ mod tests {
             ver: PROTOCOL_VERSION,
             flags: control_flags(),
             cancellation: crate::executor::JobCancellation::new(),
+            session: None,
         };
         let young = route_key(9, 1);
         let held = route_key(10, 1);
@@ -19774,6 +19783,71 @@ mod tests {
         );
         assert!(pending_binds[&held].deadline_reported);
         assert!(!pending_binds[&young].deadline_reported);
+    }
+
+    /// The frame loop serves every session. After it has served session A,
+    /// the slow-bind warning for a bind that session B requested must carry
+    /// B's tag, and one for a bind with no session must carry no tag; neither
+    /// may carry A's.
+    #[test]
+    fn slow_pending_bind_warning_carries_the_bind_session_not_the_last_served() {
+        let (_dir, root) = test_root("route-bind-slow-warn-session");
+        let pending_bind = |corr: u64, session: Option<&str>| PendingBind {
+            ack_publication: None,
+            bind_root_id: root.clone(),
+            inserted_new_actor: false,
+            cancelled: false,
+            configure_request_id: format!("subc-bind-{corr}"),
+            started_at: Instant::now()
+                .checked_sub(DISPATCH_PATH_BIND_WARN_AFTER + Duration::from_secs(1))
+                .expect("monotonic clock is older than the bind age"),
+            warned_half_deadline: false,
+            deadline_reported: false,
+            corr,
+            ver: PROTOCOL_VERSION,
+            flags: control_flags(),
+            cancellation: crate::executor::JobCancellation::new(),
+            session: session.map(str::to_string),
+        };
+        let owned = route_key(352, 1);
+        let unowned = route_key(353, 1);
+        let mut pending_binds = HashMap::from([
+            (owned, pending_bind(352, Some("ses_B"))),
+            (unowned, pending_bind(353, None)),
+        ]);
+        let executor = Executor::new();
+
+        let ((), lines) = crate::logging::capture_log_lines(|| {
+            log_ctx::with_session(Some("ses_A".to_string()), || {
+                crate::slog_info!("serving session A");
+            });
+            warn_slow_pending_binds(&mut pending_binds, &executor);
+        });
+
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("INFO [ses_A] serving session A")
+        );
+        let owned_line = lines
+            .iter()
+            .find(|line| line.contains("route 352@1"))
+            .unwrap_or_else(|| panic!("no warning for route 352: {lines:?}"));
+        let unowned_line = lines
+            .iter()
+            .find(|line| line.contains("route 353@1"))
+            .unwrap_or_else(|| panic!("no warning for route 353: {lines:?}"));
+        assert!(
+            owned_line.starts_with("WARN [ses_B] subc attach: "),
+            "{owned_line}"
+        );
+        assert!(
+            unowned_line.starts_with("WARN subc attach: "),
+            "{unowned_line}"
+        );
+        assert!(
+            !lines[1..].iter().any(|line| line.contains("ses_A")),
+            "{lines:?}"
+        );
     }
 
     /// A bind whose deadline passes while it waits behind a reader on its root
@@ -19837,6 +19911,7 @@ mod tests {
                 ver: PROTOCOL_VERSION,
                 flags: control_flags(),
                 cancellation: bind_token,
+                session: None,
             },
         )]);
         let mut installed_route_epochs = HashMap::from([(route.channel, route.epoch)]);
@@ -20031,6 +20106,7 @@ mod tests {
                 ver: PROTOCOL_VERSION,
                 flags: control_flags(),
                 cancellation,
+                session: None,
             },
         )]);
         let mut installed = HashMap::from([(route.channel, route.epoch)]);
@@ -20275,6 +20351,7 @@ mod tests {
                 ver: PROTOCOL_VERSION,
                 flags: control_flags(),
                 cancellation,
+                session: None,
             },
         )]);
         let mut installed = HashMap::from([(route.channel, route.epoch)]);

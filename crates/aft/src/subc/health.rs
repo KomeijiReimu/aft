@@ -1216,14 +1216,18 @@ impl DispatchPathMetrics {
                     continue;
                 }
                 logged.insert(key, now);
-                crate::slog_warn!(
-                    "subc bg wake: pending watch remains unacked root={} session={} task={} watch={} age_ms={}",
-                    root.as_path().display(),
-                    session,
-                    task_id,
-                    watch_id,
-                    age_ms
-                );
+                // One scan covers every session's watches, so log each inside
+                // its own session's scope to tag it with that session.
+                crate::log_ctx::with_session(Some(session.clone()), || {
+                    crate::slog_warn!(
+                        "subc bg wake: pending watch remains unacked root={} session={} task={} watch={} age_ms={}",
+                        root.as_path().display(),
+                        session,
+                        task_id,
+                        watch_id,
+                        age_ms
+                    );
+                });
             }
         }
         logged.retain(|_, last| {
@@ -1684,16 +1688,19 @@ pub(super) fn warn_slow_pending_binds(
                 in_flight_writer: None,
                 reader_admissions_while_promoted_writer_waited: 0,
             });
-        crate::slog_warn!(
-            "{}",
-            pending_bind_breadcrumb(
-                *route,
-                &pending.bind_root_id,
-                age,
-                &pending.configure_request_id,
-                &snapshot,
-            )
+        let breadcrumb = pending_bind_breadcrumb(
+            *route,
+            &pending.bind_root_id,
+            age,
+            &pending.configure_request_id,
+            &snapshot,
         );
+        // The frame loop serves every session, so tag the line with the
+        // session that requested this bind rather than whatever scope (if
+        // any) the thread happens to be in.
+        crate::log_ctx::with_session(pending.session.clone(), || {
+            crate::slog_warn!("{breadcrumb}");
+        });
     }
 }
 

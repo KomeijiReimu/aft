@@ -36,6 +36,7 @@ async fn bind_publication_rejects_missing_or_mismatched_applied_snapshot() {
                 ver: PROTOCOL_VERSION,
                 flags: control_flags(),
                 cancellation: JobCancellation::new(),
+                session: None,
             },
         )]);
         let mut routes = HashMap::new();
