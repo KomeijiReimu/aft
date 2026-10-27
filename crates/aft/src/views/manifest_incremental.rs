@@ -75,6 +75,8 @@ impl HeadPaths {
 /// temporary file, a rename destination) has no member under it, because every
 /// ancestor of a member is a HEAD directory; `nonmember_is_inert` decides
 /// whether such a path can still stand for a member under another spelling.
+/// A batch that names no member and no HEAD directory at all is not evidence
+/// that the watcher observed the checkout, so it still reads everything.
 pub(super) fn delta_read_scope(
     head: &[crate::alias::TrackedPath],
     paths: &OnceLock<HeadPaths>,
@@ -83,14 +85,18 @@ pub(super) fn delta_read_scope(
 ) -> Option<BTreeSet<Vec<u8>>> {
     let paths = paths.get_or_init(|| HeadPaths::new(head));
     let mut directories = BTreeSet::new();
+    let mut names_head_path = false;
     for path in changed {
         if HeadPaths::contains(&paths.directories, path) {
             directories.insert(path.clone());
-        } else if !HeadPaths::contains(&paths.members, path) && !nonmember_is_inert(path) {
+            names_head_path = true;
+        } else if HeadPaths::contains(&paths.members, path) {
+            names_head_path = true;
+        } else if !nonmember_is_inert(path) {
             return None;
         }
     }
-    Some(directories)
+    names_head_path.then_some(directories)
 }
 
 /// Whether `path` lies under one of `directories` (HEAD directories from

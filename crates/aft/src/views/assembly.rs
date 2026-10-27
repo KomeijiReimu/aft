@@ -820,7 +820,8 @@ pub fn prepare_checkout_deferring(
     // other member keeps its previous entry. The whole checkout is read when
     // there is no batch (a rescan, an ignore-rule change, a periodic
     // verification), when HEAD or the index moved since the cached manifest,
-    // and when a named path may be a member under another spelling.
+    // and when the batch names no member or HEAD directory, or names a path
+    // that may be a member under another spelling.
     let reread_directories = if request.changed_paths.is_empty()
         || !head_cached
         || cached
