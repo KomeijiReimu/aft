@@ -1319,7 +1319,10 @@ impl Fixture {
         assert!(response.success, "{:?}", response.data);
     }
     fn wait_idle(&self) {
-        self.wait_idle_for(Duration::from_secs(10));
+        // Generous on purpose: this is a positive wait, and on a loaded
+        // Windows runner one publication's compare-and-swap step alone has
+        // taken 11 s. A publication that never settles still fails here.
+        self.wait_idle_for(Duration::from_secs(60));
     }
     fn wait_idle_for(&self, limit: Duration) {
         let deadline = Instant::now() + limit;

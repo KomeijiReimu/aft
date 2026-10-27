@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "flake-batch-8"
+  ],
+  "note": "Test-only: the view publication tests wait up to 60 s instead of 10 s for publication to settle on loaded runners. No product search behavior changed and no changed path matches RANKING_FENCE_PREFIXES."
+}
