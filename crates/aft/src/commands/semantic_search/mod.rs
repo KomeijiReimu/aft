@@ -9968,6 +9968,72 @@ mod tests {
         );
     }
 
+    /// After a fill is folded into a new generation, the worker installs that
+    /// generation before it rebuilds the scored index. A search in that window
+    /// must still see the views-on semantic lane as ready: with no snapshot the
+    /// engine plans no semantic lane and answers lexical hits only, with no
+    /// symbol names or previews, while the reply still says `semantic: ready`.
+    #[test]
+    fn readiness_sample_serves_a_freshly_published_checkout_view() {
+        use extensions::ReadinessSource as _;
+        let project = tempfile::tempdir().expect("project");
+        let storage = tempfile::tempdir().expect("storage");
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn needle() -> u8 {\n    1\n}\n").unwrap();
+        let ctx = test_context(&root);
+        let slot = ctx.checkout_semantic();
+        let (epoch, _wake) = slot.begin();
+        let runtime = Arc::new(
+            crate::views::semantic_runtime::CheckoutSemantic::new(
+                &crate::root_cache::StoragePaths::same(storage.path()),
+                "family",
+                "scope",
+                &root,
+                crate::views::semantic::SemanticProducer::current(
+                    "readiness-model",
+                    crate::semantic_index::EmbedTextCaps::default(),
+                ),
+                Arc::downgrade(slot),
+            )
+            .unwrap(),
+        );
+        runtime.load().unwrap();
+        // Fill and fold, which publishes and installs a new generation, without
+        // the scored-index rebuild the worker runs afterwards.
+        let published_before = runtime.installed().generation().name().to_owned();
+        runtime
+            .refresh(
+                crate::views::semantic::FillBudget::default(),
+                &mut |texts: Vec<String>| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
+            )
+            .unwrap();
+        assert_ne!(
+            runtime.installed().generation().name(),
+            published_before,
+            "the fill must publish a new generation"
+        );
+        assert!(slot.install(epoch, Arc::clone(&runtime)));
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
+
+        let source = RuntimeReadinessSource { ctx: &ctx };
+        let observation = source.sample();
+        let sampled = observation
+            .semantic
+            .snapshot
+            .as_ref()
+            .and_then(extensions::SemanticSnapshot::index)
+            .map(|index| index as *const crate::semantic_index::SemanticIndex);
+        assert!(
+            sampled.is_some(),
+            "a freshly published checkout view must report as ready"
+        );
+        assert_eq!(
+            sampled,
+            Some(Arc::as_ptr(&runtime.index().unwrap())),
+            "readiness must hold the index that search scores for the installed snapshot"
+        );
+    }
+
     /// Mark the semantic lane ready with an empty resident index, so a test
     /// can exercise the walk routes aft_search takes while the trigram lane
     /// is not ready.
