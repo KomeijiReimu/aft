@@ -10973,7 +10973,7 @@ mod tests {
                 &stop,
                 true,
             );
-            super::SYMBOL_PREWARM_AFTER_FILE.with(|hook| hook.borrow_mut().take());
+            super::SYMBOL_PREWARM_AFTER_FILE.with(|hook| *hook.borrow_mut() = None);
 
             let expected_visits = if trigger == Trigger::Nothing {
                 FILES
