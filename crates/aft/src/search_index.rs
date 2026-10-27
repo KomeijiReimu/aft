@@ -884,8 +884,8 @@ impl SearchIndexSnapshot {
             .map(|file| file.modified)
     }
 
-    /// The files this snapshot answers for, with the size, modification time
-    /// and content hash it verified for each.
+    /// The files this snapshot answers for, with the size and content hash it
+    /// records for each and the modification time observed when it was built.
     pub(crate) fn file_entries(&self) -> &[FileEntry] {
         &self.files
     }

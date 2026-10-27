@@ -301,8 +301,8 @@ fn refresh_trigram(session: &ParentSession, child: &Child) {
     );
 }
 
-/// The child's published v3 lexical view, or `None` when its sessions never
-/// published one (a child bound with views off, or never bound).
+/// The child's published v3 lexical view, or `None` when none is published
+/// yet (a child bound only with views off, never bound, or not yet bound).
 fn open_child_lexical_view(
     session: &ParentSession,
     child: &Child,
