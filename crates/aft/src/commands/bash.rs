@@ -229,6 +229,9 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     // reason that cannot happen is refused here, before any local work (even
     // resolving a local shell).
     let mut remote = match params.runon.as_deref() {
+        // Placeholder routing was decided before sandbox checks. A live config
+        // change must not turn a locally admitted launch into a remote job.
+        None if has_secrets => None,
         None => crate::bash_background::remote_for_legacy_command(
             &ctx.config(),
             &params.command,
