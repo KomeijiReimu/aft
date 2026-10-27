@@ -334,13 +334,12 @@ pub(super) fn file_secret_consent(
 }
 
 /// Settle a pending secret ask the call left behind.
+///
+/// Test-only until a production launch path needs to withdraw a filed ask:
+/// nothing outside tests calls this yet.
+#[cfg(test)]
 pub(super) fn withdraw_secret_consent(pending: &PendingSecretConsent) {
     let _ = withhold_consent(&pending.request);
-}
-
-/// Whether a stamp is one this seam may ever hand to a vault.
-pub(super) fn is_command_stamp(stamp: &ScopeStamp) -> bool {
-    alfonso_of_kind(stamp, &COMMAND_SCOPE_KINDS)
 }
 
 /// What one launch decided for one label, before anything starts.

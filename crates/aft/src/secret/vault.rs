@@ -17,7 +17,6 @@
 //! only under `cfg(test)` or the `secret-test-fake` feature, which no release
 //! profile enables (`scripts/check-secret-test-fake.sh` checks that in CI).
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -232,7 +231,6 @@ pub trait SecretUseTransport: Send + Sync {
 /// immediately, exactly as the contract's material rule requires.
 pub struct SubcSecretVault {
     transport: std::sync::Arc<dyn SecretUseTransport>,
-    released: std::sync::Mutex<HashMap<String, crate::secret::wire::ReleasedApiKey>>,
 }
 
 impl std::fmt::Debug for SubcSecretVault {
@@ -244,10 +242,7 @@ impl std::fmt::Debug for SubcSecretVault {
 impl SubcSecretVault {
     /// Build the client over `transport`.
     pub fn new(transport: std::sync::Arc<dyn SecretUseTransport>) -> Self {
-        Self {
-            transport,
-            released: std::sync::Mutex::new(HashMap::new()),
-        }
+        Self { transport }
     }
 
     /// Send one `secret.use` call for `label` and read the answer.
