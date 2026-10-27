@@ -1759,5 +1759,55 @@ mod url_tests {
             assert_absent(&run, &documents, &[KEY, ENCODED_KEY.as_bytes()]);
             assert!(!run.strings().contains("for url"), "{}", run.strings());
         }
+
+        /// `material` is asked only for a hop that substitutes: not for a
+        /// placeholder in another parameter, and not for a same-prefix
+        /// redirect hop that carries no placeholder.
+        #[test]
+        fn material_is_requested_only_for_a_hop_that_substitutes() {
+            let fixture = fixture(Default::default());
+            let server = serve(&fixture.tls, |target| {
+                if target.starts_with("/v1/first.md") {
+                    return Some(http("302 Found", &[("Location", "/v1/next.md")], b""));
+                }
+                Some(markdown(b"# Page\n"))
+            });
+            let port = server.addr.port();
+            let routes = [("api.secret.test", server.addr)];
+
+            let other_param =
+                format!("https://api.secret.test:{port}/v1/doc.md?other={PLACEHOLDER}");
+            let vault = granted_vault(rule("api.secret.test", port, "/v1"));
+            let (run, _) = run_with(
+                &fixture,
+                &vault,
+                &routes,
+                &request("outline", &other_param, serde_json::json!({})),
+                no_extra,
+            );
+            assert!(run.response.success, "{:?}", run.response.data);
+            assert_eq!(vault.material_calls(), 0, "nothing was substituted");
+
+            let redirected =
+                format!("https://api.secret.test:{port}/v1/first.md?key={PLACEHOLDER}");
+            let vault = granted_vault(rule("api.secret.test", port, "/v1"));
+            let (run, _) = run_with(
+                &fixture,
+                &vault,
+                &routes,
+                &request("outline", &redirected, serde_json::json!({})),
+                no_extra,
+            );
+            assert!(run.response.success, "{:?}", run.response.data);
+            assert_eq!(vault.material_calls(), 1, "only the first hop substituted");
+            assert_eq!(
+                server.targets(),
+                vec![
+                    format!("/v1/doc.md?other={PLACEHOLDER}"),
+                    format!("/v1/first.md?key={ENCODED_KEY}"),
+                    "/v1/next.md".to_string(),
+                ]
+            );
+        }
     }
 }

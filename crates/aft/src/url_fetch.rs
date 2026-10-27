@@ -1279,9 +1279,13 @@ fn secret_hop(
         return Err(refused(&*held, refusal.reason()));
     }
 
+    // Material is asked only for a rule this hop actually substitutes. A
+    // rule whose host and path match while its placeholder is absent, not the
+    // whole value, or in another parameter needs no key, and asking anyway
+    // would spend a single-use grant on a request that sends none.
     let mut materials = Vec::with_capacity(rules.len());
-    for (rule, matched) in rules.iter().zip(&matched) {
-        if !matched {
+    for ((rule, matched), planned) in rules.iter().zip(&matched).zip(&plan.labels) {
+        if !matched || !planned.is_substituted() {
             materials.push(None);
             continue;
         }
