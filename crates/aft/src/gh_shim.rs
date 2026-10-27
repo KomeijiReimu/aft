@@ -800,13 +800,17 @@ fn run_with(
     // A worker shell carries a read broker, never a write ticket, so no
     // write-class command can be spoken from it. Refuse here, before the
     // manifest lookup, the rung probe for governance reachability, and any
-    // relay traffic, with an
-    // instruction instead of a retry hint: retrying cannot help, and the old
-    // governance-unavailable text sent agents back to retry forever. Reads
-    // (`is_unbound_safe`) fall through to the governed-read path unchanged.
+    // relay traffic, with an instruction instead of a retry hint: retrying
+    // cannot help, and the old governance-unavailable text sent agents back
+    // to retry forever. Credential commands (`gh auth token`, token-revealing
+    // status flags, login/logout and friends) are not writes: they are
+    // excluded here so they keep their existing operator-credentials refusal
+    // below. Reads (`is_unbound_safe`) fall through to the governed-read path
+    // unchanged.
     if relay_client::RelayContext::from_process()
         .worker_broker
         .is_some()
+        && operator_credential_use(args).is_none()
         && !is_unbound_safe(args)
     {
         return refuse(RefusalCode::WorkerWriteRefused, WORKER_WRITE_REFUSED_TEXT);
@@ -7856,8 +7860,51 @@ fn refusal_line(code: RefusalCode, text: &str) -> String {
     format!("gh-shim: {}: {text}", code.as_str())
 }
 
+/// Test seam: when a test installs a refusal sink, `refuse` records the
+/// rendered line there instead of writing to stderr, so tests can assert the
+/// exact refusal the agent would see without stealing the process's shared
+/// file descriptor 2 (which parallel tests also use). The sink is
+/// thread-local, so parallel tests never see each other's refusals.
+#[cfg(test)]
+thread_local! {
+    static REFUSAL_SINK: std::cell::RefCell<
+        Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Holds an installed refusal sink; dropping restores plain stderr output.
+#[cfg(test)]
+pub(crate) struct RefusalSinkGuard;
+
+#[cfg(test)]
+impl Drop for RefusalSinkGuard {
+    fn drop(&mut self) {
+        REFUSAL_SINK.with(|slot| slot.replace(None));
+    }
+}
+
+/// Records every `refuse` line until the returned guard drops.
+#[cfg(test)]
+pub(crate) fn capture_refusals_for_test() -> (
+    RefusalSinkGuard,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    REFUSAL_SINK.with(|slot| slot.replace(Some(lines.clone())));
+    (RefusalSinkGuard, lines)
+}
+
+fn emit_refusal_line(line: &str) {
+    #[cfg(test)]
+    if let Some(sink) = REFUSAL_SINK.with(|slot| slot.borrow().clone()) {
+        sink.lock().unwrap().push(line.to_string());
+        return;
+    }
+    eprintln!("{line}");
+}
+
 fn refuse(code: RefusalCode, text: &str) -> i32 {
-    eprintln!("{}", refusal_line(code, text));
+    emit_refusal_line(&refusal_line(code, text));
     match code {
         RefusalCode::OutcomeUnknown => OUTCOME_UNKNOWN_EXIT_STATUS,
         _ => REFUSAL_EXIT_STATUS,

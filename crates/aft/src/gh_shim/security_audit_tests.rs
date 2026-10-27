@@ -1050,6 +1050,7 @@ fn audit_worker_write_is_refused_before_any_broker_or_relay_traffic() {
         Some(capability.as_os_str()),
     );
     let _no_ticket = Env::set(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, None);
+    let (_sink, lines) = capture_refusals_for_test();
     let context = relay_client::RelayContext::from_process();
     assert!(
         context.worker_broker.is_some(),
@@ -1120,6 +1121,20 @@ fn audit_worker_write_is_refused_before_any_broker_or_relay_traffic() {
         daemon.requests.lock().unwrap().is_empty(),
         "worker writes must not reach the relay"
     );
+    // The refusal the agent actually sees: the exact report-to-parent line,
+    // once per refused command.
+    let lines = lines.lock().unwrap();
+    assert_eq!(
+        lines.len(),
+        6,
+        "every worker write must refuse loudly: {lines:?}"
+    );
+    for line in lines.iter() {
+        assert_eq!(
+            line,
+            "gh-shim: gh_shim_worker_write_refused: workers cannot write to GitHub; report what should be posted to your parent instead"
+        );
+    }
 }
 
 /// The refusal above must not open a broker connection either. A bound
@@ -1146,6 +1161,7 @@ fn audit_worker_write_opens_no_broker_connection() {
         Some(capability.as_os_str()),
     );
     let _no_ticket = Env::set(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, None);
+    let (_sink, lines) = capture_refusals_for_test();
     let listener = UnixListener::bind(&socket).unwrap();
     let status = run_with(
         &args(&[
@@ -1161,6 +1177,10 @@ fn audit_worker_write_opens_no_broker_connection() {
         |_, _, _, _| panic!("worker write must not reach identity lookup"),
     );
     assert_eq!(status, 86);
+    assert_eq!(
+        lines.lock().unwrap().as_slice(),
+        ["gh-shim: gh_shim_worker_write_refused: workers cannot write to GitHub; report what should be posted to your parent instead"],
+    );
     listener.set_nonblocking(true).unwrap();
     match listener.accept() {
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -1194,6 +1214,7 @@ fn audit_worker_read_still_reaches_the_broker() {
         Some(capability.as_os_str()),
     );
     let _no_ticket = Env::set(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, None);
+    let (_sink, refusals) = capture_refusals_for_test();
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let served = seen.clone();
     let server = std::thread::spawn(move || {
@@ -1251,6 +1272,10 @@ fn audit_worker_read_still_reaches_the_broker() {
         worker_reads::identity_for_command,
     );
     assert_eq!(status, 0);
+    assert!(
+        refusals.lock().unwrap().is_empty(),
+        "a successful worker read must refuse nothing"
+    );
     assert!(
         delegated.is_empty(),
         "a worker read must be brokered, not delegated: {delegated:?}"
@@ -1327,6 +1352,7 @@ fn audit_head_write_still_routes_through_the_relay() {
         "cortexkit/aft",
     ]);
     let mut delegated = Vec::new();
+    let (_sink, refusals) = capture_refusals_for_test();
     let status = run_with(
         &argv,
         |forwarded| {
@@ -1336,6 +1362,10 @@ fn audit_head_write_still_routes_through_the_relay() {
         worker_reads::identity_for_command,
     );
     assert_eq!(status, 0);
+    assert!(
+        refusals.lock().unwrap().is_empty(),
+        "a routed head write must refuse nothing"
+    );
     assert!(
         delegated.is_empty(),
         "a head write must route, not delegate: {delegated:?}"
@@ -1349,4 +1379,44 @@ fn audit_head_write_still_routes_through_the_relay() {
             .any(|request| request["op"] == crate::gh_shim_relay::BOT_REQUEST_OPERATION),
         "a head write must still reach the relay"
     );
+}
+
+/// Credential commands are not writes: `gh auth token`, a token-revealing
+/// status flag, and `gh auth login` from a worker shell must keep the
+/// operator-credentials refusal (exit 86), never the worker-write line.
+#[test]
+fn audit_worker_credential_command_keeps_the_credential_refusal() {
+    let _lock = crate::test_env::process_env_lock();
+    let fixture = Fixture::new(20);
+    let _worker = Env::set(
+        crate::gh_shim_ticket::GH_SHIM_WORKER_ENV,
+        Some(OsStr::new("1")),
+    );
+    let _no_ticket = Env::set(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, None);
+    let _no_bypass = Env::set("GH_SHIM_BYPASS", None);
+    let (_sink, lines) = capture_refusals_for_test();
+    for raw in [
+        vec!["auth", "token"],
+        vec!["auth", "status", "--show-token"],
+        vec!["auth", "login"],
+    ] {
+        let status = run_with(
+            &args(&raw),
+            |_| panic!("a credential refusal must not delegate: {raw:?}"),
+            |_, _, _, _| panic!("a credential refusal must not reach identity lookup: {raw:?}"),
+        );
+        assert_eq!(status, 86, "{raw:?}");
+    }
+    let lines = lines.lock().unwrap();
+    assert_eq!(
+        lines.len(),
+        3,
+        "every credential command must refuse loudly: {lines:?}"
+    );
+    for line in lines.iter() {
+        assert!(
+            line.starts_with("gh-shim: gh_shim_operator_credentials: "),
+            "a worker credential command must keep the credential refusal code: {line}"
+        );
+    }
 }
