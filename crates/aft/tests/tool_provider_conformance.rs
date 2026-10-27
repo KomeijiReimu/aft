@@ -1274,6 +1274,7 @@ async fn premature_trigger_diagnostics_include_response_error_and_eof() {
             wire: wire.clone(),
             channel: 1,
             scoped_preset: None,
+            legacy_diagnostics: None,
         };
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let server = async move {
