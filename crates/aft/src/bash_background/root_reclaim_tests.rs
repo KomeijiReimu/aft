@@ -28,6 +28,8 @@ pub(crate) fn register_task(
             pid,
             comm: "sleep".into(),
             argv0: "sleep".into(),
+            user: None,
+            command: None,
         }]
     });
     super::super::persistence::write_task(&layout.paths.json, &metadata).unwrap();
