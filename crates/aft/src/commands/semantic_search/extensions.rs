@@ -292,11 +292,12 @@ pub struct Readiness<'a> {
     retained: RetainedReadinessSnapshots<'a>,
     #[serde(skip)]
     cancelled: bool,
-    /// Why the sampled semantic source could not serve, when the sample saw
-    /// it fail although the shared semantic status may still read ready (a
-    /// views-on checkout view whose index could not be built).
+    /// The semantic status the sample observed. It can differ from the shared
+    /// status: a views-on root is sampled in its checkout lane's state (still
+    /// loading, failed to load, or unable to build its index) even when the
+    /// shared status reads ready.
     #[serde(skip)]
-    semantic_failure: Option<String>,
+    semantic_status: Option<SemanticIndexStatus>,
 }
 
 impl PartialEq for Readiness<'_> {
@@ -348,20 +349,19 @@ impl<'a> Readiness<'a> {
             reasons,
             retained,
             cancelled,
-            semantic_failure: None,
+            semantic_status: None,
         }
     }
 
-    /// Records why the sampled semantic source failed; see `semantic_failure`.
-    pub fn with_semantic_failure(mut self, reason: Option<String>) -> Self {
-        self.semantic_failure = reason;
+    /// Records the semantic status the sample observed; see `semantic_status`.
+    pub fn with_semantic_status(mut self, status: Option<SemanticIndexStatus>) -> Self {
+        self.semantic_status = status;
         self
     }
 
-    /// Why the sampled semantic source could not serve this search, if the
-    /// sample saw it fail.
-    pub fn semantic_failure(&self) -> Option<&str> {
-        self.semantic_failure.as_deref()
+    /// The semantic status the sample observed, if it was sampled.
+    pub fn semantic_status(&self) -> Option<&SemanticIndexStatus> {
+        self.semantic_status.as_ref()
     }
 
     pub fn retained(&self) -> &RetainedReadinessSnapshots<'a> {

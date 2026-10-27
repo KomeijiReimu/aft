@@ -838,6 +838,10 @@ impl WriteIntentListener for WakeOnWrite {
     }
 }
 
+/// The semantic index status stage of a views-on lane whose checkout view is
+/// still loading.
+pub const CHECKOUT_VIEW_LOADING_STAGE: &str = "loading_checkout_view";
+
 /// What a root's views-on semantic lane currently is.
 #[derive(Clone)]
 pub enum CheckoutSemanticState {
@@ -991,6 +995,17 @@ impl CheckoutSemanticSlot {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// [`Self::state`] without waiting: `None` while the state is being
+    /// replaced, so status observers that must never block can report the
+    /// lane as changing.
+    pub fn try_state(&self) -> Option<Option<CheckoutSemanticState>> {
+        match self.state.try_read() {
+            Ok(state) => Some(state.clone()),
+            Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner().clone()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
     }
 
     /// Forgets the lane of an idle root without waiting. A loaded lane's

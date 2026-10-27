@@ -7258,7 +7258,7 @@ fn start_checkout_semantic_lane(
     *ctx.semantic_index_status()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
-        stage: "loading_checkout_view".to_string(),
+        stage: crate::views::semantic_runtime::CHECKOUT_VIEW_LOADING_STAGE.to_string(),
         files: None,
         entries_done: None,
         entries_total: None,
