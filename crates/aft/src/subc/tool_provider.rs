@@ -7013,7 +7013,11 @@ mod route_tests {
 
         // A file where the task directories belong makes the policy's private
         // tool directory impossible to create, so the policy refuses.
-        std::fs::write(storage.path().join("bash-tasks"), "not a directory").unwrap();
+        let task_root = storage.path().join("bash-tasks");
+        if task_root.is_dir() {
+            std::fs::remove_dir_all(&task_root).unwrap();
+        }
+        std::fs::write(&task_root, "not a directory").unwrap();
         let data = call("launch", 0);
         let built_up_front = crate::sandbox_spawn::with_authenticated_principal(
             identity.spawn_principal.clone(),
