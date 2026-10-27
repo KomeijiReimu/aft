@@ -12,6 +12,39 @@ use crate::bash_background::process::LIVE_DESCENDANT_CAP;
 
 const SESSION: &str = "session";
 
+/// A process that has exited but whose parent has not reaped it yet (a
+/// zombie) is not a survivor: `killpg(pgid, 0)` still succeeds for it, so the
+/// settlement after a kill only ends once the group listing stops counting it.
+/// Counting it could make a kill wait past the point where the whole group had
+/// exited.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_group_holding_only_an_unreaped_child_is_not_reported_as_live() {
+    let child = crate::bash_background::process::spawn_unreaped_zombie_for_test();
+    // A zombie cannot leave its group, and the child runs no code of its own.
+    let group = unsafe { libc::getpgrp() };
+    assert_eq!(
+        unsafe { libc::killpg(group, 0) },
+        0,
+        "the group probe still finds this process's group"
+    );
+
+    let listing = live_process_group_members(group).expect("the group must be listable");
+
+    assert!(
+        listing
+            .members
+            .iter()
+            .all(|member| member.pid != child.id()),
+        "the exited child was reported as a live member: {:?}",
+        listing
+            .members
+            .iter()
+            .filter(|member| member.pid == child.id())
+            .collect::<Vec<_>>()
+    );
+}
+
 /// A process that ignores SIGTERM, so it outlives the kill whenever the group
 /// SIGKILL does not reach it.
 const TERM_IGNORING: &str = "trap '' TERM; touch ready; exec sleep 30";
