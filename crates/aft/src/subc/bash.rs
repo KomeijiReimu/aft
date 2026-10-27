@@ -7282,9 +7282,11 @@ mod grant_path_tests {
             &executor,
             &root,
             running_bash_stub,
-            json!({"command":"sleep 5", "background":true, "timeout":5000}),
+            json!({"command":"sleep 120", "background":true, "timeout":120000}),
         );
-        let done = tokio::time::timeout(Duration::from_millis(750), rx.recv())
+        // The bound only has to separate "replied at launch" from "waited for
+        // the command" (120 s); a tight bound failed on a loaded Windows runner.
+        let done = tokio::time::timeout(Duration::from_secs(30), rx.recv())
             .await
             .expect("a local background launch must not wait for capture or command completion")
             .unwrap();
