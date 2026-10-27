@@ -1210,11 +1210,14 @@ impl HeartbeatPump {
                     }
                     self.index(&handle);
                 }
-                // A partially visible rewrite, or a lease this process is
-                // replacing right now: read it afresh on the next attempt.
-                Err(HeartbeatError::Malformed(_)) => {
+                // A partial rewrite does not prove ownership was lost. Retire
+                // the descriptor so the next scheduled beat opens the live
+                // path, including when recovery replaces the inode atomically.
+                // Let the heartbeat loop schedule that retry: waiting here can
+                // turn a transient read into a terminal NotOwner timeout.
+                Err(error @ HeartbeatError::Malformed(_)) => {
                     self.retire_handle(&handle);
-                    self.index(&handle);
+                    return Err(error);
                 }
                 Err(error) => return Err(error),
             }
@@ -4334,6 +4337,71 @@ mod tests {
         )));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn released_lease_closes_all_descriptors_synchronously() {
+        let (dir, path) = test_lock_path();
+        let open_under_root = || {
+            fs::read_dir("/proc/self/fd")
+                .expect("descriptor census")
+                .filter_map(Result::ok)
+                .filter_map(|entry| fs::read_link(entry.path()).ok())
+                .filter(|target| target.starts_with(dir.path()))
+                .collect::<Vec<_>>()
+        };
+        let guard = acquire_with_config(&path, None, test_config()).expect("acquire lease");
+        let handle = Arc::downgrade(&guard.heartbeat_file);
+        assert!(!open_under_root().is_empty(), "live lease keeps its handle");
+        drop(guard);
+        assert!(
+            handle.upgrade().is_none(),
+            "heartbeat must release its handle"
+        );
+        assert!(open_under_root().is_empty(), "no descriptors after release");
+    }
+
+    #[test]
+    fn malformed_beat_reopens_atomic_replacement_on_next_beat() {
+        let (_dir, path) = test_lock_path();
+        let guard = acquire_with_config(
+            &path,
+            None,
+            LockConfig {
+                heartbeat_interval_ms: 60_000,
+                ..test_config()
+            },
+        )
+        .expect("acquire lease");
+        let live = fs::read(&path).expect("read lease");
+        fs::write(&path, vec![b'x'; live.len()]).expect("corrupt lease");
+
+        assert!(matches!(
+            guard.pump.heartbeat_once(),
+            Err(HeartbeatError::Malformed(_))
+        ));
+        assert!(guard.heartbeat_file.lock().unwrap().is_none());
+        assert!(guard.heartbeat_is_visible());
+
+        let mut restored = guard.metadata.clone();
+        restored.heartbeat_at_ms = now_ms().saturating_sub(1_000_000);
+        let replacement = path.with_extension("replacement");
+        fs::write(&replacement, lock_metadata_bytes(&restored).unwrap()).unwrap();
+        rename_over(&replacement, &path).expect("atomic recovery outside the lease registry");
+        let _ = io_ledger::take();
+        guard
+            .pump
+            .heartbeat_once()
+            .expect("retry through live inode");
+        let recovered = read_lock_metadata(&path).expect("independently read recovered lease");
+        assert!(lock_identity_matches(&recovered, &guard.metadata));
+        assert!(recovered.heartbeat_at_ms > restored.heartbeat_at_ms);
+        let recovery = io_ledger::take();
+        assert_eq!((recovery.opens, recovery.closes), (1, 0));
+
+        guard.pump.heartbeat_once().expect("healthy next beat");
+        assert_beat_opens_no_descriptor(&io_ledger::take());
+    }
+
     #[test]
     fn heartbeat_survives_transient_malformed_and_recovers() {
         // Regression: a single transient failure (e.g. a read that races a
@@ -4371,9 +4439,8 @@ mod tests {
         let mut restored = owner.clone();
         restored.heartbeat_at_ms = now_ms().saturating_sub(1_000_000);
         let sentinel = restored.heartbeat_at_ms;
-        // The atomic replacement, not a plain write: it releases the beat's
-        // kept descriptor, while a plain write would leave that descriptor
-        // still looking at the corrupted contents. The bytes keep the length.
+        // Use an atomic replacement to exercise reopening the lease, rather
+        // than only rewriting the inode that the heartbeat previously held.
         {
             let bytes = lock_metadata_bytes(&restored).expect("serialize restored metadata");
             with_lease_handles_closed(&path, || replace_lock_bytes_unsynced(&path, &bytes))

@@ -8703,6 +8703,13 @@ impl AppContext {
     /// Refreshes the project snapshot on one worker. Batches arriving during a
     /// walk replace one pending request instead of creating waiting threads.
     fn refresh_project_applicability(&self, config: Arc<Config>, root_changed: bool) {
+        // Applicability only reads project files and LSP settings. A detached
+        // walk must not keep storage locks and pinned directories alive after
+        // the context's last storage-using owner has gone away.
+        let mut walk_config = (*config).clone();
+        walk_config.cache_lease = None;
+        walk_config.storage_lease = None;
+        let config = Arc::new(walk_config);
         let progress = Arc::clone(&self.project_applicability_progress);
         let mut refresh = progress.refresh.lock();
         let epoch = self
@@ -21970,6 +21977,59 @@ mod health_warming_honesty_tests {
 #[cfg(test)]
 mod configure_applicability_tests {
     use super::*;
+
+    #[test]
+    fn applicability_walk_does_not_retain_released_storage_leases() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&storage).unwrap();
+        let mut config = Config {
+            project_root: Some(root),
+            storage_dir: Some(storage.clone()),
+            ..Config::default()
+        };
+        crate::root_cache::ensure_config_storage_lease(&mut config).unwrap();
+        assert!(crate::root_cache::prepare_cache_root(&mut config).is_none());
+        let cache_lease = Arc::downgrade(config.cache_lease.as_ref().unwrap());
+        let storage_lease = Arc::downgrade(config.storage_lease.as_ref().unwrap());
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config.clone(),
+        );
+        let _held_walk = ctx.hold_project_applicability_walks_for_test();
+        ctx.refresh_project_applicability(Arc::new(config), false);
+
+        #[cfg(target_os = "linux")]
+        let open_under_storage = || {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+                .filter(|target| target.starts_with(&storage))
+                .collect::<Vec<_>>()
+        };
+        #[cfg(target_os = "linux")]
+        assert!(!open_under_storage().is_empty(), "live context owns leases");
+        drop(ctx);
+        #[cfg(target_os = "linux")]
+        {
+            let targets = open_under_storage();
+            assert!(
+                targets.is_empty(),
+                "released storage retained descriptors: {targets:?}"
+            );
+        }
+        assert!(
+            cache_lease.upgrade().is_none(),
+            "cache lease released synchronously"
+        );
+        assert!(
+            storage_lease.upgrade().is_none(),
+            "storage lease released synchronously"
+        );
+    }
 
     #[test]
     fn configure_applicability_content_batches_keep_cache_and_health_counters() {
