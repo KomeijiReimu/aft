@@ -777,7 +777,15 @@ jobs:
         working-directory: packages/aft-cli
 
       - name: Fetch final v0.48.1 activation baseline
-        run: git fetch --force origin refs/tags/v0.48.1:refs/tags/v0.48.1
+        run: |
+          set -euo pipefail
+          # Retry so a brief network failure reaching github.com does not
+          # fail the release.
+          for attempt in 1 2 3; do
+            git fetch --force origin refs/tags/v0.48.1:refs/tags/v0.48.1 && break
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            sleep 20
+          done
 
       - name: Prepare publication records from the tagged candidate
         run: node scripts/release-gate-v049.mjs --prepare --snapshot-dir "${{ runner.temp }}/governed-publication" --candidate
