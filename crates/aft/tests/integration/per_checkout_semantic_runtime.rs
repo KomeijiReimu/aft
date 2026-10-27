@@ -791,6 +791,42 @@ fn assert_reloading_after_eviction(answer: &Value) {
     );
 }
 
+/// Idle eviction drops the trigram index too, and both lanes reload by
+/// design. Reloads the trigram index through a grep, which reloads only that
+/// index, and waits until it is ready, so the next search has a ready lexical
+/// lane however long the reload takes on this machine while the semantic lane
+/// is still released.
+fn reload_trigram_after_eviction(ctx: &AppContext) {
+    let grep = aft::commands::grep::handle_grep(
+        &request(json!({
+            "id": "views-semantic-grep",
+            "command": "grep",
+            "pattern": "parse_config_file",
+            "max_results": 1
+        })),
+        ctx,
+    );
+    assert!(grep.success, "grep failed: {grep:?}");
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        aft::runtime_drain::drain_search_index_events(ctx);
+        let ready = ctx
+            .search_index()
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|index| index.ready);
+        if ready {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the trigram index never reloaded after eviction"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// After an idle eviction releases a views-on root's semantic lane, the next
 /// search restarts the lane (the reload a views-off root's evicted index gets
 /// too) and that same search reports the lane as building with the
@@ -804,9 +840,10 @@ fn views_on_search_after_idle_eviction_reports_the_lane_reloading() {
     let ctx = configure(&repo.main, storage.path(), &server, true);
     wait_views_filled(&ctx);
     assert!(ctx.evict_idle_artifacts(), "the root must be idle");
+    reload_trigram_after_eviction(&ctx);
     assert!(
         !ctx.checkout_semantic().active(),
-        "idle eviction must release the lane"
+        "idle eviction must release the lane, and reloading the trigram index must not restart it"
     );
 
     let query = "read a configuration file from disk";
