@@ -970,9 +970,6 @@ fn cross_session_project_restart_sweep_retires_fate_unknown_without_delivery() {
     }
     registry.set_db_pool(conn);
 
-    // This expects the first pass to reach this project's session; a duration
-    // limit would defer the replay to a later pass.
-    registry.set_project_replay_scan_budget_for_test(None);
     registry
         .replay_session_for_project(storage.path(), "session-b", project.path())
         .unwrap();
@@ -1039,9 +1036,6 @@ fn replay_retires_old_id_once_without_touching_valid_id() {
         aft::db::bash_tasks::upsert_bash_task(&conn.lock().unwrap(), &row).unwrap();
     }
     registry.set_db_pool(Arc::clone(&conn));
-    // Both passes must reach the two legacy bundles on their own; a duration
-    // limit would spread that work over later passes.
-    registry.set_project_replay_scan_budget_for_test(None);
     registry
         .replay_session_for_project(storage.path(), SESSION, project.path())
         .unwrap();
@@ -1112,9 +1106,6 @@ fn foreign_replay_retires_orphan_when_gc_already_removed_its_layout() {
     }
     registry.set_db_pool(Arc::clone(&conn));
 
-    // This expects the first pass to reach the task bundle; a duration limit
-    // would defer recovery to a later pass.
-    registry.set_project_replay_scan_budget_for_test(None);
     registry
         .replay_session_for_project(storage.path(), "session-a", project.path())
         .unwrap();
