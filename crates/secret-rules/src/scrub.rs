@@ -1218,10 +1218,15 @@ pub fn reveals_any(text: &[u8], keys: &[&[u8]]) -> bool {
 /// Each change is undone repeatedly in its own chain, and all of them
 /// together in one more chain, so nested layers (a key percent-encoded
 /// seventeen times) and mixed layers (an entity inside an escape) are both
-/// followed to the end. A chain stops when nothing changes any more, and a
-/// layer rescans only the regions its change touched (widened by the
-/// longest spelling of any key and to the enclosing base64 group); the rest
-/// was examined in an earlier layer. All keys are checked in one pass. A
+/// followed to the end. In the combined chain every step is checked before
+/// the next one runs, so markup removal cannot delete a key the decoding
+/// steps of the same layer revealed; and while a layer still decodes
+/// something, markup with no closer is kept as text, because its closer may
+/// itself still be encoded. HTML's rule that open markup runs to the end is
+/// applied only once nothing is left to decode. A chain stops when nothing
+/// changes any more, and each step rescans only the regions it changed
+/// (widened by the longest spelling of any key and to the enclosing base64
+/// group); the rest was examined before that step. All keys are checked in one pass. A
 /// chain still changing after [`MAX_REVEAL_DEPTH`] layers, or more scanning
 /// than [`REVEAL_WORK_FACTOR`] times the text's length, gives
 /// [`RevealOutcome::Exhausted`]; a `deadline` that passes gives
@@ -1244,31 +1249,91 @@ pub fn reveal_outcome(text: &[u8], keys: &[&[u8]], deadline: Option<Instant>) ->
         Ok(true) => return RevealOutcome::Found,
         Ok(false) => {}
     }
-    for chain in REVEAL_CHAINS {
-        // Only the current layer is kept: memory stays at two copies of the
-        // text whatever the depth.
-        let mut layer: Option<Layer> = None;
+    // Checks one step's result, rescanning only what that step changed: its
+    // input was already examined. `None` lets the chain go on.
+    let mut check = |edited: &Edited| -> Option<RevealOutcome> {
+        let changed: Vec<(usize, usize)> =
+            edited.changes.iter().map(|change| change.output).collect();
+        let regions = rescan_regions(&edited.text, &changed, needles.margin);
+        spent = spent.saturating_add(regions.iter().map(|(lo, hi)| hi - lo).sum::<usize>());
+        if spent > budget {
+            return Some(RevealOutcome::Exhausted);
+        }
+        for (lo, hi) in regions {
+            match needles.held_in(&edited.text[lo..hi], &clock) {
+                Err(OutOfTime) => return Some(RevealOutcome::OutOfTime),
+                Ok(true) => return Some(RevealOutcome::Found),
+                Ok(false) => {}
+            }
+        }
+        None
+    };
+    for &chain in REVEAL_CHAINS {
+        // Only the current layer and the step being built are kept: memory
+        // stays at a few copies of the text whatever the depth.
+        let mut layer: Option<Zeroizing<Vec<u8>>> = None;
         for depth in 1..=MAX_REVEAL_DEPTH {
             if clock.expired() {
                 return RevealOutcome::OutOfTime;
             }
-            let current = layer.as_ref().map_or(text, |layer| layer.text.as_slice());
-            let Some(next) = chain(current) else {
-                break;
-            };
-            let regions = rescan_regions(&next.text, &next.changed, needles.margin);
-            spent = spent.saturating_add(regions.iter().map(|(lo, hi)| hi - lo).sum::<usize>());
-            if spent > budget {
-                return RevealOutcome::Exhausted;
-            }
-            for (lo, hi) in regions {
-                match needles.held_in(&next.text[lo..hi], &clock) {
-                    Err(OutOfTime) => return RevealOutcome::OutOfTime,
-                    Ok(true) => return RevealOutcome::Found,
-                    Ok(false) => {}
+            let current = layer.as_ref().map_or(text, |layer| layer.as_slice());
+            let mut working: Option<Zeroizing<Vec<u8>>> = None;
+            match chain {
+                RevealChain::Single(transform) => {
+                    if let Some(edited) = transform(current) {
+                        if let Some(outcome) = check(&edited) {
+                            return outcome;
+                        }
+                        working = Some(edited.text);
+                    }
+                }
+                RevealChain::Composite => {
+                    // At the first layer, a step whose input is still the
+                    // original text gives exactly the first layer of that
+                    // step's own chain, which was checked already. Control
+                    // removal (the first step) has no chain of its own.
+                    let repeats_a_single_chain =
+                        |working: &Option<Zeroizing<Vec<u8>>>, has_own_chain: bool| {
+                            depth == 1 && working.is_none() && has_own_chain
+                        };
+                    let mut decoded = false;
+                    for (step, &transform) in DECODING_TRANSFORMS.iter().enumerate() {
+                        let input = working.as_ref().map_or(current, |text| text.as_slice());
+                        if let Some(edited) = transform(input) {
+                            if !repeats_a_single_chain(&working, step > 0) {
+                                if let Some(outcome) = check(&edited) {
+                                    return outcome;
+                                }
+                            }
+                            decoded = true;
+                            working = Some(edited.text);
+                        }
+                    }
+                    // In a layer that still decoded something, a tag's `>` or a
+                    // comment's `-->` may itself still be encoded, so markup
+                    // left open is kept as text. HTML's rule that open markup
+                    // runs to the end applies only to the rendered text, once
+                    // nothing is left to decode.
+                    let markup = if decoded {
+                        without_closed_markup_tags
+                    } else {
+                        without_markup_tags
+                    };
+                    let input = working.as_ref().map_or(current, |text| text.as_slice());
+                    if let Some(edited) = markup(input) {
+                        if !repeats_a_single_chain(&working, true) {
+                            if let Some(outcome) = check(&edited) {
+                                return outcome;
+                            }
+                        }
+                        working = Some(edited.text);
+                    }
                 }
             }
-            if depth == MAX_REVEAL_DEPTH && chain(&next.text).is_some() {
+            let Some(next) = working else {
+                break;
+            };
+            if depth == MAX_REVEAL_DEPTH && chain.would_change(&next) {
                 return RevealOutcome::Exhausted;
             }
             layer = Some(next);
@@ -1608,99 +1673,53 @@ struct Edited {
     changes: Vec<Change>,
 }
 
-/// One layer of a chain: its text and the ranges of it a change touched.
-struct Layer {
-    text: Zeroizing<Vec<u8>>,
-    changed: Vec<(usize, usize)>,
-}
-
 /// One change [`reveal_outcome`] undoes; `None` when it would change nothing.
 type RevealTransform = fn(&[u8]) -> Option<Edited>;
 
-/// One step of a chain; `None` when nothing changed.
-type RevealChain = fn(&[u8]) -> Option<Layer>;
+/// How a chain builds each of its layers.
+#[derive(Clone, Copy)]
+enum RevealChain {
+    /// One change, undone again at every layer.
+    Single(RevealTransform),
+    /// Every decoding change in turn, then markup removal, at every layer.
+    /// Each step's result is checked on its own, so a key one step reveals
+    /// is seen before a later step of the same layer can remove it.
+    Composite,
+}
 
-/// The single changes, each also undone repeatedly in a chain of its own.
-const REVEAL_TRANSFORMS: &[RevealTransform] = &[
+/// The chains [`reveal_outcome`] follows: every single change on its own,
+/// then all of them in turn at every layer.
+///
+/// Control-byte removal has no chain of its own: it never changes text twice,
+/// and the combined chain's first step applies it to the original text.
+const REVEAL_CHAINS: &[RevealChain] = &[
+    RevealChain::Single(percent_decoded),
+    RevealChain::Single(markdown_unescaped),
+    RevealChain::Single(html_entities_decoded),
+    RevealChain::Single(without_markup_tags),
+    RevealChain::Composite,
+];
+
+/// The decoding steps of a composite layer, applied before its markup step.
+const DECODING_TRANSFORMS: &[RevealTransform] = &[
     without_control_bytes,
     percent_decoded,
     markdown_unescaped,
     html_entities_decoded,
-    without_markup_tags,
 ];
 
-/// The chains [`reveal_outcome`] follows: every single change on its own,
-/// then all of them applied in turn at every layer.
-const REVEAL_CHAINS: &[RevealChain] = &[
-    |text| single_layer(without_control_bytes, text),
-    |text| single_layer(percent_decoded, text),
-    |text| single_layer(markdown_unescaped, text),
-    |text| single_layer(html_entities_decoded, text),
-    |text| single_layer(without_markup_tags, text),
-    all_reveal_transforms,
-];
-
-fn single_layer(transform: RevealTransform, text: &[u8]) -> Option<Layer> {
-    transform(text).map(|edited| Layer {
-        changed: edited.changes.iter().map(|change| change.output).collect(),
-        text: edited.text,
-    })
-}
-
-/// Every [`REVEAL_TRANSFORMS`] change applied once, in order. The touched
-/// ranges of earlier transforms are carried through the later ones.
-fn all_reveal_transforms(text: &[u8]) -> Option<Layer> {
-    let mut current: Option<Layer> = None;
-    for transform in REVEAL_TRANSFORMS {
-        let input = current.as_ref().map_or(text, |layer| layer.text.as_slice());
-        let Some(edited) = transform(input) else {
-            continue;
-        };
-        let mut changed: Vec<(usize, usize)> = current
-            .take()
-            .map(|layer| layer.changed)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(start, end)| {
-                (
-                    map_position(&edited.changes, start, false),
-                    map_position(&edited.changes, end, true),
-                )
-            })
-            .collect();
-        changed.extend(edited.changes.iter().map(|change| change.output));
-        changed.sort_unstable();
-        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(changed.len());
-        for range in changed {
-            match merged.last_mut() {
-                Some(last) if range.0 <= last.1 => last.1 = last.1.max(range.1),
-                _ => merged.push(range),
+impl RevealChain {
+    /// True when one more layer of this chain would change `text`.
+    fn would_change(self, text: &[u8]) -> bool {
+        match self {
+            RevealChain::Single(transform) => transform(text).is_some(),
+            RevealChain::Composite => {
+                DECODING_TRANSFORMS
+                    .iter()
+                    .any(|transform| transform(text).is_some())
+                    || without_markup_tags(text).is_some()
             }
         }
-        current = Some(Layer {
-            text: edited.text,
-            changed: merged,
-        });
-    }
-    current
-}
-
-/// Where input position `position` lands in a transform's output. A position
-/// inside a change lands on the start of that change's output, or its end
-/// when `end` is set.
-fn map_position(changes: &[Change], position: usize, end: bool) -> usize {
-    let before = changes.partition_point(|change| change.input.0 <= position);
-    let Some(change) = before.checked_sub(1).map(|index| changes[index]) else {
-        return position;
-    };
-    if position < change.input.1 {
-        if end {
-            change.output.1
-        } else {
-            change.output.0
-        }
-    } else {
-        position - change.input.1 + change.output.1
     }
 }
 
@@ -1832,19 +1851,46 @@ fn html_entities_decoded(text: &[u8]) -> Option<Edited> {
 /// (a `>` inside a quoted attribute value does not end one), comments
 /// (`<!--` to `-->`), and the bogus comments `<!...>`, `<?...>` and `</...>`
 /// that do not start with a letter. Markup still open at the end of the text
-/// runs to the end, as in HTML. One linear pass.
+/// runs to the end, as HTML renders it. One linear pass.
 fn without_markup_tags(text: &[u8]) -> Option<Edited> {
+    markup_removed(text, true)
+}
+
+/// [`without_markup_tags`] for text that may still be partly encoded: markup
+/// left open is kept as text, because its closer may only appear once
+/// another layer is decoded.
+fn without_closed_markup_tags(text: &[u8]) -> Option<Edited> {
+    markup_removed(text, false)
+}
+
+/// Remove markup; `open_runs_to_end` says whether markup with no closer runs
+/// to the end of the text (rendered HTML) or is kept as text.
+///
+/// Linear either way: a closer search that succeeds is never repeated over
+/// the bytes it passed, and the first search that reaches the end without a
+/// closer ends the markup scan (with `open_runs_to_end` unset, everything
+/// after it is kept as text, so no later `<` is searched again).
+fn markup_removed(text: &[u8], open_runs_to_end: bool) -> Option<Edited> {
     if !text.contains(&b'<') {
         return None;
     }
     let mut rewrite = Rewrite::with_capacity(text.len());
     let mut index = 0;
+    let mut closers_left = true;
     while index < text.len() {
-        if text[index] == b'<' {
-            if let Some(end) = markup_end(text, index) {
-                rewrite.replace(index, end, &[]);
-                index = end;
-                continue;
+        if closers_left && text[index] == b'<' {
+            match markup_end(text, index) {
+                Some(Markup::Closed(end)) => {
+                    rewrite.replace(index, end, &[]);
+                    index = end;
+                    continue;
+                }
+                Some(Markup::Open) if open_runs_to_end => {
+                    rewrite.replace(index, text.len(), &[]);
+                    break;
+                }
+                Some(Markup::Open) => closers_left = false,
+                None => {}
             }
         }
         rewrite.keep(text[index]);
@@ -1853,22 +1899,32 @@ fn without_markup_tags(text: &[u8]) -> Option<Edited> {
     rewrite.finish()
 }
 
-/// Where the markup starting with the `<` at `text[index]` ends (just past
-/// it), or `None` when that `<` starts no markup and is plain text.
-fn markup_end(text: &[u8], index: usize) -> Option<usize> {
+/// What the `<` at the start of some markup opened.
+enum Markup {
+    /// Markup that ends just before this position.
+    Closed(usize),
+    /// Markup with no closer before the end of the text.
+    Open,
+}
+
+/// The markup starting with the `<` at `text[index]`, or `None` when that
+/// `<` starts no markup and is plain text.
+fn markup_end(text: &[u8], index: usize) -> Option<Markup> {
     let after = index + 1;
     let first = *text.get(after)?;
-    let past = |at: Option<usize>, len: usize| Some(at.map_or(text.len(), |at| at + len));
+    let closed = |at: Option<usize>, len: usize| {
+        Some(at.map_or(Markup::Open, |at| Markup::Closed(at + len)))
+    };
     if text[after..].starts_with(b"!--") {
-        return past(find_bytes(text, after + 3, b"-->"), 3);
+        return closed(find_bytes(text, after + 3, b"-->"), 3);
     }
     let starts_tag = first.is_ascii_alphabetic()
         || (first == b'/' && text.get(after + 1).is_some_and(u8::is_ascii_alphabetic));
     if starts_tag {
-        return past(tag_close(text, after), 1);
+        return closed(tag_close(text, after), 1);
     }
     if matches!(first, b'!' | b'?' | b'/') {
-        return past(find_bytes(text, after, b">"), 1);
+        return closed(find_bytes(text, after, b">"), 1);
     }
     None
 }
@@ -2476,5 +2532,34 @@ mod tests {
                 assert!(!outcome.is_clean(), "{name}");
             }
         }
+    }
+
+    /// A key that one step of the composite layer reveals is checked before a
+    /// later step of the same layer (markup removal) can delete it, and
+    /// markup still open in a half-decoded layer is kept as text.
+    #[test]
+    fn keys_revealed_inside_markup_by_the_composite_chain_are_found() {
+        let key: &[u8] = b"abcdef*xyzw123456";
+        let cases: [(&str, &[u8]); 5] = [
+            ("A", b"if x<y then abcdef%26%2342%3Bxyzw123456 end"),
+            ("B", b"while i<n { i += 1; }\nabcdef%26%2342%3Bxyzw123456\n"),
+            ("C", b"abcdef<b%253E*xyzw123456"),
+            ("D", b"<b abcdef%26%2342%3Bxyzw123456 >"),
+            ("E", b"<!-- note abcdef%26%2342%3Bxyzw123456"),
+        ];
+        for (name, text) in cases {
+            assert_eq!(
+                reveal_outcome(text, &[key], None),
+                RevealOutcome::Found,
+                "{name}"
+            );
+        }
+        let f_key: &[u8] = b"Zz9_-AbCdEfGhIjKlMn0123";
+        let f_text: &[u8] = b"Zz%25252539_-%25252541%25252562%25252543d%25252545f%25252547h<!%2525252D-%25252520c --%2525253E%25252549jK%2525256C%2525254Dn%2525253012%25252533";
+        assert_eq!(
+            reveal_outcome(f_text, &[f_key], None),
+            RevealOutcome::Found,
+            "F"
+        );
     }
 }
