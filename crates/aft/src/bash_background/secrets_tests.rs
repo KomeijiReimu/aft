@@ -410,6 +410,8 @@ fn native_pipeline() {
                 }
                 Err(error) => panic!("{error}"),
             };
+            // BSD can inherit the listener's O_NONBLOCK; TLS reads here block.
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
