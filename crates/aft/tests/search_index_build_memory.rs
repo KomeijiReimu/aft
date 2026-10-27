@@ -134,12 +134,17 @@ fn cold_build_peak_heap_per_file_stays_bounded() {
         2 * half
     );
 
-    // What the build may hold for each extra file at its peak: the resident
-    // file table and path lookup (two path copies plus about 150 bytes of
-    // entries) and the posting records not yet spilled, with room to spare.
-    // Holding any further copy of every path, as the build once did up to
-    // five times, goes over it.
-    let bound = 4 * average_path + 700;
+    // What the build holds for each extra file at its peak: the resident
+    // file table and path lookup (two path copies, 2 x the average path,
+    // plus about 150 bytes of entries) and the posting records not yet
+    // spilled. On Linux that measured 511 B per added file at 20,000 ->
+    // 40,000 files and 545 B at 125,000 -> 250,000, with 118-byte paths;
+    // the difference is the record buffer's and the lookup's capacity
+    // doubling. The bound sits between that and one more copy of every path
+    // (at least the path plus a 24-byte PathBuf, about 650 B here), so a
+    // build that keeps another copy of every path fails it. The build that
+    // kept up to five copies measured 1,322 B per added file.
+    let bound = 2 * average_path + 360;
     assert!(
         slope <= bound,
         "cold build peak grows {slope} B per added file, over {bound} B \
