@@ -212,7 +212,7 @@ pub(crate) fn authorize(
         }
     }
     let task = preflight.task.as_ref().expect("preflight owns layout");
-    let proxy = SecretProxy::start(ProxyConfig {
+    let proxy = start_proxy(ProxyConfig {
         vault,
         authorization_scope: scopes.authorization,
         lifetime_scope: scopes.lifetime.clone(),
@@ -240,6 +240,22 @@ pub(crate) fn authorize(
             lifetime: scopes.lifetime,
         })),
     })
+}
+
+#[cfg(not(test))]
+fn start_proxy(config: ProxyConfig) -> Result<SecretProxy, crate::secret_proxy::ProxyError> {
+    SecretProxy::start(config)
+}
+
+// Only test builds can inject this upstream config. Release launches always
+// call SecretProxy::start; neither a tool argument nor a test-only switch can
+// select this override.
+#[cfg(test)]
+fn start_proxy(config: ProxyConfig) -> Result<SecretProxy, crate::secret_proxy::ProxyError> {
+    match TEST_UPSTREAM.with(|slot| slot.borrow().clone()) {
+        Some(upstream) => SecretProxy::start_for_test(config, upstream),
+        None => SecretProxy::start(config),
+    }
 }
 
 #[cfg(unix)]
@@ -316,6 +332,7 @@ fn native_roots() -> Result<Vec<u8>, ()> {
 #[cfg(test)]
 thread_local! {
     static TEST_VAULT: std::cell::RefCell<Option<Arc<dyn SecretVault>>> = const { std::cell::RefCell::new(None) };
+    static TEST_UPSTREAM: std::cell::RefCell<Option<rustls::ClientConfig>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]

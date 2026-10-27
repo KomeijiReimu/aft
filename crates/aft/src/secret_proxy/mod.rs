@@ -236,6 +236,14 @@ pub struct SecretProxy {
 }
 
 impl SecretProxy {
+    #[cfg(test)]
+    pub(crate) fn start_for_test(
+        config: ProxyConfig,
+        upstream: rustls::ClientConfig,
+    ) -> Result<Self, ProxyError> {
+        Self::start_with_tls(config, upstream)
+    }
+
     pub fn start(config: ProxyConfig) -> Result<Self, ProxyError> {
         let upstream =
             crate::platform_tls::client_config().map_err(|_| ProxyError::Initialization)?;

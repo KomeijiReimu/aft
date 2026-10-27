@@ -10,6 +10,8 @@ struct Vault {
     materials: AtomicUsize,
     port: u16,
     audits: Mutex<Vec<secret_rules::audit::AuditRecordV1>>,
+    resolve_kinds: Mutex<Vec<String>>,
+    material_kinds: Mutex<Vec<String>>,
 }
 
 impl Vault {
@@ -19,6 +21,8 @@ impl Vault {
             materials: AtomicUsize::new(0),
             port,
             audits: Mutex::new(Vec::new()),
+            resolve_kinds: Mutex::new(Vec::new()),
+            material_kinds: Mutex::new(Vec::new()),
         })
     }
 }
@@ -29,6 +33,10 @@ impl SecretVault for Vault {
     fn resolve(&self, scope: &crate::secret::SecretScope, label: &str) -> Resolution {
         assert_eq!(scope.reference(), "secret-bash");
         self.resolves.fetch_add(1, Ordering::SeqCst);
+        self.resolve_kinds
+            .lock()
+            .unwrap()
+            .push(scope.kind().to_owned());
         Resolution::Granted {
             rule: LabelRule {
                 label: label.into(),
@@ -50,6 +58,10 @@ impl SecretVault for Vault {
     ) -> Result<Material, MaterialError> {
         assert_eq!(scope.reference(), "secret-bash");
         self.materials.fetch_add(1, Ordering::SeqCst);
+        self.material_kinds
+            .lock()
+            .unwrap()
+            .push(scope.kind().to_owned());
         Ok(Material::new(KEY.to_vec()))
     }
     fn audit(
@@ -317,6 +329,20 @@ fn native_pipeline() {
     params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
     let ca_key = rcgen::KeyPair::generate().unwrap();
     let ca = params.self_signed(&ca_key).unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        // Do not mutate the host keychains. This fixture tests the real bash
+        // pipeline with a local upstream anchor, not macOS system-store trust.
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.der().clone()).unwrap();
+        TEST_UPSTREAM.with(|slot| {
+            slot.replace(Some(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            ))
+        });
+    }
     let leaf_key = rcgen::KeyPair::generate().unwrap();
     let leaf = rcgen::CertificateParams::new(vec!["localhost".into()])
         .unwrap()
@@ -343,6 +369,20 @@ fn native_pipeline() {
     let vault = Vault::new(listener.local_addr().unwrap().port());
     let seen = Arc::new(AtomicUsize::new(0));
     let seen_server = seen.clone();
+    let cases = vec![
+        (crate::config::SandboxMode::Strict, false),
+        (crate::config::SandboxMode::Strict, true),
+    ];
+    #[cfg(target_os = "macos")]
+    let cases = {
+        let mut cases = cases;
+        cases.extend([
+            (crate::config::SandboxMode::Relaxed, false),
+            (crate::config::SandboxMode::Relaxed, true),
+        ]);
+        cases
+    };
+    let expected_requests = cases.len() * 2;
     let encodings = vec![
         std::str::from_utf8(KEY).unwrap().to_owned(),
         base64::engine::general_purpose::STANDARD.encode(KEY),
@@ -357,7 +397,7 @@ fn native_pipeline() {
     let body = encodings.join("\n");
     let server = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(30);
-        while seen_server.load(Ordering::SeqCst) < 4 && Instant::now() < deadline {
+        while seen_server.load(Ordering::SeqCst) < expected_requests && Instant::now() < deadline {
             let (socket, _) = match listener.accept() {
                 Ok(accepted) => accepted,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -394,9 +434,8 @@ fn native_pipeline() {
             stream.flush().unwrap();
             seen_server.fetch_add(1, Ordering::SeqCst);
         }
-        assert_eq!(seen_server.load(Ordering::SeqCst), 4);
+        assert_eq!(seen_server.load(Ordering::SeqCst), expected_requests);
     });
-    let ctx = context(root.path(), storage.path());
     let memory_probe = root.path().join("memory-probe.py");
     std::fs::write(&memory_probe, r#"import ctypes, os, sys
 pid = int(sys.argv[1])
@@ -417,7 +456,12 @@ paths = [os.environ[k] for k in ['SSL_CERT_FILE', 'CURL_CA_BUNDLE', 'NODE_EXTRA_
 assert len(set(paths)) == 1
 assert open(paths[0], 'rb').read().count(b'BEGIN CERTIFICATE') > 1
 "#).unwrap();
-    for (index, pty) in [false, true].into_iter().enumerate() {
+    for (index, (mode, pty)) in cases.into_iter().enumerate() {
+        let ctx = context(root.path(), storage.path());
+        ctx.update_config(|config| {
+            config.sandbox.profile.head = mode;
+            config.sandbox.profile.worker = mode;
+        });
         let gate = root.path().join(format!("go-{index}"));
         let command = format!("while [ ! -f '{}' ]; do sleep 0.05; done; test \"$HTTPS_PROXY\" = \"$https_proxy\" && test \"$HTTP_PROXY\" = \"$http_proxy\" && test -z \"${{NO_PROXY+x}}\" && test -z \"${{no_proxy+x}}\" && test -z \"${{ALL_PROXY+x}}\" && test -z \"${{all_proxy+x}}\" || exit 70; curl --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; curl --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; sleep 30", gate.display(), vault.port, vault.port);
         let command = format!(
@@ -432,7 +476,7 @@ assert open(paths[0], 'rb').read().count(b'BEGIN CERTIFICATE') > 1
         let mut lifetime = stamp("worker");
         lifetime.scope_epoch = index as u64 + 1;
         if pty {
-            lifetime = serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"secret-run","kind":"ephemeral","scope_epoch":1,"owner_authorized":true,"parent":{"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"secret-bash","scope_epoch":1},"parent_state":"linked"})).unwrap();
+            lifetime = serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"secret-run","kind":"ephemeral","scope_epoch":index as u64 + 1,"owner_authorized":true,"parent":{"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"secret-bash","scope_epoch":1},"parent_state":"linked"})).unwrap();
         }
         let launch = || {
             super::super::registry::with_scope_spawn(Some(lifetime.clone()), || {
@@ -472,7 +516,18 @@ assert open(paths[0], 'rb').read().count(b'BEGIN CERTIFICATE') > 1
         while seen.load(Ordering::SeqCst) < (index + 1) * 2 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(seen.load(Ordering::SeqCst), (index + 1) * 2);
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            (index + 1) * 2,
+            "command failed before upstream: {:?}",
+            ctx.bash_background().status(
+                task_id,
+                "secret-bash",
+                Some(root.path()),
+                Some(storage.path()),
+                0
+            )
+        );
         let snapshot = loop {
             let snapshot = ctx
                 .bash_background()
@@ -508,14 +563,31 @@ assert open(paths[0], 'rb').read().count(b'BEGIN CERTIFICATE') > 1
             "command must lead its own session"
         );
         assert_eq!(unsafe { libc::getpgid(pid) }, pid);
-        ctx.bash_background().kill_scope(&lifetime);
+        if pty {
+            ctx.bash_background().kill_scope(&lifetime);
+        } else {
+            ctx.bash_background().detach();
+            assert!(
+                super::super::process::is_process_alive(pid as u32),
+                "detach should leave the child alive but revoke its proxy"
+            );
+            super::super::process::terminate_pgid(pid, None);
+        }
         assert!(
             std::net::TcpStream::connect(address).is_err(),
             "ended scope kept proxy listener alive"
         );
     }
     server.join().unwrap();
-    assert_eq!(vault.materials.load(Ordering::SeqCst), 4);
+    assert_eq!(vault.materials.load(Ordering::SeqCst), expected_requests);
+    assert_eq!(
+        *vault.resolve_kinds.lock().unwrap(),
+        ["worker", "head"].repeat(expected_requests / 4)
+    );
+    assert_eq!(
+        *vault.material_kinds.lock().unwrap(),
+        ["worker", "worker", "head", "head"].repeat(expected_requests / 4)
+    );
     for record in vault.audits.lock().unwrap().iter() {
         let serialized = record.to_json_line_with_key(KEY).unwrap();
         for encoded in &encodings {
