@@ -733,6 +733,10 @@ mod tests {
 
     fn migrated_memory_conn() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
+        // The writer test below depends on the foreign key from
+        // bash_view_records to bash_tasks; run_migrations does not set
+        // per-connection pragmas, so enable it here like open() does.
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         super::super::run_migrations(&mut conn).unwrap();
         conn
     }
@@ -1171,40 +1175,26 @@ mod tests {
         assert!(template_bytes(&conn, unreferenced).unwrap().is_none());
     }
 
-    /// Both production upsert paths must write the record in the same
-    /// transaction as the row, and the schema-pin handoff must reach the
-    /// spawn that records it. A new row write that bypasses the wrapper, or
-    /// a dispatch that drops the pin, fails this test.
+    /// A view record without its parent task row is refused: the database
+    /// rejects the orphan insert, so a record can only ever commit beside
+    /// its row in the shared upsert transaction.
     #[test]
-    fn upsert_and_pin_handoff_caller_inventory() {
-        let registry = include_str!("../bash_background/registry.rs");
-        let production = registry
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("registry tests stay in the trailing module");
-        assert!(
-            !production.contains("upsert_bash_task("),
-            "production row writes go through upsert_task_row_with_view"
-        );
-        let mut wrappers = Vec::new();
-        for (offset, _) in production.match_indices("upsert_task_row_with_view") {
-            let enclosing = production[..offset]
-                .rfind("\n    fn ")
-                .and_then(|start| {
-                    production[start..]
-                        .split('(')
-                        .next()
-                        .map(|name| name.trim_start_matches("\n    fn ").to_string())
-                })
-                .unwrap_or_default();
-            wrappers.push(enclosing);
-        }
-        wrappers.sort();
-        assert_eq!(wrappers, ["dual_write_task", "ensure_task_row"]);
-        let bash = include_str!("../subc/bash.rs");
-        assert!(
-            bash.contains("with_schema_pin(schema_pin, run_dispatch)"),
-            "deferred bash dispatch installs the call's schema pin"
-        );
+    fn view_record_without_parent_row_is_refused() {
+        let manifest = test_view_manifest_for_test();
+        let pin = manifest.pins[0].clone();
+        let _writing = enable_test_view_writing_for_test(manifest);
+        let conn = migrated_memory_conn();
+        let metadata = terminal_task_metadata_for_test(Some(&pin));
+        assert!(!write_view_record(
+            &conn,
+            "harness",
+            "session",
+            &metadata.task_id,
+            &metadata,
+            None
+        )
+        .unwrap());
+        assert_eq!(record_count(&conn), 0);
+        assert_eq!(template_count(&conn), 0);
     }
 }

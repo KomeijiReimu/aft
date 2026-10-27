@@ -3981,6 +3981,115 @@ mod grant_path_tests {
         assert_eq!(done.response.data["view"], stored);
         assert_eq!(done.text, legacy.text);
     }
+
+    /// The deferred bash dispatch installs the call's schema pin around the
+    /// spawn: a finished task persists that pin on its record, and the
+    /// terminal upsert stores a view record carrying it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_bash_dispatch_records_the_call_schema_pin() {
+        let manifest = crate::db::rich_ui::test_view_manifest_for_test();
+        let pin = manifest.pins[0].clone();
+        let _writing = crate::db::rich_ui::enable_test_view_writing_for_test(manifest);
+        let (dir, root) = super::super::test_support::test_root("dispatch-schema-pin");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| {
+            config.project_root = Some(dir.path().into());
+            config.storage_dir = Some(dir.path().join("storage"));
+        });
+        let db = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        ));
+        ctx.set_db(std::sync::Arc::clone(&db));
+        ctx.bash_background()
+            .set_db_pool(std::sync::Arc::clone(&db));
+        ctx.bash_background()
+            .set_harness(crate::harness::Harness::Opencode);
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx.clone());
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (tx, mut rx) = mpsc::channel(8);
+        let (touch, _touch_rx) = mpsc::channel(8);
+        let session = "pin-dispatch-session";
+        submit_deferred_bash(
+            &executor,
+            &tx,
+            &touch,
+            &metrics,
+            crate::bash_background::completed_spawn_for_test,
+            root.clone(),
+            dir.path().to_path_buf(),
+            session.into(),
+            "pin-dispatch".into(),
+            RouteChannel {
+                channel: 1,
+                epoch: 1,
+            },
+            1,
+            Flags::new(false, Priority::Interactive, false),
+            PROTOCOL_VERSION,
+            json!({"command": "exit 0", "background": true}),
+            crate::subc_format::FormatContext::default(),
+            BashWaitCancel {
+                run_scope: None,
+                scope: None,
+                late_results: false,
+                ledger_carrier: None,
+                connection: PersistentCancelSignal::new(),
+                route: PersistentCancelSignal::new(),
+                drain: drain::ModuleDrainWindow::default(),
+            },
+            BindTrust::FirstParty,
+            crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+            None,
+            None,
+            Some(pin.clone()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            super::remote_policy::RemoteSource::None,
+            Instant::now(),
+        );
+        let done = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let response = done.response_for_test();
+        assert!(response.success, "{response:?}");
+        let task_id = response.data["task_id"].as_str().unwrap().to_string();
+        let started = Instant::now();
+        let stored = loop {
+            let conn = db.lock().unwrap();
+            let row = crate::db::bash_tasks::get_bash_task(&conn, "opencode", session, &task_id)
+                .unwrap();
+            let settled = row.as_ref().is_some_and(|row| row.status == "completed");
+            let record =
+                crate::db::rich_ui::view_record_json(&conn, "opencode", session, &task_id)
+                    .unwrap();
+            drop(conn);
+            if settled
+                && record
+                    .as_ref()
+                    .and_then(|record| record.get("schema_pin"))
+                    .and_then(|value| value.as_str())
+                    == Some(pin.as_str())
+            {
+                break (row.unwrap(), record.unwrap());
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "pinned task did not settle with a view record"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let persisted: serde_json::Value = serde_json::from_str(&stored.0.metadata).unwrap();
+        assert_eq!(persisted["schema_pin"], pin);
+        assert_eq!(stored.1["schema_pin"], pin);
+        assert_eq!(stored.1["task_id"], task_id);
+    }
     #[cfg(unix)]
     static CHANGED_FILES_BUDGET_FOR_TEST: std::sync::Mutex<
         Option<crate::bash_changed_files::SharedCallDeadline>,
