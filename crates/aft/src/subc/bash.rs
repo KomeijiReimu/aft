@@ -1596,9 +1596,9 @@ pub(super) fn submit_deferred_bash(
     spawn_principal: crate::sandbox_spawn::AuthenticatedPrincipal,
     edit_slot_survives: Option<bool>,
     call_key: Option<String>,
-    /// The v1 `bash` schema pin the call carried, if any. It is installed
-    /// around the dispatch (see `with_schema_pin`) so the spawned task
-    /// records it; a pinless call leaves no view record.
+    // The v1 `bash` schema pin the call carried, if any. It is installed
+    // around the dispatch (see `with_schema_pin`) so the spawned task
+    // records it; a pinless call leaves no view record.
     schema_pin: Option<String>,
     permissions_granted: Option<Vec<String>>,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
@@ -3912,6 +3912,70 @@ pub(super) async fn assert_deferred_wait_entrypoint_for_test(
 
 #[cfg(test)]
 mod grant_path_tests {
+    #[test]
+    fn finalized_terminal_bash_result_carries_the_stored_record_on_tool_result_routes() {
+        let manifest = crate::db::rich_ui::test_view_manifest_for_test();
+        let pin = manifest.pins[0].clone();
+        let _writing = crate::db::rich_ui::enable_test_view_writing_for_test(manifest.clone());
+        let (dir, _root) = super::super::test_support::test_root("finalized-view");
+        let ctx = super::super::test_support::test_ctx();
+        let db = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        ));
+        ctx.set_db(std::sync::Arc::clone(&db));
+        ctx.bash_background()
+            .set_db_pool(std::sync::Arc::clone(&db));
+        ctx.bash_background()
+            .set_harness(crate::harness::Harness::Opencode);
+        let session = "finalized-session";
+        let task = "bash-0000000000000041";
+        let mut metadata = crate::db::rich_ui::terminal_task_metadata_for_test(Some(&pin));
+        metadata.session_id = session.into();
+        metadata.task_id = task.into();
+        metadata.harness = Some("opencode".into());
+        let row =
+            crate::db::rich_ui::task_row_for_test(&metadata, "opencode", "completed", Some(7), true);
+        let stored = {
+            let conn = db.lock().unwrap();
+            crate::db::rich_ui::upsert_task_row_with_view(&conn, &row, &metadata).unwrap();
+            crate::db::rich_ui::view_record_json(&conn, "opencode", session, task)
+                .unwrap()
+                .expect("record must be stored")
+        };
+        let body = || {
+            serde_json::json!({
+                "task_id": task,
+                "status": "completed",
+                "exit_code": 0,
+                "output": "done",
+                "output_preview": "done",
+                "output_truncated": false,
+            })
+        };
+        // A legacy-envelope route never receives the record.
+        let legacy = finalized_bash_result(
+            Response::success("r1", body()),
+            &ctx,
+            session,
+            &crate::subc_format::FormatContext::default(),
+            false,
+            None,
+        );
+        assert!(legacy.response.data.get("view").is_none());
+        // A tool-result/v1 route receives the stored record, with the same
+        // model-visible text as the legacy reply.
+        let _v1 = super::result_body::enter(true);
+        let done = finalized_bash_result(
+            Response::success("r1", body()),
+            &ctx,
+            session,
+            &crate::subc_format::FormatContext::default(),
+            false,
+            None,
+        );
+        assert_eq!(done.response.data["view"], stored);
+        assert_eq!(done.text, legacy.text);
+    }
     #[cfg(unix)]
     static CHANGED_FILES_BUDGET_FOR_TEST: std::sync::Mutex<
         Option<crate::bash_changed_files::SharedCallDeadline>,

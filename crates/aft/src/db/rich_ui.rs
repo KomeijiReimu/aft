@@ -153,6 +153,94 @@ pub(crate) fn set_fail_view_template_insert_for_test(fail: bool) {
     FAIL_VIEW_TEMPLATE_INSERT.store(fail, Ordering::SeqCst);
 }
 
+#[cfg(test)]
+pub(crate) fn set_test_view_manifest_for_test(manifest: Option<ViewManifest>) {
+    // The caller holds the test serial (through the writing guard), so no
+    // parallel test can interleave a manifest swap mid-write.
+    *TEST_VIEW_MANIFEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = manifest;
+}
+
+/// A test manifest built from the frozen fixtures: the placeholder template
+/// bytes are already canonical, so each digest is the file's SHA-256, and
+/// the pins are the frozen published pin list. Stands in for the
+/// publication slice's shipped manifest.
+#[cfg(test)]
+pub(crate) fn test_view_manifest_for_test() -> ViewManifest {
+    use sha2::{Digest, Sha256};
+    let row_bytes =
+        include_bytes!("../../tests/fixtures/rich_ui/placeholder-row.json").to_vec();
+    let page_bytes =
+        include_bytes!("../../tests/fixtures/rich_ui/placeholder-page.json").to_vec();
+    let pins: Vec<String> =
+        serde_json::from_slice(include_bytes!("../../tests/fixtures/rich_ui/bash-pins.json"))
+            .unwrap();
+    assert!(!pins.is_empty(), "frozen pins fixture must not be empty");
+    let digest = |bytes: &[u8]| format!("sha256:{:x}", Sha256::digest(bytes));
+    ViewManifest {
+        row_digest: digest(&row_bytes),
+        row_bytes,
+        page_digest: digest(&page_bytes),
+        page_bytes,
+        pins,
+    }
+}
+
+/// A terminal completed task carrying `pin`, for view-record tests.
+#[cfg(test)]
+pub(crate) fn terminal_task_metadata_for_test(
+    pin: Option<&str>,
+) -> crate::bash_background::persistence::PersistedTask {
+    use crate::bash_background::BgTaskStatus;
+    let mut metadata =
+        crate::bash_background::persistence::PersistedTask::starting(
+            "bash-0123456789abcdef".into(),
+            "session".into(),
+            "exit 0".into(),
+            std::path::PathBuf::from("/work"),
+            Some(std::path::PathBuf::from("/work")),
+            None,
+            true,
+            true,
+        );
+    metadata.schema_pin = pin.map(str::to_string);
+    metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+    metadata
+}
+
+/// A `bash_tasks` row mirroring `metadata`, for view-record tests.
+#[cfg(test)]
+pub(crate) fn task_row_for_test(
+    metadata: &crate::bash_background::persistence::PersistedTask,
+    harness: &str,
+    status: &str,
+    completed_at: Option<i64>,
+    completion_delivered: bool,
+) -> super::bash_tasks::BashTaskRow {
+    super::bash_tasks::BashTaskRow {
+        harness: harness.into(),
+        session_id: metadata.session_id.clone(),
+        task_id: metadata.task_id.clone(),
+        project_key: "project".into(),
+        command: metadata.command.clone(),
+        cwd: "/work".into(),
+        status: status.into(),
+        exit_code: metadata.exit_code,
+        pid: None,
+        pgid: None,
+        started_at: metadata.started_at as i64,
+        completed_at,
+        stdout_path: None,
+        stderr_path: None,
+        compressed: false,
+        timeout_ms: None,
+        completion_delivered,
+        output_bytes: None,
+        metadata: serde_json::to_string(metadata).unwrap(),
+    }
+}
+
 /// Hold while any test enables view writing: the writing flag and the test
 /// manifest are process-global, so parallel tests must not interleave them.
 /// Dropping the guard disables writing and clears the manifest again.
@@ -629,6 +717,26 @@ mod tests {
         assert_eq!(conn.total_changes(), changes);
     }
 
+    use sha2::{Digest, Sha256};
+
+    use crate::bash_background::BgTaskStatus;
+
+    fn migrated_memory_conn() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        super::super::run_migrations(&mut conn).unwrap();
+        conn
+    }
+
+    fn record_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT count(*) FROM bash_view_records", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn template_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT count(*) FROM rich_ui_templates", [], |row| row.get(0))
+            .unwrap()
+    }
+
     #[test]
     fn rich_ui_presets_retention_tick_removes_only_older_than_thirty_days() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -642,5 +750,376 @@ mod tests {
         assert!(session_presets(&conn, &key(1)).unwrap().is_empty());
         assert_eq!(session_presets(&conn, &key(2)).unwrap(), ["worker"]);
         assert_eq!(session_presets(&conn, &key(3)).unwrap(), ["worker"]);
+    }
+
+    #[test]
+    fn view_record_writing_stays_disabled_unless_a_test_enables_it() {
+        let _serial = TEST_VIEW_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!view_record_writing_enabled());
+        assert!(view_manifest_for_writing().is_none());
+        let conn = migrated_memory_conn();
+        let metadata = terminal_task_metadata_for_test(Some("sha256:abc"));
+        assert!(!write_view_record(&conn, "harness", "session", &metadata.task_id, &metadata, None)
+            .unwrap());
+        assert_eq!(record_count(&conn), 0);
+        assert_eq!(template_count(&conn), 0);
+    }
+
+    #[test]
+    fn view_record_needs_terminal_pinned_published_call() {
+        let manifest = test_view_manifest_for_test();
+        let pin = manifest.pins[0].clone();
+        let _writing = enable_test_view_writing_for_test(manifest.clone());
+        let conn = migrated_memory_conn();
+        // A running task gets no record.
+        let mut running = terminal_task_metadata_for_test(Some(&pin));
+        running.status = BgTaskStatus::Running;
+        assert!(!write_view_record(&conn, "harness", "session", &running.task_id, &running, None)
+            .unwrap());
+        // A pinless terminal call gets no record.
+        let pinless = terminal_task_metadata_for_test(None);
+        assert!(!write_view_record(&conn, "harness", "session", &pinless.task_id, &pinless, None)
+            .unwrap());
+        // A pin the manifest does not publish gets no record.
+        let unlisted = terminal_task_metadata_for_test(Some(
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        ));
+        assert!(!write_view_record(
+            &conn,
+            "harness",
+            "session",
+            &unlisted.task_id,
+            &unlisted,
+            None
+        )
+        .unwrap());
+        assert_eq!(record_count(&conn), 0);
+        assert_eq!(template_count(&conn), 0);
+        // A terminal call with a published pin records, with both digests.
+        let metadata = terminal_task_metadata_for_test(Some(&pin));
+        assert!(write_view_record(
+            &conn,
+            "harness",
+            "session",
+            &metadata.task_id,
+            &metadata,
+            Some(41)
+        )
+        .unwrap());
+        let stored = view_record_json(&conn, "harness", "session", &metadata.task_id)
+            .unwrap()
+            .expect("record must be stored");
+        assert_eq!(
+            stored
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "schema",
+                "version",
+                "task_id",
+                "schema_pin",
+                "phase",
+                "exitCode",
+                "durationMs",
+                "outputBytes",
+                "endReason",
+                "templates"
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_eq!(stored["schema"], "aft.bash.view");
+        assert_eq!(stored["version"], 1);
+        assert_eq!(stored["task_id"], metadata.task_id);
+        assert_eq!(stored["schema_pin"], pin);
+        assert_eq!(stored["phase"], "finished");
+        assert_eq!(stored["exitCode"], 0);
+        assert_eq!(stored["endReason"], "completed");
+        assert_eq!(stored["outputBytes"], 41);
+        assert_eq!(stored["templates"]["row"], manifest.row_digest);
+        assert_eq!(stored["templates"]["page"], manifest.page_digest);
+        assert_eq!(
+            template_bytes(&conn, &manifest.row_digest).unwrap().as_deref(),
+            Some(manifest.row_bytes.as_slice())
+        );
+        assert_eq!(
+            template_bytes(&conn, &manifest.page_digest).unwrap().as_deref(),
+            Some(manifest.page_bytes.as_slice())
+        );
+    }
+
+    /// A manifest whose template bytes changed but whose pins did not: the
+    /// stored record keeps its original pin and digests, and the old bytes
+    /// stay readable.
+    fn upgraded_manifest(previous: &ViewManifest) -> ViewManifest {
+        let mut row_value: serde_json::Value =
+            serde_json::from_slice(&previous.row_bytes).unwrap();
+        row_value["source"] = serde_json::json!("upgraded");
+        let row_bytes = serde_json::to_vec(&row_value).unwrap();
+        let mut page_value: serde_json::Value =
+            serde_json::from_slice(&previous.page_bytes).unwrap();
+        page_value["source"] = serde_json::json!("upgraded");
+        let page_bytes = serde_json::to_vec(&page_value).unwrap();
+        ViewManifest {
+            pins: previous.pins.clone(),
+            row_digest: format!("sha256:{:x}", Sha256::digest(&row_bytes)),
+            row_bytes,
+            page_digest: format!("sha256:{:x}", Sha256::digest(&page_bytes)),
+            page_bytes,
+        }
+    }
+
+    #[test]
+    fn view_record_first_write_wins_across_template_upgrades() {
+        let manifest = test_view_manifest_for_test();
+        let pin = manifest.pins[0].clone();
+        let _writing = enable_test_view_writing_for_test(manifest.clone());
+        let conn = migrated_memory_conn();
+        let metadata = terminal_task_metadata_for_test(Some(&pin));
+        assert!(write_view_record(&conn, "harness", "session", &metadata.task_id, &metadata, None)
+            .unwrap());
+        // After the upgrade the same pin still validates, but the terminal
+        // re-upsert must not change the stored pin or digests.
+        set_test_view_manifest_for_test(Some(upgraded_manifest(&manifest)));
+        assert!(!write_view_record(&conn, "harness", "session", &metadata.task_id, &metadata, None)
+            .unwrap());
+        let stored = view_record_json(&conn, "harness", "session", &metadata.task_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored["schema_pin"], pin);
+        assert_eq!(stored["templates"]["row"], manifest.row_digest);
+        assert_eq!(stored["templates"]["page"], manifest.page_digest);
+        assert_eq!(
+            template_bytes(&conn, &manifest.row_digest).unwrap().as_deref(),
+            Some(manifest.row_bytes.as_slice()),
+            "old template bytes stay readable"
+        );
+        // An upgrade that drops the pin records nothing new either.
+        let mut dropped = upgraded_manifest(&manifest);
+        dropped.pins.clear();
+        set_test_view_manifest_for_test(Some(dropped));
+        assert!(!write_view_record(&conn, "harness", "session", &metadata.task_id, &metadata, None)
+            .unwrap());
+    }
+
+    #[test]
+    fn forced_template_insert_error_rolls_back_the_record_but_keeps_the_row() {
+        let manifest = test_view_manifest_for_test();
+        let pin = manifest.pins[0].clone();
+        let _writing = enable_test_view_writing_for_test(manifest);
+        let conn = migrated_memory_conn();
+        let metadata = terminal_task_metadata_for_test(Some(&pin));
+        let row = task_row_for_test(&metadata, "harness", "completed", Some(7), true);
+        super::super::bash_tasks::upsert_bash_task(&conn, &row).unwrap();
+        set_fail_view_template_insert_for_test(true);
+        assert!(!write_view_record(
+            &conn,
+            &row.harness,
+            &row.session_id,
+            &row.task_id,
+            &metadata,
+            None
+        )
+        .unwrap());
+        // The caller still commits the task row; the record and its template
+        // bytes are rolled back together.
+        assert!(super::super::bash_tasks::get_bash_task(
+            &conn,
+            &row.harness,
+            &row.session_id,
+            &row.task_id
+        )
+        .unwrap()
+        .is_some());
+        assert_eq!(record_count(&conn), 0);
+        assert_eq!(template_count(&conn), 0);
+    }
+
+    fn seed_view_record(
+        conn: &Connection,
+        harness: &str,
+        session: &str,
+        task: &str,
+        pin: &str,
+    ) {
+        let mut metadata = terminal_task_metadata_for_test(Some(pin));
+        metadata.session_id = session.into();
+        metadata.task_id = task.into();
+        let row = task_row_for_test(&metadata, harness, "completed", Some(7), true);
+        super::super::bash_tasks::upsert_bash_task(conn, &row).unwrap();
+        assert!(write_view_record(conn, harness, session, task, &metadata, None).unwrap());
+    }
+
+    #[test]
+    fn view_records_cascade_with_their_parent_row_on_every_deletion_path() {
+        let manifest = test_view_manifest_for_test();
+        let pin = manifest.pins[0].clone();
+        let _writing = enable_test_view_writing_for_test(manifest.clone());
+        // GC delete of a delivered terminal row.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let conn = super::super::open(&dir.path().join("aft.db")).unwrap();
+            seed_view_record(&conn, "opencode", "session", "bash-0000000000000001", &pin);
+            assert_eq!(
+                super::super::bash_tasks::delete_delivered_terminal_bash_task(
+                    &conn,
+                    "opencode",
+                    "session",
+                    "bash-0000000000000001",
+                    "persisted_gc_delivered_terminal"
+                )
+                .unwrap(),
+                1
+            );
+            assert!(view_record_json(&conn, "opencode", "session", "bash-0000000000000001")
+                .unwrap()
+                .is_none());
+            assert!(template_bytes(&conn, &manifest.row_digest).unwrap().is_some());
+        }
+        // Orphan and old-id retirement delete the exact identity.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let conn = super::super::open(&dir.path().join("aft.db")).unwrap();
+            seed_view_record(&conn, "opencode", "session", "bash-0000000000000002", &pin);
+            assert_eq!(
+                super::super::bash_tasks::delete_bash_task(
+                    &conn,
+                    "opencode",
+                    "session",
+                    "bash-0000000000000002"
+                )
+                .unwrap(),
+                1
+            );
+            assert!(view_record_json(&conn, "opencode", "session", "bash-0000000000000002")
+                .unwrap()
+                .is_none());
+            assert!(template_bytes(&conn, &manifest.row_digest).unwrap().is_some());
+        }
+        // The 30-day prune of a delivered terminal row whose layout is gone.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let conn = super::super::open(&dir.path().join("aft.db")).unwrap();
+            seed_view_record(&conn, "opencode", "session", "bash-0000000000000003", &pin);
+            let now_ms = 100 * super::super::bash_tasks::TERMINAL_ROW_RETENTION_AGE_MS;
+            let old = now_ms - super::super::bash_tasks::TERMINAL_ROW_RETENTION_AGE_MS - 1;
+            conn.execute(
+                "UPDATE bash_tasks SET completed_at = ?1 WHERE task_id = 'bash-0000000000000003'",
+                [old],
+            )
+            .unwrap();
+            let plan =
+                super::super::bash_tasks::select_terminal_prune_candidates(&conn, now_ms, 500)
+                    .unwrap();
+            let prepared = super::super::bash_tasks::prepare_terminal_prune(plan, |_| false);
+            let removed =
+                super::super::bash_tasks::delete_prepared_terminal_rows(&conn, prepared).unwrap();
+            assert_eq!(removed.removed, 1);
+            assert!(view_record_json(&conn, "opencode", "session", "bash-0000000000000003")
+                .unwrap()
+                .is_none());
+            assert!(template_bytes(&conn, &manifest.row_digest).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn retention_tick_removes_only_unreferenced_unshipped_templates() {
+        let manifest = test_view_manifest_for_test();
+        let pin = manifest.pins[0].clone();
+        let _writing = enable_test_view_writing_for_test(manifest.clone());
+        let mut conn = migrated_memory_conn();
+        seed_view_record(&conn, "opencode", "session", "bash-0000000000000004", &pin);
+        // Shared digests: a second project references the same bytes.
+        seed_view_record(&conn, "opencode", "other", "bash-0000000000000005", &pin);
+        let unreferenced = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        conn.execute(
+            "INSERT INTO rich_ui_templates(digest, bytes) VALUES (?1, ?2)",
+            rusqlite::params![unreferenced, vec![1u8]],
+        )
+        .unwrap();
+        let shipped = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        conn.execute(
+            "INSERT INTO rich_ui_templates(digest, bytes) VALUES (?1, ?2)",
+            rusqlite::params![shipped, vec![2u8]],
+        )
+        .unwrap();
+        // Removing one referencing row keeps the shared bytes readable.
+        super::super::bash_tasks::delete_bash_task(
+            &conn,
+            "opencode",
+            "session",
+            "bash-0000000000000004",
+        )
+        .unwrap();
+        assert!(template_bytes(&conn, &manifest.row_digest).unwrap().is_some());
+        // The tick removes the unreferenced bytes but keeps referenced ones.
+        super::super::compression_events::prune_retention_tick(&mut conn, 1).unwrap();
+        assert!(template_bytes(&conn, &manifest.row_digest).unwrap().is_some());
+        assert!(template_bytes(&conn, unreferenced).unwrap().is_none());
+        assert!(
+            template_bytes(&conn, shipped).unwrap().is_none(),
+            "nothing ships yet, so the tick treats every stored template as unshipped"
+        );
+        // A directly listed shipped digest is kept.
+        conn.execute(
+            "INSERT INTO rich_ui_templates(digest, bytes) VALUES (?1, ?2)",
+            rusqlite::params![unreferenced, vec![1u8]],
+        )
+        .unwrap();
+        assert_eq!(prune_orphaned_templates(&conn, &[unreferenced.to_string()]).unwrap(), 0);
+        assert!(template_bytes(&conn, unreferenced).unwrap().is_some());
+        // Deleting the last referencing row makes the shared bytes eligible.
+        super::super::bash_tasks::delete_bash_task(
+            &conn,
+            "opencode",
+            "other",
+            "bash-0000000000000005",
+        )
+        .unwrap();
+        assert_eq!(prune_orphaned_templates(&conn, &[]).unwrap(), 3);
+        assert!(template_bytes(&conn, &manifest.row_digest).unwrap().is_none());
+        assert!(template_bytes(&conn, &manifest.page_digest).unwrap().is_none());
+        assert!(template_bytes(&conn, unreferenced).unwrap().is_none());
+    }
+
+    /// Both production upsert paths must write the record in the same
+    /// transaction as the row, and the schema-pin handoff must reach the
+    /// spawn that records it. A new row write that bypasses the wrapper, or
+    /// a dispatch that drops the pin, fails this test.
+    #[test]
+    fn upsert_and_pin_handoff_caller_inventory() {
+        let registry = include_str!("../bash_background/registry.rs");
+        let production = registry
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("registry tests stay in the trailing module");
+        assert!(
+            !production.contains("upsert_bash_task("),
+            "production row writes go through upsert_task_row_with_view"
+        );
+        let mut wrappers = Vec::new();
+        for (offset, _) in production.match_indices("upsert_task_row_with_view") {
+            let enclosing = production[..offset]
+                .rfind("\n    fn ")
+                .and_then(|start| {
+                    production[start..]
+                        .split('(')
+                        .next()
+                        .map(|name| name.trim_start_matches("\n    fn ").to_string())
+                })
+                .unwrap_or_default();
+            wrappers.push(enclosing);
+        }
+        wrappers.sort();
+        assert_eq!(wrappers, ["dual_write_task", "ensure_task_row"]);
+        let bash = include_str!("../subc/bash.rs");
+        assert!(
+            bash.contains("with_schema_pin(schema_pin, run_dispatch)"),
+            "deferred bash dispatch installs the call's schema pin"
+        );
     }
 }

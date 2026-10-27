@@ -6082,6 +6082,35 @@ mod tests {
         assert!(error.contains("7"), "{error}");
     }
     #[test]
+    fn schema_pin_is_an_optional_defaulted_field_and_keeps_schema_version() {
+        // The task-record format keeps version 7: older files without the
+        // field still read, with no pin.
+        assert_eq!(SCHEMA_VERSION, 7);
+        let directory = tempfile::tempdir().unwrap();
+        let (resolved, task) = counted_task(directory.path());
+        assert!(task.schema_pin.is_none());
+        let mut value = serde_json::to_value(&task).unwrap();
+        assert!(value.get("schema_pin").is_none(), "pinless tasks omit the field");
+        // A file written before the field existed reads with no pin.
+        value.as_object_mut().unwrap().remove("schema_pin");
+        std::fs::write(&resolved.paths.json, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(read_task_at(&resolved).unwrap().schema_pin.is_none());
+        // The dispatch pin is recorded at spawn when the call carried one.
+        let pinned = super::with_schema_pin(Some("sha256:pin".into()), || {
+            let (_, task) = counted_task(directory.path());
+            task
+        });
+        assert_eq!(pinned.schema_pin.as_deref(), Some("sha256:pin"));
+        // A pin survives a disk round trip.
+        let mut task = task;
+        task.schema_pin = Some("sha256:pin".into());
+        write_task_at(&resolved, &task).unwrap();
+        assert_eq!(
+            read_task_at(&resolved).unwrap().schema_pin.as_deref(),
+            Some("sha256:pin")
+        );
+    }
+    #[test]
     fn durability_bash_record_payload_count() {
         let storage = tempfile::tempdir().unwrap();
         let task =

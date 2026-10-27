@@ -26746,6 +26746,302 @@ mod a02_tests {
         assert_eq!(work_counts::get().artifact_opens, 0);
         assert_eq!(work_counts::get().artifact_bytes, 0);
     }
+
+    use crate::db::rich_ui::{
+        enable_test_view_writing_for_test, set_fail_view_template_insert_for_test,
+        set_test_view_manifest_for_test, task_row_for_test, terminal_task_metadata_for_test,
+        test_view_manifest_for_test,
+    };
+    use crate::sandbox_spawn::{with_authenticated_principal, AuthenticatedPrincipal};
+
+    const VIEW_TEST_SESSION: &str = "view-session";
+    const VIEW_TEST_HARNESS: &str = "opencode";
+
+    fn view_test_principal() -> AuthenticatedPrincipal {
+        AuthenticatedPrincipal::RouteBind {
+            trust: crate::sandbox_spawn::PrincipalTrust::FirstParty,
+            route_channel: 41,
+            route_epoch: 1,
+            project_root: std::path::PathBuf::from("/work"),
+            harness: VIEW_TEST_HARNESS.into(),
+            session_id: VIEW_TEST_SESSION.into(),
+            principal_id: Some("direct".into()),
+        }
+    }
+
+    fn view_test_registry(db_path: &std::path::Path) -> (super::BgTaskRegistry, std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>) {
+        let pool = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::db::open(db_path).unwrap(),
+        ));
+        let registry = super::BgTaskRegistry::default();
+        registry.set_db_pool(std::sync::Arc::clone(&pool));
+        (registry, pool)
+    }
+
+    fn seed_view_record(
+        registry: &super::BgTaskRegistry,
+        session: &str,
+        task: &str,
+        harness: &str,
+        pin: &str,
+    ) -> serde_json::Value {
+        let mut metadata = terminal_task_metadata_for_test(Some(pin));
+        metadata.session_id = session.into();
+        metadata.task_id = task.into();
+        metadata.harness = Some(harness.into());
+        let row = task_row_for_test(&metadata, harness, "completed", Some(7), true);
+        let (resolved_harness, pool) = registry
+            .db_harness_and_pool_for_session(session)
+            .expect("test pool and harness");
+        assert_eq!(resolved_harness, harness);
+        let conn = pool.lock().unwrap();
+        crate::db::rich_ui::upsert_task_row_with_view(&conn, &row, &metadata).unwrap();
+        crate::db::rich_ui::view_record_json(&conn, harness, session, task)
+            .unwrap()
+            .expect("seeded record")
+    }
+
+    #[test]
+    fn terminal_view_record_follows_the_observed_task_session() {
+        let manifest = test_view_manifest_for_test();
+        let pin = manifest.pins[0].clone();
+        let _writing = enable_test_view_writing_for_test(manifest);
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _pool) = view_test_registry(&dir.path().join("aft.db"));
+        with_authenticated_principal(view_test_principal(), || {
+            // A head observing its worker's task passes the worker session,
+            // and gets the worker task's stored record.
+            let stored = seed_view_record(
+                &registry,
+                "worker-session",
+                "bash-0000000000000021",
+                VIEW_TEST_HARNESS,
+                &pin,
+            );
+            assert_eq!(
+                registry
+                    .terminal_view_record("worker-session", "bash-0000000000000021"),
+                Some(stored)
+            );
+            assert!(registry
+                .terminal_view_record("other-session", "bash-0000000000000021")
+                .is_none());
+        });
+    }
+
+    #[test]
+    fn dual_write_task_records_terminal_pins_and_ignores_running_ones() {
+        let manifest = test_view_manifest_for_test();
+        let pin = manifest.pins[0].clone();
+        let _writing = enable_test_view_writing_for_test(manifest.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, pool) = view_test_registry(&dir.path().join("aft.db"));
+        let layout = super::super::persistence::create_task_layout(
+            storage.path(),
+            VIEW_TEST_SESSION,
+            "bash-0000000000000022",
+        )
+        .unwrap();
+        // A restart before settlement replays the running row first: no record.
+        let mut metadata = terminal_task_metadata_for_test(Some(&pin));
+        metadata.session_id = VIEW_TEST_SESSION.into();
+        metadata.task_id = "bash-0000000000000022".into();
+        metadata.harness = Some(VIEW_TEST_HARNESS.into());
+        metadata.status = super::BgTaskStatus::Running;
+        metadata.finished_at = None;
+        registry.dual_write_task(&layout.paths, &metadata);
+        {
+            let conn = pool.lock().unwrap();
+            assert!(crate::db::rich_ui::view_record_json(
+                &conn,
+                VIEW_TEST_HARNESS,
+                VIEW_TEST_SESSION,
+                "bash-0000000000000022"
+            )
+            .unwrap()
+            .is_none());
+        }
+        // Recovery settles the task with its original pin: the record lands.
+        metadata.status = super::BgTaskStatus::Completed;
+        registry.dual_write_task(&layout.paths, &metadata);
+        let stored = with_authenticated_principal(view_test_principal(), || {
+            registry.terminal_view_record(VIEW_TEST_SESSION, "bash-0000000000000022")
+        })
+        .expect("terminal replay writes the record");
+        assert_eq!(stored["schema_pin"], pin);
+        // An upgrade that drops the pin leaves the stored record alone.
+        let mut upgraded = manifest;
+        upgraded.pins.clear();
+        set_test_view_manifest_for_test(Some(upgraded));
+        registry.dual_write_task(&layout.paths, &metadata);
+        let stored_again = with_authenticated_principal(view_test_principal(), || {
+            registry.terminal_view_record(VIEW_TEST_SESSION, "bash-0000000000000022")
+        })
+        .unwrap();
+        assert_eq!(stored_again, stored);
+    }
+
+    #[test]
+    fn dual_write_task_commits_the_row_when_the_template_insert_fails() {
+        let manifest = test_view_manifest_for_test();
+        let pin = manifest.pins[0].clone();
+        let _writing = enable_test_view_writing_for_test(manifest);
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, pool) = view_test_registry(&dir.path().join("aft.db"));
+        let layout = super::super::persistence::create_task_layout(
+            storage.path(),
+            VIEW_TEST_SESSION,
+            "bash-0000000000000023",
+        )
+        .unwrap();
+        let mut metadata = terminal_task_metadata_for_test(Some(&pin));
+        metadata.session_id = VIEW_TEST_SESSION.into();
+        metadata.task_id = "bash-0000000000000023".into();
+        metadata.harness = Some(VIEW_TEST_HARNESS.into());
+        set_fail_view_template_insert_for_test(true);
+        registry.dual_write_task(&layout.paths, &metadata);
+        let conn = pool.lock().unwrap();
+        assert!(crate::db::bash_tasks::get_bash_task(
+            &conn,
+            VIEW_TEST_HARNESS,
+            VIEW_TEST_SESSION,
+            "bash-0000000000000023"
+        )
+        .unwrap()
+        .is_some());
+        assert!(crate::db::rich_ui::view_record_json(
+            &conn,
+            VIEW_TEST_HARNESS,
+            VIEW_TEST_SESSION,
+            "bash-0000000000000023"
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn ensure_task_row_rewrites_a_missing_row_with_its_view_record() {
+        let manifest = test_view_manifest_for_test();
+        let pin = manifest.pins[0].clone();
+        let _writing = enable_test_view_writing_for_test(manifest.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, pool) = view_test_registry(&dir.path().join("aft.db"));
+        let layout = super::super::persistence::create_task_layout(
+            storage.path(),
+            VIEW_TEST_SESSION,
+            "bash-0000000000000024",
+        )
+        .unwrap();
+        let mut metadata = terminal_task_metadata_for_test(Some(&pin));
+        metadata.session_id = VIEW_TEST_SESSION.into();
+        metadata.task_id = "bash-0000000000000024".into();
+        metadata.harness = Some(VIEW_TEST_HARNESS.into());
+        super::super::persistence::write_task(&layout.paths.json, &metadata).unwrap();
+        registry
+            .insert_rehydrated_task(metadata.clone(), layout.paths.clone(), false)
+            .unwrap();
+        registry.dual_write_task(&layout.paths, &metadata);
+        with_authenticated_principal(view_test_principal(), || {
+            assert!(registry
+                .terminal_view_record(VIEW_TEST_SESSION, "bash-0000000000000024")
+                .is_some());
+        });
+        // The row is deleted underneath the live task; the rewrite restores
+        // the row and its record and template rows together.
+        {
+            let conn = pool.lock().unwrap();
+            assert_eq!(
+                crate::db::bash_tasks::delete_bash_task(
+                    &conn,
+                    VIEW_TEST_HARNESS,
+                    VIEW_TEST_SESSION,
+                    "bash-0000000000000024"
+                )
+                .unwrap(),
+                1
+            );
+            assert!(crate::db::rich_ui::view_record_json(
+                &conn,
+                VIEW_TEST_HARNESS,
+                VIEW_TEST_SESSION,
+                "bash-0000000000000024"
+            )
+            .unwrap()
+            .is_none());
+        }
+        let task = registry
+            .task_for_session("bash-0000000000000024", VIEW_TEST_SESSION)
+            .expect("live task");
+        assert!(registry.ensure_task_row(&task));
+        with_authenticated_principal(view_test_principal(), || {
+            let stored = registry
+                .terminal_view_record(VIEW_TEST_SESSION, "bash-0000000000000024")
+                .expect("rewritten record");
+            assert_eq!(stored["schema_pin"], pin);
+        });
+        let conn = pool.lock().unwrap();
+        assert!(crate::db::rich_ui::template_bytes(&conn, &manifest.row_digest)
+            .unwrap()
+            .is_some());
+        assert!(crate::db::rich_ui::template_bytes(&conn, &manifest.page_digest)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn attach_terminal_view_needs_a_terminal_v1_reply_with_a_stored_record() {
+        let manifest = test_view_manifest_for_test();
+        let pin = manifest.pins[0].clone();
+        let _writing = enable_test_view_writing_for_test(manifest);
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _pool) = view_test_registry(&dir.path().join("aft.db"));
+        with_authenticated_principal(view_test_principal(), || {
+            let stored = seed_view_record(
+                &registry,
+                VIEW_TEST_SESSION,
+                "bash-0000000000000025",
+                VIEW_TEST_HARNESS,
+                &pin,
+            );
+            // A legacy-envelope route never receives the record.
+            let mut legacy = serde_json::json!({
+                "task_id": "bash-0000000000000025",
+                "status": "completed",
+                "output": "done",
+            });
+            registry.attach_terminal_view(&mut legacy, VIEW_TEST_SESSION);
+            assert!(legacy.get("view").is_none());
+            // A running reply on a versioned route carries no record either.
+            let _v1 = crate::subc::result_body::enter(true);
+            let mut running = serde_json::json!({
+                "task_id": "bash-0000000000000025",
+                "status": "running",
+                "output": "partial",
+            });
+            registry.attach_terminal_view(&mut running, VIEW_TEST_SESSION);
+            assert!(running.get("view").is_none());
+            // A terminal reply on a versioned route carries the stored record.
+            let mut terminal = serde_json::json!({
+                "task_id": "bash-0000000000000025",
+                "status": "completed",
+                "output": "done",
+            });
+            registry.attach_terminal_view(&mut terminal, VIEW_TEST_SESSION);
+            assert_eq!(terminal["view"], stored);
+            // A reply that would reach the 3 MiB wire cap with the record
+            // omits it instead.
+            let mut huge = serde_json::json!({
+                "task_id": "bash-0000000000000025",
+                "status": "completed",
+                "output": "x".repeat(3 * 1024 * 1024),
+            });
+            registry.attach_terminal_view(&mut huge, VIEW_TEST_SESSION);
+            assert!(huge.get("view").is_none());
+        });
+    }
 }
 
 #[cfg(all(test, unix))]
