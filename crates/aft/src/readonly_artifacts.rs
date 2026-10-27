@@ -1969,8 +1969,7 @@ mod tests {
         // never saw the reload reads 0 and fails loudly instead of passing
         // vacuously. Elapsed time cannot show any of this on a loaded
         // runner, where even a stopped-early reload can exceed 1 s.
-        let records =
-            crate::search_index::observe_borrowed_load_records_read_for_test(&root);
+        let records = crate::search_index::observe_borrowed_load_records_read_for_test(&root);
         let opened = open_search_index_from_cache_dir_with_budget(
             &root,
             cache_dir,
