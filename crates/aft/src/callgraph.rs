@@ -1657,6 +1657,72 @@ pub(crate) fn build_file_data_from_source_with_lang(
     build_file_data_from_tree(path, source, lang, &tree, &line_index)
 }
 
+#[derive(Default)]
+struct CallSiteSyntax {
+    construction: bool,
+    argument: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CALL_SITE_KIND_NODE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn classify_call_site_kinds(
+    root: tree_sitter::Node<'_>,
+    calls: &mut HashMap<String, Vec<CallSite>>,
+    value_refs: &mut HashMap<String, Vec<CallSite>>,
+) {
+    let mut syntax_by_span = calls
+        .values()
+        .chain(value_refs.values())
+        .flatten()
+        .map(|site| ((site.byte_start, site.byte_end), CallSiteSyntax::default()))
+        .collect::<HashMap<_, _>>();
+    if syntax_by_span.is_empty() {
+        return;
+    }
+
+    // Looking every range up from the root repeats long descents on nested calls.
+    // One cursor walk retains argument context on a heap-backed ancestor path.
+    let mut cursor = root.walk();
+    let mut argument_parents = Vec::new();
+    'walk: loop {
+        let node = cursor.node();
+        #[cfg(test)]
+        CALL_SITE_KIND_NODE_VISITS.with(|visits| visits.set(visits.get() + 1));
+        if let Some(syntax) = syntax_by_span.get_mut(&(node.start_byte(), node.end_byte())) {
+            // Equal-span descendants overwrite ancestors, matching the deepest range lookup.
+            syntax.construction = node.kind() == "new_expression";
+            syntax.argument = argument_parents.last().copied().unwrap_or(false);
+        }
+        let arguments = matches!(node.kind(), "arguments" | "argument_list");
+        if cursor.goto_first_child() {
+            argument_parents.push(arguments);
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                break 'walk;
+            }
+            argument_parents.pop();
+        }
+    }
+    for site in calls.values_mut().flatten() {
+        if syntax_by_span[&(site.byte_start, site.byte_end)].construction {
+            site.kind = CallSiteKind::Construction;
+        }
+    }
+    for site in value_refs.values_mut().flatten() {
+        if syntax_by_span[&(site.byte_start, site.byte_end)].argument {
+            site.kind = CallSiteKind::CallbackReference;
+        }
+    }
+}
+
 /// Reuse a caller-owned syntax tree and position index during blob extraction.
 pub(crate) fn build_file_data_from_tree(
     path: &Path,
@@ -1706,16 +1772,6 @@ pub(crate) fn build_file_data_from_tree(
         HashMap::new()
     };
 
-    for site in value_refs_by_symbol.values_mut().flatten() {
-        if root
-            .descendant_for_byte_range(site.byte_start, site.byte_end)
-            .and_then(|node| node.parent())
-            .is_some_and(|node| node.kind() == "arguments" || node.kind() == "argument_list")
-        {
-            site.kind = CallSiteKind::CallbackReference;
-        }
-    }
-
     let default_export = find_default_export(&source, root, path, lang);
 
     if let Some(default_export) = &default_export {
@@ -1743,14 +1799,7 @@ pub(crate) fn build_file_data_from_tree(
         }
     }
 
-    for site in calls_by_symbol.values_mut().flatten() {
-        if root
-            .descendant_for_byte_range(site.byte_start, site.byte_end)
-            .is_some_and(|node| node.kind() == "new_expression")
-        {
-            site.kind = CallSiteKind::Construction;
-        }
-    }
+    classify_call_site_kinds(root, &mut calls_by_symbol, &mut value_refs_by_symbol);
 
     // Collect exported symbol names
     let mut exported_symbols: Vec<String> = symbols
@@ -4384,6 +4433,75 @@ mod tests {
         let tree = parser.parse(source, None).unwrap();
         let symbols = crate::parser::extract_symbols_from_tree(source, &tree, lang).unwrap();
         (tree, symbols)
+    }
+
+    #[test]
+    fn call_site_kind_classification_matches_range_lookup() {
+        for (lang, source) in [
+            (LangId::TypeScript, "function callback() {} class Service { constructor() {} method() {} } export default function entry() { register(callback); new Service().method(); }"),
+            (LangId::JavaScript, "function callback() {} class Service {} export default () => { register(callback); return new Service().method(); };"),
+            (LangId::Rust, "fn callback() {} fn entry() { spawn(callback); let saved = callback; spawn(crate::callback); }"),
+            (LangId::Go, "package main\nfunc callback() {}\nfunc entry() { spawn(callback); saved := callback; _ = saved }\n"),
+        ] {
+            let (tree, _) = parse_symbols(source, lang);
+            let root = tree.root_node();
+            let data = build_file_data_from_tree(
+                Path::new("fixture"), source, lang, &tree, &SourceLineIndex::new(source),
+            ).unwrap();
+            assert!(data.value_refs_by_symbol.values().flatten()
+                .any(|site| site.kind == CallSiteKind::CallbackReference));
+            let sites = data.calls_by_symbol.values().flatten().map(|site| (site, false))
+                .chain(data.value_refs_by_symbol.values().flatten().map(|site| (site, true)));
+            for (site, value_ref) in sites {
+                let node = root.descendant_for_byte_range(site.byte_start, site.byte_end).unwrap();
+                let expected = if value_ref {
+                    if node.parent().is_some_and(|parent| {
+                        matches!(parent.kind(), "arguments" | "argument_list")
+                    }) {
+                        CallSiteKind::CallbackReference
+                    } else {
+                        CallSiteKind::Call
+                    }
+                } else if node.kind() == "new_expression" {
+                    CallSiteKind::Construction
+                } else {
+                    CallSiteKind::Call
+                };
+                assert_eq!(site.kind, expected, "{lang:?}: {}", site.full_callee);
+            }
+        }
+    }
+
+    #[test]
+    fn call_site_kind_classification_is_linear_on_deep_calls() {
+        for depth in [64, 8_000] {
+            let source = format!(
+                "export default function entry() {{ {}0{}; }}",
+                "f(".repeat(depth),
+                ")".repeat(depth)
+            );
+            CALL_SITE_KIND_NODE_VISITS.with(|visits| visits.set(0));
+            let data = build_file_data_from_source_with_lang(
+                Path::new("main.ts"),
+                &source,
+                LangId::TypeScript,
+            )
+            .unwrap();
+            let visits = CALL_SITE_KIND_NODE_VISITS.with(|visits| visits.get());
+            assert_eq!(data.calls_by_symbol["entry"].len(), depth);
+            assert!(data.calls_by_symbol["entry"]
+                .iter()
+                .all(|site| site.kind == CallSiteKind::Call));
+            assert!(
+                data.value_refs_by_symbol.is_empty(),
+                "nested f(...0) calls do not pass callbacks"
+            );
+            assert!(
+                visits >= depth && visits <= 8 * depth + 100,
+                "depth={depth}, node_visits={visits}"
+            );
+            eprintln!("call-site kind work: depth={depth} node_visits={visits}");
+        }
     }
 
     fn test_symbol(name: &str, start_col: u32, end_col: u32) -> Symbol {
