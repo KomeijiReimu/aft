@@ -582,7 +582,10 @@ pub(crate) mod pause_test_support {
         let recorded = requests.clone();
         let server = std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
-                tokio::time::timeout(Duration::from_secs(10), async move {
+                // Safety net only: stops a hung test from blocking forever. The
+                // session lasts as long as the test's own work, which a loaded
+                // CI runner (Windows) has stretched past 10 s, so keep it generous.
+                tokio::time::timeout(Duration::from_secs(60), async move {
                     let listener = tokio::net::TcpListener::from_std(listener).unwrap();
                     let (mut stream, _) = listener.accept().await.unwrap();
                     subc_transport::authenticate_server(&mut stream, &key, &daemon_id, "synapse-test", Duration::from_secs(2)).await.unwrap();

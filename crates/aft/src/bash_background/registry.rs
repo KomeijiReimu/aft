@@ -17746,6 +17746,12 @@ mod tests {
         let db_task_id = "bash-4444444444444444";
         let disk_task_id = "bash-5555555555555555";
         let (registry, db, _) = registry_with_db_and_frames(storage.path());
+        // The assertion below claims one pass reaches every session. A duration
+        // limit lets a loaded machine stop the scan before it gets there.
+        registry.set_project_replay_scan_budget_for_test(
+            PROJECT_REPLAY_SCAN_ENTRY_BUDGET,
+            Duration::from_secs(60),
+        );
 
         write_running_project_task(storage.path(), project.path(), db_session, db_task_id);
         write_running_project_task(storage.path(), project.path(), disk_session, disk_task_id);
@@ -17775,6 +17781,12 @@ mod tests {
         let session = "delivered-project-task";
         let task_id = "bash-6666666666666666";
         let (registry, _db, _) = registry_with_db_and_frames(storage.path());
+        // This asserts the first pass already decided the delivered bundle is not
+        // replayed. A duration limit would defer that decision to a later pass.
+        registry.set_project_replay_scan_budget_for_test(
+            PROJECT_REPLAY_SCAN_ENTRY_BUDGET,
+            Duration::from_secs(60),
+        );
         write_running_project_task(storage.path(), project.path(), session, task_id);
         let paths = task_paths(storage.path(), session, task_id).unwrap();
         let mut metadata = read_task(&paths.json).unwrap();
@@ -17802,6 +17814,12 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let (registry, _db, _) = registry_with_db_and_frames(storage.path());
+        // The batch is expected to reach the healthy session after parking the
+        // blocked one. A duration limit could stop the scan in between.
+        registry.set_project_replay_scan_budget_for_test(
+            PROJECT_REPLAY_SCAN_ENTRY_BUDGET,
+            Duration::from_secs(60),
+        );
         let blocked_session = "unreadable-project-session";
         let healthy_session = "readable-project-session";
         let healthy_task = "bash-000000000000beef";
@@ -18033,6 +18051,8 @@ mod tests {
         let (registry, db, _) = registry_with_db_and_frames(storage.path());
         let (session, mut live) =
             project_replay_history_fixture(storage.path(), project.path(), &db);
+        // The pass after the drain is expected to restore the live tasks on its
+        // own. A duration limit could stop it before reaching their session.
         registry.set_project_replay_scan_budget_for_test(64, Duration::from_secs(60));
         let (mut merged, reads, passes) =
             drain_project_replay_fixture(&registry, storage.path(), project.path(), &session);
@@ -18117,6 +18137,12 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let (registry, db, _) = registry_with_db_and_frames(storage.path());
+        // The first pass is expected to reach the task directory of this session;
+        // a duration limit could postpone it to a later pass.
+        registry.set_project_replay_scan_budget_for_test(
+            PROJECT_REPLAY_SCAN_ENTRY_BUDGET,
+            Duration::from_secs(60),
+        );
         let session = "cross-harness-project-session";
         let task_id = "bash-000000000000cafe";
         write_running_project_task(storage.path(), project.path(), session, task_id);
@@ -18242,6 +18268,14 @@ mod tests {
         db.lock().unwrap().execute_batch(
             "CREATE TRIGGER reject_discovery BEFORE INSERT ON bash_tasks BEGIN SELECT RAISE(FAIL, 'fixture recording refused'); END;"
         ).unwrap();
+        // The product's 25 ms time budget can expire on a slow runner after
+        // the task is read but before the session directory is exhausted, and
+        // a budget stop is reported ahead of the recording failure. A wide
+        // time budget keeps each pass checking the recording-failure report.
+        registry.set_project_replay_scan_budget_for_test(
+            PROJECT_REPLAY_SCAN_ENTRY_BUDGET,
+            Duration::from_secs(60),
+        );
         for _ in 0..2 {
             let batch = registry.replay_session_from_disk_for_project(
                 storage.path(),
@@ -25545,6 +25579,12 @@ mod tests {
                     .persisted_gc_started
                     .store(true, Ordering::SeqCst);
                 if project_scoped {
+                    // This asserts the first project pass already replayed the task.
+                    // A duration limit could postpone that to a later pass.
+                    replay.set_project_replay_scan_budget_for_test(
+                        PROJECT_REPLAY_SCAN_ENTRY_BUDGET,
+                        Duration::from_secs(60),
+                    );
                     replay
                         .replay_session_for_project(storage.path(), "session", storage.path())
                         .unwrap();
@@ -25628,6 +25668,12 @@ mod tests {
             .inner
             .persisted_gc_started
             .store(true, Ordering::SeqCst);
+        // This expects a single pass to reach the task and record the foreign
+        // acknowledgement. A duration limit could postpone it to a later pass.
+        replay.set_project_replay_scan_budget_for_test(
+            PROJECT_REPLAY_SCAN_ENTRY_BUDGET,
+            Duration::from_secs(60),
+        );
         replay
             .replay_session_for_project(storage.path(), "session", storage.path())
             .unwrap();

@@ -96,7 +96,8 @@ describe("archive prechecks", () => {
       execFileSync("tar", ["-cf", archive, "-C", root, name]);
       expect(await installerFixture()._precheckTarForTesting(archive, "tar")).toBe(4);
     });
-  });
+    // Spawns tar twice; a loaded CI runner can exceed bun's 5 s default.
+  }, 30_000);
 });
 
 describe("cache publication already on main", () => {
@@ -155,6 +156,8 @@ describe("cache publication already on main", () => {
         expect(existsSync(join(root, "lsp-binaries", ".quarantine"))).toBe(false);
       });
     },
+    // Spawns tar and runs an install; a loaded CI runner can exceed bun's 5 s default.
+    30_000,
   );
 
   test("cache validation cannot quarantine a leased GitHub installation", async () => {
