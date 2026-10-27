@@ -1419,9 +1419,11 @@ fn speech_with_a_thread_url_naming_a_bound_repository_routes_as_its_bot_from_out
         Governance::Available,
     );
     assert_routed_as(&run, OTHER_BOUND_REPOSITORY, OTHER_BOUND_AGENT);
+    // The route holder routes on the bare thread number: the shim sends the
+    // URL's digits, not the URL.
     assert_eq!(
         run.route_request.as_ref().unwrap()["target"]["number"],
-        json!(url)
+        json!("513")
     );
 }
 

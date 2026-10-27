@@ -806,6 +806,24 @@ fn plexus_contract_accepts_every_governed_wire_request_the_shim_builds() {
             vec!["api", "graphql", "-f", unresolve_query, "-f", "id=PRRT_kwDOAbc123"],
             "unresolve_thread",
         ),
+        // A thread URL positional names its number and repository: the wire
+        // carries the bare digits (the holder routes on numbers, not URLs).
+        ("issue comment url",
+            vec!["issue", "comment", "https://github.com/cortexkit/aft/issues/42", "--body", "Via a URL.", "--repo", "cortexkit/aft"],
+            "comment",
+        ),
+        ("pr comment url",
+            vec!["pr", "comment", "https://github.com/cortexkit/aft/pull/7", "--body", "Via a URL.", "--repo", "cortexkit/aft"],
+            "comment",
+        ),
+        ("pr edit url",
+            vec!["pr", "edit", "https://github.com/cortexkit/aft/pull/7", "--title", "Via a URL.", "--repo", "cortexkit/aft"],
+            "pr_edit",
+        ),
+        ("pr review url",
+            vec!["pr", "review", "https://github.com/cortexkit/aft/pull/7#issuecomment-123", "--comment", "--body", "Via a URL.", "--repo", "cortexkit/aft"],
+            "pr_review",
+        ),
     ];
     // (row name, argv, expected Plexus kind, stdin). The review reply, pull
     // PATCH and stack writes only exist as `api` rows.
@@ -859,6 +877,19 @@ fn plexus_contract_accepts_every_governed_wire_request_the_shim_builds() {
             canonicalize_governed_from(&argv, &tuple, &canonical, 22, &mut Cursor::new(""))
                 .unwrap_or_else(|error| panic!("{name}: must canonicalize: {error:?}"));
         let wire = wire_of(request);
+        // A URL positional contributes its bare thread number to the wire:
+        // the digits of the URL's last path segment, before any query or
+        // fragment. Anything else is the shim's bug, not the holder's.
+        if let Some(url) = raw.iter().find(|arg| arg.starts_with("https://")) {
+            let digits = url
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .split(['#', '?'])
+                .next()
+                .unwrap_or("");
+            assert_eq!(wire["target"]["number"], json!(digits), "{name}: bare thread number");
+        }
         match plexus_contract_judge::judge(&wire) {
             Ok(kind) => {
                 assert_eq!(kind, expected_kind, "{name}: routed kind");
