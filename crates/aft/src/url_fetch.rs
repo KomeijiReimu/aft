@@ -840,6 +840,16 @@ impl HeldKeys {
         self.0.iter().map(|(_, key)| key.as_slice()).collect()
     }
 
+    /// Error text from a library (reqwest, the decoders) with every held key
+    /// replaced by its placeholder. Text that still spells a key after that,
+    /// or that cannot be scrubbed, is dropped whole.
+    fn sanitize_detail(&self, detail: &str) -> String {
+        match self.scrub(detail.as_bytes()) {
+            Ok(clean) if !self.reveals(&clean) => String::from_utf8_lossy(&clean).into_owned(),
+            _ => String::new(),
+        }
+    }
+
     /// True when `bytes` still spell a held key, as they stand or after a
     /// URL parser or reader normalizes them (see
     /// [`secret_rules::reveals_key`]).
@@ -896,7 +906,7 @@ pub fn fetch_url_with_secrets(
         let sent = send_request(
             &client,
             outbound.as_ref().unwrap_or(&current),
-            Some(current.as_str()),
+            Some((current.as_str(), &held)),
             &deadline,
             &progress,
         );
@@ -983,7 +993,11 @@ pub fn fetch_url_with_secrets(
         .is_empty()
         .then(|| response.content_length())
         .flatten();
-    let (raw, mut download_truncated) = read_response_body(response, logical_url, &deadline)?;
+    // A failed read's text comes from reqwest and may name the request URL,
+    // which held the key; it is scrubbed like everything else read back.
+    let sanitize = |detail: &str| held.sanitize_detail(detail);
+    let (raw, mut download_truncated) =
+        read_response_body_with(response, logical_url, &deadline, &sanitize)?;
     let raw = Zeroizing::new(raw);
     let decoded = decode_secret_body(&raw, &codings, &mut download_truncated, logical_url)?;
     let mut body = held.scrub(&decoded).map_err(scrub_refusal(logical_url))?;
@@ -1770,19 +1784,20 @@ fn send_with_transient_retries(
     send_request(client, target, None, deadline, progress)
 }
 
-/// [`send_with_transient_retries`] for one request. With `shown` set, the
-/// request carries a substituted secret: every message names `shown` (the
-/// placeholder URL) instead of `target`, reqwest errors lose their URL before
-/// they are read, and the request asks for an unencoded response so the body
-/// can be scrubbed byte for byte.
+/// [`send_with_transient_retries`] for one request. With `secret` set, the
+/// request belongs to a placeholder fetch: every message names the given
+/// placeholder URL instead of `target`, a failure is reported through
+/// [`send_failure`] with the held keys, and the request asks for an unencoded
+/// response so the body can be scrubbed byte for byte.
 fn send_request(
     client: &Client,
     target: &Url,
-    shown: Option<&str>,
+    secret: Option<(&str, &HeldKeys)>,
     deadline: &FetchDeadline,
     progress: &ConnectProgress,
 ) -> Result<HttpResponse, UrlFetchError> {
-    let named = shown.unwrap_or(target.as_str());
+    let named = secret.map_or(target.as_str(), |(shown, _)| shown);
+    let held = secret.map(|(_, held)| held);
     let mut attempt = 0;
     loop {
         let remaining = deadline.remaining();
@@ -1797,13 +1812,11 @@ fn send_request(
             .header(USER_AGENT, USER_AGENT_VALUE)
             .header(ACCEPT, ACCEPT_HEADER)
             .timeout(remaining.min(HEADERS_TIMEOUT));
-        if shown.is_some() {
+        if held.is_some() {
             request = request.header(ACCEPT_ENCODING, "identity");
         }
         let error = match request.send() {
             Ok(response) => return Ok(response),
-            // A reqwest error prints the request URL, which here holds the key.
-            Err(error) if shown.is_some() => error.without_url(),
             Err(error) => error,
         };
         let phase = error
@@ -1822,14 +1835,38 @@ fn send_request(
             attempt += 1;
             continue;
         }
-        if let Some(phase) = phase {
-            return Err(request_timeout_error(&error, phase, deadline, named));
-        }
-        return Err(UrlFetchError::new(format!(
-            "Failed to fetch {named}: {}",
-            reqwest_error_detail(&error)
-        )));
+        return Err(send_failure(error, phase, deadline, named, held));
     }
+}
+
+/// The error for a request that failed for good, naming `named`. For a
+/// placeholder fetch (`held` set) reqwest's error first loses its URL, which
+/// carried the key, and the detail left is scrubbed of every held key (or
+/// dropped if it still spells one).
+fn send_failure(
+    error: reqwest::Error,
+    phase: Option<FetchPhase>,
+    deadline: &FetchDeadline,
+    named: &str,
+    held: Option<&HeldKeys>,
+) -> UrlFetchError {
+    let error = if held.is_some() {
+        error.without_url()
+    } else {
+        error
+    };
+    let detail = reqwest_error_detail(&error);
+    let detail = match held {
+        Some(held) => held.sanitize_detail(&detail),
+        None => detail,
+    };
+    if let Some(phase) = phase {
+        return request_timeout_error(&detail, phase, deadline, named);
+    }
+    if detail.is_empty() {
+        return UrlFetchError::new(format!("Failed to fetch {named}"));
+    }
+    UrlFetchError::new(format!("Failed to fetch {named}: {detail}"))
 }
 
 /// Name the phase a timed-out request was in: a name lookup still running in
@@ -1846,7 +1883,7 @@ fn timed_out_phase(error: &reqwest::Error, progress: &ConnectProgress) -> FetchP
 }
 
 fn request_timeout_error(
-    error: &reqwest::Error,
+    detail: &str,
     phase: FetchPhase,
     deadline: &FetchDeadline,
     target: &str,
@@ -1865,7 +1902,7 @@ fn request_timeout_error(
             phase.as_str(),
             limit.as_millis(),
             target,
-            reqwest_error_detail(error)
+            detail
         ),
     )
 }
@@ -2766,6 +2803,17 @@ fn read_response_body(
     url: &str,
     deadline: &FetchDeadline,
 ) -> Result<(Vec<u8>, bool), UrlFetchError> {
+    read_response_body_with(response, url, deadline, &|detail: &str| detail.to_string())
+}
+
+/// [`read_response_body`] with `detail` applied to the text of a failed read
+/// before it goes into the error, so a placeholder fetch can scrub it.
+fn read_response_body_with(
+    response: impl Read + Send + 'static,
+    url: &str,
+    deadline: &FetchDeadline,
+    detail: &dyn Fn(&str) -> String,
+) -> Result<(Vec<u8>, bool), UrlFetchError> {
     // Bound the producer, not just its consumer: an unbounded channel can
     // queue the entire response before the caller notices the byte ceiling.
     let (tx, rx) = mpsc::sync_channel(1);
@@ -2822,7 +2870,13 @@ fn read_response_body(
             }
             Ok(BodyReadEvent::Done) => return Ok((chunks, false)),
             Ok(BodyReadEvent::Error(kind, message, waited)) => {
-                return Err(body_read_failure(deadline, url, kind, &message, waited));
+                return Err(body_read_failure(
+                    deadline,
+                    url,
+                    kind,
+                    &detail(&message),
+                    waited,
+                ));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => return Err(slow_body_error()),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -2850,6 +2904,9 @@ fn body_read_failure(
     }
     if waited >= BODY_CHUNK_TIMEOUT || is_body_stall_kind(kind) {
         return body_stall_error(url);
+    }
+    if message.is_empty() {
+        return UrlFetchError::new(format!("Failed to read response body for {url}"));
     }
     UrlFetchError::new(format!("Failed to read response body for {url}: {message}"))
 }
@@ -3359,6 +3416,30 @@ mod tests {
                 .unwrap();
         let text = String::from_utf8(markdown).unwrap();
         assert!(text.contains("abcdef\\*1234567890"), "{text}");
+    }
+
+    /// The text of a failed body read can name the request URL, which held
+    /// the key in a placeholder fetch; it is scrubbed before it is reported.
+    #[test]
+    fn a_failed_body_read_in_a_placeholder_fetch_is_scrubbed_of_held_keys() {
+        struct Failing;
+        impl Read for Failing {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other(
+                    "error reading body for url (https://api.test/v1?key=fetch-secret-key%2F0123456789%2Babc)",
+                ))
+            }
+        }
+        let mut held = HeldKeys::default();
+        held.hold("test", b"fetch-secret-key/0123456789+abc")
+            .unwrap();
+        let deadline = FetchDeadline::for_current_call();
+        let sanitize = |detail: &str| held.sanitize_detail(detail);
+        let error = read_response_body_with(Failing, "https://api.test/v1", &deadline, &sanitize)
+            .expect_err("the read fails");
+        let text = error.to_string();
+        assert!(!text.contains("fetch-secret-key"), "{text}");
+        assert!(text.contains("key={{ck-secret:test}})"), "{text}");
     }
 }
 

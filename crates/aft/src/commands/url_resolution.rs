@@ -1732,5 +1732,32 @@ mod url_tests {
                 );
             }
         }
+
+        /// A body that ends before its declared length fails while reading;
+        /// that error must not carry the key-bearing request URL.
+        #[test]
+        fn a_body_read_error_names_only_the_placeholder_url() {
+            let fixture = fixture(Default::default());
+            let server = serve(&fixture.tls, |_| {
+                Some(
+                    b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/markdown\r\nContent-Length: 100\r\n\r\n# short\n"
+                        .to_vec(),
+                )
+            });
+            let port = server.addr.port();
+            let url = format!("https://api.secret.test:{port}/v1/doc.md?key={PLACEHOLDER}");
+            let vault = granted_vault(rule("api.secret.test", port, "/v1"));
+            let (run, documents) = run_with(
+                &fixture,
+                &vault,
+                &[("api.secret.test", server.addr)],
+                &request("outline", &url, serde_json::json!({})),
+                no_extra,
+            );
+            assert!(!run.response.success, "{:?}", run.response.data);
+            assert_eq!(server.targets().len(), 1);
+            assert_absent(&run, &documents, &[KEY, ENCODED_KEY.as_bytes()]);
+            assert!(!run.strings().contains("for url"), "{}", run.strings());
+        }
     }
 }
