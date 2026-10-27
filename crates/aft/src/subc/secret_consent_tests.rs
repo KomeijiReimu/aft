@@ -149,9 +149,11 @@ fn bound(head: &RouteIdentity, run_stamp: ScopeStamp) -> RouteIdentity {
     effective.session = head.session.clone();
     effective.spawn_principal = head.spawn_principal.clone();
     effective.run_owner = Some(Arc::new(codemode::RunOwner {
-        agent_id: "agent-1".into(),
+        kind: codemode::RunKind::Agent {
+            agent_id: "agent-1".into(),
+        },
         run_id: "run-1".into(),
-        head: head.clone(),
+        owner_route: head.clone(),
         run_route: RouteChannel {
             channel: 7,
             epoch: 1,

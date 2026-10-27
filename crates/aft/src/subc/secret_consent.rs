@@ -256,8 +256,9 @@ fn bound_codemode(
     // The parent link must name the very head the daemon bound this call to.
     // Otherwise a run parented to a worker (which `resolve_owner` refuses with
     // `head_route_not_bound`) could arrive here carrying a head route and
-    // inherit that head's authority through the vault.
-    let Some(head_stamp) = owner.head.scope.as_ref() else {
+    // inherit that head's authority through the vault. `owner_route` is the
+    // head agent's route for an agent run.
+    let Some(head_stamp) = owner.owner_route.scope.as_ref() else {
         return Err(Ineligibility::HeadScopeNotAlfonso);
     };
     if parent.owner != head_stamp.owner
