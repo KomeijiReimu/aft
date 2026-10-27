@@ -352,11 +352,14 @@ impl Drop for FetchTempScope {
     }
 }
 
+/// Delete one placeholder fetch's private folder. Deletion is best effort:
+/// nothing retries a failure later, so a failure is logged as a warning that
+/// names the folder left on disk, for an operator to remove.
 fn remove_fetch_dir(dir: &Path) {
     if let Err(error) = std::fs::remove_dir_all(dir) {
         if error.kind() != std::io::ErrorKind::NotFound {
             log::warn!(
-                "failed to delete a placeholder fetch's private folder {}: {error}",
+                "placeholder fetch cleanup failed: the private folder {} and its scrubbed document remain on disk and must be removed by hand ({error})",
                 dir.display()
             );
         }
