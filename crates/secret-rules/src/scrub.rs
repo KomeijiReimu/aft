@@ -1223,7 +1223,10 @@ pub fn reveals_any(text: &[u8], keys: &[&[u8]]) -> bool {
 /// steps of the same layer revealed; and while a layer still decodes
 /// something, markup with no closer is kept as text, because its closer may
 /// itself still be encoded. HTML's rule that open markup runs to the end is
-/// applied only once nothing is left to decode. A chain stops when nothing
+/// applied only once nothing is left to decode. One more chain applies the
+/// decoding steps at every layer and never removes markup, for a reader that
+/// sees tags verbatim (text, Markdown, JSON): a key still split inside a
+/// closed tag when the combined chain removes that tag is joined there. A chain stops when nothing
 /// changes any more, and each step rescans only the regions it changed
 /// (widened by the longest spelling of any key and to the enclosing base64
 /// group); the rest was examined before that step. All keys are checked in one pass. A
@@ -1268,7 +1271,13 @@ pub fn reveal_outcome(text: &[u8], keys: &[&[u8]], deadline: Option<Instant>) ->
         }
         None
     };
+    // Whether the combined chain removed any markup. If it never did, the
+    // decoding chain would repeat it layer for layer and is skipped.
+    let mut composite_removed_markup = false;
     for &chain in REVEAL_CHAINS {
+        if matches!(chain, RevealChain::Decoding) && !composite_removed_markup {
+            continue;
+        }
         // Only the current layer and the step being built are kept: memory
         // stays at a few copies of the text whatever the depth.
         let mut layer: Option<Zeroizing<Vec<u8>>> = None;
@@ -1326,7 +1335,23 @@ pub fn reveal_outcome(text: &[u8], keys: &[&[u8]], deadline: Option<Instant>) ->
                                 return outcome;
                             }
                         }
+                        composite_removed_markup = true;
                         working = Some(edited.text);
+                    }
+                }
+                RevealChain::Decoding => {
+                    // The first layer's steps are exactly the combined
+                    // chain's first-layer decoding steps, checked already.
+                    for &transform in DECODING_TRANSFORMS {
+                        let input = working.as_ref().map_or(current, |text| text.as_slice());
+                        if let Some(edited) = transform(input) {
+                            if depth > 1 {
+                                if let Some(outcome) = check(&edited) {
+                                    return outcome;
+                                }
+                            }
+                            working = Some(edited.text);
+                        }
                     }
                 }
             }
@@ -1685,6 +1710,12 @@ enum RevealChain {
     /// Each step's result is checked on its own, so a key one step reveals
     /// is seen before a later step of the same layer can remove it.
     Composite,
+    /// Every decoding change in turn at every layer, never removing markup:
+    /// a reader that decodes but does not render, as for text, Markdown or
+    /// JSON, where a tag reaches the reader verbatim. A key still split
+    /// inside a closed tag when the combined chain removes that tag is
+    /// joined here by a later layer.
+    Decoding,
 }
 
 /// The chains [`reveal_outcome`] follows: every single change on its own,
@@ -1692,12 +1723,16 @@ enum RevealChain {
 ///
 /// Control-byte removal has no chain of its own: it never changes text twice,
 /// and the combined chain's first step applies it to the original text.
+///
+/// The decoding chain comes last: its first layer repeats the combined
+/// chain's decoding steps, which were checked already.
 const REVEAL_CHAINS: &[RevealChain] = &[
     RevealChain::Single(percent_decoded),
     RevealChain::Single(markdown_unescaped),
     RevealChain::Single(html_entities_decoded),
     RevealChain::Single(without_markup_tags),
     RevealChain::Composite,
+    RevealChain::Decoding,
 ];
 
 /// The decoding steps of a composite layer, applied before its markup step.
@@ -1719,6 +1754,9 @@ impl RevealChain {
                     .any(|transform| transform(text).is_some())
                     || without_markup_tags(text).is_some()
             }
+            RevealChain::Decoding => DECODING_TRANSFORMS
+                .iter()
+                .any(|transform| transform(text).is_some()),
         }
     }
 }
@@ -2599,5 +2637,30 @@ mod tests {
             reveal_outcome(b"intro abcdef*xyzw12345<!-- -->6 outro", &[key], None),
             RevealOutcome::Found
         );
+    }
+
+    /// A key inside a closed tag that is still split (by a control byte or by
+    /// another encoding layer) when the combined chain removes the tag is
+    /// found by the chain that decodes without rendering markup: text,
+    /// Markdown or JSON shows the tag, and the key in it, verbatim.
+    #[test]
+    fn keys_still_split_inside_a_closed_tag_are_found() {
+        let key: &[u8] = b"abcdef*xyzw123456";
+        let mut l1 = b"<b ".to_vec();
+        l1.extend_from_slice(&b"y".repeat(1100));
+        l1.extend_from_slice(b" abcdef%0C*xyzw123456>");
+        let mut l2 = b"<b ".to_vec();
+        l2.extend_from_slice(&b"x".repeat(10));
+        l2.extend_from_slice(b" abcdef%2526%252342%253Bxyzw123456 ");
+        l2.extend_from_slice(&b"y".repeat(1100));
+        l2.extend_from_slice(b">");
+        let l3: &[u8] = b"<b abcdef%0C*xyzw123456 >";
+        for (name, text) in [("L1", l1.as_slice()), ("L2", l2.as_slice()), ("L3", l3)] {
+            assert_eq!(
+                reveal_outcome(text, &[key], None),
+                RevealOutcome::Found,
+                "{name}"
+            );
+        }
     }
 }
