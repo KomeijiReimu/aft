@@ -13094,7 +13094,7 @@ mod tests {
             .expect("initialize external git fixture");
         assert!(git_status.success());
         let storage = tempfile::tempdir().expect("storage");
-        for file_index in 0..64 {
+        for file_index in 0..8 {
             let file = external_root.join(format!(
                 "packages/pkg_{}/src/module_{file_index}.rs",
                 file_index % 8
@@ -13129,7 +13129,7 @@ mod tests {
         );
         assert_eq!(first["success"], true, "initial borrow failed: {first:?}");
 
-        for file_index in 0..40 {
+        for file_index in 0..8 {
             let file = external_root.join(format!(
                 "packages/pkg_{}/src/module_{file_index}.rs",
                 file_index % 8
@@ -13143,16 +13143,30 @@ mod tests {
         let mut rebuilt = SearchIndex::build(&external_root);
         rebuilt.write_to_disk(&cache_dir, None);
 
-        let started = Instant::now();
+        // The churned generation holds 8 files, inside the 10-entry budget
+        // below, while its trigram lookup table holds far more entries, so
+        // the reload reads the 8 file entries and then stops at the entry
+        // budget. The time budget is generous on purpose: with time unable
+        // to stop the reload, a count inside 1..=10 proves the entry budget
+        // is what stopped it. The lower bound matters too: a probe that
+        // never saw the reload (for example a root-key mismatch) reads 0
+        // and fails loudly instead of passing vacuously. Elapsed time
+        // cannot show any of this on a loaded runner, where the whole
+        // search can exceed 1 s even when the reload itself stopped
+        // immediately.
+        let records =
+            crate::search_index::observe_borrowed_load_records_read_for_test(&external_root);
         let degraded = crate::readonly_artifacts::with_borrowed_search_load_limits_for_test(
             10,
-            Duration::from_secs(5),
+            Duration::from_secs(60),
             || response_value(handle_semantic_search(&req, &ctx)),
         );
+        crate::search_index::unobserve_borrowed_load_records_read_for_test(&external_root);
 
         assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "churned generation must stop at the borrowed-load budget"
+            (1..=10).contains(&records.load(Ordering::SeqCst)),
+            "churned generation must stop at the borrowed-load entry budget, read {} records",
+            records.load(Ordering::SeqCst)
         );
         assert_eq!(degraded["success"], true);
         assert_ne!(degraded["fully_degraded"], true);
