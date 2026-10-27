@@ -191,10 +191,15 @@ pub(crate) struct CallgraphReconcileState {
     queries: parking_lot::Mutex<Vec<Weak<ReconcileQueryObservation>>>,
     last: parking_lot::Mutex<Option<CallgraphReconcileOutcome>>,
     completed: AtomicU64,
+    /// Test-only count of read-only opens the owning context finished before
+    /// starting a comparison. The ordering test reads it through the entry
+    /// hold to prove the caller's open completed first.
+    #[cfg(test)]
+    ensure_open_completed: AtomicU64,
     #[cfg(all(test, target_os = "linux"))]
     finished_at: parking_lot::Mutex<Option<std::time::Instant>>,
     #[cfg(test)]
-    hold: parking_lot::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    hold: parking_lot::Mutex<Option<(std::sync::mpsc::Sender<u64>, std::sync::mpsc::Receiver<()>)>>,
     #[cfg(test)]
     settled: parking_lot::Condvar,
 }
@@ -327,10 +332,23 @@ impl CallgraphReconcileState {
         true
     }
 
+    /// Record that the owning context finished a read-only open before
+    /// starting the next comparison.
+    #[cfg(test)]
+    pub(crate) fn note_ensure_open_completed_for_test(&self) {
+        self.ensure_open_completed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// How many read-only opens finished before the current comparison.
+    #[cfg(test)]
+    pub(crate) fn ensure_open_completed_for_test(&self) -> u64 {
+        self.ensure_open_completed.load(Ordering::SeqCst)
+    }
+
     #[cfg(test)]
     pub(crate) fn hold_next_for_test(
         &self,
-    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    ) -> (std::sync::mpsc::Receiver<u64>, std::sync::mpsc::Sender<()>) {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         *self.hold.lock() = Some((entered_tx, release_rx));
@@ -426,7 +444,10 @@ impl CallgraphReconcileJob {
         {
             let hold = ownership.state.hold.lock().take();
             if let Some((entered, release)) = hold {
-                let _ = entered.send(());
+                // The entry hold reports how many of the caller's opens had
+                // finished when this thread started: with the spawn ordered
+                // after the open, that already includes the current reopen.
+                let _ = entered.send(ownership.state.ensure_open_completed_for_test());
                 let _ = release.recv_timeout(std::time::Duration::from_secs(30));
             }
         }

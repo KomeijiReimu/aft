@@ -411,7 +411,9 @@ fn finish_leaving_a_survivor(
     let task_id = spawn_for_kill(
         registry,
         dir,
-        "sh -c 'trap \"\" TERM; echo $$ > survivor.pid; exec sleep 30' & while [ ! -f go ]; do sleep 0.01; done",
+        // Write the pid to a temp file and rename it, so the reader never sees
+        // the file between its creation and the write (an empty read failed once).
+        "sh -c 'trap \"\" TERM; echo $$ > survivor.pid.tmp && mv survivor.pid.tmp survivor.pid; exec sleep 30' & while [ ! -f go ]; do sleep 0.01; done",
     );
     wait_for_file(&dir.join("survivor.pid"), "the survivor did not start");
     let survivor = std::fs::read_to_string(dir.join("survivor.pid"))

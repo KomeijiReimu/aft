@@ -284,8 +284,11 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
   test("foreground promotion returns server text and does not call bash_status or bash_promote", async () => {
     const { h, bash, bridgeCalls } = await pluginHarness({ experimental_bash_background: true });
 
+    // The command must still be running when the 25 ms wait window ends. A
+    // 0.2 s command finished first on a loaded runner and came back as a
+    // completed result, which is correct product behaviour, so give it seconds.
     const result = await withEnv({ AFT_TEST_FOREGROUND_WAIT_MS: "25" }, async () =>
-      callPluginBash(bash, h, { command: "sleep 0.2 && echo late" }),
+      callPluginBash(bash, h, { command: "sleep 5 && echo late" }),
     );
 
     expect(result.output).toContain("promoted to background");
