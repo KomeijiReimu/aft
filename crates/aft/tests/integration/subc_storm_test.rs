@@ -325,11 +325,6 @@ fn handle_embedding_request(mut stream: std::net::TcpStream, delay: Duration) {
 }
 
 fn storm_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
-    // Delaying a real fixture read must still trip the two-second interactive
-    // read bound, regardless of the optimization profile used by the harness.
-    if req.command == "read" && storm_positive_control_is("interactive-read") {
-        thread::sleep(Duration::from_secs(3));
-    }
     match req.command.as_str() {
         "configure" => {
             if let Some(delay) = configure_sleep_delay(&req) {
@@ -343,10 +338,6 @@ fn storm_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "subc_storm_egress_payload" => egress_payload_response(&req, ctx),
         _ => subc_bridge_test::bridge_dispatch(req, ctx),
     }
-}
-
-fn storm_positive_control_is(name: &str) -> bool {
-    std::env::var("AFT_STORM_POSITIVE_CONTROL").as_deref() == Ok(name)
 }
 
 fn egress_payload_response(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -2418,11 +2409,6 @@ fn start_io(
         loop {
             match read_frame(&mut read_half).await {
                 Ok(Some(frame)) => {
-                    // Hold the acknowledgement in the transport fixture, not
-                    // the assertion: the unchanged bind deadline must reject it.
-                    if storm_positive_control_is("bind-ack") && is_ack(&frame, frame.header.corr) {
-                        tokio::time::sleep(Duration::from_secs(3)).await;
-                    }
                     if in_tx.send(frame).is_err() {
                         break;
                     }

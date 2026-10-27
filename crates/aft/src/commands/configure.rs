@@ -22,7 +22,8 @@ use crate::context::{
 use crate::harness::Harness;
 use crate::log_ctx;
 use crate::lsp::registry::{
-    resolve_lsp_binary, resolve_server_binary, servers_for_file, ServerKind,
+    resolve_lsp_binary, resolve_server_binary, servers_for_file_in_pass, BiomeSelectionMemo,
+    ServerKind,
 };
 use crate::parser::{detect_language, LangId, SharedSymbolCache};
 use crate::protocol::{RawRequest, Response};
@@ -2113,12 +2114,16 @@ fn configured_lsp_binary_resolves(
     configured: &crate::config::UserServerDef,
     files: &[PathBuf],
     config: &crate::config::Config,
+    memo: &mut BiomeSelectionMemo,
 ) -> bool {
     let project_root = config.project_root.as_deref();
     for file in files {
-        if let Some(server) = servers_for_file(file, config).into_iter().find(|server| {
-            server.kind.id_str() == configured.id && server.binary == configured.binary
-        }) {
+        if let Some(server) = servers_for_file_in_pass(file, config, memo)
+            .into_iter()
+            .find(|server| {
+                server.kind.id_str() == configured.id && server.binary == configured.binary
+            })
+        {
             let workspace_root = if matches!(server.kind, ServerKind::Python | ServerKind::Ty) {
                 server.workspace_root_for_file_with_project_root(file, project_root)
             } else {
@@ -2620,9 +2625,12 @@ fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config
     let mut warned_binaries = HashSet::new();
 
     let project_root = config.project_root.as_deref();
+    // One memo for the whole pass: files that share folders share their Biome
+    // root and configuration lookups. A fresh one each pass sees config edits.
+    let mut biome_memo = BiomeSelectionMemo::default();
 
     for file in files {
-        for server in servers_for_file(&file, config) {
+        for server in servers_for_file_in_pass(file, config, &mut biome_memo) {
             let workspace_root = if matches!(server.kind, ServerKind::Python | ServerKind::Ty) {
                 server.workspace_root_for_file_with_project_root(file, project_root)
             } else {
@@ -2682,7 +2690,7 @@ fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config
             continue;
         }
 
-        if !configured_lsp_binary_resolves(server, files, config)
+        if !configured_lsp_binary_resolves(server, files, config, &mut biome_memo)
             && warned_binaries.insert(server.binary.clone())
         {
             warnings.push(json!({
@@ -2696,6 +2704,41 @@ fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config
 
     warnings.sort_by_key(|warning| warning.to_string());
     warnings
+}
+
+#[cfg(test)]
+#[test]
+fn lsp_warnings_probe_each_biome_folder_once_per_pass() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join("biome.json"), "{}").unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let files: Vec<PathBuf> = (0..25)
+        .map(|index| {
+            let file = root.join(format!("src/file{index}.ts"));
+            std::fs::write(&file, "").unwrap();
+            file
+        })
+        .collect();
+    let config = Config {
+        project_root: Some(root.clone()),
+        ..Default::default()
+    };
+    let walks = || crate::lsp::registry::BIOME_ROOT_WALKS.with(std::cell::Cell::get);
+    let probes = || crate::lsp::registry::BIOME_CONFIG_DIRECTORY_PROBES.with(std::cell::Cell::get);
+    let (walks_before, probes_before) = (walks(), probes());
+    detect_missing_lsp_binaries(&files, &config);
+    assert_eq!(
+        walks() - walks_before,
+        1,
+        "src resolved its Biome root once"
+    );
+    assert_eq!(
+        probes() - probes_before,
+        1,
+        "the root was searched for a configuration once"
+    );
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3042,6 +3085,44 @@ fn walk_semantic_project_files_bounded(
 ) -> Result<Vec<PathBuf>, usize> {
     let filters = build_path_filters(&[], &[]).unwrap_or_default();
     walk_project_files_bounded_matching(root, &filters, max_files, is_semantic_indexed_extension)
+}
+
+#[cfg(test)]
+mod nested_worktree_semantic_tests {
+    use super::*;
+
+    #[test]
+    fn semantic_enumeration_skips_nested_linked_worktrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture =
+            crate::git_probe::init_repo_with_nested_worktree_for_test(dir.path(), "semantic");
+        let files = walk_semantic_project_files_bounded(&fixture.root, 1000)
+            .expect("fixture walk must complete")
+            .into_iter()
+            .map(|path| {
+                path.strip_prefix(&fixture.root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            files.contains("src/main.rs"),
+            "missing main file: {files:?}"
+        );
+        assert!(
+            files.contains("vendor/independent/inner.rs"),
+            "nested independent repository must still be walked: {files:?}"
+        );
+        assert!(
+            files.contains("submod/code.rs"),
+            "submodule-style checkout must still be walked: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|path| path.starts_with("linked/")),
+            "nested linked worktree files were enumerated: {files:?}"
+        );
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -3561,6 +3642,7 @@ fn handle_configure_prepared(
     // refused connect that left it in place.
     let active_before = prepared.is_none().then(|| ctx.config_unpinned());
     if prepared.is_none() {
+        ctx.config_live().clear_applied_bind_snapshot();
         ctx.note_connect_started();
     }
     let _sources_scope = crate::config_live::configure_sources_scope();
@@ -3687,9 +3769,26 @@ fn handle_configure_inner(
     // already holds this request's resolved tiers, so nothing is re-resolved
     // and the recorded config sources are left as they are.
     let recovery = prepared.is_some();
+    let bind_config = if recovery {
+        None
+    } else {
+        crate::subc_config::current_prepared_bind_config()
+    };
+    if bind_config
+        .as_ref()
+        .is_some_and(|snapshot| !snapshot.matches(&root_path, &harness))
+    {
+        return Response::error(
+            &req.id,
+            "config_unknown",
+            "prepared local configuration does not match this bind's root and harness",
+        );
+    }
     ctx.begin_configure_ack_step("tier_file_reads");
     let (tiers, user_config_migration) = if recovery {
         (Vec::new(), None)
+    } else if let Some(snapshot) = bind_config.as_ref() {
+        (snapshot.tiers().to_vec(), snapshot.migration())
     } else {
         match resolve_config_tiers_for_configure(params, &root_path, Some(&harness)) {
             Ok(read) => read,
@@ -3721,14 +3820,17 @@ fn handle_configure_inner(
     }
     ctx.begin_configure_ack_step("source_tracking");
     if !recovery {
-        crate::config_live::stage_configure_sources(
+        let sources = if let Some(snapshot) = bind_config.as_ref() {
+            snapshot.sources(&next_config)
+        } else {
             crate::config_live::ConfigSources::from_configure(
                 parse_cortexkit_user_config_path(params).ok().flatten(),
                 &root_path,
                 &tiers,
                 &next_config,
-            ),
-        );
+            )
+        };
+        crate::config_live::stage_configure_sources(sources);
     }
     ctx.begin_configure_ack_step("validate_params");
     let mut configure_warnings = config_diagnostics
@@ -3759,22 +3861,27 @@ fn handle_configure_inner(
             "message": migration.notice(),
         }));
     }
-    if let Some(project) = find_config_tier(&tiers, "project") {
-        if let Some(notice) = crate::subc_config::legacy_project_config_location_notice(
-            &root_path,
-            Path::new(&project.source),
-        )
-        .filter(|_| {
-            crate::subc_config::project_config_read_path(&root_path, Some(&harness))
-                == Path::new(&project.source)
-        }) {
-            configure_warnings.push(json!({
-                "code": "legacy_project_config_location",
-                "tier": "project",
-                "hint": notice,
-                "message": notice,
-            }));
-        }
+    let legacy_notice = if let Some(snapshot) = bind_config.as_ref() {
+        snapshot.legacy_notice()
+    } else {
+        find_config_tier(&tiers, "project").and_then(|project| {
+            crate::subc_config::legacy_project_config_location_notice(
+                &root_path,
+                Path::new(&project.source),
+            )
+            .filter(|_| {
+                crate::subc_config::project_config_read_path(&root_path, Some(&harness))
+                    == Path::new(&project.source)
+            })
+        })
+    };
+    if let Some(notice) = legacy_notice {
+        configure_warnings.push(json!({
+            "code": "legacy_project_config_location",
+            "tier": "project",
+            "hint": notice,
+            "message": notice,
+        }));
     }
 
     // NO configure-time SSRF guard on semantic.base_url — deliberate (config
@@ -14331,7 +14438,6 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         init_git_fixture(project.path());
         let canonical_root = project.path().canonicalize().unwrap();
-        let fills = crate::views::semantic_runtime::FillObserver::new(canonical_root.clone());
         let source = canonical_root.join("tracked.rs");
         let ctx = AppContext::new(
             Box::new(TreeSitterProvider::new()),
@@ -14340,7 +14446,12 @@ mod tests {
                 ..Config::default()
             },
         );
-        let request = configure_semantic_views(&canonical_root, storage.path(), &server.base_url);
+        let request = configure_semantic_views_with_timeout(
+            &canonical_root,
+            storage.path(),
+            &server.base_url,
+            30_000,
+        );
         assert!(handle_configure_for_test(&request, &ctx).success);
         super::drain_deferred_configure_maintenance(&ctx);
         // The non-probe request proves the fill reached the server's response
@@ -14405,35 +14516,27 @@ mod tests {
         }
 
         server.release_responses();
-        // A held request may time out before release. Observe the worker's
-        // completion after its normal retry/backoff, not an embedding latency budget.
+        // A fill event describes one worker round, not query readiness. Wait for
+        // the semantic view to cover the edited source after releasing the server.
         ctx.checkout_semantic().wake();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let mut events = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let event = fills.next_until(deadline).unwrap_or_else(|error| {
-                panic!(
-                    "semantic fill completion missing after response release ({error:?}); \
-                     events={events:?}; lane={}",
-                    ctx.checkout_semantic().describe()
-                )
+            let complete = ctx.checkout_semantic_runtime().map(|runtime| {
+                runtime
+                    .search(&[1.0, 0.0, 0.0], 10, &|_| true)
+                    .map(|answer| answer.complete())
             });
-            events.push(event);
-            if event == "settled" {
+            if matches!(complete, Some(Ok(true))) {
                 break;
             }
+            assert!(
+                Instant::now() < deadline,
+                "semantic view did not become complete after response release; \
+                 lane={}; search={complete:?}",
+                ctx.checkout_semantic().describe()
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
-        let complete = ctx.checkout_semantic_runtime().map(|runtime| {
-            runtime
-                .search(&[1.0, 0.0, 0.0], 10, &|_| true)
-                .map(|answer| answer.complete())
-        });
-        assert!(
-            matches!(complete, Some(Ok(true))),
-            "semantic fill settled without a complete view; events={events:?}; \
-             lane={}; search={complete:?}",
-            ctx.checkout_semantic().describe()
-        );
     }
 
     #[test]
@@ -15426,6 +15529,15 @@ mod tests {
         storage: &std::path::Path,
         base_url: &str,
     ) -> RawRequest {
+        configure_semantic_views_with_timeout(root, storage, base_url, 5_000)
+    }
+
+    fn configure_semantic_views_with_timeout(
+        root: &std::path::Path,
+        storage: &std::path::Path,
+        base_url: &str,
+        timeout_ms: u64,
+    ) -> RawRequest {
         configure_request_with_params(json!({
             "project_root": root,
             "harness": "opencode",
@@ -15437,7 +15549,7 @@ mod tests {
                     "backend": "openai_compatible",
                     "model": "counting-test-embedding",
                     "base_url": base_url,
-                    "timeout_ms": 5_000,
+                    "timeout_ms": timeout_ms,
                     "max_batch_size": 64,
                     "max_files": 1_000
                 }
@@ -16615,6 +16727,86 @@ mod tests {
     }
 
     #[test]
+    fn prepared_bind_branches_do_not_reselect_config_files() {
+        let source = include_str!("configure.rs");
+        for marker in [
+            "else if let Some(snapshot) = bind_config.as_ref() {",
+            "let sources = if let Some(snapshot) = bind_config.as_ref() {",
+            "let legacy_notice = if let Some(snapshot) = bind_config.as_ref() {",
+        ] {
+            let body = source
+                .split_once(marker)
+                .expect("prepared branch exists")
+                .1
+                .split_once("} else")
+                .unwrap()
+                .0;
+            assert!(body.contains("snapshot."));
+            for forbidden in [
+                "resolve_config_tiers_for_configure",
+                "from_configure",
+                "project_config_read_path",
+                ".exists(",
+                "std::fs::",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "prepared configure re-observes files: {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_bind_config_keeps_content_sources_and_notice_across_attempts() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        let user = temp.path().join("user.jsonc");
+        let project = temp.path().join(".pi/aft.jsonc");
+        let canonical = temp.path().join(".cortexkit/aft.jsonc");
+        write_config(&user, r#"{"url_fetch_allow_private":true}"#);
+        write_config(&project, r#"{"callgraph_chunk_size":7}"#);
+        write_config(
+            &temp.path().join(".opencode/aft.jsonc"),
+            r#"{"callgraph_chunk_size":8}"#,
+        );
+        let snapshot = crate::subc_config::PreparedBindConfig::read(
+            Some(&user),
+            temp.path(),
+            &crate::harness::Harness::Pi,
+        )
+        .unwrap();
+        write_config(&user, r#"{"url_fetch_allow_private":false}"#);
+        write_config(&canonical, r#"{"callgraph_chunk_size":9}"#);
+        fs::remove_file(&project).unwrap();
+        let request = configure_request_with_params(json!({
+            "project_root": temp.path(), "harness":"pi", "cortexkit_user_config_path":user,
+        }));
+        for _ in 0..2 {
+            let response =
+                crate::subc_config::with_prepared_bind_config(Arc::clone(&snapshot), || {
+                    handle_configure_for_test(&request, &ctx)
+                });
+            assert!(response.success, "{:?}", response.data);
+            assert_eq!(ctx.config().callgraph_chunk_size, 7);
+            assert!(ctx.config().url_fetch_allow_private);
+            let sources = ctx.config_live().sources().expect("applied sources");
+            assert_eq!(sources.project.path.as_deref(), Some(project.as_path()));
+            assert!(sources.project.from_file);
+            assert_eq!(
+                sources.project.text.as_deref(),
+                Some(r#"{"callgraph_chunk_size":7}"#)
+            );
+            assert!(response.data["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning["code"] == "legacy_project_config_location"));
+        }
+        assert!(crate::subc_config::current_prepared_bind_config().is_none());
+    }
+
+    #[test]
     fn configure_legacy_project_file_is_read_in_place_and_reports_its_location() {
         for harness in ["opencode", "pi"] {
             let temp = tempfile::tempdir().unwrap();
@@ -17335,6 +17527,57 @@ mod tests {
                 assert_eq!(
                     cached_after_pass, None,
                     "a read of a provisional root's key does not cache it"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn prepared_bind_identity_replay_retains_the_original_observation() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_temp, root, storage, lock) = busy_bind_fixture();
+        let ctx = test_context();
+        let user = root.join("user.jsonc");
+        let legacy = root.join(".pi/aft.jsonc");
+        write_config(
+            &user,
+            r#"{"indexes":{"trigram":true,"semantic":false,"callgraph":false},"views":{"enabled":false},"url_fetch_allow_private":true}"#,
+        );
+        write_config(&legacy, r#"{"callgraph_chunk_size":7}"#);
+        let snapshot = crate::subc_config::PreparedBindConfig::read(
+            Some(&user),
+            &root,
+            &crate::harness::Harness::Pi,
+        )
+        .unwrap();
+        let request = configure_request_with_params(
+            json!({"project_root":root,"storage_dir":storage,"harness":"pi","cortexkit_user_config_path":user}),
+        );
+        crate::provisional_identity_retry::with_timing_for_test(
+            Duration::ZERO,
+            Duration::from_secs(600),
+            || {
+                let response = crate::subc_config::with_prepared_bind_config(snapshot, || {
+                    super::handle_configure(&request, &ctx)
+                });
+                assert!(response.success, "{}", response.data);
+                super::drain_deferred_configure_maintenance(&ctx);
+                assert!(ctx.provisional_identity_retry().is_armed());
+                write_config(&user, r#"{"url_fetch_allow_private":false}"#);
+                write_config(
+                    &root.join(".cortexkit/aft.jsonc"),
+                    r#"{"callgraph_chunk_size":9}"#,
+                );
+                fs::remove_file(&legacy).unwrap();
+                lock.execute_batch("ROLLBACK").unwrap();
+                drop(lock);
+                super::drain_deferred_configure_maintenance(&ctx);
+                assert!(!ctx.provisional_identity_retry().is_armed());
+                assert_eq!(ctx.config().callgraph_chunk_size, 7);
+                assert!(ctx.config().url_fetch_allow_private);
+                assert_eq!(
+                    ctx.config_live().sources().unwrap().project.path.as_deref(),
+                    Some(legacy.as_path())
                 );
             },
         );

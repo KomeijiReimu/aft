@@ -58,6 +58,13 @@ impl ExecRemoteClient {
     }
 
     pub async fn run(&self, request: &RunRequest) -> Result<RemoteStream, Error> {
+        if (request.submission_key().is_some() || request.resume_from_seq().is_some())
+            && !self.supports_submission_key().await?
+        {
+            return Err(Error::Protocol(
+                "executor does not advertise submission keys".into(),
+            ));
+        }
         if request.platform == Some(Platform::Windows) {
             let catalog = self.consumer.catalog_list().await.map_err(|error| {
                 Error::Protocol(format!(
@@ -77,8 +84,34 @@ impl ExecRemoteClient {
                 return Err(Error::Protocol(format!("runon \"windows\" is unavailable: the build server doesn't offer Windows jobs yet (missing {WINDOWS_CAPABILITY})")));
             }
         }
-        self.stream("exec.run", request, StreamConsumer::new())
+        self.stream(
+            "exec.run",
+            request,
+            StreamConsumer::keyed_run(request.resume_from_seq()),
+        )
+        .await
+    }
+
+    pub(crate) async fn supports_submission_key(&self) -> Result<bool, Error> {
+        let catalog = self
+            .consumer
+            .catalog_list()
             .await
+            .map_err(Error::Transport)?;
+        Ok(catalog.modules.iter().any(|module| {
+            module.module_id == self.module_id
+                && module.capabilities.as_ref().is_some_and(|capabilities| {
+                    capabilities
+                        .provides
+                        .iter()
+                        .any(|capability| capability == SUBMISSION_KEY_CAPABILITY)
+                })
+        }))
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn reopen_route(&self, identity: BindIdentity) -> Result<Self, Error> {
+        Self::from_consumer(Arc::clone(&self.consumer), identity).await
     }
 
     /// Resume from the last durably delivered seq, not from the last received

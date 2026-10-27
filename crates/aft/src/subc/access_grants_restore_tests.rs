@@ -80,6 +80,7 @@ impl WireRestore {
                 app,
                 executor,
                 |request, ctx| match request.command.as_str() {
+                    "configure" => crate::commands::configure::handle_configure(&request, ctx),
                     "read" => crate::commands::read::handle_read(&request, ctx),
                     "write" => crate::commands::write::handle_write(&request, ctx),
                     "bash" => crate::commands::bash::handle(&request, ctx),

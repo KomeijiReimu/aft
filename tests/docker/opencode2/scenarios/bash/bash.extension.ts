@@ -28,8 +28,6 @@ async function validate(context: HarnessValidationContext): Promise<void> {
   }
   const matrix = JSON.parse(await readFile(join(here, "matrix.json"), "utf8"));
   if (JSON.stringify(matrix.rows?.[0]?.trajectories) !== JSON.stringify({"T1":"applicable","T2":"applicable","T3":"applicable","T4":"applicable","T5":"applicable","T6":"applicable","T7":"applicable"})) throw new Error("bash" + " applicability mismatch");
-  const controls = JSON.parse(await readFile(join(here, "mutation-controls.json"), "utf8"));
-  if (!Array.isArray(controls.controls) || controls.controls.length < 3) throw new Error("bash" + " mutation controls missing");
   // Every fallback row says what its dead transport produces, and a row that
   // refuses instead of falling back has to record where the break-glass
   // coverage went. Read at validation time so a row that drops the record

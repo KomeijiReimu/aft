@@ -4249,11 +4249,30 @@ pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBat
         lsp.drain_events_bounded(max_events)
     };
     let outcome = DrainBatchOutcome {
-        processed: drained.processed_events,
+        processed: drained.processed,
         has_more: drained.has_more,
     };
     let mut status_changed = drained.diagnostics_changed;
-    for event in drained.events {
+    #[cfg(all(test, unix))]
+    for instance in drained.instances.iter().flatten() {
+        crate::lsp::manager::instance_regression_tests::pause_dispatch(*instance);
+    }
+    let Some(mut lsp) = ctx.try_lsp() else {
+        // Store mutations already committed during the first lock acquisition.
+        // Refresh their status without waiting or replaying the receipts; only
+        // optional dispatch logging is lost when another caller owns the lock.
+        if outcome.processed > 0 || status_changed {
+            ctx.signal_status_changed();
+        }
+        return DrainBatchOutcome {
+            has_more: true,
+            ..outcome
+        };
+    };
+    for (event, instance) in drained.events.into_iter().zip(drained.instances) {
+        if !lsp.accept_event_instance(&event, instance) {
+            continue;
+        }
         match event {
             LspEvent::DocumentDiagnosticsPulled { .. } => {
                 // The manager already stored and version-checked this reply.
@@ -4300,6 +4319,7 @@ pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBat
             }
         }
     }
+    drop(lsp);
     if status_changed {
         ctx.signal_status_changed();
     }
@@ -9790,7 +9810,7 @@ mod idle_lsp_tests {
     fn spawn_sleep_client(ctx: &AppContext, root: std::path::PathBuf) -> u32 {
         let registry = LspChildRegistry::new();
         ctx.lsp().set_child_registry(registry.clone());
-        let client = LspClient::spawn(
+        let client = LspClient::spawn_with_reclaim_root(
             ServerKind::TypeScript,
             root,
             Path::new("sh"),
@@ -9798,6 +9818,8 @@ mod idle_lsp_tests {
             &HashMap::new(),
             ctx.lsp().event_sender_for_test(),
             registry,
+            None,
+            false,
         )
         .expect("spawn idle-lsp stand-in");
         let pid = client.child_pid();

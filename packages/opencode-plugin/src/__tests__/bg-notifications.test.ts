@@ -128,6 +128,22 @@ describe("OpenCode background notifications", () => {
       ]),
     ).toContain(reason);
   });
+  test("completion notice shows AFT's incomplete-listing sentence exactly", () => {
+    const sentence =
+      "AFT could not read every process in the task's group, so others may also be running.";
+    const text = formatSystemReminder([
+      {
+        task_id: "bash-hidden",
+        command: "deploy",
+        status: "timed_out",
+        exit_code: 124,
+        live_descendants: null,
+        live_descendants_unavailable: "listing_incomplete",
+        live_descendants_summary: sentence,
+      },
+    ]);
+    expect(text.split("\n")).toContain(`    ${sentence}`);
+  });
   test("PTY incomplete capture completion reminder preserves exit code and shows warning", () => {
     const reason = "PTY output may be incomplete: output drain deadline expired before EOF";
     for (const exitCode of [0, 17]) {
@@ -2458,6 +2474,13 @@ describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
     await sleep(50);
 
     expect(promptAsync).toHaveBeenCalledTimes(2);
+    const firstIdentity = (promptAsync.mock.calls[0][0] as { body: { messageID?: string } }).body
+      .messageID;
+    const retryIdentity = (promptAsync.mock.calls[1][0] as { body: { messageID?: string } }).body
+      .messageID;
+    expect(firstIdentity).toEqual(expect.any(String));
+    expect(firstIdentity).not.toBe("");
+    expect(retryIdentity).toBe(firstIdentity);
     expect(
       (promptAsync.mock.calls[0][0] as { body: { model?: unknown } }).body.model,
     ).toBeDefined();

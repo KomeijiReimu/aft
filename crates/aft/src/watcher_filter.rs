@@ -308,6 +308,12 @@ pub(crate) fn watcher_path_is_infra_skip_under(root: &Path, path: &Path) -> bool
         || absolute
             .strip_prefix(root)
             .is_ok_and(watcher_path_has_infra_component)
+        // Events under a nested linked worktree of this repository belong to
+        // that checkout's own session, like other excluded paths. The boundary
+        // resolves the common dir lazily and only reads a `.git` file for
+        // directories that hold one.
+        || crate::project_content::NestedWorktreeBoundary::for_root(root)
+            .is_under_nested_worktree(&absolute)
 }
 
 /// High-churn ignored directories that can be dropped from the raw event stream

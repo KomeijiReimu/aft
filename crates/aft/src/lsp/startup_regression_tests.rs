@@ -600,12 +600,12 @@ fn unlocked_request_waits_until_startup_notification_replay_finishes() {
                 method: "custom/producerProgress".into(),
                 params: None,
             };
-            manager.event_tx.send(event).unwrap();
+            manager.event_tx.send(event.into()).unwrap();
             let drained = manager.drain_events_bounded(1);
             event_deferred = manager.clients.contains_key(&f.key)
                 && manager.starting[&f.key].deferred_events.len() == before + 1
                 && drained.events.is_empty()
-                && drained.processed_events == 1;
+                && drained.processed == 1;
         }
         let returned_early = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
         resume_tx.send(()).unwrap();
@@ -623,7 +623,7 @@ fn unlocked_request_waits_until_startup_notification_replay_finishes() {
         assert!(!returned_early, "request returned before replay completed");
     });
     let delivered = f.manager.lock().drain_events_bounded(1);
-    assert_eq!(delivered.processed_events, 1);
+    assert_eq!(delivered.processed, 1);
     assert!(
         matches!(&delivered.events[..], [LspEvent::Notification { method, .. }] if method == "custom/producerProgress")
     );

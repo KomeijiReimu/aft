@@ -5305,7 +5305,7 @@ mod runtime_note_tests {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let ctx = context();
-        let mut client = LspClient::spawn(
+        let mut client = LspClient::spawn_with_reclaim_root(
             ServerKind::TypeScript,
             root.clone(),
             Path::new("/bin/sh"),
@@ -5313,6 +5313,8 @@ mod runtime_note_tests {
             &std::collections::HashMap::new(),
             ctx.lsp().event_sender_for_test(),
             LspChildRegistry::new(),
+            None,
+            false,
         )
         .unwrap();
         client.runtime_note = note.map(str::to_owned);

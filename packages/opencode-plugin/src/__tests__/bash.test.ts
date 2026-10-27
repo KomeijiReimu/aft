@@ -304,7 +304,7 @@ describe("OpenCode bash adapter", () => {
         "Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs this machine's own operating system or hardware (its sandbox, code signing, service manager, permission prompts or GUI frameworks)",
       );
       expect(bash.description).toContain(
-        "or runs a binary that already exists on this machine; building and testing still go remote, and a remote build leaves no binaries or target/ output in the local worktree.",
+        'or runs a binary that already exists on this machine; a build or test that needs only macOS (its sandbox, code signing or file watching) can use runon: "macos" instead; building and testing still go remote, and a remote build leaves no binaries or target/ output in the local worktree.',
       );
     },
   );
@@ -1636,6 +1636,23 @@ describe("bash_status tool", () => {
 
     expect(text).toContain("Task bash-remote: running");
     expect(text).not.toContain("remote job");
+  });
+
+  test("bash_status shows AFT's incomplete-listing sentence exactly", async () => {
+    const sentence =
+      "AFT could not read every process in the task's group, so others may also be running.";
+    const { statusTool } = makeCtx(() => ({
+      success: true,
+      status: "timed_out",
+      exit_code: 124,
+      live_descendants: null,
+      live_descendants_unavailable: "listing_incomplete",
+      live_descendants_summary: sentence,
+    }));
+
+    const text = await statusTool.execute({ taskId: "bash-hidden" }, createMockSdkContext());
+
+    expect(text).toContain(`Task bash-hidden: timed_out (exit 124) · ${sentence}`);
   });
 
   test("default sync cap rejects 120001 with the config knob in the error", async () => {

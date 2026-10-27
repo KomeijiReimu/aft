@@ -1723,7 +1723,7 @@ fn inspect_view_pending_publication_reschedules_dead_code_without_another_inspec
     assert!(!fixture.ctx.tier2_pull_demand_pending());
 
     fixture.schedule();
-    fixture.wait_idle();
+    fixture.wait_idle_for(Duration::from_secs(30));
     assert!(
         fixture.ctx.tier2_pull_demand_pending(),
         "view publication must wake deferred Tier-2 work"
@@ -1776,7 +1776,7 @@ fn inspect_view_pending_publication_reschedules_dead_code_without_another_inspec
     assert!(!manager.deferred_view_refresh_ready(&fixture.ctx.canonical_cache_root()));
     fixture.change("no_more_deferred_analysis");
     fixture.schedule();
-    fixture.wait_idle();
+    fixture.wait_idle_for(Duration::from_secs(30));
     assert!(
         !fixture.ctx.tier2_pull_demand_pending(),
         "a later publication must not repeat the consumed refresh"
@@ -2088,7 +2088,7 @@ fn callgraph_producer_change_republishes_an_existing_generation() {
     let (_, built) = load();
     let views = owner.view_store().unwrap();
     let built_name = built.snapshot.generation().name().to_string();
-    let mut previous = built.snapshot.generation().manifest().clone();
+    let mut previous = built.snapshot.generation().flatten().unwrap();
     previous.header_mut().producers.callgraph = PREVIOUS_PRODUCER.into();
     let previous_name = GenerationName::for_manifest(&previous).unwrap();
     let store = owner.open_store(FamilyPlane::Callgraph).unwrap();
@@ -2117,7 +2117,7 @@ fn callgraph_producer_change_republishes_an_existing_generation() {
     );
     let generation = current.snapshot.generation();
     assert_ne!(generation.name(), previous_name);
-    assert_eq!(generation.manifest().header().producers.callgraph, PRODUCER);
+    assert_eq!(generation.header().producers.callgraph, PRODUCER);
     assert_eq!(
         views.current_generation().unwrap().as_deref(),
         Some(generation.name())
@@ -2134,8 +2134,7 @@ fn callgraph_producer_change_republishes_an_existing_generation() {
     // The served database equals a cold build of the new manifest.
     let cold_dir = tempfile::tempdir().unwrap();
     let cold = cold_dir.path().join("cold.sqlite");
-    crate::views::callgraph::materialize(&cold, generation.manifest(), &BlobReader(store.reader()))
-        .unwrap();
+    crate::views::callgraph::materialize(&cold, generation, &BlobReader(store.reader())).unwrap();
     crate::views::materialization::parity::assert_logical_parity(
         &views.derived_path(generation.name()).unwrap(),
         &cold,

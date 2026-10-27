@@ -1966,10 +1966,14 @@ mod tests {
     fn views_incremental_random_sequences_equal_full_rebuild() {
         // Deterministic seeds keep a failing sequence reproducible. Each cycle
         // includes every operation, with random members, bytes and ordering.
-        for seed in (1..=16u64).map(|value| value.wrapping_mul(0x9e3779b97f4a7c15)) {
+        // Two full operation cycles per seed keep every arm in the default run;
+        // nightly stress retains the longer histories and all sixteen seeds.
+        let stress = std::env::var("AFT_STRESS").as_deref() == Ok("1");
+        let (seeds, steps) = if stress { (16u64, 72) } else { (2, 22) };
+        for seed in (1..=seeds).map(|value| value.wrapping_mul(0x9e3779b97f4a7c15)) {
             let (project, _storage, mut request) = fixture();
             let mut random = seed;
-            for step in 0..72 {
+            for step in 0..steps {
                 random ^= random << 13;
                 random ^= random >> 7;
                 random ^= random << 17;

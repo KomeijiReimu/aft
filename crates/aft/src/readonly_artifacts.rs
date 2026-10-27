@@ -1932,7 +1932,7 @@ mod tests {
     fn churned_borrowed_generation_stops_at_load_budget() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let (_project, root) = fixture_project();
-        for file_index in 0..64 {
+        for file_index in 0..8 {
             fs::write(
                 root.join(format!("src/module_{file_index}.rs")),
                 format!("pub fn borrowed_budget_{file_index}() {{}}\n"),
@@ -1951,7 +1951,7 @@ mod tests {
             ReadOnlyArtifact::Fresh(_)
         ));
 
-        for file_index in 0..40 {
+        for file_index in 0..8 {
             fs::write(
                 root.join(format!("src/module_{file_index}.rs")),
                 format!("pub fn churned_borrowed_budget_{file_index}() {{}}\n"),
@@ -1960,17 +1960,27 @@ mod tests {
         }
         build_search_artifact(&root, storage.path());
 
-        let started = std::time::Instant::now();
+        // The churned generation holds 8 files, inside the 10-entry budget
+        // below, while its trigram lookup table holds far more entries, so
+        // the reload reads the 8 file entries and then stops at the entry
+        // budget. The time budget is generous on purpose: with time unable
+        // to stop the reload, a count inside 1..=10 proves the entry budget
+        // is what stopped it. The lower bound matters too: a probe that
+        // never saw the reload reads 0 and fails loudly instead of passing
+        // vacuously. Elapsed time cannot show any of this on a loaded
+        // runner, where even a stopped-early reload can exceed 1 s.
+        let records = crate::search_index::observe_borrowed_load_records_read_for_test(&root);
         let opened = open_search_index_from_cache_dir_with_budget(
             &root,
             cache_dir,
             10,
-            Duration::from_secs(5),
+            Duration::from_secs(60),
         );
-        assert_eq!(
-            started.elapsed() < Duration::from_secs(1),
-            true,
-            "record budget must stop before rerooting the churned corpus"
+        crate::search_index::unobserve_borrowed_load_records_read_for_test(&root);
+        assert!(
+            (1..=10).contains(&records.load(std::sync::atomic::Ordering::SeqCst)),
+            "record budget must stop before rerooting the churned corpus, read {} records",
+            records.load(std::sync::atomic::Ordering::SeqCst)
         );
         assert!(matches!(
             opened,
@@ -2129,7 +2139,12 @@ mod tests {
         build_search_artifact(&root, storage.path());
         let (_wt_dir, worktree) = linked_worktree(&root);
 
-        match open_search_index_read_only(&worktree, Some(storage.path())) {
+        let borrowed = with_borrowed_search_load_limits_for_test(
+            BORROWED_SEARCH_BACKGROUND_MAX_RECORDS,
+            Duration::from_secs(30),
+            || open_search_index_read_only(&worktree, Some(storage.path())),
+        );
+        match borrowed {
             ReadOnlyArtifact::Fresh(index) => {
                 assert!(index.path_to_id.contains_key(&worktree.join("src/lib.rs")));
             }

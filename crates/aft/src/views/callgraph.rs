@@ -23,9 +23,9 @@ use crate::callgraph_store::join::{CallgraphBlob, ManifestBlobReader, ManifestJo
 use crate::callgraph_store::ReadonlyCallGraphStore;
 
 use super::contracts::{PlaneAdapter, PlaneError, ViewAccess};
-use super::manifest_v2::{EntryV2, ManifestV2};
+use super::manifest_v2::EntryV2;
 use super::readiness::{plane_readiness, FillMap, PlaneReadiness, PlaneState};
-use super::snapshot::{DiskState, LiveEntry, OpenGeneration, Snapshot};
+use super::snapshot::{ComposedGeneration, DiskState, LiveEntry, Snapshot};
 use super::{Manifest, ManifestEntry, RegularPlanes, RelPath};
 
 /// Bump when extracted evidence, its encoding or interpretation changes. Version
@@ -92,7 +92,9 @@ impl ManifestBlobReader for BlobReader {
 
 /// Project membership and compatible ready keys, not checkout paths/configuration.
 /// Missing/failed callgraph members refuse construction rather than falsely ready.
-pub fn project_manifest(manifest: &ManifestV2) -> Result<Manifest, PlaneError> {
+pub fn project_manifest(
+    manifest: &super::snapshot::ComposedGeneration,
+) -> Result<Manifest, PlaneError> {
     if manifest.header().producers.callgraph != PRODUCER {
         return Err(error("incompatible callgraph producer"));
     }
@@ -102,10 +104,9 @@ pub fn project_manifest(manifest: &ManifestV2) -> Result<Manifest, PlaneError> {
             EntryV2::Regular {
                 mode,
                 resolution_input,
-                planes,
                 ..
             } => {
-                let key = match &planes.callgraph {
+                let key = match manifest.plane_readiness(path, FamilyPlane::Callgraph) {
                     Some(PlaneState::Ready { key }) => Some(key.clone()),
                     None => None,
                     Some(_) => {
@@ -138,7 +139,7 @@ pub fn project_manifest(manifest: &ManifestV2) -> Result<Manifest, PlaneError> {
 
 pub fn materialize(
     database: &Path,
-    manifest: &ManifestV2,
+    manifest: &super::snapshot::ComposedGeneration,
     reader: &impl ManifestBlobReader,
 ) -> Result<(), PlaneError> {
     let projected = project_manifest(manifest)?;
@@ -149,7 +150,7 @@ pub fn materialize(
 /// Holding a reader keeps exactly its generation pinned, including after a swap.
 pub struct PinnedReader {
     pub store: Arc<ReadonlyCallGraphStore>,
-    pub generation: Arc<OpenGeneration>,
+    pub generation: Arc<ComposedGeneration>,
 }
 #[derive(Default)]
 pub struct CallgraphPlane {
@@ -167,7 +168,7 @@ impl CallgraphPlane {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&(
                 access.scope().to_string(),
-                snapshot.generation().name().to_string(),
+                snapshot.generation().resident_key(),
             ))
             .cloned();
         match reader {
@@ -175,7 +176,7 @@ impl CallgraphPlane {
             None => {
                 // A refused keyless generation will never have a resident reader.
                 // Preserve that refusal instead of making it look like a build.
-                queryable_manifest(snapshot.generation().manifest())?;
+                queryable_manifest(snapshot.generation())?;
                 Err(error("pinned callgraph reader is not resident"))
             }
         }
@@ -197,9 +198,9 @@ impl PlaneAdapter for CallgraphPlane {
     fn open_generation(
         &self,
         access: &ViewAccess,
-        generation: &Arc<OpenGeneration>,
+        generation: &Arc<ComposedGeneration>,
     ) -> Result<(), PlaneError> {
-        queryable_manifest(generation.manifest())?;
+        queryable_manifest(generation)?;
         let (root, dir): (PathBuf, PathBuf) = match access {
             ViewAccess::Owner(view) => (view.root().to_path_buf(), view.view_dir().to_path_buf()),
             ViewAccess::Reader {
@@ -227,23 +228,27 @@ impl PlaneAdapter for CallgraphPlane {
             generation.name(),
         )
         .map_err(error)?;
-        self.readers
+        let retired = self
+            .readers
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(
-                (access.scope().into(), generation.name().into()),
+                (access.scope().into(), generation.resident_key()),
                 Arc::new(PinnedReader {
                     store: Arc::new(store.retain_generation(generation.clone())),
                     generation: generation.clone(),
                 }),
             );
+        drop(retired);
         Ok(())
     }
     fn release_generation(&self, access: &ViewAccess, generation: &str) {
-        self.readers
+        let retired = self
+            .readers
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&(access.scope().into(), generation.into()));
+        drop(retired);
     }
     fn readiness(&self, access: &ViewAccess, snapshot: &Snapshot) -> PlaneReadiness {
         if !self
@@ -252,15 +257,17 @@ impl PlaneAdapter for CallgraphPlane {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&(
                 access.scope().to_owned(),
-                snapshot.generation().name().to_owned(),
+                snapshot.generation().resident_key(),
             ))
-            .is_some_and(|reader| Arc::ptr_eq(&reader.generation, snapshot.generation()))
+            .is_some_and(|reader| {
+                reader.generation.resident_key() == snapshot.generation().resident_key()
+            })
         {
             return PlaneReadiness::Building;
         }
         let readiness = plane_readiness(
             FamilyPlane::Callgraph,
-            Some(snapshot.generation().manifest()),
+            Some(snapshot.generation()),
             snapshot,
             &FillMap::default(),
             &|path| self.applies_to(path),
@@ -272,7 +279,9 @@ impl PlaneAdapter for CallgraphPlane {
         }
     }
 }
-fn queryable_manifest(manifest: &ManifestV2) -> Result<Manifest, PlaneError> {
+fn queryable_manifest(
+    manifest: &super::snapshot::ComposedGeneration,
+) -> Result<Manifest, PlaneError> {
     let projected = project_manifest(manifest)?;
     // A disabled plane still has a valid empty derived database. It must not
     // answer navigation or reachability questions as though a graph was built.

@@ -96,7 +96,8 @@ describe("archive prechecks", () => {
       execFileSync("tar", ["-cf", archive, "-C", root, name]);
       expect(await installerFixture()._precheckTarForTesting(archive, "tar")).toBe(4);
     });
-  });
+    // Spawns tar twice; a loaded CI runner can exceed bun's 5 s default.
+  }, 30_000);
 });
 
 describe("cache publication already on main", () => {
@@ -155,6 +156,8 @@ describe("cache publication already on main", () => {
         expect(existsSync(join(root, "lsp-binaries", ".quarantine"))).toBe(false);
       });
     },
+    // Spawns tar and runs an install; a loaded CI runner can exceed bun's 5 s default.
+    30_000,
   );
 
   test("cache validation cannot quarantine a leased GitHub installation", async () => {
@@ -278,12 +281,18 @@ describe("GitHub release lookups", () => {
           controller.abort();
           return new Response("failure", { status: 500 });
         }) as typeof fetch;
-        await installerFixture(versionChecks)._resolveTargetTagForTesting(
+        const result = await installerFixture(versionChecks)._resolveTargetTagForTesting(
           clangd,
           config,
           fakeFetch,
           controller.signal,
         );
+        expect(result).toEqual({
+          tag: null,
+          assets: [],
+          blockedByGrace: false,
+          reason: "github releases probe failed",
+        });
         const observed = signals.get(branch === "cached" ? "tag" : "list");
         expect(observed).toBeInstanceOf(AbortSignal);
         expect(observed?.aborted).toBe(true);

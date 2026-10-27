@@ -23,7 +23,7 @@ use crate::backup::hash_session;
 use crate::bash_permissions::PermissionAsk;
 use crate::db::bash_tasks::BashTaskRow;
 
-use super::process::LiveDescendant;
+use super::process::{LiveDescendant, LiveDescendantsUnavailable, ProcessIdentity};
 use super::BgTaskStatus;
 
 #[cfg(test)]
@@ -1603,12 +1603,35 @@ pub struct PersistedTask {
     /// Used to detect when the OS reuses that PID for a different process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_start_time_ms: Option<u64>,
-    /// `Some` records a completed Unix sample, including an empty group. `None`
-    /// means sampling is unavailable (Windows and unsupported Unix targets).
+    /// `Some` records a completed check of the task's process group, including
+    /// an empty group. `None` means it could not be checked; the reason is in
+    /// `live_descendants_unavailable`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_descendants: Option<Vec<LiveDescendant>>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub live_descendants_omitted: usize,
+    /// Why the last check of the process group failed, was not possible, or
+    /// (`listing_incomplete`) saw only part of the group; the members it did
+    /// find stay in `live_descendants`. Cleared by a complete check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_descendants_unavailable: Option<LiveDescendantsUnavailable>,
+    /// AFT sent the kill signal to the task's process group (a timeout,
+    /// `bash_kill`, or a cancelled call), so any member still listed in
+    /// `live_descendants` survived that kill.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub group_kill_sent: bool,
+    /// The identities of the group members the latest check found: every one
+    /// of them, not only the members shown, up to `GROUP_IDENTITY_CAP`. A
+    /// later kill of the finished task signals its group only if the leader or
+    /// one of these processes is still running in it; otherwise the group
+    /// number may by then belong to an unrelated group. Kept through a failed
+    /// or incomplete check that found nobody, cleared by a clean one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_member_identities: Vec<ProcessIdentity>,
+    /// The latest check found more members than `GROUP_IDENTITY_CAP`, so
+    /// `group_member_identities` holds only the first of them by pid.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub group_member_identities_truncated: bool,
     pub completion_delivered: bool,
     #[serde(default = "default_notify_on_completion")]
     pub notify_on_completion: bool,
@@ -1744,6 +1767,10 @@ impl PersistedTask {
             child_start_time_ms: None,
             live_descendants: None,
             live_descendants_omitted: 0,
+            live_descendants_unavailable: None,
+            group_kill_sent: false,
+            group_member_identities: Vec::new(),
+            group_member_identities_truncated: false,
             completion_delivered: !notify_on_completion,
             notify_on_completion,
             compressed,
@@ -1901,6 +1928,10 @@ impl From<BashTaskRow> for PersistedTask {
             child_start_time_ms: None,
             live_descendants: None,
             live_descendants_omitted: 0,
+            live_descendants_unavailable: None,
+            group_kill_sent: false,
+            group_member_identities: Vec::new(),
+            group_member_identities_truncated: false,
             completion_delivered: row.completion_delivered,
             notify_on_completion: !row.completion_delivered,
             compressed: row.compressed,
@@ -2769,7 +2800,10 @@ fn write_task_in_dir(
     let mut upgraded = task.clone();
     upgraded.schema_version = SCHEMA_VERSION;
     let content = serde_json::to_vec_pretty(&upgraded).map_err(io::Error::other)?;
-    atomic_replace(dir, name, &content, sync)
+    super::gc_memo::metadata_written(&dir.path().join(name));
+    let result = atomic_replace(dir, name, &content, sync);
+    super::gc_memo::metadata_written(&dir.path().join(name));
+    result
 }
 
 #[cfg(test)]
@@ -4215,6 +4249,10 @@ pub(crate) mod work_counts {
         pub marker_reads: usize,
         pub stats: usize,
         pub gc_entries: usize,
+        pub gc_deadlines: usize,
+        pub gc_teardown_opens: usize,
+        pub gc_teardown_metadata_reads: usize,
+        pub gc_teardown_stats: usize,
         pub artifact_bytes: usize,
         pub artifact_opens: usize,
         pub syncs: usize,
@@ -4259,6 +4297,16 @@ pub(crate) mod work_counts {
     }
     pub(crate) fn record_gc_entry() {
         record(|counts| counts.gc_entries += 1);
+    }
+    pub(crate) fn record_gc_deadline() {
+        record(|counts| counts.gc_deadlines += 1);
+    }
+    pub(crate) fn record_gc_teardown_since(before: Counts) {
+        record(|counts| {
+            counts.gc_teardown_opens += counts.opens - before.opens;
+            counts.gc_teardown_metadata_reads += counts.metadata_reads - before.metadata_reads;
+            counts.gc_teardown_stats += counts.stats - before.stats;
+        });
     }
     pub(crate) fn record_parse() {
         record(|counts| counts.parses += 1);
@@ -4882,6 +4930,27 @@ pub(crate) const ARTIFACT_CONCURRENTLY_REPLACED: &str = "task artifact was concu
 #[cfg(all(test, unix))]
 std::thread_local! {
     static BEFORE_ARTIFACT_VALIDATION: std::cell::RefCell<Option<Box<dyn FnMut(&File)>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn metadata_open_attempts_for_test() -> u32 {
+    METADATA_OPEN_ATTEMPTS
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn with_artifact_validation_hook_for_test<T>(
+    hook: impl FnMut(&File) + 'static,
+    read: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<Box<dyn FnMut(&File)>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BEFORE_ARTIFACT_VALIDATION.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+    let _restore =
+        Restore(BEFORE_ARTIFACT_VALIDATION.with(|slot| slot.replace(Some(Box::new(hook)))));
+    read()
 }
 
 #[cfg(unix)]

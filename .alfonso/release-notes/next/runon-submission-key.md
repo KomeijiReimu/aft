@@ -1,0 +1,1 @@
+- When the connection to a build-server (runon) job is lost, AFT re-attaches to the same job and continues its output instead of reporting the outcome as unknown, on build servers that support it.

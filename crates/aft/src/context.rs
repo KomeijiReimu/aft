@@ -4686,6 +4686,10 @@ pub struct AppContext {
     lsp_watcher_forward_slot: crate::lsp::manager::WatcherForwardSlot,
     /// How many of those helper threads were started, for tests.
     lsp_watcher_forward_helpers_spawned: AtomicUsize,
+    /// Held by tests to keep that helper thread from forwarding anything
+    /// (see [`Self::pause_lsp_watcher_forwarding_for_test`]); never held
+    /// otherwise.
+    lsp_watcher_forward_pause: Arc<parking_lot::Mutex<()>>,
     #[cfg(test)]
     lsp_classified_watcher_forwards: parking_lot::Mutex<Option<Vec<Vec<PathBuf>>>>,
     /// Document and configuration-file changes waiting for the LSP manager
@@ -5475,6 +5479,7 @@ impl AppContext {
             lsp_post_edit_worker_running: Arc::new(AtomicBool::new(false)),
             lsp_watcher_forward_slot: Default::default(),
             lsp_watcher_forward_helpers_spawned: AtomicUsize::new(0),
+            lsp_watcher_forward_pause: Arc::default(),
             #[cfg(test)]
             lsp_classified_watcher_forwards: Default::default(),
             lsp_pending_change_slot: Default::default(),
@@ -8693,6 +8698,13 @@ impl AppContext {
     /// Refreshes the project snapshot on one worker. Batches arriving during a
     /// walk replace one pending request instead of creating waiting threads.
     fn refresh_project_applicability(&self, config: Arc<Config>, root_changed: bool) {
+        // Applicability only reads project files and LSP settings. A detached
+        // walk must not keep storage locks and pinned directories alive after
+        // the context's last storage-using owner has gone away.
+        let mut walk_config = (*config).clone();
+        walk_config.cache_lease = None;
+        walk_config.storage_lease = None;
+        let config = Arc::new(walk_config);
         let progress = Arc::clone(&self.project_applicability_progress);
         let mut refresh = progress.refresh.lock();
         let epoch = self
@@ -14473,10 +14485,12 @@ impl AppContext {
         drop(slot);
         let manager = Arc::clone(&self.lsp_manager);
         let forward_slot = Arc::clone(&self.lsp_watcher_forward_slot);
+        let pause = Arc::clone(&self.lsp_watcher_forward_pause);
         match std::thread::Builder::new()
             .name("aft-lsp-watched-files".into())
-            .spawn(move || crate::lsp::manager::run_watcher_forward_helper(&manager, &forward_slot))
-        {
+            .spawn(move || {
+                crate::lsp::manager::run_watcher_forward_helper(&manager, &forward_slot, &pause)
+            }) {
             Ok(_) => {
                 self.lsp_watcher_forward_helpers_spawned
                     .fetch_add(1, Ordering::Relaxed);
@@ -14487,6 +14501,45 @@ impl AppContext {
                 crate::slog_warn!("could not reach LSP servers after a watcher change: {error}");
             }
         }
+    }
+
+    /// Forward the watcher changes still queued for the LSP manager (see
+    /// [`Self::lsp_forward_or_queue_watcher_changes`]) now, waiting for its
+    /// lock, instead of leaving them to the helper thread.
+    ///
+    /// Diagnostics readers call this first. A change that is still queued has
+    /// not reached the language servers: rust-analyzer has neither heard of
+    /// it nor been asked for the `cargo check` it needs, so nothing marks its
+    /// published results as describing the files before the change, and a
+    /// reader would certify them as current. Once forwarded, the check the
+    /// change asked for counts as running until it reports.
+    ///
+    /// The backlog is taken while holding the manager lock, the order the
+    /// helper uses, so changes reach the servers in the order they were
+    /// queued. The slot itself stays in place: the helper still owns it,
+    /// finds it empty, and clears it.
+    pub(crate) fn lsp_forward_queued_watcher_changes(&self) {
+        let reloads = {
+            let mut lsp = self.lsp_manager.lock();
+            let Some(backlog) = self
+                .lsp_watcher_forward_slot
+                .lock()
+                .as_mut()
+                .map(std::mem::take)
+            else {
+                return;
+            };
+            backlog.apply(&mut lsp)
+        };
+        crate::lsp::manager::spawn_watcher_rust_workspace_reloads(&self.lsp_manager, reloads);
+    }
+
+    /// Keep the helper thread that forwards queued watcher changes from
+    /// forwarding anything until the returned guard is dropped, so a test
+    /// can act while a change waits in the queue.
+    #[doc(hidden)]
+    pub fn pause_lsp_watcher_forwarding_for_test(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.lsp_watcher_forward_pause.lock()
     }
 
     /// How many helper threads have waited for the LSP manager lock on behalf
@@ -14739,30 +14792,13 @@ impl AppContext {
                 err
             );
         }
-        let mut lsp = manager.lock();
-        let remaining = deadline.saturating_duration_since(Instant::now());
-
-        // Register the wake receiver while the manager is still locked. Events
-        // that raced with registration remain on the raw receiver; events won by
-        // another drain path wake this waiter after that path updates the store.
-        let mut wait = lsp.start_post_edit_diagnostics_wait(
+        crate::lsp::fresh_wait::wait_for_post_edit_diagnostics_unlocked(
+            || manager.lock(),
             file_path,
             &expected_versions,
             &pre_snapshot,
-            remaining,
-        );
-        let mut complete = lsp.poll_post_edit_diagnostics_wait(&mut wait, None);
-        drop(lsp);
-
-        while !complete && !wait.deadline_reached() {
-            // Waiting on channel activity does not require access to manager
-            // state, so other LSP operations can continue their bookkeeping.
-            let event = wait.next_event();
-            let mut lsp = manager.lock();
-            complete = lsp.poll_post_edit_diagnostics_wait(&mut wait, event);
-        }
-
-        manager.lock().finish_post_edit_diagnostics_wait(wait)
+            deadline,
+        )
     }
 
     /// Collect custom server root_markers from user config for use in
@@ -21960,6 +21996,59 @@ mod health_warming_honesty_tests {
 #[cfg(test)]
 mod configure_applicability_tests {
     use super::*;
+
+    #[test]
+    fn applicability_walk_does_not_retain_released_storage_leases() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&storage).unwrap();
+        let mut config = Config {
+            project_root: Some(root),
+            storage_dir: Some(storage.clone()),
+            ..Config::default()
+        };
+        crate::root_cache::ensure_config_storage_lease(&mut config).unwrap();
+        assert!(crate::root_cache::prepare_cache_root(&mut config).is_none());
+        let cache_lease = Arc::downgrade(config.cache_lease.as_ref().unwrap());
+        let storage_lease = Arc::downgrade(config.storage_lease.as_ref().unwrap());
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config.clone(),
+        );
+        let _held_walk = ctx.hold_project_applicability_walks_for_test();
+        ctx.refresh_project_applicability(Arc::new(config), false);
+
+        #[cfg(target_os = "linux")]
+        let open_under_storage = || {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+                .filter(|target| target.starts_with(&storage))
+                .collect::<Vec<_>>()
+        };
+        #[cfg(target_os = "linux")]
+        assert!(!open_under_storage().is_empty(), "live context owns leases");
+        drop(ctx);
+        #[cfg(target_os = "linux")]
+        {
+            let targets = open_under_storage();
+            assert!(
+                targets.is_empty(),
+                "released storage retained descriptors: {targets:?}"
+            );
+        }
+        assert!(
+            cache_lease.upgrade().is_none(),
+            "cache lease released synchronously"
+        );
+        assert!(
+            storage_lease.upgrade().is_none(),
+            "storage lease released synchronously"
+        );
+    }
 
     #[test]
     fn configure_applicability_content_batches_keep_cache_and_health_counters() {

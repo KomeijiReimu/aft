@@ -2140,7 +2140,7 @@ fn inspect_scope_candidate(
 
     // Keep the lease through deletion so a concurrent writer either wins first
     // and protects the scope, or starts after this directory has been removed.
-    let _writer_lease = match crate::fs_lock::try_acquire(
+    let mut writer_lease = match crate::fs_lock::try_acquire(
         &crate::root_cache::writer_lease_path(scope_dir),
         Duration::ZERO,
     ) {
@@ -2151,6 +2151,7 @@ fn inspect_scope_candidate(
         return InspectScopeCandidateResult::SkippedMarker;
     }
 
+    writer_lease.stop_heartbeat_for_removal();
     match fs::remove_dir_all(scope_dir) {
         Ok(()) => InspectScopeCandidateResult::Removed { bytes: stats.bytes },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && !scope_dir.exists() => {
@@ -2571,8 +2572,14 @@ fn walk_resolver_config_files(project_root: &Path) -> BTreeSet<PathBuf> {
     // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
     let mut builder = ignore::WalkBuilder::new(project_root);
     builder.same_file_system(true).hidden(true);
+    // Resolver configs inside a nested linked worktree of this repository
+    // belong to that checkout's own scope, not this one.
+    let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(project_root);
     let walker = crate::context::apply_project_ignore_rules(&mut builder, project_root)
-        .filter_entry(|entry| {
+        .filter_entry(move |entry| {
+            if crate::search_index::is_nested_worktree_entry(entry, &worktrees) {
+                return false;
+            }
             let name = entry.file_name().to_string_lossy();
             if entry
                 .file_type()
@@ -2864,6 +2871,34 @@ fn now_nanos() -> u128 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn resolver_configs_skip_nested_linked_worktrees() {
+        // tsconfig files inside a nested linked worktree belong to that
+        // checkout's own scope, not this one's.
+        let dir = tempfile::tempdir().unwrap();
+        let fixture =
+            crate::git_probe::init_repo_with_nested_worktree_for_test(dir.path(), "resolver");
+        for config_dir in [&fixture.root, &fixture.worktree, &fixture.independent] {
+            std::fs::write(config_dir.join("tsconfig.json"), r#"{"files": []}"#).unwrap();
+        }
+        let configs = walk_resolver_config_files(&fixture.root);
+        assert!(
+            configs.contains(&canonical_file_path(fixture.root.join("tsconfig.json")).unwrap()),
+            "missing main config: {configs:?}"
+        );
+        assert!(
+            configs
+                .contains(&canonical_file_path(fixture.independent.join("tsconfig.json")).unwrap()),
+            "nested independent repository must still be walked: {configs:?}"
+        );
+        assert!(
+            !configs
+                .iter()
+                .any(|path| path.starts_with(&fixture.worktree)),
+            "nested linked worktree configs were collected: {configs:?}"
+        );
+    }
 
     fn cache_epoch_fixture(
         marker: Option<u32>,

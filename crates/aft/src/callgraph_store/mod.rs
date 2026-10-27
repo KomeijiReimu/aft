@@ -5138,6 +5138,141 @@ struct ProjectIndex<'a> {
     /// changed file set means a new `ProjectIndex`, which starts empty.
     crate_scans: std::cell::OnceCell<CrateScanMemo>,
     go_packages: RefCell<GoPackageMemo>,
+    local_symbols: RefCell<CallerSymbolMemo>,
+}
+
+/// Symbol-query answers for the active caller. Resolution visits references in
+/// caller order, so retaining only one file avoids a corpus-sized name cache.
+/// The caller's symbol set is immutable for the lifetime of a resolver index.
+#[derive(Clone, Default)]
+struct CallerSymbolMemo {
+    file: Option<String>,
+    symbols: HashMap<String, Option<String>>,
+    #[cfg(test)]
+    builds: usize,
+}
+
+impl CallerSymbolMemo {
+    fn resolve(&mut self, file: &str, data: &FileCallData, query: &str) -> Option<String> {
+        if self.file.as_deref() != Some(file) {
+            self.symbols.clear();
+            for symbol in data
+                .symbol_metadata
+                .keys()
+                .chain(data.calls_by_symbol.keys())
+                .chain(data.exported_symbols.iter())
+            {
+                // Qualified queries require an exact match; bare queries must
+                // remain ambiguous even when one candidate is file-level.
+                if symbol.contains("::") {
+                    self.symbols.insert(symbol.clone(), Some(symbol.clone()));
+                }
+                let bare = symbol.rsplit("::").next().unwrap_or(symbol);
+                self.symbols
+                    .entry(bare.to_string())
+                    .and_modify(|existing| {
+                        if existing.as_ref() != Some(symbol) {
+                            *existing = None;
+                        }
+                    })
+                    .or_insert_with(|| Some(symbol.clone()));
+            }
+            self.file = Some(file.to_string());
+            #[cfg(test)]
+            {
+                self.builds += 1;
+            }
+        }
+        self.symbols.get(query).cloned().flatten()
+    }
+}
+
+#[cfg(test)]
+mod local_symbol_memo_tests {
+    use super::*;
+
+    #[test]
+    fn local_symbol_memo_preserves_scan_results_and_builds_once_per_caller() {
+        let file = "fixture.rs";
+        let mut source = String::from(
+            "fn local() {} fn ambiguous() {}\n\
+             mod nested { fn ambiguous() {} fn scoped_only() {} }\n\
+             struct Item; impl Item { fn method(&self) {} }\n",
+        );
+        for i in 0..512 {
+            source.push_str(&format!("fn function_{i}() {{ local(); }}\n"));
+        }
+        let mut data = callgraph::build_file_data_from_source(Path::new(file), &source).unwrap();
+        data.calls_by_symbol
+            .insert("caller_only".into(), Vec::new());
+        data.exported_symbols.push("nested::export_only".into());
+        let index = ProjectIndex::from_parts(
+            Path::new("/fixture"),
+            HashMap::new(),
+            HashMap::from([(file.to_string(), &data)]),
+            WorkspaceCratePrefixCache::default(),
+            Rc::new(DiskFacts::new(Path::new("/fixture"))),
+        );
+        assert_eq!(
+            rust_unique_file_level_function(&index, file, "local", "local", &data),
+            Some(("resolved_local".into(), file.into(), "local".into()))
+        );
+        assert!(
+            rust_unique_file_level_function(&index, file, "ambiguous", "ambiguous", &data)
+                .is_none()
+        );
+        assert_eq!(index.local_symbol(file, &data, "ambiguous"), None);
+        assert_eq!(
+            index.local_symbol(file, &data, "nested::ambiguous"),
+            Some("nested::ambiguous".into())
+        );
+        let queries = data
+            .symbol_metadata
+            .keys()
+            .chain(data.calls_by_symbol.keys())
+            .chain(data.exported_symbols.iter())
+            .flat_map(|name| [name.clone(), name.rsplit("::").next().unwrap().to_string()])
+            .chain(["missing".into(), "caller_only".into(), "export_only".into()])
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        let expected = queries
+            .iter()
+            .map(|query| {
+                callgraph::resolve_symbol_query_in_data(&data, Path::new(file), query).ok()
+            })
+            .collect::<Vec<_>>();
+        let scan_elapsed = started.elapsed();
+        let started = Instant::now();
+        for _ in 0..8 {
+            for (query, expected) in queries.iter().zip(&expected) {
+                assert_eq!(&index.local_symbol(file, &data, query), expected, "{query}");
+            }
+        }
+        let memo_elapsed = started.elapsed();
+        assert_eq!(index.local_symbols.borrow().builds, 1);
+        let other =
+            callgraph::build_file_data_from_source(Path::new("other.rs"), "fn other() {}").unwrap();
+        assert_eq!(index.local_symbol("other.rs", &other, "local"), None);
+        assert_eq!(
+            index.local_symbol("other.rs", &other, "other"),
+            Some("other".into())
+        );
+        assert_eq!(index.local_symbols.borrow().builds, 2);
+        // A later cold-build window can reparse the same caller path.
+        index.local_symbols.borrow_mut().file = None;
+        assert_eq!(index.local_symbol("other.rs", &data, "other"), None);
+        assert_eq!(
+            index.local_symbol("other.rs", &data, "local"),
+            Some("local".into())
+        );
+        assert_eq!(index.local_symbols.borrow().builds, 3);
+        eprintln!(
+            "local symbol queries={} scan_ns_per_query={} memo_ns_per_query={} builds=1",
+            queries.len(),
+            scan_elapsed.as_nanos() / queries.len() as u128,
+            memo_elapsed.as_nanos() / (queries.len() * 8) as u128,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5222,6 +5357,7 @@ trait ResolverIndex {
         go_symbol_target_by_scan(self, caller_file, module, symbol)
     }
     fn caller_data(&self, file: &str) -> Option<&FileCallData>;
+    fn local_symbol(&self, file: &str, data: &FileCallData, query: &str) -> Option<String>;
     fn lang_for(&self, file: &str) -> Option<LangId>;
     fn module_target(&self, caller_file: &str, module_path: &str) -> Option<String>;
     fn module_parent(&self, target_file: &str) -> Option<(String, String)>;
@@ -5285,6 +5421,10 @@ impl ResolverIndex for ProjectIndex<'_> {
     }
     fn caller_data(&self, file: &str) -> Option<&FileCallData> {
         self.caller_data.get(file).copied()
+    }
+
+    fn local_symbol(&self, file: &str, data: &FileCallData, query: &str) -> Option<String> {
+        self.local_symbols.borrow_mut().resolve(file, data, query)
     }
 
     fn lang_for(&self, file: &str) -> Option<LangId> {
@@ -5557,6 +5697,7 @@ struct DiskProjectIndex<'a> {
 #[derive(Default)]
 struct DiskIndexMemos {
     go_packages: RefCell<GoPackageMemo>,
+    local_symbols: RefCell<CallerSymbolMemo>,
     file_indexes: RefCell<HashMap<String, Option<Rc<DbFileIndex>>>>,
     file_index_order: RefCell<VecDeque<String>>,
     /// Target file -> first `(declaring file, module path)` naming it, in
@@ -5846,6 +5987,13 @@ impl ResolverIndex for DiskProjectIndex<'_> {
     }
     fn caller_data(&self, file: &str) -> Option<&FileCallData> {
         (file == self.caller_file).then_some(self.caller_data)
+    }
+
+    fn local_symbol(&self, file: &str, data: &FileCallData, query: &str) -> Option<String> {
+        self.memos
+            .local_symbols
+            .borrow_mut()
+            .resolve(file, data, query)
     }
 
     fn lang_for(&self, file: &str) -> Option<LangId> {
@@ -7485,6 +7633,10 @@ impl CallGraphStore {
                 missing.into_iter().collect(),
                 &extraction_memo,
             );
+
+            // A caller split across windows may have been reparsed. Its local
+            // name table must use this window's data, not an earlier parse.
+            index_memos.local_symbols.borrow_mut().file = None;
 
             self.verify_writer_lease()?;
             let total_changes_before = conn.total_changes();
@@ -16136,7 +16288,7 @@ fn resolve_rust_target<I: ResolverIndex>(
     // `mod tests { use super::{..}; }`); applying it to the whole file
     // resolved ordinary same-file calls through the wrong module.
     if let Some(local) =
-        rust_unique_file_level_function(caller_file, full_ref, short_name, caller_data)
+        rust_unique_file_level_function(index, caller_file, full_ref, short_name, caller_data)
     {
         return Some(local);
     }
@@ -16186,7 +16338,8 @@ fn rust_macro_use_target<I: ResolverIndex>(
     None
 }
 
-fn rust_unique_file_level_function(
+fn rust_unique_file_level_function<I: ResolverIndex>(
+    index: &I,
     caller_file: &str,
     full_ref: &str,
     short_name: &str,
@@ -16197,9 +16350,7 @@ fn rust_unique_file_level_function(
     }
     // The only symbol with this unqualified name must be the file-level one
     // itself; with a same-named nested item the call could mean either.
-    let symbol =
-        callgraph::resolve_symbol_query_in_data(caller_data, Path::new(caller_file), short_name)
-            .ok()?;
+    let symbol = index.local_symbol(caller_file, caller_data, short_name)?;
     let is_file_level_function = symbol == short_name
         && caller_data
             .symbol_metadata
@@ -16874,7 +17025,7 @@ fn rust_module_segments_for_rel(rel_path: &str) -> Vec<String> {
 }
 
 fn resolve_local_target<I: ResolverIndex>(
-    _index: &I,
+    index: &I,
     caller_file: &str,
     full_ref: &str,
     short_name: &str,
@@ -16883,8 +17034,8 @@ fn resolve_local_target<I: ResolverIndex>(
     if !callgraph::is_bare_callee(full_ref, short_name) {
         return None;
     }
-    callgraph::resolve_symbol_query_in_data(caller_data, Path::new(caller_file), short_name)
-        .ok()
+    index
+        .local_symbol(caller_file, caller_data, short_name)
         .map(|symbol| {
             (
                 "resolved_local".to_string(),
@@ -16913,6 +17064,7 @@ impl<'a> ProjectIndex<'a> {
             rust_crate_roots: callgraph::RustCrateRootMemo::default(),
             crate_scans: std::cell::OnceCell::new(),
             go_packages: RefCell::default(),
+            local_symbols: RefCell::default(),
         }
     }
 
@@ -31523,6 +31675,7 @@ mod reexport_resolution_tests {
             rust_crate_roots: callgraph::RustCrateRootMemo::default(),
             crate_scans: std::cell::OnceCell::new(),
             go_packages: RefCell::default(),
+            local_symbols: RefCell::default(),
         }
     }
 

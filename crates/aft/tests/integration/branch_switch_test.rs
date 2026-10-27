@@ -565,7 +565,8 @@ fn views_round_trip_reuses_semantic_blobs_without_embedding() {
             .expect("views-on semantic view")
             .installed()
             .generation()
-            .manifest()
+            .flatten()
+            .unwrap()
             .entries()
             .filter(|(_, entry)| {
                 matches!(
@@ -667,7 +668,8 @@ fn wait_for_semantic_view(ctx: &AppContext) {
                 && snapshot.live_entries().next().is_none()
                 && !snapshot
                     .generation()
-                    .manifest()
+                    .flatten()
+                    .unwrap()
                     .entries()
                     .any(|(_, entry)| {
                         entry

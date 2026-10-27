@@ -27,7 +27,39 @@ fn fixture(name: &str) -> Value {
         "bash-inputs.json",
         "bash-output.json"
     );
-    serde_json::from_slice(bytes).unwrap()
+    let mut value: Value = serde_json::from_slice(bytes).unwrap();
+    if name == "bash-output.json" {
+        for vector in value["vectors"].as_array_mut().unwrap() {
+            for raw in vector["raw"]
+                .as_object_mut()
+                .into_iter()
+                .flat_map(|raw| raw.values_mut())
+            {
+                if raw.is_object() {
+                    // Only input bytes are encoded. Expected page text, splits
+                    // and cursor fields remain independently frozen in JSON.
+                    let mut expanded = vec![
+                        raw["repeatByte"].as_u64().unwrap() as u8;
+                        raw["count"].as_u64().unwrap() as usize
+                    ];
+                    expanded.extend(
+                        raw["suffix"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|byte| byte.as_u64().unwrap() as u8),
+                    );
+                    use sha2::{Digest, Sha256};
+                    assert_eq!(
+                        format!("{:x}", Sha256::digest(&expanded)),
+                        raw["sha256"].as_str().unwrap()
+                    );
+                    *raw = json!(expanded);
+                }
+            }
+        }
+    }
+    value
 }
 
 fn bash_pins() -> Vec<String> {

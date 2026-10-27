@@ -222,6 +222,7 @@ fn tool_result_images_are_ordered_and_kept_in_structured_content() {
 
 #[tokio::test]
 async fn tool_result_ast_search_t6_complete_and_budget_cut_on_negotiated_route() {
+    let _watcher_disabled = crate::test_env::without_project_watcher();
     let (project, root_id) = test_support::test_root("ast-search-t6");
     let root = project.path().to_path_buf();
     std::fs::write(root.join("small.js"), "console.log(1);\n".repeat(3)).unwrap();
@@ -232,7 +233,7 @@ async fn tool_result_ast_search_t6_complete_and_budget_cut_on_negotiated_route()
     // Reuse a configured actor without starting unrelated background indexing.
     let ctx = Arc::new(context(&root));
     let app = ctx.app().clone();
-    executor.register_actor(root_id, ctx);
+    executor.register_actor(root_id, ctx.clone());
     let loop_executor = executor.clone();
     let (mut daemon, module) = tokio::io::duplex(64 * 1024);
     let module_thread = std::thread::spawn(move || {
@@ -249,12 +250,12 @@ async fn tool_result_ast_search_t6_complete_and_budget_cut_on_negotiated_route()
             loop_executor,
             |request, ctx| {
                 if request.command == "configure" {
-                    Response::success(request.id, json!({}))
+                    crate::commands::configure::handle_configure(&request, ctx)
                 } else {
                     crate::commands::ast_search::handle_ast_search(&request, &ctx)
                 }
             },
-            Some(module_root.join("absent-user-config.json")),
+            Some(test_support::bind_config_without_indexes(&module_root)),
             false,
             usize::MAX,
             None,
@@ -327,6 +328,14 @@ async fn tool_result_ast_search_t6_complete_and_budget_cut_on_negotiated_route()
         serde_json::from_slice::<ModuleControlResponse>(&ack.body).unwrap(),
         ModuleControlResponse::RouteBindAck {}
     ));
+    let configured = ctx.config();
+    assert!(
+        !configured.indexes.trigram
+            && !configured.indexes.semantic
+            && !configured.indexes.callgraph,
+        "protocol fixture unexpectedly enabled background indexes"
+    );
+    drop(configured);
     let mut replies = Vec::new();
     for (corr, file) in [(10, "small.js"), (11, "large.js")] {
         let call = json!({"name":"ast_search", "arguments":{
@@ -348,6 +357,10 @@ async fn tool_result_ast_search_t6_complete_and_budget_cut_on_negotiated_route()
         .unwrap();
         replies.push(receive(&mut daemon, 1, corr).await);
     }
+    assert!(
+        !ctx.watcher_runtime_active(),
+        "transport fixture started a project watcher"
+    );
     drop(daemon);
     module_thread.join().unwrap().unwrap();
     for (frame, total) in replies.iter().zip([3, 24000]) {
@@ -498,6 +511,7 @@ fn tool_result_catalog_switch_preserves_schemas_digests_and_pins() {
 
 #[tokio::test]
 async fn tool_result_capability_is_selected_per_bind_not_per_call() {
+    let _watcher_disabled = crate::test_env::without_project_watcher();
     let project = scratch_project();
     let root = project.path().to_path_buf();
     let module_root = root.clone();
@@ -517,9 +531,9 @@ async fn tool_result_capability_is_selected_per_bind_not_per_call() {
             &module_root.join("absent-connection.json"),
             App::default_shared(),
             loop_executor,
-            |request, _| {
+            |request, ctx| {
                 if request.command == "configure" {
-                    return Response::success(request.id, json!({}));
+                    return crate::commands::configure::handle_configure(&request, ctx);
                 }
                 Response::error_with_data(
                     "same-id",
@@ -528,7 +542,7 @@ async fn tool_result_capability_is_selected_per_bind_not_per_call() {
                     json!({"producer_budget": result_body::active()}),
                 )
             },
-            Some(module_root.join("absent-user-config.json")),
+            Some(test_support::bind_config_without_indexes(&module_root)),
             false,
             usize::MAX,
             None,
@@ -1393,12 +1407,19 @@ fn tool_result_fixtures_release_descriptors() {
             tool_result_real_reply_validation_report,
         ),
     ];
+    // Measure every fixture after warming its caches. Nightly stress adds
+    // repetitions to expose intermittent or accumulating descriptor leaks.
+    let rounds = if std::env::var("AFT_STRESS").as_deref() == Ok("1") {
+        20
+    } else {
+        2
+    };
     let mut leaks = Vec::new();
     for (name, fixture) in cases {
         fixture(); // Initialize legitimate process-wide caches before measuring.
         let initial = fixture_descriptor_targets();
         let before: usize = initial.values().sum();
-        for round in 0..20 {
+        for round in 0..rounds {
             let prior: usize = fixture_descriptor_targets().values().sum();
             fixture();
             let current: usize = fixture_descriptor_targets().values().sum();
@@ -1415,12 +1436,25 @@ fn tool_result_fixtures_release_descriptors() {
             .collect();
         println!("FD_CENSUS SUMMARY {name} before={before} after={after} retained={retained:?}");
         if after > before {
+            let mut threads: Vec<_> = std::fs::read_dir("/proc/self/task")
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    std::fs::read_to_string(entry.path().join("comm"))
+                        .ok()
+                        .map(|name| {
+                            format!("{}:{}", entry.file_name().to_string_lossy(), name.trim())
+                        })
+                })
+                .collect();
+            threads.sort();
+            println!("FD_CENSUS_THREADS {name} {threads:?}");
             leaks.push(format!("{name}: {before} -> {after}; {retained:?}"));
         }
     }
     assert!(
         leaks.is_empty(),
-        "fixtures retained descriptors after twenty runs: {leaks:#?}"
+        "fixtures retained descriptors after {rounds} runs: {leaks:#?}"
     );
 }
 

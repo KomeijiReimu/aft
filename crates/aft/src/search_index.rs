@@ -314,6 +314,47 @@ impl<'a> BorrowedIndexLoadBudget<'a> {
     }
 }
 
+/// Borrowed-load record reads observed per fixture root. A borrowed reload
+/// parses on a background thread, so a thread-local counter on the searching
+/// thread cannot see it; each test registers its own temporary root and the
+/// read loop bumps only that root's counter. Asserting the count stayed at or
+/// below the entry budget proves the reload stopped at the entry budget,
+/// which a wall-clock bound cannot show on a loaded machine.
+#[cfg(test)]
+static BORROWED_LOAD_RECORDS_READ_PROBES: OnceLock<Mutex<HashMap<PathBuf, Arc<AtomicUsize>>>> =
+    OnceLock::new();
+
+/// Register `root` for borrowed-load record observation and return its
+/// counter. Callers remove the probe with
+/// [`unobserve_borrowed_load_records_read_for_test`] after the assertion.
+#[cfg(test)]
+pub(crate) fn observe_borrowed_load_records_read_for_test(root: &Path) -> Arc<AtomicUsize> {
+    let counter = Arc::new(AtomicUsize::new(0));
+    BORROWED_LOAD_RECORDS_READ_PROBES
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap()
+        .insert(root.to_path_buf(), Arc::clone(&counter));
+    counter
+}
+
+/// Stop observing borrowed-load record reads for `root`.
+#[cfg(test)]
+pub(crate) fn unobserve_borrowed_load_records_read_for_test(root: &Path) {
+    if let Some(probes) = BORROWED_LOAD_RECORDS_READ_PROBES.get() {
+        probes.lock().unwrap().remove(root);
+    }
+}
+
+#[cfg(test)]
+fn note_borrowed_load_record_read_for_test(project_root: &Path) {
+    if let Some(probes) = BORROWED_LOAD_RECORDS_READ_PROBES.get() {
+        if let Some(counter) = probes.lock().unwrap().get(project_root) {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Read an artifact pointer without allowing a writer to strand an interactive request.
 ///
 /// Index refreshes publish through `RwLock`s and can legitimately hold a write guard while
@@ -2680,6 +2721,10 @@ impl SearchIndex {
             if unindexed[0] == 1 {
                 unindexed_files.insert(file_id_u32);
             }
+            #[cfg(test)]
+            if borrowed_load_budget.is_some() {
+                note_borrowed_load_record_read_for_test(&project_root);
+            }
         }
 
         if !reader_has_remaining(&mut reader, postings_body_end, 8).ok()? {
@@ -2764,6 +2809,10 @@ impl SearchIndex {
                 offset,
                 count,
             });
+            #[cfg(test)]
+            if borrowed_load_budget.is_some() {
+                note_borrowed_load_record_read_for_test(&project_root);
+            }
         }
 
         let base = BasePostings {
@@ -6642,10 +6691,35 @@ fn project_walk_builder_pruned(
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
     // the daemon, so never open directories outside this walk root's filesystem.
     builder.same_file_system(true).hidden(false);
+    // Nested linked worktrees of this repository index again under their own
+    // roots; prune them here so every walk sharing this builder skips them.
+    // The named root itself is always admitted (depth 0), so an explicitly
+    // targeted walk inside a worktree still reads it.
+    let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(search_root);
     crate::context::apply_project_ignore_rules(&mut builder, search_root).filter_entry(
-        move |entry| project_walk_admits_entry(entry, excludes) && descend(entry.path()),
+        move |entry| {
+            project_walk_admits_entry(entry, excludes)
+                && descend(entry.path())
+                && !is_nested_worktree_entry(entry, &worktrees)
+        },
     );
     builder
+}
+
+/// True when `entry` is a directory below the walk root that is itself a
+/// nested linked worktree of this repository, which the walk must prune.
+/// Shared by every walker built on the project walk; the depth check keeps
+/// an explicitly named root (depth 0) admitted.
+pub(crate) fn is_nested_worktree_entry(
+    entry: &ignore::DirEntry,
+    worktrees: &crate::project_content::NestedWorktreeBoundary,
+) -> bool {
+    entry.depth() > 0
+        && entry
+            .file_type()
+            .as_ref()
+            .is_some_and(std::fs::FileType::is_dir)
+        && worktrees.is_nested_worktree_root(entry.path())
 }
 
 /// The membership rule the project walk applies to each entry on top of the

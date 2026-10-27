@@ -73,6 +73,33 @@ pub struct ManifestHeader {
     pub segment: Option<String>,
 }
 
+/// A depth-one reference to a fixed-membership base. The generation is
+/// diagnostic: readiness successors keep the same identity and membership.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BaseHeader {
+    pub scope: String,
+    pub membership_digest: String,
+    pub identity_digest: String,
+    pub bound_generation: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PublishedFrontier {
+    pub delta_cut_version: u64,
+    pub watcher_epoch: u64,
+    pub published_at_ms: u64,
+    pub verified_frontier: Option<VerifiedFrontier>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct VerifiedFrontier {
+    #[serde(rename = "E0")]
+    pub e0: u64,
+    #[serde(rename = "F")]
+    pub f: u64,
+    pub delivery_seq: u64,
+}
+
 /// Per-plane states of one regular entry. `None` means the plane does not
 /// apply to the file (for example, no semantic chunks for an image).
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -169,6 +196,11 @@ impl EntryV2 {
 pub struct ManifestV2 {
     header: ManifestHeader,
     entries: BTreeMap<RelPath, EntryV2>,
+    v3: bool,
+    base: Option<BaseHeader>,
+    published: Option<PublishedFrontier>,
+    tombstones: BTreeSet<RelPath>,
+    readiness_overrides: BTreeMap<RelPath, EntryPlanes>,
 }
 
 impl ManifestV2 {
@@ -176,6 +208,64 @@ impl ManifestV2 {
         Self {
             header,
             entries: BTreeMap::new(),
+            v3: false,
+            base: None,
+            published: None,
+            tombstones: BTreeSet::new(),
+            readiness_overrides: BTreeMap::new(),
+        }
+    }
+
+    pub fn new_v3(
+        header: ManifestHeader,
+        base: Option<BaseHeader>,
+        published: PublishedFrontier,
+    ) -> Self {
+        Self {
+            v3: true,
+            base,
+            published: Some(published),
+            ..Self::new(header)
+        }
+    }
+
+    pub fn base_header(&self) -> Option<&BaseHeader> {
+        self.base.as_ref()
+    }
+    pub fn published(&self) -> Option<&PublishedFrontier> {
+        self.published.as_ref()
+    }
+    pub fn tombstones(&self) -> &BTreeSet<RelPath> {
+        &self.tombstones
+    }
+    pub fn readiness_overrides(&self) -> &BTreeMap<RelPath, EntryPlanes> {
+        &self.readiness_overrides
+    }
+
+    pub fn set_readiness_override(&mut self, path: RelPath, patch: EntryPlanes) -> Result<()> {
+        if !self.v3
+            || self.base.is_none()
+            || self.entries.contains_key(&path)
+            || self.tombstones.contains(&path)
+        {
+            return Err(ViewError::InvalidManifest(
+                "readiness overrides require an inherited path in a v3 worker".into(),
+            ));
+        }
+        self.readiness_overrides.insert(path, patch);
+        Ok(())
+    }
+
+    pub(super) fn inherit(&mut self, path: RelPath, patch: Option<EntryPlanes>) {
+        self.entries.remove(&path);
+        self.tombstones.remove(&path);
+        match patch {
+            Some(patch) => {
+                self.readiness_overrides.insert(path, patch);
+            }
+            None => {
+                self.readiness_overrides.remove(&path);
+            }
         }
     }
 
@@ -189,6 +279,11 @@ impl ManifestV2 {
 
     pub fn insert(&mut self, rel_path: RelPath, entry: EntryV2) -> Result<()> {
         validate_entry(&rel_path, &entry)?;
+        if self.tombstones.contains(&rel_path) || self.readiness_overrides.contains_key(&rel_path) {
+            return Err(ViewError::InvalidManifest(
+                "manifest sections must be disjoint".into(),
+            ));
+        }
         if self.entries.insert(rel_path, entry).is_some() {
             return Err(ViewError::InvalidManifest(
                 "a manifest cannot contain the same rel_path twice".to_string(),
@@ -202,10 +297,16 @@ impl ManifestV2 {
         match entry {
             Some(entry) => {
                 validate_entry(&rel_path, &entry)?;
+                self.tombstones.remove(&rel_path);
+                self.readiness_overrides.remove(&rel_path);
                 self.entries.insert(rel_path, entry);
             }
             None => {
                 self.entries.remove(&rel_path);
+                self.readiness_overrides.remove(&rel_path);
+                if self.base.is_some() {
+                    self.tombstones.insert(rel_path);
+                }
             }
         }
         Ok(())
@@ -251,9 +352,10 @@ impl ManifestV2 {
         changed
     }
 
-    /// Every `Ready` key, with its plane.
+    /// Deduplicated Ready keys in entries and overrides. Deduplication is lazy
+    /// so a bounded marking walk can stop without scanning the remaining rows.
     pub fn ready_keys(&self) -> impl Iterator<Item = FamilyKey> + '_ {
-        self.entries.values().flat_map(|entry| {
+        let entries = self.entries.values().flat_map(|entry| {
             FamilyPlane::ALL
                 .into_iter()
                 .filter_map(move |plane| match entry.plane_state(plane) {
@@ -261,7 +363,20 @@ impl ManifestV2 {
                         .map(|bytes| FamilyKey::new(plane, bytes)),
                     _ => None,
                 })
-        })
+        });
+        let overrides = self.readiness_overrides.values().flat_map(|patch| {
+            FamilyPlane::ALL
+                .into_iter()
+                .filter_map(move |plane| match patch.get(plane) {
+                    Some(PlaneState::Ready { key }) => crate::blob_store::v2::parse_hex32(key)
+                        .map(|bytes| FamilyKey::new(plane, bytes)),
+                    _ => None,
+                })
+        });
+        let mut seen = BTreeSet::new();
+        entries
+            .chain(overrides)
+            .filter(move |key| seen.insert(*key))
     }
 
     /// The segment this generation references, if any.
@@ -332,6 +447,25 @@ struct BorrowedManifest<'a> {
     #[serde(flatten)]
     header: &'a ManifestHeader,
     entries: BorrowedEntries<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base: Option<&'a BaseHeader>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    published: Option<&'a PublishedFrontier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tombstones: Option<&'a BTreeSet<RelPath>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    readiness_overrides: Option<Vec<OverrideRow<'a>>>,
+}
+
+#[derive(Serialize)]
+struct OverrideRow<'a> {
+    rel_path: &'a RelPath,
+    planes: &'a EntryPlanes,
+}
+#[derive(Deserialize, Serialize)]
+struct OwnedOverrideRow {
+    rel_path: RelPath,
+    planes: EntryPlanes,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -348,6 +482,14 @@ struct JsonManifestV2 {
     #[serde(flatten)]
     header: ManifestHeader,
     entries: Vec<JsonEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base: Option<BaseHeader>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    published: Option<PublishedFrontier>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tombstones: Vec<RelPath>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    readiness_overrides: Vec<OwnedOverrideRow>,
 }
 
 impl Serialize for ManifestV2 {
@@ -355,10 +497,19 @@ impl Serialize for ManifestV2 {
         #[cfg(test)]
         SERIALIZATIONS.with(|count| count.set(count.get() + 1));
         BorrowedManifest {
-            format_version: MANIFEST_FORMAT_VERSION,
+            format_version: if self.v3 { 3 } else { MANIFEST_FORMAT_VERSION },
             path_identity_version: PATH_IDENTITY_VERSION,
             header: &self.header,
             entries: BorrowedEntries(&self.entries),
+            base: self.base.as_ref(),
+            published: self.published.as_ref(),
+            tombstones: self.v3.then_some(&self.tombstones),
+            readiness_overrides: self.v3.then(|| {
+                self.readiness_overrides
+                    .iter()
+                    .map(|(rel_path, planes)| OverrideRow { rel_path, planes })
+                    .collect()
+            }),
         }
         .serialize(serializer)
     }
@@ -372,7 +523,7 @@ thread_local! {
 impl<'de> Deserialize<'de> for ManifestV2 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         let json = JsonManifestV2::deserialize(deserializer)?;
-        if json.format_version != MANIFEST_FORMAT_VERSION {
+        if !matches!(json.format_version, 2 | 3) {
             return Err(D::Error::custom(format!(
                 "unsupported manifest format_version {}",
                 json.format_version
@@ -384,10 +535,45 @@ impl<'de> Deserialize<'de> for ManifestV2 {
                 json.path_identity_version
             )));
         }
-        let mut manifest = Self::new(json.header);
+        if json.format_version == 2
+            && (json.base.is_some()
+                || json.published.is_some()
+                || !json.tombstones.is_empty()
+                || !json.readiness_overrides.is_empty())
+        {
+            return Err(D::Error::custom("v2 cannot contain composition sections"));
+        }
+        let mut manifest = if json.format_version == 3 {
+            Self::new_v3(
+                json.header,
+                json.base,
+                json.published
+                    .ok_or_else(|| D::Error::custom("v3 requires a published frontier"))?,
+            )
+        } else {
+            Self::new(json.header)
+        };
         for member in json.entries {
             manifest
                 .insert(member.rel_path, member.entry)
+                .map_err(D::Error::custom)?;
+        }
+        for path in json.tombstones {
+            if manifest.base.is_none()
+                || manifest.entries.contains_key(&path)
+                || !manifest.tombstones.insert(path)
+            {
+                return Err(D::Error::custom(
+                    "tombstones must be unique inherited paths, disjoint from entries",
+                ));
+            }
+        }
+        for row in json.readiness_overrides {
+            if manifest.readiness_overrides.contains_key(&row.rel_path) {
+                return Err(D::Error::custom("duplicate readiness override"));
+            }
+            manifest
+                .set_readiness_override(row.rel_path, row.planes)
                 .map_err(D::Error::custom)?;
         }
         Ok(manifest)
@@ -558,6 +744,28 @@ impl ViewStore {
         prepared: PreparedV2,
         observer: Option<&dyn DurabilityObserver>,
     ) -> Result<PublishV2> {
+        self.commit_v2_completion(prepared, observer, || Ok(()), false)
+    }
+
+    /// Complete publication-time SQLite reads before scheduling retirement.
+    /// The callback must close its connections before returning, including on
+    /// error; a callback error does not roll back the already durable pointer.
+    pub(crate) fn commit_v2_before_sweep(
+        &self,
+        prepared: PreparedV2,
+        observer: Option<&dyn DurabilityObserver>,
+        after_publish: impl FnOnce() -> Result<()>,
+    ) -> Result<PublishV2> {
+        self.commit_v2_completion(prepared, observer, after_publish, true)
+    }
+
+    fn commit_v2_completion(
+        &self,
+        prepared: PreparedV2,
+        observer: Option<&dyn DurabilityObserver>,
+        after_publish: impl FnOnce() -> Result<()>,
+        coordinate_probe: bool,
+    ) -> Result<PublishV2> {
         let name = prepared.generation.to_string();
         // Keep both the private attempt and the resolved pointer generation
         // protected through observer callbacks and return, not merely CAS.
@@ -572,7 +780,13 @@ impl ViewStore {
                 super::checkpoint_pointer_after_cas(&self.pointer_path())?;
                 sync_directory(self.view_dir())?;
                 observe(observer, DurabilityStep::PointerSynced);
+                let completion = if coordinate_probe {
+                    super::generation::with_publication_probe(self.view_dir(), after_publish)
+                } else {
+                    after_publish()
+                };
                 super::generation::schedule_generation_sweep(self.clone());
+                completion?;
                 Ok(PublishV2::Published)
             }
             super::PublishOutcome::Conflict { current_generation } => {
@@ -696,6 +910,121 @@ fn write_bytes_once(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_probe_closes_before_generation_maintenance_is_scheduled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let registry =
+            super::super::registry::FamilyRegistry::open(storage.path(), "probe-order").unwrap();
+        let owner = registry
+            .register_view_with_storage(storage.path(), "worker", root.path())
+            .unwrap();
+        let view = owner.view_store().unwrap();
+        let first_manifest = manifest();
+        let first = GenerationName::for_manifest(&first_manifest).unwrap();
+        let prepared = view
+            .prepare_v2(&first, None, &first_manifest, None)
+            .unwrap();
+        assert_eq!(
+            view.commit_v2(prepared, None).unwrap(),
+            PublishV2::Published
+        );
+        super::super::wait_for_generation_maintenance_for_test(view.view_dir());
+        let mut next_manifest = first_manifest;
+        next_manifest.header_mut().head_tree = Some("next-tree".into());
+        let next = GenerationName::for_manifest(&next_manifest).unwrap();
+        let open = Arc::new(AtomicBool::new(false));
+        let overlap = Arc::new(AtomicBool::new(false));
+        let (started, maintenance_started) = mpsc::channel();
+        let observed_open = open.clone();
+        let observed_overlap = overlap.clone();
+        let _hook = crate::storage_retention::observe_test_hook(
+            view.view_dir(),
+            Arc::new(move |step| {
+                if step == "post-publication-sweep" {
+                    observed_overlap
+                        .fetch_or(observed_open.load(Ordering::SeqCst), Ordering::SeqCst);
+                    let _ = started.send(());
+                }
+            }),
+        );
+        let (entered, probe_opened) = mpsc::channel();
+        let (resume, finish_probe) = mpsc::channel();
+        let publishing = view.clone();
+        let next_for_worker = next.clone();
+        let first_name = first.to_string();
+        let worker = std::thread::spawn(move || {
+            let prepared = publishing
+                .prepare_v2(&next_for_worker, Some(&first_name), &next_manifest, None)
+                .unwrap();
+            publishing.commit_v2_before_sweep(prepared, None, || {
+                let connection = crate::db::file_identity::IdentityConnection::open_with_flags(
+                    publishing.pointer_path(),
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    "publication probe ordering test",
+                )
+                .unwrap();
+                let _: String = connection
+                    .query_row(
+                        "SELECT generation FROM pointer WHERE singleton=1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                open.store(true, Ordering::SeqCst);
+                entered.send(()).unwrap();
+                finish_probe
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                drop(connection);
+                open.store(false, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        probe_opened
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert!(crate::db::file_identity::open_connections(&view.pointer_path()) > 0);
+        let scheduled_while_open = maintenance_started
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_ok();
+        resume.send(()).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap(), PublishV2::Published);
+        super::super::wait_for_generation_maintenance_for_test(view.view_dir());
+        assert!(
+            !scheduled_while_open,
+            "maintenance started before the publication probe closed"
+        );
+        assert!(!overlap.load(Ordering::SeqCst));
+        assert_eq!(
+            view.current_generation_read_only().unwrap(),
+            Some(next.to_string())
+        );
+        assert!(view.load_manifest_v2(&next.to_string()).is_ok());
+    }
+
+    #[test]
+    fn completion_error_does_not_undo_a_landed_pointer() {
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "completion-error").unwrap();
+        let manifest = manifest();
+        let name = GenerationName::for_manifest(&manifest).unwrap();
+        let prepared = view.prepare_v2(&name, None, &manifest, None).unwrap();
+        assert!(view
+            .commit_v2_before_sweep(prepared, None, || Err(ViewError::InvalidManifest(
+                "probe failure".into()
+            )))
+            .is_err());
+        super::super::wait_for_generation_maintenance_for_test(view.view_dir());
+        assert_eq!(
+            view.current_generation_read_only().unwrap(),
+            Some(name.to_string())
+        );
+        assert!(view.load_manifest_v2(&name.to_string()).is_ok());
+    }
 
     pub(crate) fn producers() -> Producers {
         Producers {
@@ -943,6 +1272,10 @@ mod tests {
             format_version: MANIFEST_FORMAT_VERSION,
             path_identity_version: PATH_IDENTITY_VERSION,
             header: manifest.header.clone(),
+            base: None,
+            published: None,
+            tombstones: Vec::new(),
+            readiness_overrides: Vec::new(),
             entries: manifest
                 .entries
                 .iter()

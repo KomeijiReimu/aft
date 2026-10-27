@@ -230,8 +230,8 @@ impl DatabaseWaits {
         if let Some(operation) =
             operation.filter(|operation| tool_provider::recognized_operation(operation))
         {
-            // Access settings (notably a head's approval mode) also use aft.db.
-            // Their readiness must not depend on having a saved worker policy.
+            // Access settings and scoped catalog preset attestations also use
+            // aft.db, even when no saved worker policy needs to be read.
             let catalog_wait = operation == "tool.catalog"
                 && ctx.database_runtime_initializing()
                 && remote_policy::catalog_needs_database(body, identity);
@@ -743,6 +743,11 @@ mod tests {
         scope.owner = Principal::Reserved {
             module_id: "prefrontal-core".into(),
         };
+        if let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+            &mut Arc::get_mut(&mut head.0).unwrap().spawn_principal
+        {
+            *principal_id = Some("reserved:prefrontal-core".into());
+        }
         let decoded = DecodedFrame {
             parsed_body: Default::default(),
             confinement: None,
@@ -843,6 +848,72 @@ mod tests {
             crate::db::access_grants::mode(&conn, &key).unwrap(),
             crate::access_policy::ApprovalMode::Ask
         );
+    }
+
+    #[tokio::test]
+    async fn rich_ui_preset_writer_catalog_waits_for_open_then_records_without_refetch() {
+        use std::future::Future;
+        for preset in ["worker", "reader"] {
+            let (dir, root) = test_support::test_root("preset-catalog-database-wait");
+            let ctx = test_support::test_ctx();
+            ctx.mark_database_runtime_initializing_for_test();
+            let executor = Arc::new(Executor::new());
+            assert!(executor.register_actor(root.clone(), ctx.clone()));
+            let (mut identity, mut decoded) = head_catalog(&root, None);
+            let data = Arc::get_mut(&mut identity.0).unwrap();
+            data.role = tool_provider::RouteRole::ToolProviderV1;
+            if preset == "worker" {
+                data.scope.as_mut().unwrap().kind = subc_protocol::scope::ScopeKind::Worker;
+            }
+            if let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+                &mut data.spawn_principal
+            {
+                *principal_id = Some("reserved:broca".into());
+            }
+            decoded.frame = Frame::build(
+                FrameType::Request,
+                control_flags(),
+                43,
+                1,
+                7,
+                serde_json::to_vec(&json!({"op":"tool.catalog","preset":preset})).unwrap(),
+            )
+            .unwrap();
+            let routes = HashMap::from([(route_key(43, 1), identity.clone())]);
+            let mut waits = DatabaseWaits::default();
+            assert!(
+                waits.defer(decoded, &routes, &executor).is_ok(),
+                "{preset} catalog must wait"
+            );
+            let resumed = waits.next();
+            tokio::pin!(resumed);
+            tokio::task::yield_now().await;
+            std::future::poll_fn(|cx| {
+                assert!(
+                    resumed.as_mut().poll(cx).is_pending(),
+                    "catalog resumed before open"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+            ctx.set_db(Arc::new(std::sync::Mutex::new(
+                crate::db::open(&dir.path().join("aft.db")).unwrap(),
+            )));
+            ctx.finish_database_runtime(Ok(()));
+            let reply = head_catalog_reply(resumed.await, identity.clone(), &executor).await;
+            assert_eq!(
+                reply.header.ty,
+                FrameType::Response,
+                "{}",
+                String::from_utf8_lossy(&reply.body)
+            );
+            let key = remote_policy::session_preset_key(&identity, preset).unwrap();
+            assert_eq!(
+                crate::db::rich_ui::session_presets(&ctx.db().unwrap().lock().unwrap(), &key)
+                    .unwrap(),
+                [preset]
+            );
+        }
     }
 
     #[tokio::test]

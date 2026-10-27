@@ -95,6 +95,12 @@ pub fn handle_lsp_diagnostics(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(message) => return Response::error(&req.id, "invalid_request", message),
     };
 
+    // Watcher changes still queued for the manager lock (an edit made by
+    // another program, say) have not reached the servers. Until they do,
+    // rust-analyzer owes no `cargo check` for them, and its old results
+    // would be read as describing the files as they are now.
+    ctx.lsp_forward_queued_watcher_changes();
+
     match (&params.file, &params.directory) {
         (Some(file), None) => handle_file_mode(req, ctx, file, severity_filter, wait_ms),
         (None, Some(directory)) => {

@@ -196,7 +196,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S1MoreAtDepth, StopState::S2Exhausted, more_available, handle_external_semantic_or_hybrid_search, handle_external_grep_search, handle_semantic_or_hybrid_search, handle_grep_search, from_matches, run_engine_ranking, blast_radius_annotation_for_result, enrich_snippets_from_source_reference, enrich_snippets_from_source_with_context, read_bounded_snippet_line, truncate_chars, split_semantic_results, handle_split_search, rank_hits",
+                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S1MoreAtDepth, StopState::S2Exhausted, more_available, handle_external_semantic_or_hybrid_search, handle_external_grep_search, handle_semantic_or_hybrid_search, handle_grep_search, from_matches, run_engine_ranking, blast_radius_annotation_for_result, enrich_snippets_from_source_reference, enrich_snippets_from_source_with_context, read_bounded_snippet_line, truncate_chars, split_semantic_results, handle_split_search, reply",
             },
         ],
     },
@@ -499,6 +499,18 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "a background-launch error previews at most eight of the caller's slot holders, counts omitted own holders and other sessions' holders, and shortens command labels with an ellipsis; this is actionable refusal context, not a paginated task-result list",
     },
     ExclusionEntry {
+        file: "bash_background/registry.rs",
+        enclosing_item: "kill_survivors_line",
+        location_or_primitive: "KILL_SURVIVORS_NAMED .take()",
+        reason: "the one-line kill-survivor notice names the first three surviving processes and counts the rest with +N more; every listed survivor stays in the structured live_descendants field",
+    },
+    ExclusionEntry {
+        file: "bash_background/process.rs",
+        enclosing_item: "bounded_members, safe_name, macos_argv, capped_identities",
+        location_or_primitive: "LIVE_DESCENDANT_CAP .take(), LIVE_DESCENDANT_NAME_CAP .take(), MAX_ARGS, GROUP_IDENTITY_CAP .take()",
+        reason: "a process-group check keeps at most 16 members and reports the exact omitted count in live_descendants_omitted; each member's name is shortened with an ellipsis and its arguments are never kept; the record keeps at most 1,024 member identities for recognising the group later and flags when more were found; this is task status detail, not a paginated result list",
+    },
+    ExclusionEntry {
         file: "subc/health.rs",
         enclosing_item: "budget_health_metrics",
         location_or_primitive: "storage_retention map removal and v2_family_sweeps pop under HEALTH_METRICS_BUDGET_BYTES",
@@ -545,6 +557,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "next_batch",
         location_or_primitive: "GC_ENTRY_BUDGET directory iterator advancement",
         reason: "internal persisted-task and quarantine retention scans resume the same iterator next pass; the cap bounds inspection work, not returned records",
+    },
+    ExclusionEntry {
+        file: "bash_background/gc_memo.rs",
+        enclosing_item: "due_batches",
+        location_or_primitive: "GC_ENTRY_BUDGET ordered deadline iterator advancement",
+        reason: "internal retention candidates beyond the budget remain indexed for the next maintenance request; no agent-visible records are truncated",
     },
     ExclusionEntry {
         file: "bash_background/remote.rs",
@@ -656,7 +674,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "storage_retention.rs",
-        enclosing_item: "bounded_dirs, traversal_batch_filtered, next_batch, sweep_view_generations, generation_registries, report_generation_registry_error, validate_tree, validate_tree_with_admission, reap_trash, reap_trash_with_snapshot_budget, reap_trash_with_cursor, trash_scans, reap_retired_with_budget, due_first, orphan_first, run_pass_with_budget, prune_bindings, retirement_members, retirement_members_with_budget, write_retirement_witness, verify_retirement_witness",
+        enclosing_item: "bounded_dirs, traversal_batch_filtered, next_batch, sweep_view_generations, generation_registries, report_generation_registry_error, validate_tree, validate_tree_with_admission, report_candidate_error, reap_trash, reap_trash_with_snapshot_budget, reap_trash_with_cursor, trash_scans, reap_retired_with_budget, due_first, orphan_first, run_pass_with_budget, prune_bindings, retirement_members, retirement_members_with_budget, write_retirement_witness, verify_retirement_witness",
         location_or_primitive: "DUE_FIRST_ENTRIES, PASS_ENTRIES, TREE_ENTRIES, HISTORY_ENTRIES, TRASH_SCAN_HANDLES, reaper deadline and 10ms mount-snapshot admission budget, 64-view generation batch, 16 diagnostic errors, take",
         reason: "internal disk-maintenance walks, not tool-result lists; bounded lexical batches persist only processed names, incomplete protection snapshots refuse deletion, and health reports remaining views, trash estimates, kept reasons and incomplete censuses",
     },
@@ -1026,7 +1044,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     // results page is the search surface's, registered under its cap reason.
     ExclusionEntry {
         file: "commands/semantic_search/external_exact.rs",
-        enclosing_item: "files_with_hits",
+        enclosing_item: "sweep",
         location_or_primitive: "commands::semantic_search::external_exact::sweep skipped_foreign_mounts",
         reason: "counts mount points of other filesystems that the walk does not enter; no list is cut here, and a walk the deadline stops is reported through the sweep's enumeration_stopped and the reply's coverage line",
     },
@@ -1044,9 +1062,9 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "commands/semantic_search/external_pattern.rs",
-        enclosing_item: "semantic_results, semantic_index",
+        enclosing_item: "semantic_results",
         location_or_primitive: "commands::semantic_search::external_pattern::Corpus semantic enumeration",
-        reason: "enumerates at most SEMANTIC_ENUMERATION_LIMIT prose candidates before ranking, like the external query-only route; more_available reports the remaining candidates and the engine envelopes the results page. Discovery currently attributes the restricted-visibility method to its preceding semantic_index helper",
+        reason: "enumerates at most SEMANTIC_ENUMERATION_LIMIT prose candidates before ranking, like the external query-only route; more_available reports the remaining candidates and the engine envelopes the results page",
     },
     ExclusionEntry {
         file: "commands/inspect.rs",

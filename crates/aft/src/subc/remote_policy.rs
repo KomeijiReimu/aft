@@ -57,8 +57,13 @@ fn policy_key(identity: &RouteIdentity, preset: Option<&str>) -> Result<PolicyKe
 }
 
 /// Catalog parameters can persist access settings even when the route has no
-/// saved worker policy. A head's worker-plan preview alone needs no database.
+/// saved worker policy. An unscoped head's plan preview needs no database.
 pub(super) fn catalog_needs_database(body: &Value, identity: &RouteIdentity) -> bool {
+    let preset = body.get("preset").and_then(Value::as_str).unwrap_or("head");
+    catalog_preset_key(identity, preset).is_some() || catalog_needs_policy_database(body, identity)
+}
+
+fn catalog_needs_policy_database(body: &Value, identity: &RouteIdentity) -> bool {
     let preset = body.get("preset").and_then(Value::as_str).unwrap_or("head");
     key(identity, Some("worker")).is_some()
         || body
@@ -72,11 +77,41 @@ pub(super) fn catalog_needs_database(body: &Value, identity: &RouteIdentity) -> 
 }
 
 pub(super) fn catalog(
+    body: Value,
+    identity: &RouteIdentity,
+    ctx: &AppContext,
+) -> Result<Value, subc_protocol::ErrorBody> {
+    let preset = body.get("preset").and_then(Value::as_str).unwrap_or("head");
+    let key = catalog_preset_key(identity, preset);
+    let answer = catalog_inner(body, identity, ctx)?;
+    if let Some(key) = key {
+        // An absent pool allows discovery without an attestation. Once a pool
+        // exists, do not acknowledge a fetch whose attestation could not commit.
+        if let Some(db) = ctx.db() {
+            let unavailable = || {
+                subc_protocol::ErrorBody::new(
+                    "database_unavailable",
+                    "catalog preset persistence unavailable",
+                )
+            };
+            let conn = db.lock().map_err(|_| unavailable())?;
+            crate::db::rich_ui::record_preset(
+                &conn,
+                &key,
+                crate::bash_background::persistence::unix_millis() as i64,
+            )
+            .map_err(|_| unavailable())?;
+        }
+    }
+    Ok(answer)
+}
+
+fn catalog_inner(
     mut body: Value,
     identity: &RouteIdentity,
     ctx: &AppContext,
 ) -> Result<Value, subc_protocol::ErrorBody> {
-    let needs_database = catalog_needs_database(&body, identity);
+    let needs_database = catalog_needs_policy_database(&body, identity);
     let preset = body
         .get("preset")
         .and_then(Value::as_str)
@@ -333,6 +368,52 @@ pub(super) fn catalog(
         );
     });
     Ok(answer)
+}
+
+/// Preserve the bind's harness label to identify the route that fetched the
+/// catalog. Do not apply `HarnessId::storage_segment`, which identifies bash
+/// task storage rather than catalog attestations. Carrier policy-route lookup
+/// must construct the same key as catalog recording.
+pub(super) fn session_preset_key(
+    identity: &RouteIdentity,
+    preset: &str,
+) -> Option<crate::db::rich_ui::PresetKey> {
+    let scope = identity.scope.as_ref()?;
+    let AuthenticatedPrincipal::RouteBind {
+        principal_id: Some(principal),
+        ..
+    } = &identity.spawn_principal
+    else {
+        return None;
+    };
+    Some(crate::db::rich_ui::PresetKey {
+        project_root: identity.project_root.display().to_string(),
+        harness: identity.harness.clone(),
+        session: identity.session.clone(),
+        principal: principal.clone(),
+        owner: serde_json::to_string(&scope.owner).expect("scope owner serializes"),
+        scope_ref: scope.scope_ref.clone(),
+        epoch: scope.scope_epoch,
+        preset: preset.into(),
+    })
+}
+
+fn catalog_preset_key(
+    identity: &RouteIdentity,
+    preset: &str,
+) -> Option<crate::db::rich_ui::PresetKey> {
+    if !matches!(preset, "worker" | "reader") {
+        return None;
+    }
+    let scope = identity.scope.as_ref()?;
+    let key = session_preset_key(identity, preset)?;
+    if !scope.owner_authorized
+        || key.principal == "reserved:occipital"
+        || principal_id(&Some(scope.owner.clone())).as_deref() == Some(key.principal.as_str())
+    {
+        return None;
+    }
+    Some(key)
 }
 
 // Keep the policy gates in their original short-circuit order. Both schema
@@ -694,3 +775,218 @@ pub(super) fn saved_policy(
 #[cfg(test)]
 #[path = "remote_policy_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod preset_writer_tests {
+    use super::*;
+
+    fn identity(root: &Path, principal: &str) -> RouteIdentity {
+        RouteIdentity(Arc::new(RouteIdentityData {
+            root: ProjectRootId::from_path(root).unwrap(),
+            project_root: root.into(),
+            harness: "Raw Harness".into(),
+            session: "worker-session".into(),
+            role: tool_provider::RouteRole::ToolProviderV1,
+            trust: BindTrust::FirstParty,
+            spawn_principal: AuthenticatedPrincipal::RouteBind {
+                trust: crate::sandbox_spawn::PrincipalTrust::FirstParty,
+                route_channel: 41,
+                route_epoch: 1,
+                project_root: root.into(),
+                harness: "Raw Harness".into(),
+                session_id: "worker-session".into(),
+                principal_id: Some(principal.into()),
+            },
+            consumer_elicitation_capable: false,
+            tool_result_body: false,
+            disabled_tools: Arc::new(vec![]),
+            run_scope: OnceLock::new(),
+            call_mode: subc_protocol::call_mode::CallMode::Classic,
+            scope: Some(
+                subc_protocol::scope::ScopeStamp::new(
+                    subc_protocol::Principal::Reserved {
+                        module_id: "prefrontal-core".into(),
+                    },
+                    "worker",
+                    7,
+                    subc_protocol::scope::ScopeKind::Worker,
+                )
+                .with_owner_authorized(true),
+            ),
+            made_tool_call: AtomicBool::new(false),
+            run_owner: None,
+        }))
+    }
+
+    fn context(root: &Path, storage: &Path, with_db: bool) -> AppContext {
+        let mut config = crate::config::Config::default();
+        config.project_root = Some(root.into());
+        config.storage_dir = Some(storage.into());
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        if with_db {
+            ctx.set_db(Arc::new(StdMutex::new(
+                crate::db::open(&storage.join("aft.db")).unwrap(),
+            )));
+        }
+        ctx
+    }
+
+    fn rows(ctx: &AppContext) -> i64 {
+        ctx.db()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM rich_ui_session_presets", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn rich_ui_preset_writer_records_worker_and_reader_once_and_refreshes() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = context(root.path(), storage.path(), true);
+        let route = identity(root.path(), "reserved:broca");
+        for preset in ["worker", "reader"] {
+            let request = json!({"preset":preset});
+            catalog(request.clone(), &route, &ctx).unwrap();
+            let key = session_preset_key(&route, preset).unwrap();
+            assert_eq!(key.harness, "Raw Harness");
+            assert_eq!(key.project_root, root.path().display().to_string());
+            assert_eq!(key.session, "worker-session");
+            assert_eq!(key.scope_ref, "worker");
+            assert_eq!(key.epoch, 7);
+            ctx.db()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE rich_ui_session_presets SET recorded_at=1 WHERE preset=?1",
+                    [preset],
+                )
+                .unwrap();
+            catalog(request, &route, &ctx).unwrap();
+            let db = ctx.db().unwrap();
+            let conn = db.lock().unwrap();
+            let recorded: i64 = conn
+                .query_row(
+                    "SELECT recorded_at FROM rich_ui_session_presets WHERE preset=?1",
+                    [preset],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(recorded > 1);
+            let stored: (String, String, String) = conn
+                .query_row(
+                    "SELECT harness,principal,owner FROM rich_ui_session_presets WHERE preset=?1",
+                    [preset],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(stored, (key.harness, key.principal, key.owner));
+        }
+        assert_eq!(rows(&ctx), 2);
+    }
+
+    #[test]
+    fn rich_ui_preset_writer_occipital_fetch_writes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = context(root.path(), storage.path(), true);
+        let route = identity(root.path(), "reserved:occipital");
+        for preset in ["worker", "reader"] {
+            catalog(json!({"preset":preset}), &route, &ctx).unwrap();
+        }
+        assert_eq!(rows(&ctx), 0);
+        let ordinary = identity(root.path(), "reserved:broca");
+        catalog(json!({"preset":"worker"}), &ordinary, &ctx).unwrap();
+        assert_eq!(rows(&ctx), 1);
+    }
+
+    #[test]
+    fn rich_ui_preset_writer_skips_heads_unauthorized_unscoped_and_owner_principal() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = context(root.path(), storage.path(), true);
+        let route = identity(root.path(), "reserved:broca");
+        catalog(json!({}), &route, &ctx).unwrap();
+        catalog(json!({"preset":"head"}), &route, &ctx).unwrap();
+        for preset in ["worker", "reader"] {
+            let mut unauthorized = identity(root.path(), "reserved:broca");
+            Arc::get_mut(&mut unauthorized.0)
+                .unwrap()
+                .scope
+                .as_mut()
+                .unwrap()
+                .owner_authorized = false;
+            catalog(json!({"preset":preset}), &unauthorized, &ctx).unwrap();
+            let mut unscoped = identity(root.path(), "reserved:broca");
+            Arc::get_mut(&mut unscoped.0).unwrap().scope = None;
+            catalog(json!({"preset":preset}), &unscoped, &ctx).unwrap();
+            let owner = identity(root.path(), "reserved:prefrontal-core");
+            catalog(json!({"preset":preset}), &owner, &ctx).unwrap();
+        }
+        assert_eq!(rows(&ctx), 0);
+        catalog(json!({"preset":"reader"}), &route, &ctx).unwrap();
+        assert_eq!(rows(&ctx), 1);
+    }
+
+    #[test]
+    fn rich_ui_preset_writer_failed_fetch_is_not_recorded() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = context(root.path(), storage.path(), true);
+        let route = identity(root.path(), "reserved:broca");
+        assert!(catalog(
+            json!({"preset":"worker","params":{"invalid":true}}),
+            &route,
+            &ctx
+        )
+        .is_err());
+        assert_eq!(rows(&ctx), 0);
+    }
+
+    #[test]
+    fn rich_ui_preset_writer_existing_row_write_failure_fails_fetch() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = context(root.path(), storage.path(), true);
+        let route = identity(root.path(), "reserved:broca");
+        let request = json!({"preset":"worker"});
+        catalog(request.clone(), &route, &ctx).unwrap();
+        ctx.db()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "UPDATE rich_ui_session_presets SET recorded_at=1;
+             CREATE TRIGGER fail_preset BEFORE UPDATE ON rich_ui_session_presets
+             BEGIN SELECT RAISE(FAIL, 'forced preset write failure'); END;",
+            )
+            .unwrap();
+        let error = catalog(request.clone(), &route, &ctx).unwrap_err();
+        assert_eq!(error.code, "database_unavailable");
+        assert_eq!(rows(&ctx), 1);
+        ctx.db()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_preset")
+            .unwrap();
+        catalog(request, &route, &ctx).unwrap();
+        assert_eq!(rows(&ctx), 1);
+    }
+
+    #[test]
+    fn rich_ui_preset_writer_missing_database_allows_unrecorded_fetch() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = context(root.path(), storage.path(), false);
+        let route = identity(root.path(), "reserved:broca");
+        for preset in ["worker", "reader"] {
+            catalog(json!({"preset":preset}), &route, &ctx).unwrap();
+        }
+        assert!(ctx.db().is_none());
+    }
+}

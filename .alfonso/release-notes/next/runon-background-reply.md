@@ -1,0 +1,1 @@
+- Remote bash calls with background: true now return a task ID at once with background wording, instead of a message saying the command was promoted from the foreground.

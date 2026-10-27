@@ -1403,6 +1403,7 @@ fn remote_kill_result_names_the_full_job_id() {
 #[test]
 fn remote_execution_header_without_a_job_id_keeps_its_existing_text() {
     let mut remote = RemoteTask {
+        submission: None,
         accepted_platform: None,
         explicit_runon: false,
         connection_file: None,
@@ -2952,6 +2953,7 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
     metadata.harness = Some("runner".into());
     metadata.execution_note = Some("ran remotely on ck-motor".into());
     metadata.remote = Some(RemoteTask {
+        submission: None,
         accepted_platform: None,
         explicit_runon: false,
         connection_file: Some(daemon.connection.clone()),
@@ -4257,6 +4259,7 @@ fn persist_accepted_with_snapshot_cap(
     metadata.status = BgTaskStatus::Running;
     metadata.execution_note = Some("ran remotely on ck-motor".into());
     metadata.remote = Some(RemoteTask {
+        submission: None,
         accepted_platform: None,
         explicit_runon: false,
         connection_file: Some(connection),
@@ -5735,6 +5738,26 @@ async fn runon_sends_the_whole_compound_line_remote_exactly_as_written() {
 }
 
 #[tokio::test]
+async fn runon_macos_reaches_the_wire_request_as_macos_platform() {
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({"command": "uname -a", "runon": "macos", "compressed": false}),
+    );
+    assert!(response.success, "{response:?}");
+    let task_id = response.data["task_id"].as_str().unwrap().to_string();
+    let _done = terminal(ctx.bash_background(), &task_id).await;
+    let runs = exec_runs(&daemon);
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0]["platform"], "macos");
+    assert!(runs[0].get("weight_hint").is_none(), "{runs:?}");
+    assert!(runs[0].get("network").is_none(), "{runs:?}");
+}
+
+#[tokio::test]
 async fn runon_vcpu_count_is_sent_as_weight_hint_on_the_wire() {
     let daemon = daemon(Script::Plain, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
@@ -5795,6 +5818,9 @@ async fn malformed_runon_vcpu_requests_are_refused_before_dispatch() {
         "windows,4c",
         "windows,net",
         "windows,wat",
+        "macos,4c",
+        "macos,net",
+        "macos,wat",
     ] {
         let response = handle_with_policy(
             &restarted_context(dir.path()),
@@ -5804,9 +5830,9 @@ async fn malformed_runon_vcpu_requests_are_refused_before_dispatch() {
         assert!(!response.success, "{runon}: {response:?}");
         let message = response.data["message"].as_str().unwrap_or_default();
         assert!(message.contains(runon), "{runon}: {response:?}");
-        let reason = if runon == "windows,4c" {
+        let reason = if runon == "windows,4c" || runon == "macos,4c" {
             "fixed at 4 vCPUs"
-        } else if runon == "windows,net" {
+        } else if runon == "windows,net" || runon == "macos,net" {
             "no network"
         } else {
             "not valid"
@@ -6578,6 +6604,7 @@ async fn non_blocking_runon_is_still_promoted_at_the_foreground_wait_window() {
 #[test]
 fn remote_phase_comes_from_acceptance_started_or_output() {
     let mut remote = RemoteTask {
+        submission: None,
         accepted_platform: None,
         connection_file: None,
         explicit_runon: true,
@@ -6695,6 +6722,7 @@ fn remote_phase_note_says_submitting_then_queued_until_started() {
     metadata.status = BgTaskStatus::Running;
     metadata.started_at = 1_000_000;
     metadata.remote = Some(RemoteTask {
+        submission: None,
         accepted_platform: None,
         connection_file: None,
         explicit_runon: true,
@@ -7081,7 +7109,7 @@ async fn runon_draining_twice_then_accepts_and_discloses_wait() {
         )
         .unwrap();
     let first = clock.now();
-    clock.expect_sleep(first, first + 150).await;
+    clock.expect_sleep(first, first + 1000).await;
     let waiting = registry.observed_status(&task_id, "session", 8192).unwrap();
     assert_eq!(waiting.info.status, BgTaskStatus::Starting, "{waiting:?}");
     assert_eq!(
@@ -7094,10 +7122,10 @@ async fn runon_draining_twice_then_accepts_and_discloses_wait() {
             .contains("draining for maintenance; retrying (attempt 2"),
         "{waiting:?}"
     );
-    clock.advance(150);
-    clock.expect_sleep(first + 150, first + 300).await;
+    clock.advance(5000);
+    clock.expect_sleep(first + 5000, first + 6000).await;
     assert_eq!(exec_runs(&daemon).len(), 2);
-    clock.advance(150);
+    clock.advance(5000);
     let done = terminal(&registry, &task_id).await;
     assert_eq!(done.exit_code, Some(0), "{done:?}");
     assert!(!done.output_preview.contains("local-proof"));
@@ -7140,6 +7168,7 @@ async fn reattach_limit_counts_from_a_late_draining_resubmission() {
     // Submitted first nine minutes ago; the runner drained until now.
     metadata.started_at = now - 9 * MINUTE_MS;
     metadata.remote = Some(RemoteTask {
+        submission: None,
         accepted_platform: None,
         connection_file: None,
         explicit_runon: true,
@@ -7257,11 +7286,18 @@ enum DrainingClockEvent {
 pub(super) struct DrainingClock {
     ticks: tokio::sync::watch::Sender<u64>,
     events: tokio::sync::mpsc::UnboundedSender<DrainingClockEvent>,
+    retry_jitter_ms: std::sync::atomic::AtomicU64,
 }
 
 impl DrainingClock {
     pub(super) fn now(&self) -> u64 {
         *self.ticks.borrow()
+    }
+
+    pub(super) fn retry_jitter_ms(&self, max: u64) -> u64 {
+        let jitter = self.retry_jitter_ms.load(Ordering::SeqCst);
+        assert!(jitter <= max, "injected jitter {jitter} exceeds {max}");
+        jitter
     }
 
     pub(super) async fn sleep_until(&self, from: u64, until: u64) {
@@ -7315,7 +7351,11 @@ impl PausedDrainingClock {
         let root = test_clock_key(root);
         let (ticks, _) = tokio::sync::watch::channel(1_000_000);
         let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let clock = Arc::new(DrainingClock { ticks, events });
+        let clock = Arc::new(DrainingClock {
+            ticks,
+            events,
+            retry_jitter_ms: std::sync::atomic::AtomicU64::new(0),
+        });
         assert!(draining_clocks()
             .lock()
             .unwrap()
@@ -7334,6 +7374,10 @@ impl PausedDrainingClock {
 
     fn advance(&self, ms: u64) {
         self.clock.ticks.send_modify(|now| *now += ms);
+    }
+
+    fn set_retry_jitter_ms(&self, ms: u64) {
+        self.clock.retry_jitter_ms.store(ms, Ordering::SeqCst);
     }
 
     async fn expect_event(&mut self, expected: DrainingClockEvent) {
@@ -7402,6 +7446,121 @@ fn start_runon_retry(registry: &BgTaskRegistry, dir: &Path, connection: PathBuf)
         .unwrap()
 }
 
+fn retry_backoff_script(signer: bool, hint: u64) -> Script {
+    if signer {
+        Script::SignerRefused {
+            refusals: 1,
+            detail: "runner_sign_unavailable",
+            retry_after_ms: Some(hint),
+        }
+    } else {
+        Script::Draining {
+            refusals: 1,
+            retry_after_ms: Some(hint),
+        }
+    }
+}
+
+async fn assert_zero_hint_waits_for_floor(signer: bool) {
+    let daemon = daemon(retry_backoff_script(signer, 0), "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let first = clock.now();
+    tokio::select! {
+        _ = clock.expect_sleep(first, first + if signer { 5000 } else { 1000 }) => {},
+        done = terminal(&registry, &task) => panic!("zero hint resubmitted without waiting: {done:?}"),
+    }
+    clock.advance(4999);
+    if !signer {
+        clock.expect_sleep(first + 4999, first + 5000).await;
+    }
+    assert_eq!(
+        exec_runs(&daemon).len(),
+        1,
+        "must wait at least five seconds"
+    );
+    clock.advance(1);
+    let done = terminal(&registry, &task).await;
+    assert_eq!(done.exit_code, Some(0), "{done:?}");
+    assert_eq!(exec_runs(&daemon).len(), 2);
+}
+
+#[tokio::test]
+async fn runon_retry_backoff_draining_zero_hint_waits_five_seconds() {
+    assert_zero_hint_waits_for_floor(false).await;
+}
+
+#[tokio::test]
+async fn runon_retry_backoff_signer_zero_hint_waits_five_seconds() {
+    assert_zero_hint_waits_for_floor(true).await;
+}
+
+#[tokio::test]
+async fn runon_retry_backoff_large_hints_are_not_shortened() {
+    for signer in [false, true] {
+        let daemon = daemon(retry_backoff_script(signer, 30_000), "exec-remote/v1").await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut clock = PausedDrainingClock::new(dir.path());
+        let registry = registry();
+        let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+        let first = clock.now();
+        clock
+            .expect_sleep(first, first + if signer { 30_000 } else { 1000 })
+            .await;
+        clock.advance(29_999);
+        if !signer {
+            clock.expect_sleep(first + 29_999, first + 30_000).await;
+        }
+        assert_eq!(exec_runs(&daemon).len(), 1, "must honour the runner's hint");
+        clock.advance(1);
+        assert_eq!(terminal(&registry, &task).await.exit_code, Some(0));
+        assert_eq!(exec_runs(&daemon).len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn runon_retry_backoff_simultaneous_refusals_resubmit_at_different_times() {
+    for signer in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut clock = PausedDrainingClock::new(dir.path());
+        let registry = registry();
+        let first = clock.now();
+        let mut tasks = Vec::new();
+        for jitter in [0, 500, 1000] {
+            clock.set_retry_jitter_ms(jitter);
+            let daemon = daemon(retry_backoff_script(signer, 5000), "exec-remote/v1").await;
+            let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+            clock
+                .expect_sleep(first, first + if signer { 5000 + jitter } else { 1000 })
+                .await;
+            if !signer {
+                let saved = read_task(&registry.task(&task).unwrap().paths.json).unwrap();
+                assert_eq!(
+                    saved.remote.unwrap().retry.unwrap().next_retry_at_ms,
+                    Some(first + 5000 + jitter)
+                );
+            }
+            tasks.push((daemon, task));
+        }
+        // All three refusals used the same logical time; only their jitter differs.
+        clock.advance(5000);
+        for (index, (daemon, task)) in tasks.iter().enumerate() {
+            if index > 0 {
+                assert_eq!(
+                    exec_runs(daemon).len(),
+                    1,
+                    "later retries must still be waiting"
+                );
+                clock.advance(500);
+            }
+            assert_eq!(terminal(&registry, task).await.exit_code, Some(0));
+            assert_eq!(exec_runs(daemon).len(), 2);
+        }
+    }
+}
+
 #[tokio::test]
 async fn runon_draining_budget_caps_retry_after() {
     let daemon = daemon(
@@ -7451,10 +7610,10 @@ async fn runon_draining_retry_after_is_honoured() {
     let registry = registry();
     let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
     let first = clock.now();
-    clock.expect_sleep(first, first + 300).await;
+    clock.expect_sleep(first, first + 1000).await;
     clock.advance(100);
     assert_eq!(exec_runs(&daemon).len(), 1, "must not resubmit early");
-    clock.advance(200);
+    clock.advance(4900);
     let done = terminal(&registry, &task).await;
     assert_eq!(done.exit_code, Some(0));
     assert_eq!(exec_runs(&daemon).len(), 2);
@@ -7491,12 +7650,12 @@ async fn runon_draining_kill_stops_retries() {
     )
     .await;
     let dir = tempfile::tempdir().unwrap();
-    shorten_draining_budget(dir.path(), 1000);
+    shorten_draining_budget(dir.path(), 60_000);
     let mut clock = PausedDrainingClock::new(dir.path());
     let registry = registry();
     let task_id = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
     let first = clock.now();
-    clock.expect_sleep(first, first + 500).await;
+    clock.expect_sleep(first, first + 1000).await;
     let killing = registry.clone();
     let killed_id = task_id.clone();
     // With the retry clock frozen, a terminal kill proves cancellation woke
@@ -7511,7 +7670,7 @@ async fn runon_draining_kill_stops_retries() {
     .unwrap();
     assert_eq!(killed.info.status, BgTaskStatus::Killed);
     assert_eq!(clock.now(), first);
-    clock.advance(550);
+    clock.advance(6000);
     assert_eq!(
         exec_runs(&daemon).len(),
         1,
@@ -7597,6 +7756,7 @@ async fn runon_draining_restart_resubmits_and_accepts() {
     .await;
     let dir = tempfile::tempdir().unwrap();
     let mut clock = PausedDrainingClock::new(dir.path());
+    clock.set_retry_jitter_ms(1000);
     stopped_draining_roots()
         .lock()
         .unwrap()
@@ -7604,11 +7764,25 @@ async fn runon_draining_restart_resubmits_and_accepts() {
     let original = registry();
     let task = start_runon_retry(&original, dir.path(), daemon.connection.clone());
     clock.expect_event(DrainingClockEvent::Stopped).await;
+    let first = clock.now();
+    let saved = read_task(&original.task(&task).unwrap().paths.json).unwrap();
+    assert_eq!(
+        saved.remote.unwrap().retry.unwrap().next_retry_at_ms,
+        Some(first + 6000)
+    );
+    // Replaying must keep the sampled deadline, not choose jitter again.
+    clock.set_retry_jitter_ms(0);
     let restarted = registry();
     restarted.replay_session(dir.path(), "session").unwrap();
-    let first = clock.now();
-    clock.expect_sleep(first, first + 200).await;
-    clock.advance(200);
+    clock.expect_sleep(first, first + 1000).await;
+    clock.advance(5999);
+    clock.expect_sleep(first + 5999, first + 6000).await;
+    assert_eq!(
+        exec_runs(&daemon).len(),
+        1,
+        "persisted jitter must survive restart"
+    );
+    clock.advance(1);
     let done = terminal(&restarted, &task).await;
     assert_eq!(done.exit_code, Some(0), "{done:?}");
     let requests = exec_runs(&daemon);
@@ -7626,10 +7800,16 @@ fn draining_default_backoff_is_bounded() {
         (5, 60000),
         (100, 60000),
     ] {
-        assert_eq!(draining_delay_ms(attempt, None), expected);
+        assert_eq!(draining_delay_ms(attempt, None, |_| 0), expected);
+        assert_eq!(
+            draining_delay_ms(attempt, None, |max| max),
+            expected + expected / 5
+        );
     }
-    assert_eq!(draining_delay_ms(100, Some(17)), 17);
-    assert_eq!(draining_delay_ms(1, Some(0)), 0);
+    assert_eq!(draining_delay_ms(100, Some(17), |_| 0), 5000);
+    assert_eq!(draining_delay_ms(1, Some(0), |max| max), 6000);
+    assert_eq!(draining_delay_ms(1, Some(30_000), |max| max), 36_000);
+    assert_eq!(draining_delay_ms(1, Some(u64::MAX), |max| max), u64::MAX);
 }
 
 #[tokio::test]
@@ -7726,8 +7906,8 @@ async fn runon_draining_network_retry_preserves_outbound_and_vcpu_request() {
         ),
         async {
             let first = clock.now();
-            clock.expect_sleep(first, first + 50).await;
-            clock.advance(50);
+            clock.expect_sleep(first, first + 1000).await;
+            clock.advance(5000);
         },
     );
     assert!(reply.success, "{reply:?}");
@@ -8015,15 +8195,15 @@ async fn bash_kill_scope_settles_when_paused_just_before_draining_resubmit() {
     let scope = owner_scope("draining-resubmit");
     let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
     let first = clock.now();
-    clock.expect_sleep(first, first + 200).await;
+    clock.expect_sleep(first, first + 1000).await;
     let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeResubmit);
-    clock.advance(200);
+    clock.advance(5000);
     gate.reached().await;
     let operation = start_kill_scope(&registry, &scope);
     pause_recorded(&registry, &task).await;
     gate.release();
     assert_pause_settles_promptly(&registry, operation, &task).await;
-    assert_eq!(clock.now(), first + 200);
+    assert_eq!(clock.now(), first + 5000);
     remote_worker_exited(&task).await;
     assert_paused(&registry, &task);
     assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
@@ -8091,7 +8271,7 @@ async fn bash_kill_scope_settles_when_restored_draining_retry_cannot_reconnect()
     let mut saved = read_task(&json).unwrap();
     saved.remote.as_mut().unwrap().connection_file = Some(dir.path().join("missing.json"));
     write_task(&json, &saved).unwrap();
-    clock.advance(200);
+    clock.advance(5000);
     let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeBudgetCheck);
     let restarted = registry();
     restarted.replay_session(dir.path(), "session").unwrap();
@@ -8857,7 +9037,7 @@ async fn bash_kill_scope_never_resubmits_a_due_saved_draining_retry() {
     original.detach();
     let (local_task, local_pid) = start_saved_term_ignoring_task(dir.path(), &scope).await;
     // The retry is due by the time the owner pauses the restarted module.
-    clock.advance(200);
+    clock.advance(5000);
     let reply = kill_scope_with_saved_tasks(dir.path(), &scope).await;
     assert_eq!(
         exec_runs(&daemon).len(),
@@ -8905,7 +9085,7 @@ async fn saved_due_draining_retry(
     .await;
     let json = original.task(&task_id).unwrap().paths.json.clone();
     original.detach();
-    clock.advance(200);
+    clock.advance(5000);
     (daemon, clock, task_id, json)
 }
 
@@ -9343,6 +9523,91 @@ async fn concurrent_stop_and_registration_of_a_shared_task_never_deadlock() {
             .filter(|completion| completion.task_id == task_id)
             .count();
         assert_eq!(completions, 1, "round {round}: completions for {task_id}");
+        assert_paused(&project, &task_id);
+        recovery.detach();
+        project.detach();
+    }
+}
+
+/// Repeated owner stops can replace metadata during every optimistic replay
+/// open. A busy writer is not a corrupt task: replay must still register it
+/// and deliver its stop, even when the bounded open retries are exhausted.
+#[tokio::test]
+async fn a_stop_racing_every_replay_metadata_open_still_delivers_one_completion() {
+    use std::os::unix::fs::MetadataExt;
+
+    // Disk discovery resolves then reads metadata (skip 0/1); the batch's
+    // revalidation repeats those opens (skip 2/3). Project-scoped discovery
+    // reads metadata directly after resolving directories (skip 0, true).
+    for (skip_metadata_opens, project_scoped) in
+        [(1, false), (0, false), (2, false), (3, false), (0, true)]
+    {
+        let open_attempts = crate::bash_background::persistence::metadata_open_attempts_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let scope = owner_scope(&format!(
+            "stop-during-replay-metadata-open-{skip_metadata_opens}-{project_scoped}"
+        ));
+        let (_daemon, _clock, task_id, json) =
+            saved_due_draining_retry(dir.path(), &scope, u32::MAX).await;
+        let (recovered, errors) =
+            BgTaskRegistry::recover_saved_scope_tasks(dir.path(), &scope, &[]);
+        assert!(errors.is_empty(), "{errors:?}");
+        let recovery = recovered.into_iter().next().unwrap();
+        let project = registry();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let registration = {
+            let (project, storage) = (project.clone(), dir.path().to_path_buf());
+            std::thread::spawn(move || {
+                let mut metadata_opens = 0;
+                crate::bash_background::persistence::with_artifact_validation_hook_for_test(
+                    move |file| {
+                        let opened = file.metadata().unwrap();
+                        let current = fs::metadata(&json).unwrap();
+                        if (opened.dev(), opened.ino()) != (current.dev(), current.ino()) {
+                            return;
+                        }
+                        metadata_opens += 1;
+                        // Pause with the old metadata open, before its link count
+                        // is checked. Each owner write unlinks that exact handle.
+                        if (skip_metadata_opens + 1..=skip_metadata_opens + open_attempts)
+                            .contains(&metadata_opens)
+                        {
+                            reached_tx
+                                .send(metadata_opens - skip_metadata_opens)
+                                .unwrap();
+                            release_rx
+                                .recv_timeout(Duration::from_secs(30))
+                                .expect("the owner must release the metadata reader");
+                        }
+                    },
+                    || {
+                        if project_scoped {
+                            project.replay_session_for_project(&storage, "session", &storage)
+                        } else {
+                            project.replay_session(&storage, "session")
+                        }
+                    },
+                )
+            })
+        };
+        for attempt in 1..=open_attempts {
+            assert_eq!(
+                reached_rx.recv_timeout(Duration::from_secs(30)).unwrap(),
+                attempt
+            );
+            if attempt < open_attempts {
+                recovery
+                    .record_owner_pause_intent(&recovery.task(&task_id).unwrap())
+                    .unwrap();
+            } else {
+                let members = recovery.begin_scope_pause(&scope).unwrap();
+                recovery.pause_scope(&scope, true, &members).unwrap();
+            }
+            release_tx.send(()).unwrap();
+        }
+        registration.join().unwrap().unwrap();
+        assert_project_told_of_the_stop_once(&project, &task_id);
         assert_paused(&project, &task_id);
         recovery.detach();
         project.detach();
@@ -10262,6 +10527,7 @@ async fn runon_cd_background_jobs_preserve_foreground_directory() {
         .unwrap();
     let ctx = remote_test_context(checkout.path());
     fs::create_dir(checkout.path().join("nested")).unwrap();
+    fs::write(checkout.path().join("nested/source.txt"), "source\n").unwrap();
     let marker = checkout.path().join("must-not-run-locally");
     for (line, refused) in [
         ("sleep 1 & cd ..", true),
@@ -10275,7 +10541,7 @@ async fn runon_cd_background_jobs_preserve_foreground_directory() {
         ("cd nested && { sleep 1 & cd ..; }", false),
         ("false & cd ..", true),
         ("sleep 1 & false && cd ..", false),
-        ("cd nested; sleep 1 & cd ..", true),
+        ("cd nested; sleep 1 & cd ..", false),
     ] {
         let daemon = daemon(Script::Plain, "exec-remote/v1").await;
         let command = format!("{line}; printf local-proof > '{}'", marker.display());
@@ -10465,11 +10731,12 @@ async fn runon_cd_skipped_changes_do_not_hide_checkout_exits() {
         .unwrap();
     let ctx = remote_test_context(checkout.path());
     fs::create_dir(checkout.path().join("nested")).unwrap();
+    fs::write(checkout.path().join("nested/source.txt"), "source\n").unwrap();
     let marker = checkout.path().join("must-not-run-locally");
     for (line, refused) in [
         ("false && cd nested; cd ..", true),
         ("maybe && cd nested; cd ..", true),
-        ("cd nested; cd ..", true),
+        ("cd nested; cd ..", false),
         ("true || cd nested; cd ..", true),
         ("cd \"$X\" || cd ..", true),
         ("cd nested && cd ..", false),
@@ -10517,6 +10784,327 @@ async fn runon_cd_skipped_changes_do_not_hide_checkout_exits() {
             assert_eq!(runs[0]["command"], command);
         }
         assert!(!marker.exists(), "runon must never spawn locally");
+    }
+}
+
+#[tokio::test]
+async fn runon_cd_sequences_use_existing_copied_directories() {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .canonicalize()
+        .unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("aft-runon-copied-cwd-")
+        .tempdir_in(&home)
+        .unwrap();
+    let checkout = dir.path().join("checkout");
+    let sibling = dir.path().join("commons");
+    for folder in [
+        checkout.join("packages/a"),
+        checkout.join("packages/b"),
+        sibling.join("a"),
+        sibling.join("b"),
+    ] {
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("source.txt"), "source\n").unwrap();
+    }
+    git_fixture(&sibling);
+    let ctx = remote_test_context(&checkout);
+    let marker = checkout.join("must-not-run-locally");
+    for (line, refused) in [
+        ("cd packages/a && true; cd ../b", false),
+        ("pushd packages/a && true; cd ../b", true),
+        ("cd ../commons/a && true; cd ../b", false),
+        ("cd packages/missing && true; cd ../b", true),
+        ("cd ../../outside", true),
+        ("cd missing || cd ../../outside", true),
+    ] {
+        let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+        let mut policy = launch(daemon.connection.clone());
+        policy.params.siblings = vec![sibling.to_str().unwrap().to_owned()];
+        let command = format!("{line}; printf local-proof > '{}'", marker.display());
+        let response = handle_with_policy(
+            &ctx,
+            Some(policy),
+            serde_json::json!({"command": command, "runon": "linux", "compressed": false}),
+        );
+        assert!(response.success, "{line}: {response:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            response.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        if refused {
+            assert_eq!(done.info.status, BgTaskStatus::Failed, "{line}: {done:?}");
+            let refusal = refusal_response(done);
+            assert_eq!(refusal.data["code"], "runon_cd_outside_checkout");
+            assert!(exec_runs(&daemon).is_empty(), "a refusal must never submit");
+        } else {
+            assert_eq!(
+                done.info.status,
+                BgTaskStatus::Completed,
+                "{line}: {done:?}"
+            );
+            let runs = exec_runs(&daemon);
+            assert_eq!(runs.len(), 1, "{line}: {runs:?}");
+            assert_eq!(runs[0]["command"], command);
+        }
+        assert!(!marker.exists(), "runon must never spawn locally");
+    }
+}
+
+fn runon_cd_snapshot_fixture() -> (tempfile::TempDir, RunRequest) {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .canonicalize()
+        .unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("aft-runon-snapshot-cwd-")
+        .tempdir_in(home)
+        .unwrap();
+    let checkout = dir.path().join("workspace/checkout");
+    git_fixture(&checkout);
+    let request = build_remote_request(
+        &checkout,
+        &checkout,
+        "true",
+        BTreeMap::new(),
+        30,
+        &exec::PresetParams::default(),
+    )
+    .unwrap();
+    (dir, request)
+}
+
+#[test]
+fn runon_cd_snapshot_ignored_existing_directories_keep_failure_branch() {
+    let (_dir, mut request) = runon_cd_snapshot_fixture();
+    let checkout = PathBuf::from(&request.workspace_key);
+    fs::write(checkout.join(".gitignore"), "node_modules/\ndeleted/\n").unwrap();
+    fs::write(checkout.join(".git/info/exclude"), "excluded/\n").unwrap();
+    let global = checkout.join("global-ignore");
+    fs::write(&global, "globalignored/\n").unwrap();
+    hermetic_git(
+        &checkout,
+        &["config", "core.excludesFile", global.to_str().unwrap()],
+    );
+    fs::create_dir_all(checkout.join("nested")).unwrap();
+    fs::write(checkout.join("nested/.gitignore"), "cache/\n").unwrap();
+    for folder in [
+        "node_modules/x",
+        "excluded/x",
+        "globalignored/x",
+        "nested/cache/x",
+        "deleted/x",
+    ] {
+        fs::create_dir_all(checkout.join(folder)).unwrap();
+        if folder != "deleted/x" {
+            fs::write(checkout.join(folder).join("source.txt"), "not copied\n").unwrap();
+        }
+    }
+    fs::write(checkout.join("deleted/x/tracked.txt"), "deleted\n").unwrap();
+    hermetic_git(&checkout, &["add", "-f", "deleted/x/tracked.txt"]);
+    fs::remove_file(checkout.join("deleted/x/tracked.txt")).unwrap();
+    let sibling = checkout.parent().unwrap().join("sibling");
+    git_fixture(&sibling);
+    fs::write(sibling.join(".gitignore"), "node_modules/\n").unwrap();
+    fs::create_dir_all(sibling.join("node_modules/x")).unwrap();
+    fs::write(sibling.join("node_modules/x/source.txt"), "not copied\n").unwrap();
+    request.siblings = vec![sibling.to_str().unwrap().to_owned()];
+    for line in [
+        "cd node_modules/x; cd ../..",
+        "cd excluded/x; cd ../..",
+        "cd globalignored/x; cd ../..",
+        "cd nested/cache/x; cd ../../..",
+        "cd deleted/x; cd ../..",
+        "cd ../sibling/node_modules/x; cd ../../../checkout",
+    ] {
+        assert!(
+            runon_cd_refusal(line, &request).unwrap().is_some(),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn runon_cd_snapshot_directories_without_copied_files_keep_failure_branch() {
+    let (_dir, request) = runon_cd_snapshot_fixture();
+    let checkout = Path::new(&request.workspace_key);
+    fs::write(checkout.join(".gitignore"), "*.cache\n").unwrap();
+    fs::create_dir_all(checkout.join("empty/x")).unwrap();
+    fs::create_dir_all(checkout.join("onlyignored/x")).unwrap();
+    fs::write(checkout.join("onlyignored/x/file.cache"), "not copied\n").unwrap();
+    for line in ["cd empty/x; cd ../..", "cd onlyignored/x; cd ../.."] {
+        assert!(
+            runon_cd_refusal(line, &request).unwrap().is_some(),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn runon_cd_snapshot_nonignored_and_tracked_directories_are_known() {
+    let (_dir, mut request) = runon_cd_snapshot_fixture();
+    let checkout = PathBuf::from(&request.workspace_key);
+    fs::write(checkout.join(".gitignore"), "forced/\n").unwrap();
+    for folder in ["tracked/x", "untracked/x", "forced/x", "src/target"] {
+        fs::create_dir_all(checkout.join(folder)).unwrap();
+        fs::write(checkout.join(folder).join("file.txt"), "source\n").unwrap();
+    }
+    hermetic_git(&checkout, &["add", "tracked/x/file.txt"]);
+    hermetic_git(&checkout, &["add", "-f", "forced/x/file.txt"]);
+    let sibling = checkout.parent().unwrap().join("sibling");
+    git_fixture(&sibling);
+    fs::write(sibling.join(".gitignore"), "forced/\n").unwrap();
+    fs::create_dir_all(sibling.join("forced/x")).unwrap();
+    fs::write(sibling.join("forced/x/file.txt"), "source\n").unwrap();
+    hermetic_git(&sibling, &["add", "-f", "forced/x/file.txt"]);
+    request.siblings = vec![sibling.to_str().unwrap().to_owned()];
+    for line in [
+        "cd tracked/x; cd ../..",
+        "cd untracked/x; cd ../..",
+        "cd forced/x; cd ../..",
+        "cd src/target; cd ../..",
+        "cd ../sibling/forced/x; cd ../../../checkout",
+    ] {
+        assert_eq!(runon_cd_refusal(line, &request).unwrap(), None, "{line}");
+    }
+}
+
+#[test]
+fn runon_cd_snapshot_mc_package_sequence_is_allowed() {
+    let (_dir, request) = runon_cd_snapshot_fixture();
+    let checkout = Path::new(&request.workspace_key);
+    for package in ["pi-plugin", "plugin"] {
+        let path = checkout.join("packages").join(package);
+        fs::create_dir_all(&path).unwrap();
+        for index in 0..200 {
+            fs::write(path.join(format!("source-{index:03}.ts")), "source\n").unwrap();
+        }
+    }
+    let line =
+        "cd packages/pi-plugin && bun test src/__tests__; cd ../plugin && bun test src/__tests__";
+    assert_eq!(runon_cd_refusal(line, &request).unwrap(), None);
+}
+
+#[test]
+fn runon_cd_snapshot_missing_git_keeps_failure_branch() {
+    let (_dir, request) = runon_cd_snapshot_fixture();
+    let checkout = Path::new(&request.workspace_key);
+    fs::create_dir_all(checkout.join("source/x")).unwrap();
+    fs::write(checkout.join("source/x/source.txt"), "source\n").unwrap();
+    assert_eq!(
+        runon_cd_refusal("cd source/x; cd ../..", &request).unwrap(),
+        None
+    );
+    assert!(runon_cd_refusal_with_git(
+        "cd source/x; cd ../..",
+        &request,
+        &checkout.join("missing-git"),
+    )
+    .unwrap()
+    .is_some());
+}
+
+#[test]
+fn runon_cd_snapshot_rule_invalid_cd_keeps_failure_branch() {
+    let (_dir, request) = runon_cd_snapshot_fixture();
+    let checkout = Path::new(&request.workspace_key);
+    fs::create_dir(checkout.join("a")).unwrap();
+    fs::write(checkout.join("a/source.txt"), "source\n").unwrap();
+    for line in [
+        "cd a extra || cd ..",
+        "cd -Z a || cd ..",
+        "cd -PZ a || cd ..",
+        "cd -- a extra || cd ..",
+    ] {
+        assert!(
+            runon_cd_refusal(line, &request).unwrap().is_some(),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn runon_cd_snapshot_rule_prior_command_keeps_failure_branch() {
+    let (_dir, request) = runon_cd_snapshot_fixture();
+    let checkout = Path::new(&request.workspace_key);
+    fs::create_dir(checkout.join("a")).unwrap();
+    fs::write(checkout.join("a/source.txt"), "source\n").unwrap();
+    for line in [
+        "mv a moved; cd a || cd ..",
+        "rm -rf a; cd a || cd ..",
+        "git clean -fd; cd a || cd ..",
+        "./script; cd a || cd ..",
+        "true; cd a || cd ..",
+        "set +P; cd a || cd ..",
+        "pushd .; cd a || cd ..",
+        "rm -rf a & cd a || cd ..",
+        "cd \"$(rm -rf a)\" || cd a || cd ..",
+    ] {
+        assert!(
+            runon_cd_refusal(line, &request).unwrap().is_some(),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn runon_cd_snapshot_rule_shared_deadline_bounds_git_lookups() {
+    let (_dir, request) = runon_cd_snapshot_fixture();
+    let checkout = Path::new(&request.workspace_key);
+    let counter = checkout.join("git-spawns");
+    let git = checkout.join("fake-git");
+    crate::executable_cache::write_executable(
+        &git,
+        format!(
+            "#!/bin/sh\nprintf 'spawn\\n' >> '{}'\nsleep 0.4\nfor target; do :; done\nprintf '%s/source.txt\\000' \"$target\"\n",
+            counter.display()
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let mut line = String::from("cd d0");
+    for index in 0..8 {
+        let folder = checkout.join(format!("d{index}"));
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("source.txt"), "source\n").unwrap();
+        if index > 0 {
+            line.push_str(&format!("; cd ../d{index}"));
+        }
+    }
+    let start = Instant::now();
+    assert_eq!(
+        runon_cd_refusal_with_git(&line, &request, &git).unwrap(),
+        None
+    );
+    let elapsed = start.elapsed();
+    let spawns = fs::read_to_string(counter).unwrap().lines().count();
+    assert!((2..=6).contains(&spawns), "spawned Git {spawns} times");
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "elapsed: {elapsed:?}"
+    );
+}
+
+#[test]
+fn runon_cd_snapshot_top_level_target_is_not_source() {
+    let (_dir, mut request) = runon_cd_snapshot_fixture();
+    let checkout = PathBuf::from(&request.workspace_key);
+    let sibling = checkout.parent().unwrap().join("sibling");
+    git_fixture(&sibling);
+    for root in [&checkout, &sibling] {
+        fs::create_dir_all(root.join("target/x")).unwrap();
+        fs::write(root.join("target/x/tracked.txt"), "not copied\n").unwrap();
+        hermetic_git(root, &["add", "-f", "target/x/tracked.txt"]);
+    }
+    request.siblings = vec![sibling.to_str().unwrap().to_owned()];
+    for line in [
+        "cd target/x; cd ../..",
+        "cd ../sibling/target/x; cd ../../../checkout",
+    ] {
+        assert!(
+            runon_cd_refusal(line, &request).unwrap().is_some(),
+            "{line}"
+        );
     }
 }
 
@@ -10871,7 +11459,7 @@ async fn runon_signer_refusal_is_resubmitted_after_its_hint_and_only_success_is_
     let registry = registry();
     let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
     let first = clock.now();
-    clock.expect_sleep(first, first + 2000).await;
+    clock.expect_sleep(first, first + 5000).await;
     let waiting = registry.observed_status(&task, "session", 8192).unwrap();
     assert!(!waiting.info.status.is_terminal(), "{waiting:?}");
     assert!(waiting.remote_refusal.is_none(), "{waiting:?}");
@@ -10881,7 +11469,7 @@ async fn runon_signer_refusal_is_resubmitted_after_its_hint_and_only_success_is_
         "a foreground launch keeps waiting while the retry is pending"
     );
     assert_eq!(exec_runs(&daemon).len(), 1);
-    clock.advance(2000);
+    clock.advance(5000);
     let done = terminal(&registry, &task).await;
     assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
     assert_eq!(done.exit_code, Some(0), "{done:?}");
@@ -10907,20 +11495,20 @@ async fn runon_signer_hint_longer_than_the_admission_time_left_surfaces_the_refu
     )
     .await;
     let dir = tempfile::tempdir().unwrap();
-    // Room for one 2 s wait, counted from the first submission; the second
-    // refusal's hint is longer than the 1 s then left.
-    shorten_hinted_retry_budget(dir.path(), 3000);
+    // Room for one floored 5 s wait, counted from the first submission; the
+    // second refusal's delay is longer than the 1 s then left.
+    shorten_hinted_retry_budget(dir.path(), 6000);
     let mut clock = PausedDrainingClock::new(dir.path());
     let registry = registry();
     let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
     let first = clock.now();
-    clock.expect_sleep(first, first + 2000).await;
-    clock.advance(2000);
+    clock.expect_sleep(first, first + 5000).await;
+    clock.advance(5000);
     let done = terminal(&registry, &task).await;
     assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
     assert_runon_refusal(&refusal_response(done), SIGNER_REFUSED);
     assert_eq!(exec_runs(&daemon).len(), 2);
-    assert_eq!(clock.now(), first + 2000);
+    assert_eq!(clock.now(), first + 5000);
     assert_no_retry_sleep(&mut clock);
 }
 
@@ -10966,9 +11554,9 @@ async fn runon_signer_retries_stop_after_five_resubmissions() {
     let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
     let first = clock.now();
     for resubmission in 0..5 {
-        let from = first + resubmission * 100;
-        clock.expect_sleep(from, from + 100).await;
-        clock.advance(100);
+        let from = first + resubmission * 5000;
+        clock.expect_sleep(from, from + 5000).await;
+        clock.advance(5000);
     }
     let done = terminal(&registry, &task).await;
     assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
@@ -10997,7 +11585,7 @@ async fn runon_kill_during_a_signer_retry_wait_ends_the_task_without_resubmittin
     let registry = registry();
     let task_id = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
     let first = clock.now();
-    clock.expect_sleep(first, first + 2000).await;
+    clock.expect_sleep(first, first + 5000).await;
     let killing = registry.clone();
     let killed_id = task_id.clone();
     // With the retry clock frozen, a terminal kill proves cancellation woke
@@ -11012,7 +11600,7 @@ async fn runon_kill_during_a_signer_retry_wait_ends_the_task_without_resubmittin
     .unwrap();
     assert_eq!(killed.info.status, BgTaskStatus::Killed);
     assert_eq!(clock.now(), first);
-    clock.advance(2000);
+    clock.advance(5000);
     // Give a worker that wrongly kept waiting the chance to resubmit.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
@@ -11031,23 +11619,23 @@ async fn runon_signer_retry_follows_a_live_draining_resubmission() {
     let daemon = daemon(
         Script::DrainingThenSigner {
             signer_refusals: 1,
-            draining_after_ms: 500,
+            draining_after_ms: 10_000,
             signer_after_ms: 100,
         },
         "exec-remote/v1",
     )
     .await;
     let dir = tempfile::tempdir().unwrap();
-    shorten_hinted_retry_budget(dir.path(), 150);
+    shorten_hinted_retry_budget(dir.path(), 6000);
     let mut clock = PausedDrainingClock::new(dir.path());
     let registry = registry();
     let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
     let first = clock.now();
-    clock.expect_sleep(first, first + 500).await;
-    clock.advance(500);
-    clock.expect_sleep(first + 500, first + 600).await;
+    clock.expect_sleep(first, first + 1000).await;
+    clock.advance(10_000);
+    clock.expect_sleep(first + 10_000, first + 15_000).await;
     assert_eq!(exec_runs(&daemon).len(), 2);
-    clock.advance(100);
+    clock.advance(5000);
     let done = terminal(&registry, &task).await;
     assert_eq!(done.exit_code, Some(0), "{done:?}");
     assert!(done.remote_refusal.is_none(), "{done:?}");
@@ -11064,7 +11652,7 @@ async fn runon_signer_retry_follows_a_draining_resubmission_resumed_after_restar
     let daemon = crate::exec_remote::wire_tests::daemon_with_clients(
         Script::DrainingThenSigner {
             signer_refusals: 1,
-            draining_after_ms: 200,
+            draining_after_ms: 10_000,
             signer_after_ms: 100,
         },
         "exec-remote/v1",
@@ -11072,7 +11660,7 @@ async fn runon_signer_retry_follows_a_draining_resubmission_resumed_after_restar
     )
     .await;
     let dir = tempfile::tempdir().unwrap();
-    shorten_hinted_retry_budget(dir.path(), 150);
+    shorten_hinted_retry_budget(dir.path(), 6000);
     let mut clock = PausedDrainingClock::new(dir.path());
     stopped_draining_roots()
         .lock()
@@ -11084,11 +11672,11 @@ async fn runon_signer_retry_follows_a_draining_resubmission_resumed_after_restar
     let restarted = registry();
     restarted.replay_session(dir.path(), "session").unwrap();
     let first = clock.now();
-    clock.expect_sleep(first, first + 200).await;
-    clock.advance(200);
-    clock.expect_sleep(first + 200, first + 300).await;
+    clock.expect_sleep(first, first + 1000).await;
+    clock.advance(10_000);
+    clock.expect_sleep(first + 10_000, first + 15_000).await;
     assert_eq!(exec_runs(&daemon).len(), 2);
-    clock.advance(100);
+    clock.advance(5000);
     let done = terminal(&restarted, &task).await;
     assert_eq!(done.exit_code, Some(0), "{done:?}");
     assert!(done.remote_refusal.is_none(), "{done:?}");
@@ -11112,14 +11700,14 @@ async fn runon_signer_retry_that_wakes_after_the_deadline_surfaces_the_refusal()
     )
     .await;
     let dir = tempfile::tempdir().unwrap();
-    shorten_hinted_retry_budget(dir.path(), 3000);
+    shorten_hinted_retry_budget(dir.path(), 6000);
     let mut clock = PausedDrainingClock::new(dir.path());
     let registry = registry();
     let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
     let first = clock.now();
-    clock.expect_sleep(first, first + 2000).await;
-    // The worker wakes 5 s after the first submission, 2 s past its deadline.
-    clock.advance(5000);
+    clock.expect_sleep(first, first + 5000).await;
+    // The worker wakes 10 s after the first submission, 4 s past its deadline.
+    clock.advance(10_000);
     let done = terminal(&registry, &task).await;
     assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
     assert_runon_refusal(&refusal_response(done), SIGNER_REFUSED);
@@ -11128,7 +11716,7 @@ async fn runon_signer_retry_that_wakes_after_the_deadline_surfaces_the_refusal()
 }
 
 /// A zero hint on a job whose admission time is already used up sends
-/// nothing either, although it needs no wait at all.
+/// nothing either: the minimum retry delay exceeds the admission time left.
 #[tokio::test]
 async fn runon_signer_zero_hint_after_the_deadline_surfaces_the_refusal() {
     let daemon = daemon(
@@ -11235,14 +11823,14 @@ async fn bash_kill_scope_settles_while_signer_retry_waits() {
     let scope = owner_scope("signer-wait");
     let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
     let first = clock.now();
-    clock.expect_sleep(first, first + 2000).await;
+    clock.expect_sleep(first, first + 5000).await;
     assert_pause_settles_promptly(&registry, start_kill_scope(&registry, &scope), &task).await;
     // The retry clock never moved: cancellation, not the hint, woke the worker.
     assert_eq!(clock.now(), first);
     remote_worker_exited(&task).await;
     assert_paused(&registry, &task);
     // Give a worker that wrongly kept waiting its chance to resubmit.
-    clock.advance(2000);
+    clock.advance(5000);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
     assert_signer_retry_pause_saved(&registry.task(&task).unwrap().paths.json);
@@ -11259,15 +11847,15 @@ async fn bash_kill_scope_settles_when_paused_just_before_signer_resubmit() {
     let scope = owner_scope("signer-resubmit");
     let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
     let first = clock.now();
-    clock.expect_sleep(first, first + 2000).await;
+    clock.expect_sleep(first, first + 5000).await;
     let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeHintedResubmit);
-    clock.advance(2000);
+    clock.advance(5000);
     gate.reached().await;
     let operation = start_kill_scope(&registry, &scope);
     pause_recorded(&registry, &task).await;
     gate.release();
     assert_pause_settles_promptly(&registry, operation, &task).await;
-    assert_eq!(clock.now(), first + 2000);
+    assert_eq!(clock.now(), first + 5000);
     remote_worker_exited(&task).await;
     assert_paused(&registry, &task);
     assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
@@ -11322,7 +11910,7 @@ async fn bash_kill_scope_never_resubmits_a_saved_signer_refusal() {
     original.detach();
     let (local_task, local_pid) = start_saved_term_ignoring_task(dir.path(), &scope).await;
     // The hint has passed by the time the owner pauses the restarted module.
-    clock.advance(2000);
+    clock.advance(5000);
     let reply = kill_scope_with_saved_tasks(dir.path(), &scope).await;
     assert_eq!(
         exec_runs(&daemon).len(),
@@ -11396,8 +11984,8 @@ async fn bash_kill_scope_settles_when_paused_as_a_signer_resubmit_fails_unsent()
     let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeNoStartRefusal);
     let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
     let first = clock.now();
-    clock.expect_sleep(first, first + 2000).await;
-    clock.advance(2000);
+    clock.expect_sleep(first, first + 5000).await;
+    clock.advance(5000);
     gate.reached().await;
     let operation = start_kill_scope(&registry, &scope);
     pause_recorded(&registry, &task).await;
@@ -11430,8 +12018,8 @@ async fn bash_kill_scope_settles_when_paused_as_a_draining_resubmit_fails_unsent
     let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeNoStartRefusal);
     let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
     let first = clock.now();
-    clock.expect_sleep(first, first + 200).await;
-    clock.advance(200);
+    clock.expect_sleep(first, first + 1000).await;
+    clock.advance(5000);
     gate.reached().await;
     let operation = start_kill_scope(&registry, &scope);
     pause_recorded(&registry, &task).await;
@@ -11881,4 +12469,580 @@ async fn bash_kill_scope_withdraws_submission_before_acceptance() {
         "no job ID was known for exec.cancel"
     );
     daemon.acceptance_gate.notify_one();
+}
+
+async fn submission_daemon(
+    never_accepted: bool,
+    mismatch: bool,
+    always_unknown: bool,
+    clients: usize,
+) -> crate::exec_remote::wire_tests::Daemon {
+    crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::Submission {
+            never_accepted,
+            mismatch,
+            always_unknown,
+            disconnect: false,
+        },
+        &["exec-remote/v1", "exec-remote-submission-key/v1"],
+        clients,
+    )
+    .await
+}
+
+fn submission_runs(daemon: &crate::exec_remote::wire_tests::Daemon) -> Vec<serde_json::Value> {
+    daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, body)| body["method"] == "exec.run")
+        .map(|(_, body)| body["params"].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn submission_key_attach_resumes_output_exactly_once() {
+    let daemon = submission_daemon(false, false, false, 1).await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    let task = registry.task(&task_id).unwrap();
+    assert_eq!(
+        fs::read_to_string(&task.paths.stdout).unwrap(),
+        "line-0\nline-1\nline-2\nline-3\n"
+    );
+    let runs = submission_runs(&daemon);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0]["submission_key"], format!("aft:{task_id}"));
+    assert_eq!(runs[1]["resume_from_seq"], 1);
+    let mut resumed = runs[1].clone();
+    resumed.as_object_mut().unwrap().remove("resume_from_seq");
+    assert_eq!(resumed, runs[0]);
+    let durable = read_task(&task.paths.json).unwrap();
+    assert_eq!(durable.remote.as_ref().unwrap().job_id, Some(id()));
+    assert!(
+        durable
+            .remote
+            .as_ref()
+            .unwrap()
+            .submission
+            .as_ref()
+            .unwrap()
+            .reattached
+    );
+}
+
+#[tokio::test]
+async fn submission_key_never_accepted_uses_one_new_key() {
+    let daemon = submission_daemon(true, false, false, 1).await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    let runs = submission_runs(&daemon);
+    assert_eq!(runs.len(), 3);
+    assert_eq!(runs[0]["submission_key"], runs[1]["submission_key"]);
+    assert_ne!(runs[1]["submission_key"], runs[2]["submission_key"]);
+    assert!(runs[2].get("resume_from_seq").is_none());
+    let task = registry.task(&task_id).unwrap();
+    let durable = serde_json::to_value(read_task(&task.paths.json).unwrap()).unwrap();
+    assert_eq!(
+        durable["remote"]["submission"]["key"],
+        runs[2]["submission_key"]
+    );
+}
+
+#[tokio::test]
+async fn submission_key_without_capability_is_never_sent_or_retried() {
+    let daemon = daemon(Script::Lost, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    assert_eq!(
+        terminal(&registry, &task_id).await.info.status,
+        BgTaskStatus::FateUnknown
+    );
+    let runs = submission_runs(&daemon);
+    assert_eq!(runs.len(), 1);
+    assert!(runs[0].get("submission_key").is_none(), "{runs:?}");
+    assert!(runs[0].get("resume_from_seq").is_none());
+}
+
+#[tokio::test]
+async fn submission_key_mismatch_preserves_existing_job_for_cancel() {
+    let daemon = submission_daemon(false, true, false, 2).await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown);
+    assert_eq!(submission_runs(&daemon).len(), 2);
+    assert!(
+        done.remote_refusal.is_none(),
+        "the retry's refusal is not proof about the existing job"
+    );
+    assert!(
+        done.output_preview.contains("submission_key_mismatch"),
+        "{done:?}"
+    );
+    let task = registry.task(&task_id).unwrap();
+    assert_eq!(
+        read_task(&task.paths.json).unwrap().remote.unwrap().job_id,
+        Some(id())
+    );
+    let recorded_id = read_task(&task.paths.json)
+        .unwrap()
+        .remote
+        .unwrap()
+        .job_id
+        .unwrap();
+    let client = ExecRemoteClient::connect(
+        &daemon.connection,
+        subc_protocol::BindIdentity::new(dir.path().display().to_string(), "broca", "session"),
+    )
+    .await
+    .unwrap();
+    client.cancel_job(recorded_id).await.unwrap();
+    daemon.wait_for_requests("exec.cancel", 1).await;
+    let log = daemon.log.lock().unwrap();
+    assert_eq!(
+        log.iter()
+            .find(|(_, b)| b["method"] == "exec.cancel")
+            .unwrap()
+            .1["params"]["job_id"],
+        id().to_string()
+    );
+}
+
+async fn stopped_submission(
+    dir: &Path,
+    daemon: &crate::exec_remote::wire_tests::Daemon,
+) -> (BgTaskRegistry, String) {
+    stopped_draining_roots().lock().unwrap().insert(dir.into());
+    let registry = registry();
+    let task_id = start(&registry, dir, daemon.connection.clone());
+    remote_worker_exited(&task_id).await;
+    (registry, task_id)
+}
+
+#[tokio::test]
+async fn submission_key_restart_restores_request_key_and_output_cursor() {
+    let daemon = submission_daemon(false, false, false, 2).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (old, task_id) = stopped_submission(dir.path(), &daemon).await;
+    let task = old.task(&task_id).unwrap();
+    let saved = read_task(&task.paths.json).unwrap();
+    assert_eq!(saved.remote.as_ref().unwrap().last_seq, Some(1));
+    let value = serde_json::to_value(&saved).unwrap();
+    assert_eq!(
+        value["remote"]["submission"]["key"],
+        format!("aft:{task_id}")
+    );
+    drop(task);
+    drop(old);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    assert_eq!(
+        terminal(&restarted, &task_id).await.info.status,
+        BgTaskStatus::Completed
+    );
+    let task = restarted.task(&task_id).unwrap();
+    assert_eq!(
+        fs::read_to_string(&task.paths.stdout).unwrap(),
+        "line-0\nline-1\nline-2\nline-3\n"
+    );
+    let runs = submission_runs(&daemon);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[1]["resume_from_seq"], 1);
+    assert_eq!(runs[1]["submission_key"], runs[0]["submission_key"]);
+}
+
+#[tokio::test]
+async fn submission_key_older_than_retention_is_not_resubmitted() {
+    let daemon = submission_daemon(false, false, false, 2).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (old, task_id) = stopped_submission(dir.path(), &daemon).await;
+    let task = old.task(&task_id).unwrap();
+    let mut value = serde_json::to_value(read_task(&task.paths.json).unwrap()).unwrap();
+    assert!(value["remote"]["submission"].is_object());
+    value["remote"]["submission"]["created_at_ms"] =
+        serde_json::json!(unix_millis() - 24 * 60 * 60 * 1000);
+    write_task(&task.paths.json, &serde_json::from_value(value).unwrap()).unwrap();
+    drop(task);
+    drop(old);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    assert_eq!(
+        terminal(&restarted, &task_id).await.info.status,
+        BgTaskStatus::FateUnknown
+    );
+    assert_eq!(submission_runs(&daemon).len(), 1);
+}
+
+#[test]
+fn submission_key_reattachment_copy_is_not_enabled_without_approval() {
+    assert_eq!(REATTACHED_RESULT_SENTENCE, None);
+}
+
+#[tokio::test]
+async fn submission_key_recovery_attempts_are_bounded() {
+    let daemon = submission_daemon(false, false, true, 1).await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    assert_eq!(
+        terminal(&registry, &task_id).await.info.status,
+        BgTaskStatus::FateUnknown
+    );
+    let runs = submission_runs(&daemon);
+    assert_eq!(runs.len(), 4);
+    let task = registry.task(&task_id).unwrap();
+    assert_eq!(
+        read_task(&task.paths.json).unwrap().remote.unwrap().job_id,
+        Some(id())
+    );
+    for run in &runs[1..] {
+        assert_eq!(run["submission_key"], runs[0]["submission_key"]);
+        assert_eq!(run["resume_from_seq"], 1);
+    }
+}
+
+#[tokio::test]
+async fn submission_key_closed_runner_time_budget_is_not_resubmitted() {
+    let daemon = submission_daemon(false, false, false, 2).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (old, task_id) = stopped_submission(dir.path(), &daemon).await;
+    let task = old.task(&task_id).unwrap();
+    let mut saved = read_task(&task.paths.json).unwrap();
+    saved.started_at =
+        unix_millis() - saved.timeout_ms.unwrap() - duration_ms(RUNNER_QUEUE_WAIT_LIMIT) - 1;
+    write_task(&task.paths.json, &saved).unwrap();
+    drop(task);
+    drop(old);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    assert_eq!(
+        terminal(&restarted, &task_id).await.info.status,
+        BgTaskStatus::FateUnknown
+    );
+    assert_eq!(submission_runs(&daemon).len(), 1);
+}
+
+#[tokio::test]
+async fn submission_key_daemon_restart_reconnects_before_resubmission() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::Submission {
+            never_accepted: false,
+            mismatch: false,
+            always_unknown: false,
+            disconnect: true,
+        },
+        &["exec-remote/v1", "exec-remote-submission-key/v1"],
+        2,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    let done = terminal(&registry, &task_id).await;
+    let operations: Vec<_> = daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, body)| {
+            body.get("method")
+                .or_else(|| body.get("op"))
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(
+        done.info.status,
+        BgTaskStatus::Completed,
+        "{done:?}; operations: {operations:?}"
+    );
+    let task = registry.task(&task_id).unwrap();
+    assert_eq!(
+        fs::read_to_string(&task.paths.stdout).unwrap(),
+        "line-0\nline-1\nline-2\nline-3\n"
+    );
+    let runs = submission_runs(&daemon);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0]["submission_key"], runs[1]["submission_key"]);
+    assert_eq!(runs[1]["resume_from_seq"], 1);
+}
+
+#[tokio::test]
+async fn submission_key_restart_before_acceptance_replays_from_beginning() {
+    let daemon = submission_daemon(false, false, false, 2).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (old, task_id) = stopped_submission(dir.path(), &daemon).await;
+    let task = old.task(&task_id).unwrap();
+    let mut saved = read_task(&task.paths.json).unwrap();
+    let remote = saved.remote.as_mut().unwrap();
+    remote.accepted = false;
+    remote.job_id = None;
+    remote.last_seq = None;
+    remote.stdout_len = 0;
+    remote.output_received = false;
+    remote.terminal = None;
+    write_task(&task.paths.json, &saved).unwrap();
+    drop(task);
+    drop(old);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    assert_eq!(
+        terminal(&restarted, &task_id).await.info.status,
+        BgTaskStatus::Completed
+    );
+    let task = restarted.task(&task_id).unwrap();
+    assert_eq!(
+        fs::read_to_string(&task.paths.stdout).unwrap(),
+        "line-0\nline-1\nline-2\nline-3\n"
+    );
+    let runs = submission_runs(&daemon);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[1]["submission_key"], runs[0]["submission_key"]);
+    assert!(runs[1].get("resume_from_seq").is_none());
+}
+
+#[tokio::test]
+async fn submission_key_queue_wait_does_not_consume_execution_timeout() {
+    let daemon = submission_daemon(false, false, false, 2).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (old, task_id) = stopped_submission(dir.path(), &daemon).await;
+    let task = old.task(&task_id).unwrap();
+    let mut saved = read_task(&task.paths.json).unwrap();
+    saved.started_at = unix_millis() - saved.timeout_ms.unwrap() - 1;
+    let remote = saved.remote.as_mut().unwrap();
+    remote.submission.as_mut().unwrap().created_at_ms = saved.started_at;
+    // Recover the checkpoint from admission, before any execution was observed.
+    remote.last_seq = None;
+    remote.stdout_len = 0;
+    remote.output_received = false;
+    remote.terminal = None;
+    write_task(&task.paths.json, &saved).unwrap();
+    drop(task);
+    drop(old);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    assert_eq!(
+        terminal(&restarted, &task_id).await.info.status,
+        BgTaskStatus::Completed
+    );
+    assert_eq!(submission_runs(&daemon).len(), 2);
+}
+
+fn lost_submission_roots() -> &'static Mutex<HashSet<PathBuf>> {
+    static ROOTS: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub(super) fn lose_submission_replies(root: &Path) -> bool {
+    lost_submission_roots()
+        .lock()
+        .unwrap()
+        .contains(&test_clock_key(root))
+}
+
+struct LostSubmissionReplies(PathBuf);
+
+impl LostSubmissionReplies {
+    fn new(root: &Path) -> Self {
+        let root = test_clock_key(root);
+        assert!(lost_submission_roots().lock().unwrap().insert(root.clone()));
+        Self(root)
+    }
+}
+
+impl Drop for LostSubmissionReplies {
+    fn drop(&mut self) {
+        lost_submission_roots().lock().unwrap().remove(&self.0);
+    }
+}
+
+async fn review_daemon(script: Script, clients: usize) -> crate::exec_remote::wire_tests::Daemon {
+    crate::exec_remote::wire_tests::daemon_with_capabilities(
+        script,
+        &["exec-remote/v1", "exec-remote-submission-key/v1"],
+        clients,
+    )
+    .await
+}
+
+async fn fresh_reply_loss_never_runs_locally(restored: bool) {
+    let daemon = review_daemon(
+        Script::SubmissionFreshReplyLost,
+        if restored { 2 } else { 1 },
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    ensure_git_fixture(dir.path());
+    let _loss = LostSubmissionReplies::new(dir.path());
+    if restored {
+        stopped_draining_roots()
+            .lock()
+            .unwrap()
+            .insert(dir.path().into());
+    }
+    let old = registry();
+    let counter = dir.path().join("local-spawn-counter");
+    let task_id = old
+        .spawn_remote(
+            launch(daemon.connection.clone()),
+            SpawnPlan::Unsandboxed,
+            "printf x >> \"$LOCAL_SPAWN_COUNTER\"",
+            resolve_posix_shell(),
+            "session".into(),
+            dir.path().into(),
+            HashMap::from([("LOCAL_SPAWN_COUNTER".into(), counter.display().to_string())]),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
+            dir.path().into(),
+            crate::bash_background::TaskSlot::Background { max: 10 },
+            true,
+            false,
+            Some(dir.path().into()),
+        )
+        .unwrap();
+    let registry = if restored {
+        remote_worker_exited(&task_id).await;
+        drop(old);
+        let restarted = registry();
+        restarted.replay_session(dir.path(), "session").unwrap();
+        restarted
+    } else {
+        old
+    };
+    let done = terminal(&registry, &task_id).await;
+    let local_spawns = match fs::read(&counter) {
+        Ok(bytes) => bytes.len(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+        Err(error) => panic!("read local spawn counter: {error}"),
+    };
+    assert_eq!(
+        local_spawns, 0,
+        "an uncertain fresh submission must not also run locally"
+    );
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown, "{done:?}");
+    let runs = submission_runs(&daemon);
+    assert!(
+        runs.len() >= 2,
+        "fresh dispatch must reach the fake executor"
+    );
+    assert_ne!(runs[0]["submission_key"], runs[1]["submission_key"]);
+    for request in &runs[1..] {
+        assert_eq!(request["submission_key"], runs[1]["submission_key"]);
+    }
+    let task = registry.task(&task_id).unwrap();
+    let durable = read_task(&task.paths.json).unwrap();
+    assert!(!durable.local_fallback_started);
+    assert!(durable.child_pid.is_none());
+    let remote = durable.remote.as_ref().unwrap();
+    assert_eq!(
+        serde_json::to_value(remote).unwrap()["submission"]["key"],
+        runs[1]["submission_key"]
+    );
+    assert!(remote.terminal.is_none());
+    assert!(remote.submission.as_ref().unwrap().refusal.is_none());
+    assert!(remote.submission.as_ref().unwrap().fresh_key_used);
+}
+
+#[tokio::test]
+async fn submission_review_fresh_reply_loss_never_runs_locally() {
+    fresh_reply_loss_never_runs_locally(false).await;
+}
+
+#[tokio::test]
+async fn submission_review_restored_fresh_reply_loss_never_runs_locally() {
+    fresh_reply_loss_never_runs_locally(true).await;
+}
+
+async fn expired_gap_keeps_confirmed_exit(restored: bool) {
+    for unknown in [false, true] {
+        let daemon = review_daemon(
+            Script::SubmissionGapExpired { unknown },
+            if restored { 2 } else { 1 },
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, task_id) = if restored {
+            let (old, task_id) = stopped_submission(dir.path(), &daemon).await;
+            let task = old.task(&task_id).unwrap();
+            let saved = read_task(&task.paths.json).unwrap();
+            assert!(saved.remote.as_ref().unwrap().gap_recovery.is_some());
+            drop(task);
+            drop(old);
+            let restarted = registry();
+            restarted.replay_session(dir.path(), "session").unwrap();
+            (restarted, task_id)
+        } else {
+            let registry = registry();
+            let task_id = start(&registry, dir.path(), daemon.connection.clone());
+            (registry, task_id)
+        };
+        let done = terminal(&registry, &task_id).await;
+        assert_eq!(
+            done.info.status,
+            BgTaskStatus::Completed,
+            "unknown={unknown}, {done:?}"
+        );
+        assert_eq!(done.exit_code, Some(0));
+        let task = registry.task(&task_id).unwrap();
+        assert_eq!(fs::read(&task.paths.stdout).unwrap(), b"AC");
+        let durable = read_task(&task.paths.json).unwrap();
+        assert_eq!(durable.incomplete_output, vec![(1, 1)]);
+        assert!(
+            done.output_preview
+                .contains("output lost between seq 1 and 1"),
+            "{done:?}"
+        );
+        assert!(!durable.local_fallback_started);
+        let remote = durable.remote.unwrap();
+        assert!(remote.gap_recovery.is_none());
+        assert_eq!(remote.terminal.unwrap().outcome, Outcome::Exit { code: 0 });
+    }
+}
+
+#[tokio::test]
+async fn submission_review_expired_gap_keeps_confirmed_exit() {
+    expired_gap_keeps_confirmed_exit(false).await;
+}
+
+#[tokio::test]
+async fn submission_review_restored_expired_gap_keeps_confirmed_exit() {
+    expired_gap_keeps_confirmed_exit(true).await;
+}
+
+#[tokio::test]
+async fn submission_review_current_never_accepted_allows_local_fallback() {
+    let daemon = review_daemon(Script::SubmissionFreshReplyLost, 2).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (old, task_id) = stopped_submission(dir.path(), &daemon).await;
+    let task = old.task(&task_id).unwrap();
+    let mut saved = read_task(&task.paths.json).unwrap();
+    saved
+        .remote
+        .as_mut()
+        .unwrap()
+        .submission
+        .as_mut()
+        .unwrap()
+        .attempts = SUBMISSION_RECOVERY_ATTEMPTS;
+    write_task(&task.paths.json, &saved).unwrap();
+    drop(task);
+    drop(old);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    let done = terminal(&restarted, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    assert!(done.output_preview.contains("local-proof"));
+    let task = restarted.task(&task_id).unwrap();
+    assert!(read_task(&task.paths.json).unwrap().local_fallback_started);
+    assert_eq!(submission_runs(&daemon).len(), 1);
 }

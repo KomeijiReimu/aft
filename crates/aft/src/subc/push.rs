@@ -757,11 +757,10 @@ fn matching_route_channels(
     root: &ProjectRootId,
     frame: &PushFrame,
 ) -> Vec<RouteChannel> {
-    let Some(channels) = root_channels.get(root) else {
-        return Vec::new();
-    };
-
     if let PushFrame::Progress(progress) = frame {
+        let Some(channels) = root_channels.get(root) else {
+            return Vec::new();
+        };
         let Some(origin) = progress.origin else {
             return Vec::new();
         };
@@ -777,8 +776,25 @@ fn matching_route_channels(
         };
     }
 
-    let session = frame_session(frame);
-    let bash_observation = frame_is_bash_observation(frame);
+    matching_session_route_channels(
+        routes,
+        root_channels,
+        root,
+        frame_session(frame),
+        frame_is_bash_observation(frame),
+    )
+}
+
+fn matching_session_route_channels(
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    root: &ProjectRootId,
+    session: Option<&str>,
+    bash_observation: bool,
+) -> Vec<RouteChannel> {
+    let Some(channels) = root_channels.get(root) else {
+        return Vec::new();
+    };
     channels
         .iter()
         .copied()
@@ -1196,6 +1212,7 @@ pub(super) fn drain_reliable_push_turn(
 pub(super) struct StatusPushes {
     pending: HashMap<ProjectRootId, PendingStatus>,
     published: HashMap<RouteChannel, u64>,
+    awaiting_binds: HashSet<ProjectRootId>,
 }
 
 struct PendingStatus {
@@ -1205,11 +1222,17 @@ struct PendingStatus {
     recipients: VecDeque<RouteChannel>,
     cursor: Option<RouteChannel>,
     session: Option<String>,
+    queued_recipients: HashSet<RouteChannel>,
 }
 
 const STATUS_FANOUT_TURN_BYTES: usize = 1024 * 1024;
 
 impl StatusPushes {
+    pub(super) fn awaiting_binds(&mut self, roots: impl Iterator<Item = ProjectRootId>) {
+        self.awaiting_binds.clear();
+        self.awaiting_binds.extend(roots);
+    }
+
     fn queue(
         &mut self,
         root: ProjectRootId,
@@ -1239,6 +1262,7 @@ impl StatusPushes {
                 recipients: VecDeque::new(),
                 cursor,
                 session,
+                queued_recipients: HashSet::new(),
             },
         );
     }
@@ -1255,6 +1279,9 @@ impl StatusPushes {
         self.published
             .retain(|channel, _| routes.contains_key(channel));
         for (root, pending) in &mut self.pending {
+            pending
+                .queued_recipients
+                .retain(|channel| routes.contains_key(channel));
             if let Some(frame) = pending.frame.take() {
                 let envelope = PushFrame::StatusChanged(frame);
                 let mut recipients = matching_route_channels(routes, roots, root, &envelope);
@@ -1268,7 +1295,7 @@ impl StatusPushes {
                         recipients.rotate_left(start % len);
                     }
                 }
-                if !recipients.is_empty() {
+                if !recipients.is_empty() || self.awaiting_binds.contains(root) {
                     let PushFrame::StatusChanged(frame) = envelope else {
                         unreachable!()
                     };
@@ -1277,6 +1304,21 @@ impl StatusPushes {
                     pending.body = Some(Arc::new(body.bytes));
                     pending.recipients = recipients.into();
                 }
+            }
+            // The ACK may finish after a snapshot was sent to existing routes.
+            // Retain only its bounded bytes and session, then select any newly
+            // published siblings without sending the snapshot twice to old ones.
+            if pending.body.is_some() && pending.recipients.is_empty() {
+                let mut recipients = matching_session_route_channels(
+                    routes,
+                    roots,
+                    root,
+                    pending.session.as_deref(),
+                    false,
+                );
+                recipients.retain(|channel| !pending.queued_recipients.contains(channel));
+                recipients.sort_by_key(|route| (route.channel, route.epoch));
+                pending.recipients = recipients.into();
             }
             let Some(body) = pending.body.as_ref() else {
                 continue;
@@ -1303,6 +1345,7 @@ impl StatusPushes {
                         .get(&channel)
                         .is_some_and(|latest| order <= *latest)
                 }) {
+                    pending.queued_recipients.insert(channel);
                     pending.recipients.pop_front();
                     continue;
                 }
@@ -1314,6 +1357,7 @@ impl StatusPushes {
                 }
                 match try_send_shared_push_body(writer, metrics, channel, Arc::clone(body)) {
                     PushSendOutcome::Sent => {
+                        pending.queued_recipients.insert(channel);
                         if let Some(order) = pending.order {
                             // The writer's FIFO now owns this snapshot, even if
                             // the socket has not written it yet.
@@ -1329,8 +1373,11 @@ impl StatusPushes {
                 }
             }
         }
-        self.pending
-            .retain(|_, pending| pending.frame.is_some() || !pending.recipients.is_empty());
+        self.pending.retain(|root, pending| {
+            self.awaiting_binds.contains(root)
+                || pending.frame.is_some()
+                || !pending.recipients.is_empty()
+        });
     }
 }
 

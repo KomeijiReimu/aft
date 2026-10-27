@@ -57,7 +57,8 @@ use super::process::terminate_pgid;
 #[cfg(windows)]
 use super::process::terminate_pid;
 use super::process::{
-    is_process_alive, is_recorded_process_alive, live_process_group_members, LiveDescendant,
+    is_process_alive, is_recorded_process_alive, live_process_group_members, GroupListing,
+    LiveDescendant, LiveDescendantsUnavailable, ProcessIdentity,
 };
 use super::pty_process::spawn_pty_for_command;
 use super::pty_runtime::PtyRuntime;
@@ -184,7 +185,7 @@ pub(crate) fn ledger_spawn_for_test() -> Option<crate::db::call_ledger::Key> {
 /// How far past the last written hard-kill limit a renewal must reach before
 /// it is written to the task's record (see `BgTaskRegistry::renew_hard_kill`).
 pub(crate) const RENEWAL_PERSIST_STEP_MS: u64 = 60_000;
-const PERSISTED_GC_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+pub(super) const PERSISTED_GC_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 const QUARANTINE_GC_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// Bounded retries keep transient file locks from losing task history forever.
 const FINISHED_DELETE_MAX_ATTEMPTS: usize = 5;
@@ -236,6 +237,24 @@ fn with_memory_prepare_gate_for_test<R>(
     run()
 }
 
+#[cfg(test)]
+thread_local! {
+    static GC_AFTER_START_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn with_gc_after_start_for_test<R>(hook: impl FnOnce() + 'static, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Box<dyn FnOnce()>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            GC_AFTER_START_FOR_TEST.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(GC_AFTER_START_FOR_TEST.with(|slot| slot.replace(Some(Box::new(hook)))));
+    run()
+}
+
 /// How long a reader that must answer with a settled status (`bash_status`,
 /// a second kill) waits for a kill already in flight on the same task: the
 /// SIGTERM grace period plus a margin for the SIGKILL, the reap and the
@@ -282,8 +301,8 @@ enum KillSignalPlan {
     Nothing,
     /// Another kill is signaling this task; wait for its outcome.
     AwaitOtherKill,
-    /// The task is already terminal but members of its process group were
-    /// still alive when it ended.
+    /// The task is already terminal and its process group is evidently still
+    /// its own: the leader or a member a check found is still running in it.
     TerminalSurvivors { pgid: i32, live_count: usize },
     /// Signal a piped task's process group and reap its direct child.
     Piped {
@@ -355,6 +374,10 @@ fn terminate_piped_task(
 #[cfg(unix)]
 const KILL_GROUP_SETTLEMENT_GRACE: Duration = Duration::from_secs(2);
 
+/// Longest a completion notice waits for a process-group check another caller
+/// has started. The check is one listing of the group, normally milliseconds.
+const FIRST_GROUP_SAMPLE_WAIT: Duration = Duration::from_secs(2);
+
 #[cfg(all(test, unix))]
 static TERM_ONLY_KILL_TASKS: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
     std::sync::OnceLock::new();
@@ -389,9 +412,7 @@ fn settle_killed_process_group(task_id: &str, pgid: Option<i32>) {
         }
         // Zombies cannot run or retain output pipes. An unreaped orphan may
         // still make killpg(0) succeed, but is not a live descendant to report.
-        if live_process_group_members(pgid)
-            .is_some_and(|(members, omitted)| members.is_empty() && omitted == 0)
-        {
+        if live_process_group_members(pgid).is_ok_and(|listing| listing.is_clean()) {
             return;
         }
         #[cfg(test)]
@@ -411,6 +432,57 @@ fn settle_killed_process_group(task_id: &str, pgid: Option<i32>) {
 
 #[cfg(not(unix))]
 fn settle_killed_process_group(_task_id: &str, _pgid: Option<i32>) {}
+
+/// Whether a finished task's process group, answering under its saved
+/// number, is still that task's group and may be signalled. The number is the
+/// group leader's pid, and once the original group has exited the system can
+/// hand it to an unrelated process. So the group is the task's only while its
+/// leader, or a member a check of this task found, is still running in it
+/// with the start time AFT recorded. Without such evidence it is left alone,
+/// even when a check could not see every member.
+fn finished_group_is_still_the_tasks(metadata: &PersistedTask, pgid: i32) -> bool {
+    let leader = u32::try_from(pgid)
+        .ok()
+        .zip(metadata.child_start_time_ms)
+        .map(|(pid, started_at_ms)| ProcessIdentity { pid, started_at_ms });
+    leader
+        .into_iter()
+        .chain(metadata.group_member_identities.iter().copied())
+        .any(|identity| identity.is_running_in_group(pgid))
+}
+
+/// Store the outcome of one check of a task's process group: the surviving
+/// members, why they could not be listed, or both when the listing was
+/// incomplete. An empty list is stored only for a clean check, so `[]` always
+/// means the group was seen to be empty.
+fn record_group_check(
+    metadata: &mut PersistedTask,
+    check: &Result<GroupListing, LiveDescendantsUnavailable>,
+) {
+    match check {
+        Ok(listing) => {
+            let found_any = !listing.members.is_empty() || listing.omitted > 0;
+            metadata.live_descendants =
+                (found_any || !listing.incomplete).then(|| listing.members.clone());
+            metadata.live_descendants_omitted = listing.omitted;
+            metadata.live_descendants_unavailable = listing
+                .incomplete
+                .then_some(LiveDescendantsUnavailable::ListingIncomplete);
+            if found_any {
+                metadata.group_member_identities = listing.identities.clone();
+                metadata.group_member_identities_truncated = listing.identities_truncated;
+            } else if !listing.incomplete {
+                metadata.group_member_identities.clear();
+                metadata.group_member_identities_truncated = false;
+            }
+        }
+        Err(reason) => {
+            metadata.live_descendants = None;
+            metadata.live_descendants_omitted = 0;
+            metadata.live_descendants_unavailable = Some(*reason);
+        }
+    }
+}
 
 /// Close a PTY's pseudoterminal so its reader reaches end-of-file and
 /// the task can finalize. On Windows, ConPTY's reader sees end-of-file only
@@ -468,6 +540,47 @@ static TERMINAL_PUBLICATION_GATES: std::sync::OnceLock<Mutex<HashMap<String, Kil
 #[cfg(test)]
 static REHYDRATED_REGISTRATION_GATES: std::sync::OnceLock<Mutex<HashMap<String, KillSignalGate>>> =
     std::sync::OnceLock::new();
+
+// Park a kill's post-kill group check after it has marked sampling as started
+// and before it lists the group, so a test can let another publisher run in
+// that window.
+#[cfg(test)]
+static GROUP_SAMPLE_GATES: std::sync::OnceLock<Mutex<HashMap<String, KillSignalGate>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(all(test, unix))]
+pub(crate) fn install_group_sample_gate_for_test(
+    task_id: &str,
+) -> (
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    GROUP_SAMPLE_GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(
+            task_id.to_string(),
+            KillSignalGate {
+                reached: reached_tx,
+                release: release_rx,
+            },
+        );
+    (reached_rx, release_tx)
+}
+
+#[cfg(test)]
+fn wait_on_group_sample_gate_for_test(task_id: &str) {
+    let gate = GROUP_SAMPLE_GATES
+        .get()
+        .and_then(|gates| gates.lock().unwrap().remove(task_id));
+    if let Some(gate) = gate {
+        let _ = gate.reached.send(());
+        let _ = gate.release.recv_timeout(Duration::from_secs(30));
+    }
+}
 
 #[cfg(test)]
 fn wait_on_rehydrated_registration_gate_for_test(task_id: &str) {
@@ -624,6 +737,10 @@ pub struct BgCompletion {
     pub live_descendants: Option<Vec<LiveDescendant>>,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub live_descendants_omitted: usize,
+    /// For a finished task, why `live_descendants` is null, or, with
+    /// `listing_incomplete`, why the list may be only part of the group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_descendants_unavailable: Option<LiveDescendantsUnavailable>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_descendants_summary: Option<String>,
 }
@@ -732,6 +849,11 @@ pub struct BgTaskSnapshot {
     pub live_descendants: Option<Vec<LiveDescendant>>,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub live_descendants_omitted: usize,
+    /// For a finished task, why `live_descendants` is null, or, with
+    /// `listing_incomplete`, why the list may be only part of the group.
+    /// Absent while the task runs and after a complete check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_descendants_unavailable: Option<LiveDescendantsUnavailable>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_descendants_summary: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -1049,6 +1171,7 @@ struct ProjectReplaySessionScan {
     session_dir: PathBuf,
     entries: fs::ReadDir,
     seen_task_ids: HashSet<String>,
+    database_task_ids: HashSet<String>,
 }
 
 struct ProjectReplayScanCursor {
@@ -1058,6 +1181,9 @@ struct ProjectReplayScanCursor {
     known_sessions: HashSet<String>,
     current: Option<ProjectReplaySessionScan>,
     failures: HashMap<String, ProjectReplayFailure>,
+    database_tasks: HashSet<(String, String)>,
+    database_incomplete_reason: Option<&'static str>,
+    database_replay_failed: bool,
     #[cfg(test)]
     total_examined: usize,
 }
@@ -1071,6 +1197,9 @@ impl ProjectReplayScanCursor {
             known_sessions: HashSet::new(),
             current: None,
             failures: HashMap::new(),
+            database_tasks: HashSet::new(),
+            database_incomplete_reason: None,
+            database_replay_failed: false,
             #[cfg(test)]
             total_examined: 0,
         }
@@ -1133,6 +1262,8 @@ struct ProjectReplayDiskBatch {
     examined: usize,
     incomplete_reason: Option<&'static str>,
     retry_deferred: bool,
+    #[cfg(test)]
+    bundle_reads: Vec<String>,
 }
 
 pub(crate) struct RegistryInner {
@@ -1421,6 +1552,8 @@ pub(crate) struct BgTask {
     terminal_persist_dirty: AtomicBool,
     pub(crate) timeout_kill_queued: AtomicBool,
     kill_settled: std::sync::Condvar,
+    /// Notified when the first process-group check saves its result.
+    descendant_sample_saved: std::sync::Condvar,
     #[cfg(unix)]
     remote_cancel_notify: tokio::sync::Notify,
     /// Harness namespace the task's aft.db row is keyed under: the harness of
@@ -1692,6 +1825,12 @@ pub(crate) struct BgTaskState {
     /// Prevent duplicate completion delivery while the post-exit process-group
     /// sample is waiting for its grace period.
     pub(crate) descendant_sampling_started: bool,
+    /// The first check of the process group has started but its result is
+    /// not saved yet. Set together with `descendant_sampling_started`, so a
+    /// publisher that skips sampling because it has started waits for this to
+    /// clear (see `finish_terminal_transition`) instead of sending a notice
+    /// built before any check.
+    pub(crate) descendant_sample_pending: bool,
     /// True while a kill has released this lock to signal and reap the
     /// process group. That kill owns the terminal transition until it clears
     /// the flag: the watchdog must not declare the task dead without an exit
@@ -2806,10 +2945,15 @@ impl BgTaskRegistry {
             }
             #[cfg(unix)]
             task.publish_runon_launch_state(&state);
-            if state.metadata.mode != BgMode::Pipes || state.descendant_sampling_started {
+            // Piped tasks are always checked. A pseudoterminal task is checked
+            // only after AFT killed its group, to report what survived.
+            let checked_mode =
+                state.metadata.mode == BgMode::Pipes || state.metadata.group_kill_sent;
+            if !checked_mode || state.descendant_sampling_started {
                 false
             } else {
                 state.descendant_sampling_started = true;
+                state.descendant_sample_pending = true;
                 true
             }
         };
@@ -2826,7 +2970,7 @@ impl BgTaskRegistry {
         let survivors_at_exit = should_sample
             && self
                 .sample_task_process_group(task)
-                .is_some_and(|(members, omitted)| !members.is_empty() || omitted > 0);
+                .is_some_and(|listing| !listing.is_clean());
         if !survivors_at_exit {
             let result = self.finish_terminal_transition(task, emit_frame);
             self.inner.terminal_transition.notify_waiters();
@@ -2851,10 +2995,7 @@ impl BgTaskRegistry {
                     );
                 }
                 registry.inner.terminal_transition.notify_waiters();
-                if settled
-                    .as_ref()
-                    .is_some_and(|(members, omitted)| !members.is_empty() || *omitted > 0)
-                {
+                if settled.as_ref().is_some_and(|listing| !listing.is_clean()) {
                     std::thread::sleep(Duration::from_millis(1_700));
                     let _ = registry.sample_task_process_group(&task);
                 }
@@ -2868,28 +3009,25 @@ impl BgTaskRegistry {
         Ok(())
     }
 
-    fn sample_task_process_group(
-        &self,
-        task: &Arc<BgTask>,
-    ) -> Option<(Vec<LiveDescendant>, usize)> {
-        let pgid = task
-            .lock_state()
-            .ok()
-            .and_then(|state| state.metadata.pgid)?;
-        let sample = live_process_group_members(pgid);
+    fn sample_task_process_group(&self, task: &Arc<BgTask>) -> Option<GroupListing> {
+        let pgid = task.lock_state().ok().map(|state| state.metadata.pgid)?;
+        let sample = match pgid {
+            Some(pgid) => live_process_group_members(pgid),
+            None => Err(LiveDescendantsUnavailable::without_group()),
+        };
         let mut db = DeferredDbWrites::new(self, task);
         if let Ok(mut state) = task.lock_state() {
-            state.metadata.live_descendants = sample.as_ref().map(|(members, _)| members.clone());
-            state.metadata.live_descendants_omitted =
-                sample.as_ref().map(|(_, omitted)| *omitted).unwrap_or(0);
+            record_group_check(&mut state.metadata, &sample);
             if let Err(error) = self.persist_task_locked(task, &state.metadata, &mut db) {
                 crate::slog_warn!(
                     "failed to persist live descendants for {}: {error}",
                     task.task_id
                 );
             }
+            state.descendant_sample_pending = false;
         }
-        sample
+        task.descendant_sample_saved.notify_all();
+        sample.ok()
     }
 
     fn finish_terminal_transition(
@@ -2901,13 +3039,36 @@ impl BgTaskRegistry {
             crate::slog_warn!("failed to clean task scratch for {}: {error}", task.task_id);
         }
         let (metadata, buffer) = {
-            let state = task
+            let mut state = task
                 .lock_state()
                 .map_err(|_| "background task lock poisoned".to_string())?;
             if !state.metadata.status.is_terminal() || state.kill_in_flight {
                 return Ok(());
             }
-            (state.metadata.clone(), state.buffer.clone())
+            // Another caller has started the first check of the process group
+            // but not saved it. A notice built now would describe a group
+            // nobody checked, and the notice is sent only once, so wait for
+            // the check (it normally takes milliseconds).
+            if state.descendant_sample_pending {
+                state = match task.descendant_sample_saved.wait_timeout_while(
+                    state,
+                    FIRST_GROUP_SAMPLE_WAIT,
+                    |state| state.descendant_sample_pending,
+                ) {
+                    Ok((state, _)) => state,
+                    Err(poison) => poison.into_inner().0,
+                };
+            }
+            let mut metadata = state.metadata.clone();
+            if state.descendant_sample_pending {
+                // The check did not finish in time: say AFT could not read
+                // every process rather than describe a clean kill.
+                metadata.live_descendants = None;
+                metadata.live_descendants_omitted = 0;
+                metadata.live_descendants_unavailable =
+                    Some(LiveDescendantsUnavailable::ListingIncomplete);
+            }
+            (metadata, state.buffer.clone())
         };
 
         let cache = self.ensure_terminal_output_cache(task);
@@ -4596,6 +4757,7 @@ impl BgTaskRegistry {
             terminal_persist_dirty: AtomicBool::new(false),
             timeout_kill_queued: AtomicBool::new(false),
             kill_settled: std::sync::Condvar::new(),
+            descendant_sample_saved: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
             remote_launch_ready: AtomicBool::new(false),
@@ -4614,6 +4776,7 @@ impl BgTaskRegistry {
                 detached: false,
                 child_exit_observed: false,
                 descendant_sampling_started: false,
+                descendant_sample_pending: false,
                 kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pipes),
                 terminal_output_cache: None,
@@ -4986,6 +5149,7 @@ impl BgTaskRegistry {
             terminal_persist_dirty: AtomicBool::new(false),
             timeout_kill_queued: AtomicBool::new(false),
             kill_settled: std::sync::Condvar::new(),
+            descendant_sample_saved: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
             remote_launch_ready: AtomicBool::new(false),
@@ -5004,6 +5168,7 @@ impl BgTaskRegistry {
                 detached: false,
                 child_exit_observed: false,
                 descendant_sampling_started: false,
+                descendant_sample_pending: false,
                 kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pty),
                 terminal_output_cache: None,
@@ -5286,6 +5451,7 @@ impl BgTaskRegistry {
             terminal_persist_dirty: AtomicBool::new(false),
             timeout_kill_queued: AtomicBool::new(false),
             kill_settled: std::sync::Condvar::new(),
+            descendant_sample_saved: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
             remote_launch_ready: AtomicBool::new(false),
@@ -5304,6 +5470,7 @@ impl BgTaskRegistry {
                 detached: false,
                 child_exit_observed: false,
                 descendant_sampling_started: false,
+                descendant_sample_pending: false,
                 kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pipes),
                 terminal_output_cache: None,
@@ -5519,7 +5686,9 @@ impl BgTaskRegistry {
             .name("aft-bash-task-gc".to_string())
             .spawn(move || {
                 let mut finish = FinishSlot(Some(slot_key));
-                if let Err(error) = registry.maybe_gc_persisted(&storage_dir) {
+                if let Err(error) =
+                    registry.scheduled_gc_persisted(&storage_dir, Instant::now(), SystemTime::now)
+                {
                     crate::slog_warn!("failed to GC persisted background bash tasks: {error}");
                 }
                 finish.finish();
@@ -5879,6 +6048,7 @@ impl BgTaskRegistry {
                     project_root.expect("project replay continuation requires a root"),
                     std::iter::empty(),
                     &HashSet::new(),
+                    false,
                 );
                 if !batch.retry_deferred || !batch.tasks.is_empty() {
                     crate::slog_info!(
@@ -5922,6 +6092,7 @@ impl BgTaskRegistry {
                         project_root,
                         disk_sessions,
                         &database_tasks,
+                        false,
                     )
                 } else {
                     let mut disk_tasks = Vec::new();
@@ -5938,6 +6109,8 @@ impl BgTaskRegistry {
                         examined: 0,
                         incomplete_reason: None,
                         retry_deferred: false,
+                        #[cfg(test)]
+                        bundle_reads: Vec::new(),
                     }
                 };
                 let mut merged = 0usize;
@@ -5970,6 +6143,7 @@ impl BgTaskRegistry {
                             project_root,
                             [session_id.to_string()],
                             &HashSet::new(),
+                            false,
                         );
                         if let Some(reason) = batch
                             .incomplete_reason
@@ -6007,6 +6181,7 @@ impl BgTaskRegistry {
                             project_root,
                             [session_id.to_string()],
                             &HashSet::new(),
+                            true,
                         );
                         if let Some(reason) = batch
                             .incomplete_reason
@@ -6032,6 +6207,7 @@ impl BgTaskRegistry {
                             project_root,
                             [session_id.to_string()],
                             &HashSet::new(),
+                            false,
                         );
                         if let Some(reason) = batch
                             .incomplete_reason
@@ -6157,7 +6333,11 @@ impl BgTaskRegistry {
                 continue;
             }
             let session_dir = session_tasks_dir(storage_dir, &metadata.session_id);
-            let resolved = match resolve_task_layout(&session_dir, &metadata.task_id) {
+            let resolved = match retry_replay_after_metadata_replacement(
+                &metadata.session_id,
+                &metadata.task_id,
+                || resolve_task_layout(&session_dir, &metadata.task_id),
+            ) {
                 Ok(task) => task,
                 Err(error) => {
                     if skip_refused_task(&metadata.task_id, "replay", &error) {
@@ -6205,7 +6385,11 @@ impl BgTaskRegistry {
                     continue;
                 }
             };
-            match read_task_at(&resolved) {
+            match retry_replay_after_metadata_replacement(
+                &metadata.session_id,
+                &metadata.task_id,
+                || read_task_at(&resolved),
+            ) {
                 Ok(disk)
                     if disk.task_id == metadata.task_id
                         && disk.session_id == metadata.session_id =>
@@ -6328,12 +6512,17 @@ impl BgTaskRegistry {
         }
         let _recovering = self.begin_session_recovery(storage_dir, session_id);
         let session_dir = session_tasks_dir(storage_dir, session_id);
-        let resolved = match resolve_task_layout(&session_dir, task_id) {
+        let resolved = match retry_replay_after_metadata_replacement(session_id, task_id, || {
+            resolve_task_layout(&session_dir, task_id)
+        }) {
             Ok(resolved) => resolved,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(format!("background task record could not be read: {error}")),
         };
-        let metadata = read_task_at(&resolved).map_err(|error| error.to_string())?;
+        let metadata = retry_replay_after_metadata_replacement(session_id, task_id, || {
+            read_task_at(&resolved)
+        })
+        .map_err(|error| error.to_string())?;
         if metadata.task_id != task_id
             || metadata.session_id != session_id
             || metadata
@@ -6404,10 +6593,11 @@ impl BgTaskRegistry {
             if let Some((harness, pool)) =
                 self.db_harness_and_pool_for_session(&metadata.session_id)
             {
+                let harness = metadata.harness.as_deref().unwrap_or(&harness);
                 let lookup = match pool.lock() {
                     Ok(conn) => crate::db::bash_tasks::get_bash_task(
                         &conn,
-                        &harness,
+                        harness,
                         &metadata.session_id,
                         &metadata.task_id,
                     )
@@ -6415,7 +6605,41 @@ impl BgTaskRegistry {
                     Err(_) => Err("db mutex poisoned".to_string()),
                 };
                 match lookup {
-                    Ok(Some(row)) => metadata.completion_delivered |= row.completion_delivered,
+                    Ok(Some(row)) => {
+                        let checkpoint_ack = row.completion_delivered
+                            && serde_json::from_str::<serde_json::Value>(&row.metadata)
+                                .ok()
+                                .is_some_and(|snapshot| {
+                                    snapshot
+                                        .get("completion_delivered")
+                                        .and_then(serde_json::Value::as_bool)
+                                        == Some(false)
+                                });
+                        metadata.completion_delivered |= row.completion_delivered;
+                        if checkpoint_ack {
+                            // Checkpoint only the authoritative acknowledgement,
+                            // not this potentially older recovery snapshot. The
+                            // next project replay can then skip the terminal row.
+                            let result =
+                                with_task_db_fence(&metadata.session_id, &metadata.task_id, || {
+                                    let conn =
+                                        pool.lock().map_err(|_| "db mutex poisoned".to_string())?;
+                                    crate::db::bash_tasks::checkpoint_bash_task_acknowledgement(
+                                        &conn,
+                                        harness,
+                                        &metadata.session_id,
+                                        &metadata.task_id,
+                                    )
+                                    .map_err(|error| error.to_string())
+                                });
+                            if let Err(error) = result {
+                                crate::slog_warn!(
+                                    "bash task replay could not checkpoint acknowledgement for {}: {error}",
+                                    metadata.task_id
+                                );
+                            }
+                        }
+                    }
                     Ok(None) => {}
                     Err(error) => {
                         *db_ack_lookup_unavailable = true;
@@ -6618,11 +6842,21 @@ impl BgTaskRegistry {
         };
         let rows = if let Some(project_root) = project_root {
             let project_key = crate::path_identity::project_scope_key(project_root);
-            crate::db::bash_tasks::list_replayable_bash_tasks_for_project(
-                &conn,
-                &harness,
-                &project_key,
-            )
+            // Disk discovery skips every DB-owned task, so recover this
+            // project's indexed rows from every harness sharing the store.
+            crate::db::bash_tasks::bash_task_harnesses(&conn).and_then(|harnesses| {
+                let mut rows = Vec::new();
+                for harness in harnesses {
+                    rows.extend(
+                        crate::db::bash_tasks::list_replayable_bash_tasks_for_project(
+                            &conn,
+                            &harness,
+                            &project_key,
+                        )?,
+                    );
+                }
+                Ok(rows)
+            })
         } else {
             crate::db::bash_tasks::list_bash_tasks_for_session(&conn, &harness, session_id)
         };
@@ -6654,7 +6888,9 @@ impl BgTaskRegistry {
 
         let mut tasks = Vec::new();
         for task_id in task_ids {
-            let task = match resolve_task_layout(&dir, &task_id) {
+            let task = match retry_replay_after_metadata_replacement(session_id, &task_id, || {
+                resolve_task_layout(&dir, &task_id)
+            }) {
                 Ok(task) => task,
                 Err(error)
                     if error.kind() == std::io::ErrorKind::NotFound
@@ -6694,7 +6930,9 @@ impl BgTaskRegistry {
                     continue;
                 }
             };
-            match read_task_at(&task) {
+            match retry_replay_after_metadata_replacement(session_id, &task_id, || {
+                read_task_at(&task)
+            }) {
                 Ok(metadata) if metadata.session_id == session_id => tasks.push(metadata),
                 Ok(_) => {
                     crate::slog_warn!(
@@ -6737,12 +6975,54 @@ impl BgTaskRegistry {
         Ok(tasks)
     }
 
+    fn replay_database_task_ids(&self, session_id: &str) -> Result<HashSet<String>, &'static str> {
+        let pool = self
+            .inner
+            .db_pool
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .ok_or("task database unavailable")?;
+        let conn = pool.lock().map_err(|_| "task database unavailable")?;
+        crate::db::bash_tasks::list_bash_task_ids_for_session(&conn, session_id).map_err(|error| {
+            crate::slog_warn!("bash replay ownership lookup failed for {session_id}: {error}");
+            "task database ownership lookup failed"
+        })
+    }
+
+    fn record_replay_discovery(
+        &self,
+        metadata: &PersistedTask,
+        paths: &TaskPaths,
+    ) -> Result<(), &'static str> {
+        let (harness, pool) = self
+            .db_harness_and_pool_for_session(&metadata.session_id)
+            .ok_or("task database unavailable")?;
+        let result = with_task_db_fence(&metadata.session_id, &metadata.task_id, || {
+            let harness = metadata.harness.as_deref().unwrap_or(&harness);
+            let row = metadata
+                .to_bash_task_row(harness, paths)
+                .map_err(|error| error.to_string())?;
+            let conn = pool.lock().map_err(|_| "db mutex poisoned".to_string())?;
+            crate::db::bash_tasks::insert_bash_task_if_missing(&conn, &row)
+                .map_err(|error| error.to_string())
+        });
+        result.map_err(|error| {
+            crate::slog_warn!(
+                "bash replay could not record disk task {}: {error}",
+                metadata.task_id
+            );
+            "disk task database recording failed"
+        })
+    }
+
     fn replay_session_from_disk_for_project(
         &self,
         storage_dir: &Path,
         project_root: &Path,
         sessions: impl IntoIterator<Item = String>,
         database_tasks: &HashSet<(String, String)>,
+        database_replay_failed: bool,
     ) -> ProjectReplayDiskBatch {
         let project_root = canonicalized_path(project_root);
         // Session directory names are hashed, and one session can contain tasks
@@ -6789,11 +7069,26 @@ impl BgTaskRegistry {
         }
         let cursor = scan_slot.as_mut().expect("project replay cursor installed");
         cursor.enqueue_sessions(sessions);
+        // Continuations do not repeat the project query. Keep its exclusions
+        // until the saved directory iterator is exhausted.
+        cursor.database_tasks.extend(database_tasks.iter().cloned());
+        cursor.database_replay_failed |= database_replay_failed;
+        if cursor.database_replay_failed {
+            // A failed row query may still leave ID-only lookups working.
+            // Those IDs cannot exclude files needed for disk recovery.
+            cursor.database_incomplete_reason = Some("project database replay failed");
+            cursor.database_tasks.clear();
+            if let Some(current) = cursor.current.as_mut() {
+                current.database_task_ids.clear();
+            }
+        }
 
         let started = Instant::now();
         let mut examined = 0usize;
         let mut tasks = Vec::new();
         let mut incomplete_reason = None;
+        #[cfg(test)]
+        let mut bundle_reads = Vec::new();
         loop {
             if cursor.current.is_none() && cursor.sessions.is_empty() {
                 break;
@@ -6817,11 +7112,26 @@ impl BgTaskRegistry {
                 let session_dir = session_tasks_dir(storage_dir, &session_id);
                 match fs::read_dir(&session_dir) {
                     Ok(entries) => {
+                        // The project query returns only tasks needing recovery.
+                        // Include all indexed IDs here, even completed tasks and
+                        // other projects, to avoid reopening their metadata files.
+                        let database_task_ids = match if cursor.database_replay_failed {
+                            Ok(HashSet::new())
+                        } else {
+                            self.replay_database_task_ids(&session_id)
+                        } {
+                            Ok(ids) => ids,
+                            Err(reason) => {
+                                cursor.database_incomplete_reason = Some(reason);
+                                HashSet::new()
+                            }
+                        };
                         cursor.current = Some(ProjectReplaySessionScan {
                             session_id,
                             session_dir,
                             entries,
                             seen_task_ids: HashSet::new(),
+                            database_task_ids,
                         });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -6918,29 +7228,52 @@ impl BgTaskRegistry {
                 }
                 (current.session_id.clone(), current.session_dir.clone())
             };
-            if database_tasks.contains(&(session_id.clone(), task_id.to_string()))
+            if cursor
+                .database_tasks
+                .contains(&(session_id.clone(), task_id.to_string()))
+                || cursor
+                    .current
+                    .as_ref()
+                    .expect("current session")
+                    .database_task_ids
+                    .contains(task_id)
                 || self.task_for_session(task_id, &session_id).is_some()
             {
                 continue;
             }
-            let resolved = match resolve_uninitialized_task_layout(&session_dir, task_id) {
-                Ok(resolved) => resolved,
-                Err(_) => continue,
-            };
-            let metadata = match read_task_at(&resolved) {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    crate::slog_warn!(
-                        "failed to read Bash task {task_id} during project replay: {error}"
-                    );
-                    continue;
-                }
-            };
+            let resolved =
+                match retry_replay_after_metadata_replacement(&session_id, task_id, || {
+                    resolve_uninitialized_task_layout(&session_dir, task_id)
+                }) {
+                    Ok(resolved) => resolved,
+                    Err(_) => continue,
+                };
+            #[cfg(test)]
+            bundle_reads.push(task_id.to_string());
+            let metadata =
+                match retry_replay_after_metadata_replacement(&session_id, task_id, || {
+                    read_task_at(&resolved)
+                }) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        crate::slog_warn!(
+                            "failed to read Bash task {task_id} during project replay: {error}"
+                        );
+                        continue;
+                    }
+                };
             if metadata.task_id != task_id
                 || metadata.session_id != session_id
                 || session_tasks_dir(storage_dir, &metadata.session_id) != session_dir
             {
                 continue;
+            }
+            // Index every valid unindexed file before filtering by project or
+            // delivery state, so later replays do not decode the file again.
+            // An existing row may already record a client-acknowledged completion
+            // and must not be replaced with this older disk snapshot.
+            if let Err(reason) = self.record_replay_discovery(&metadata, &resolved.paths) {
+                cursor.database_incomplete_reason = Some(reason);
             }
             if metadata.is_terminal() && metadata.completion_delivered {
                 continue;
@@ -6955,6 +7288,9 @@ impl BgTaskRegistry {
         }
 
         let retry_deferred = cursor.retry_at().is_some();
+        if incomplete_reason.is_none() {
+            incomplete_reason = cursor.database_incomplete_reason;
+        }
         if retry_deferred {
             incomplete_reason = Some("session directory retry deferred");
         }
@@ -6966,6 +7302,8 @@ impl BgTaskRegistry {
             examined,
             incomplete_reason,
             retry_deferred,
+            #[cfg(test)]
+            bundle_reads,
         }
     }
 
@@ -7985,7 +8323,41 @@ impl BgTaskRegistry {
         }
     }
 
+    /// Run one explicit bounded validation slice and any due deadline work.
+    /// Recurring/replay requests additionally rate-limit validation slices.
     pub fn maybe_gc_persisted(&self, storage_dir: &Path) -> Result<usize, String> {
+        self.gc_persisted_with_clock(storage_dir, SystemTime::now, true)
+    }
+
+    fn scheduled_gc_persisted(
+        &self,
+        storage_dir: &Path,
+        now: Instant,
+        clock: impl FnMut() -> SystemTime,
+    ) -> Result<usize, String> {
+        let memo = super::gc_memo::GcMemo::new(canonicalized_path(&storage_dir.join("bash-tasks")));
+        self.gc_persisted_with_clock(storage_dir, clock, memo.validation_due(now))
+    }
+
+    fn gc_persisted_with_clock(
+        &self,
+        storage_dir: &Path,
+        mut clock: impl FnMut() -> SystemTime,
+        validate: bool,
+    ) -> Result<usize, String> {
+        let now = clock();
+        #[cfg(test)]
+        {
+            let hook = GC_AFTER_START_FOR_TEST.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let now_ms = now
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
         #[cfg(test)]
         self.inner.persisted_gc_runs.fetch_add(1, Ordering::SeqCst);
         // Recorded when the run ENDS (on every exit path, via the guard), so an
@@ -8020,7 +8392,11 @@ impl BgTaskRegistry {
         );
         let root_key = canonicalized_path(&root);
         let memo = super::gc_memo::GcMemo::new(root_key.clone());
-        let walk = gc_batches(&root, root_key);
+        let walk = if validate {
+            gc_batches(&root, root_key)
+        } else {
+            GcWalk::default()
+        };
         for session_dir in &walk.unreadable_session_paths {
             memo.session_unreadable(session_dir);
         }
@@ -8029,6 +8405,7 @@ impl BgTaskRegistry {
         }
         let mut pass = super::gc_memo::PassReport {
             walk_finished: walk.finished,
+            validation_skipped: !validate,
             root_missing: walk.missing,
             error: walk.error,
             unreadable_sessions: walk.unreadable_sessions,
@@ -8036,8 +8413,18 @@ impl BgTaskRegistry {
             ..super::gc_memo::PassReport::default()
         };
         let mut retired = 0;
+        let due = memo.due_batches(now);
+        let mut examined = HashSet::new();
         {
-            for batch in walk.batches {
+            // Validate before deleting due bundles: deletion changes a session's
+            // stamp and would otherwise invalidate unchanged sibling verdicts
+            // that the validation slice is about to visit.
+            for (discovery, batch) in walk
+                .batches
+                .into_iter()
+                .map(|batch| (true, batch))
+                .chain(due.into_iter().map(|batch| (false, batch)))
+            {
                 let session_dir = batch.session;
                 pass.tasks += batch.ids.len();
                 // Replay recovery rewrites the metadata of every task it
@@ -8087,6 +8474,13 @@ impl BgTaskRegistry {
                 // invalidates what this batch remembers about them.
                 let session_stamp = super::gc_memo::Stamp::of(&session_dir).ok();
                 for task_id in &task_ids {
+                    if !examined.insert((session_dir.clone(), task_id.clone())) {
+                        continue;
+                    }
+                    // Deadline selection uses the pass clock, but a task may
+                    // have been acknowledged after that clock was sampled.
+                    let examined_at = clock();
+                    let write_generation = memo.write_generation(&session_dir);
                     // A task judged not deletable on an earlier lap, whose
                     // folders and metadata are unchanged since, is skipped
                     // without opening anything (see `gc_memo`).
@@ -8095,7 +8489,7 @@ impl BgTaskRegistry {
                         session_stamp.as_ref(),
                         task_id,
                         PERSISTED_GC_GRACE,
-                        unix_millis(),
+                        examined_at,
                     ) {
                         pass.unchanged += 1;
                         continue;
@@ -8169,9 +8563,22 @@ impl BgTaskRegistry {
                             session,
                             task_dir,
                             metadata: super::gc_memo::Stamp::of(&resolved.paths.json).ok()?,
+                            write_generation,
                         })
                     });
-                    if modified_within(&resolved.paths.json, PERSISTED_GC_GRACE) {
+                    #[cfg(test)]
+                    super::persistence::work_counts::record_stat();
+                    if fs::metadata(&resolved.paths.json)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .is_some_and(|modified| {
+                            super::gc_memo::within_grace_at(
+                                modified,
+                                PERSISTED_GC_GRACE,
+                                examined_at,
+                            )
+                        })
+                    {
                         if let Some(evidence) = evidence.take() {
                             memo.remember_grace(&session_dir, task_id, evidence);
                         }
@@ -8247,7 +8654,7 @@ impl BgTaskRegistry {
                             }
                         }
                     }
-                    let abandoned = abandoned_completion(&metadata, unix_millis());
+                    let abandoned = abandoned_completion(&metadata, now_ms);
                     if !metadata.status.is_terminal()
                         || (!metadata.completion_delivered && !abandoned)
                     {
@@ -8343,8 +8750,14 @@ impl BgTaskRegistry {
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     self.forget_task_read_record(&resolved.paths.dir);
-                    match delete_task_bundle(&resolved.paths) {
+                    #[cfg(test)]
+                    let before_teardown = super::persistence::work_counts::get();
+                    let removal = delete_task_bundle(&resolved.paths);
+                    #[cfg(test)]
+                    super::persistence::work_counts::record_gc_teardown_since(before_teardown);
+                    match removal {
                         Ok(()) => {
+                            memo.forget(&session_dir, task_id);
                             self.forget_finished_delete_attempts(&metadata.task_id);
                             self.delete_gc_task_from_db(&metadata);
                             self.evaluate_erased_watch_targets();
@@ -8362,7 +8775,9 @@ impl BgTaskRegistry {
                         }
                     }
                 }
-                memo.session_read(&session_dir);
+                if discovery {
+                    memo.session_read(&session_dir);
+                }
                 let related_task_sessions = [session_dir.clone()];
                 if let Err(error) = self
                     .remove_empty_session_directory_if_unused(&session_dir, &related_task_sessions)
@@ -8374,7 +8789,7 @@ impl BgTaskRegistry {
                 }
             }
         }
-        // The collector runs every few seconds; a zero count is the normal
+        // Minute housekeeping normally finds nothing to retire; a zero count is the normal
         // case and logging it would flood the daemon log.
         if retired > 0 {
             crate::slog_info!("retired {retired} undelivered completions of deleted worktrees");
@@ -9739,6 +10154,7 @@ impl BgTaskRegistry {
             output_incomplete: snapshot.output_incomplete,
             live_descendants: snapshot.live_descendants,
             live_descendants_omitted: snapshot.live_descendants_omitted,
+            live_descendants_unavailable: snapshot.live_descendants_unavailable,
             live_descendants_summary: snapshot.live_descendants_summary,
         })
     }
@@ -10982,6 +11398,7 @@ impl BgTaskRegistry {
             terminal_persist_dirty: AtomicBool::new(false),
             timeout_kill_queued: AtomicBool::new(false),
             kill_settled: std::sync::Condvar::new(),
+            descendant_sample_saved: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
             remote_launch_ready: AtomicBool::new(false),
@@ -11010,6 +11427,7 @@ impl BgTaskRegistry {
                 // failure based on stale evidence.
                 child_exit_observed: false,
                 descendant_sampling_started: false,
+                descendant_sample_pending: false,
                 kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, mode.clone()),
                 terminal_output_cache: None,
@@ -11399,7 +11817,10 @@ impl BgTaskRegistry {
                     .unwrap_or(0)
                     + state.metadata.live_descendants_omitted;
                 match state.metadata.pgid {
-                    Some(pgid) if cfg!(unix) && live_count > 0 => {
+                    Some(pgid)
+                        if cfg!(unix)
+                            && finished_group_is_still_the_tasks(&state.metadata, pgid) =>
+                    {
                         KillSignalPlan::TerminalSurvivors { pgid, live_count }
                     }
                     _ => KillSignalPlan::Nothing,
@@ -11495,6 +11916,12 @@ impl BgTaskRegistry {
                 if !was_already_killing {
                     killing.status = BgTaskStatus::Killing;
                 }
+                // Both plans below signal the task's whole process group, so
+                // any member found afterwards survived the kill.
+                killing.group_kill_sent |= matches!(
+                    state.runtime,
+                    TaskRuntime::Piped(_) | TaskRuntime::Pty(Some(_))
+                );
                 if reason.is_some() {
                     killing.status_reason = reason.clone();
                 }
@@ -11716,6 +12143,8 @@ impl BgTaskRegistry {
             #[cfg(test)]
             wait_on_kill_signal_gate_for_test(&format!("{task_id}:terminal-published"));
             self.post_terminal_transition(&task, true)?;
+        } else {
+            self.check_group_after_kill(&task);
         }
         let mut snapshot = self.snapshot_with_terminal_cache(&task, RUNNING_OUTPUT_PREVIEW_BYTES);
         if snapshot.info.status.is_terminal() {
@@ -11750,9 +12179,8 @@ impl BgTaskRegistry {
         let mut state = task
             .lock_state()
             .map_err(|_| "background task lock poisoned".to_string())?;
-        state.metadata.live_descendants = sample.as_ref().map(|(members, _)| members.clone());
-        state.metadata.live_descendants_omitted =
-            sample.as_ref().map(|(_, omitted)| *omitted).unwrap_or(0);
+        state.metadata.group_kill_sent = true;
+        record_group_check(&mut state.metadata, &sample);
         self.persist_task_locked(task, &state.metadata, &mut db)
             .map_err(|error| format!("failed to persist post-kill descendant sample: {error}"))
     }
@@ -11762,6 +12190,29 @@ impl BgTaskRegistry {
     #[cfg(not(unix))]
     fn terminate_terminal_survivors(&self, _task: &Arc<BgTask>, _pgid: i32) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Check the process group of a task whose terminal state was published by
+    /// someone else while this kill was in flight. That publisher saw the kill
+    /// still running and skipped the check, which would leave the task without
+    /// a list of what survived the kill. Does nothing once a check has started.
+    fn check_group_after_kill(&self, task: &Arc<BgTask>) {
+        let due = task.lock_state().ok().is_some_and(|mut state| {
+            let due = state.metadata.status.is_terminal()
+                && !state.kill_in_flight
+                && !state.descendant_sampling_started
+                && (state.metadata.mode == BgMode::Pipes || state.metadata.group_kill_sent);
+            if due {
+                state.descendant_sampling_started = true;
+                state.descendant_sample_pending = true;
+            }
+            due
+        });
+        if due {
+            #[cfg(test)]
+            wait_on_group_sample_gate_for_test(&task.task_id);
+            let _ = self.sample_task_process_group(task);
+        }
     }
 
     /// Re-take the state lock after a PTY kill's signal and close the master.
@@ -12188,6 +12639,7 @@ impl BgTaskRegistry {
             output_incomplete: metadata.output_incomplete,
             live_descendants: metadata.live_descendants.clone(),
             live_descendants_omitted: metadata.live_descendants_omitted,
+            live_descendants_unavailable: live_descendants_unavailable(metadata),
             live_descendants_summary: live_descendants_summary(metadata),
         };
 
@@ -12579,6 +13031,7 @@ impl BgTaskRegistry {
         frame.output_incomplete = completion.output_incomplete;
         frame.live_descendants = completion.live_descendants;
         frame.live_descendants_omitted = completion.live_descendants_omitted;
+        frame.live_descendants_unavailable = completion.live_descendants_unavailable;
         frame.live_descendants_summary = completion.live_descendants_summary;
         sender(PushFrame::BashCompleted(frame));
     }
@@ -12709,7 +13162,7 @@ impl BgTaskRegistry {
         needs_sample
             && self
                 .sample_task_process_group(&task)
-                .is_none_or(|(members, omitted)| !members.is_empty() || omitted > 0)
+                .is_none_or(|listing| !listing.is_clean())
     }
 
     /// True when the task has reached a terminal state or is no longer in the
@@ -13854,7 +14307,82 @@ impl CompletionTokenCounts {
     }
 }
 
+/// The line a task's text and completion notice carry when processes in its
+/// group are still running after AFT's kill. `{count}` is "1 process" or
+/// "N processes", `{verb}` agrees with it ("is" / "are"), and `{processes}`
+/// lists them as "pid P, user U, `command`" joined by "; ".
+pub(crate) const KILL_SURVIVORS_LINE: &str = "{count} survived the kill and {verb} still running: {processes}. AFT cannot signal processes owned by another user.";
+
+/// How many surviving processes the line names before "+N more".
+const KILL_SURVIVORS_NAMED: usize = 3;
+
+fn kill_survivors_line(members: &[LiveDescendant], omitted: usize) -> String {
+    let total = members.len() + omitted;
+    let mut processes = members
+        .iter()
+        .take(KILL_SURVIVORS_NAMED)
+        .map(|member| {
+            let command = member.command.as_deref().unwrap_or(&member.argv0);
+            format!(
+                "pid {}, user {}, `{command}`",
+                member.pid,
+                member.user.as_deref().unwrap_or("unknown"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let unnamed = total.saturating_sub(members.len().min(KILL_SURVIVORS_NAMED));
+    if unnamed > 0 {
+        processes.push_str(&format!("; +{unnamed} more"));
+    }
+    let (count, verb) = if total == 1 {
+        ("1 process".to_string(), "is")
+    } else {
+        (format!("{total} processes"), "are")
+    };
+    KILL_SURVIVORS_LINE
+        .replace("{count}", &count)
+        .replace("{verb}", verb)
+        .replace("{processes}", &processes)
+}
+
+/// Why a finished task's list of surviving group members is missing or only
+/// partial. A running task has not been checked yet and carries no reason; a
+/// finished one whose list is missing always does, and an incomplete listing
+/// keeps its reason next to the members it did find.
+fn live_descendants_unavailable(metadata: &PersistedTask) -> Option<LiveDescendantsUnavailable> {
+    if !metadata.status.is_terminal() {
+        return None;
+    }
+    match (
+        metadata.live_descendants_unavailable,
+        &metadata.live_descendants,
+    ) {
+        (Some(reason), _) => Some(reason),
+        (None, None) => Some(LiveDescendantsUnavailable::NotChecked),
+        (None, Some(_)) => None,
+    }
+}
+
+/// Added to a task's text and completion notice when the check of its group
+/// could not read every process, so survivors may be missing from the list.
+pub(crate) const INCOMPLETE_LISTING_NOTE: &str =
+    "AFT could not read every process in the task's group, so others may also be running.";
+
 fn live_descendants_summary(metadata: &PersistedTask) -> Option<String> {
+    let summary = members_summary(metadata);
+    if metadata.live_descendants_unavailable != Some(LiveDescendantsUnavailable::ListingIncomplete)
+        || !metadata.status.is_terminal()
+    {
+        return summary;
+    }
+    Some(match summary {
+        Some(summary) => format!("{summary} {INCOMPLETE_LISTING_NOTE}"),
+        None => INCOMPLETE_LISTING_NOTE.to_string(),
+    })
+}
+
+fn members_summary(metadata: &PersistedTask) -> Option<String> {
     let Some(members) = metadata.live_descendants.as_deref() else {
         #[cfg(windows)]
         return (metadata.mode == BgMode::Pipes).then(|| {
@@ -13867,6 +14395,12 @@ fn live_descendants_summary(metadata: &PersistedTask) -> Option<String> {
     let total = members.len() + metadata.live_descendants_omitted;
     if total == 0 {
         return None;
+    }
+    if metadata.group_kill_sent {
+        return Some(kill_survivors_line(
+            members,
+            metadata.live_descendants_omitted,
+        ));
     }
 
     let mut counts = BTreeMap::<&str, usize>::new();
@@ -13989,6 +14523,27 @@ fn saved_scope_task_records(
         }
     }
     records
+}
+
+/// A live task can replace its metadata during every optimistic open attempt.
+/// Retry that read while excluding registered metadata writers instead of
+/// treating their progress as corruption and quarantining or skipping the task.
+/// Callers hold no task state or claim lock. The retry's json_writes mutex
+/// guard is dropped before returning, so registration and notice publication
+/// never run under that mutex.
+fn retry_replay_after_metadata_replacement<T>(
+    session_id: &str,
+    task_id: &str,
+    mut read: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    match read() {
+        Err(error) if concurrently_replaced(&error) => {
+            let order = DbWriteOrder::for_task(session_id, task_id);
+            let _writes = order.lock_json_writes();
+            read()
+        }
+        result => result,
+    }
 }
 
 /// True when a validated open lost its race against an atomic replacement
@@ -14262,6 +14817,7 @@ fn task_session_directories_for_quarantine(
 }
 
 /// One pass's share of a resumable walk over a GC root.
+#[derive(Default)]
 struct GcWalk {
     batches: Vec<super::gc_cursor::Batch>,
     /// The walk reached the end of the root in this pass (or the root does
@@ -14492,6 +15048,7 @@ fn terminal_metadata_snapshot(metadata: PersistedTask) -> BgTaskSnapshot {
             .map(|finished_at| finished_at.saturating_sub(metadata.started_at))
     });
     let live_descendants_summary = live_descendants_summary(&metadata);
+    let live_descendants_unavailable = live_descendants_unavailable(&metadata);
     let hard_kill =
         HardKillDeadline::from_metadata(metadata.timeout_ms, metadata.default_hard_kill);
     let remote_refusal = remote::remote_refusal(&metadata);
@@ -14533,6 +15090,7 @@ fn terminal_metadata_snapshot(metadata: PersistedTask) -> BgTaskSnapshot {
         phase: None,
         live_descendants: metadata.live_descendants.clone(),
         live_descendants_omitted: metadata.live_descendants_omitted,
+        live_descendants_unavailable,
         live_descendants_summary,
         kill_signaled: false,
         kill_reached: 0,
@@ -14721,6 +15279,7 @@ impl BgTask {
                 .map(|remote| remote::RemotePhase::of(remote).tag()),
             live_descendants: metadata.live_descendants.clone(),
             live_descendants_omitted: metadata.live_descendants_omitted,
+            live_descendants_unavailable: live_descendants_unavailable(metadata),
             live_descendants_summary: live_descendants_summary(metadata),
             kill_signaled: false,
             kill_reached: 0,
@@ -15531,6 +16090,10 @@ pub(crate) mod default_kill_tests;
 #[path = "completion_replay_ordering_tests.rs"]
 mod completion_replay_ordering_tests;
 
+#[cfg(all(test, unix))]
+#[path = "kill_survivor_tests.rs"]
+mod kill_survivor_tests;
+
 #[cfg(test)]
 #[path = "memory_limit_tests.rs"]
 mod memory_limit_tests;
@@ -15893,6 +16456,7 @@ mod tests {
                 output_incomplete: false,
                 live_descendants: Some(Vec::new()),
                 live_descendants_omitted: 0,
+                live_descendants_unavailable: None,
                 live_descendants_summary: None,
             });
         let estimate = registry.estimated_memory();
@@ -16790,7 +17354,7 @@ mod tests {
         assert!(
             !super::super::process::live_process_group_members(pgid)
                 .unwrap()
-                .0
+                .members
                 .is_empty(),
             "target did not survive daemon loss"
         );
@@ -16800,7 +17364,7 @@ mod tests {
         assert!(
             super::super::process::live_process_group_members(pgid)
                 .unwrap()
-                .0
+                .members
                 .is_empty(),
             "replay published Killed without terminating the surviving group"
         );
@@ -17226,6 +17790,12 @@ mod tests {
         let db_task_id = "bash-4444444444444444";
         let disk_task_id = "bash-5555555555555555";
         let (registry, db, _) = registry_with_db_and_frames(storage.path());
+        // The assertion below claims one pass reaches every session. A duration
+        // limit lets a loaded machine stop the scan before it gets there.
+        registry.set_project_replay_scan_budget_for_test(
+            PROJECT_REPLAY_SCAN_ENTRY_BUDGET,
+            Duration::from_secs(60),
+        );
 
         write_running_project_task(storage.path(), project.path(), db_session, db_task_id);
         write_running_project_task(storage.path(), project.path(), disk_session, disk_task_id);
@@ -17255,6 +17825,12 @@ mod tests {
         let session = "delivered-project-task";
         let task_id = "bash-6666666666666666";
         let (registry, _db, _) = registry_with_db_and_frames(storage.path());
+        // This asserts the first pass already decided the delivered bundle is not
+        // replayed. A duration limit would defer that decision to a later pass.
+        registry.set_project_replay_scan_budget_for_test(
+            PROJECT_REPLAY_SCAN_ENTRY_BUDGET,
+            Duration::from_secs(60),
+        );
         write_running_project_task(storage.path(), project.path(), session, task_id);
         let paths = task_paths(storage.path(), session, task_id).unwrap();
         let mut metadata = read_task(&paths.json).unwrap();
@@ -17282,6 +17858,12 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let (registry, _db, _) = registry_with_db_and_frames(storage.path());
+        // The batch is expected to reach the healthy session after parking the
+        // blocked one. A duration limit could stop the scan in between.
+        registry.set_project_replay_scan_budget_for_test(
+            PROJECT_REPLAY_SCAN_ENTRY_BUDGET,
+            Duration::from_secs(60),
+        );
         let blocked_session = "unreadable-project-session";
         let healthy_session = "readable-project-session";
         let healthy_task = "bash-000000000000beef";
@@ -17304,6 +17886,7 @@ mod tests {
             project.path(),
             [blocked_session.to_string(), healthy_session.to_string()],
             &HashSet::new(),
+            false,
         );
         fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(
@@ -17410,6 +17993,373 @@ mod tests {
             }),
             "the elapsed-time limit must report its reason: {time_logs:?}"
         );
+        registry.detach();
+    }
+
+    fn project_replay_history_fixture(
+        storage: &Path,
+        project: &Path,
+        db: &Arc<Mutex<TrackedConnection>>,
+    ) -> (String, Vec<String>) {
+        let session = "shared-history-session";
+        for index in 0..4003 {
+            let task_id = format!("bash-{index:016x}");
+            let paths = task_paths(storage, session, &task_id).unwrap();
+            let other_project = storage.join(format!("other-project-{}", index % 170));
+            let mut metadata = PersistedTask::starting(
+                task_id,
+                session.to_string(),
+                "finished fixture".to_string(),
+                other_project.clone(),
+                Some(other_project),
+                None,
+                true,
+                true,
+            );
+            metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+            metadata.completion_delivered = true;
+            write_task(&paths.json, &metadata).unwrap();
+        }
+        // Directory order is filesystem-dependent. Choose the live records from
+        // the actual tail, not from lexically high task IDs.
+        let ids = fs::read_dir(session_tasks_dir(storage, session))
+            .unwrap()
+            .filter_map(|entry| {
+                let name = entry.unwrap().file_name().into_string().unwrap();
+                let id = match name.split_once('.') {
+                    Some((id, "json")) => id,
+                    Some(_) => return None,
+                    None => &name,
+                };
+                validate_task_id(id).ok().map(|()| id.to_string())
+            })
+            .collect::<Vec<_>>();
+        let live = ids[4000..].to_vec();
+        for task_id in &live {
+            write_running_project_task(storage, project, session, task_id);
+        }
+        let conn = db.lock().unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        for task_id in &ids[..3993] {
+            let paths = task_paths(storage, session, task_id).unwrap();
+            let metadata = read_task(&paths.json).unwrap();
+            crate::db::bash_tasks::upsert_bash_task(
+                &tx,
+                &metadata.to_bash_task_row("opencode", &paths).unwrap(),
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        (session.to_string(), live)
+    }
+
+    fn drain_project_replay_fixture(
+        registry: &BgTaskRegistry,
+        storage: &Path,
+        project: &Path,
+        session: &str,
+    ) -> (Vec<String>, Vec<String>, usize) {
+        let mut merged = Vec::new();
+        let mut reads = Vec::new();
+        for pass in 1..=80 {
+            let batch = registry.replay_session_from_disk_for_project(
+                storage,
+                project,
+                [session.to_string()],
+                &HashSet::new(),
+                false,
+            );
+            if pass == 1 {
+                assert!(
+                    batch.tasks.is_empty(),
+                    "live tasks must be beyond the first budget"
+                );
+                assert_eq!(batch.incomplete_reason, Some("entry budget"));
+            }
+            reads.extend(batch.bundle_reads);
+            merged.extend(batch.tasks.into_iter().map(|task| task.task_id));
+            if !registry.project_replay_pending(storage, project) {
+                return (merged, reads, pass);
+            }
+        }
+        panic!(
+            "project replay did not finish within 80 passes; merged={merged:?}, bundle reads={}",
+            reads.len()
+        );
+    }
+
+    #[test]
+    fn project_replay_history_reads_only_unknown_bundles_and_records_them() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, db, _) = registry_with_db_and_frames(storage.path());
+        let (session, mut live) =
+            project_replay_history_fixture(storage.path(), project.path(), &db);
+        // The pass after the drain is expected to restore the live tasks on its
+        // own. A duration limit could stop it before reaching their session.
+        registry.set_project_replay_scan_budget_for_test(64, Duration::from_secs(60));
+        let (mut merged, reads, passes) =
+            drain_project_replay_fixture(&registry, storage.path(), project.path(), &session);
+        let unique = reads.iter().collect::<HashSet<_>>().len();
+        eprintln!("fixture: 4000 finished / 170 projects + 3 live; DB owns 3993; passes={passes}, bundle_reads={}, unique={unique}, rescans={}, merged={}", reads.len(), reads.len() - unique, merged.len());
+        merged.sort();
+        live.sort();
+        assert_eq!(
+            merged, live,
+            "all three late live tasks, and no delivered terminals, must merge"
+        );
+        assert_eq!(
+            reads.len(),
+            unique,
+            "continuations must never restart the prefix"
+        );
+        assert_eq!(
+            reads.len(),
+            10,
+            "known DB owners must be filtered before opening bundles"
+        );
+
+        let (_, second_reads, second_passes) =
+            drain_project_replay_fixture(&registry, storage.path(), project.path(), &session);
+        eprintln!(
+            "second replay: passes={second_passes}, bundle_reads={}",
+            second_reads.len()
+        );
+        assert!(
+            second_reads.is_empty(),
+            "valid discoveries must be recorded even for foreign projects and delivered terminals"
+        );
+        registry
+            .replay_session_for_project(storage.path(), &session, project.path())
+            .unwrap();
+        for task_id in &live {
+            assert!(
+                registry.task_for_session(task_id, &session).is_some(),
+                "a late live task must be restored into the registry"
+            );
+        }
+        assert_eq!(
+            registry.list(0).len(),
+            3,
+            "delivered and foreign bundles must not be resurrected"
+        );
+        assert!(registry.drain_completions().is_empty());
+        registry.detach();
+    }
+
+    #[test]
+    fn project_replay_backfill_cannot_overwrite_an_existing_row() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, db, _) = registry_with_db_and_frames(storage.path());
+        let session = "concurrent-backfill-session";
+        let task_id = "bash-000000000000feed";
+        write_running_project_task(storage.path(), project.path(), session, task_id);
+        let paths = task_paths(storage.path(), session, task_id).unwrap();
+        let stale = read_task(&paths.json).unwrap();
+        let mut current = stale.clone();
+        current.mark_terminal(BgTaskStatus::Completed, Some(42), None);
+        current.completion_delivered = true;
+        crate::db::bash_tasks::upsert_bash_task(
+            &db.lock().unwrap(),
+            &current.to_bash_task_row("opencode", &paths).unwrap(),
+        )
+        .unwrap();
+        registry.record_replay_discovery(&stale, &paths).unwrap();
+        let row =
+            crate::db::bash_tasks::get_bash_task(&db.lock().unwrap(), "opencode", session, task_id)
+                .unwrap()
+                .unwrap();
+        assert_eq!(row.status, "completed");
+        assert_eq!(row.exit_code, Some(42));
+        assert!(row.completion_delivered);
+        registry.detach();
+    }
+
+    #[test]
+    fn project_replay_restores_indexed_live_tasks_from_other_harnesses() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, db, _) = registry_with_db_and_frames(storage.path());
+        // The first pass is expected to reach the task directory of this session;
+        // a duration limit could postpone it to a later pass.
+        registry.set_project_replay_scan_budget_for_test(
+            PROJECT_REPLAY_SCAN_ENTRY_BUDGET,
+            Duration::from_secs(60),
+        );
+        let session = "cross-harness-project-session";
+        let task_id = "bash-000000000000cafe";
+        write_running_project_task(storage.path(), project.path(), session, task_id);
+        let paths = task_paths(storage.path(), session, task_id).unwrap();
+        let mut metadata = read_task(&paths.json).unwrap();
+        metadata.harness = Some("pi".to_string());
+        write_task(&paths.json, &metadata).unwrap();
+        crate::db::bash_tasks::upsert_bash_task(
+            &db.lock().unwrap(),
+            &metadata.to_bash_task_row("pi", &paths).unwrap(),
+        )
+        .unwrap();
+        let other_project = tempfile::tempdir().unwrap();
+        let other_task = "bash-000000000000dada";
+        write_running_project_task(storage.path(), other_project.path(), session, other_task);
+        let other_paths = task_paths(storage.path(), session, other_task).unwrap();
+        let other = read_task(&other_paths.json).unwrap();
+        crate::db::bash_tasks::upsert_bash_task(
+            &db.lock().unwrap(),
+            &other.to_bash_task_row("pi", &other_paths).unwrap(),
+        )
+        .unwrap();
+        let rows = registry
+            .replay_session_from_db(session, Some(project.path()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the DB project filter must exclude unrelated live rows before recovery"
+        );
+        registry
+            .replay_session_for_project(storage.path(), session, project.path())
+            .unwrap();
+        assert!(registry.task_for_session(task_id, session).is_some());
+        assert!(registry.task_for_session(other_task, session).is_none());
+        registry.detach();
+    }
+
+    #[test]
+    fn project_replay_row_query_failure_does_not_skip_db_owned_bundles() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, db, _) = registry_with_db_and_frames(storage.path());
+        let session = "unreadable-row-project-session";
+        let task_id = "bash-000000000000babe";
+        write_running_project_task(storage.path(), project.path(), session, task_id);
+        let paths = task_paths(storage.path(), session, task_id).unwrap();
+        let metadata = read_task(&paths.json).unwrap();
+        crate::db::bash_tasks::upsert_bash_task(
+            &db.lock().unwrap(),
+            &metadata.to_bash_task_row("opencode", &paths).unwrap(),
+        )
+        .unwrap();
+        db.lock()
+            .unwrap()
+            .execute("UPDATE bash_tasks SET pid = 'unreadable'", [])
+            .unwrap();
+        assert_eq!(registry.replay_database_task_ids(session).unwrap().len(), 1);
+        registry.set_project_replay_scan_budget_for_test(1, Duration::from_secs(60));
+        registry
+            .replay_session_for_project(storage.path(), session, project.path())
+            .unwrap();
+        for _ in 0..8 {
+            if !registry
+                .continue_project_replay(storage.path(), session, project.path(), false)
+                .unwrap()
+            {
+                break;
+            }
+        }
+        assert!(
+            registry.task_for_session(task_id, session).is_some(),
+            "a successful ID lookup must not mask a failed row query"
+        );
+        registry.detach();
+    }
+
+    #[test]
+    fn project_replay_continuation_retains_initial_database_exclusions() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let session = "retained-exclusion-session";
+        let task_id = "bash-000000000000abba";
+        write_running_project_task(storage.path(), project.path(), session, task_id);
+        registry.set_project_replay_scan_budget_for_test(1, Duration::from_secs(60));
+        let initial = registry.replay_session_from_disk_for_project(
+            storage.path(),
+            project.path(),
+            [session.to_string()],
+            &HashSet::from([(session.to_string(), task_id.to_string())]),
+            false,
+        );
+        assert!(initial.bundle_reads.is_empty());
+        for _ in 0..8 {
+            let batch = registry.replay_session_from_disk_for_project(
+                storage.path(),
+                project.path(),
+                std::iter::empty(),
+                &HashSet::new(),
+                false,
+            );
+            assert!(
+                batch.bundle_reads.is_empty(),
+                "initial DB exclusions survive even when a later ownership lookup is unavailable"
+            );
+            if !registry.project_replay_pending(storage.path(), project.path()) {
+                return;
+            }
+        }
+        panic!("continuation did not exhaust the small fixture");
+    }
+
+    #[test]
+    fn project_replay_failed_recording_is_reported_and_retried() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, db, _) = registry_with_db_and_frames(storage.path());
+        let session = "recording-failure-session";
+        let task_id = "bash-000000000000face";
+        write_running_project_task(storage.path(), project.path(), session, task_id);
+        db.lock().unwrap().execute_batch(
+            "CREATE TRIGGER reject_discovery BEFORE INSERT ON bash_tasks BEGIN SELECT RAISE(FAIL, 'fixture recording refused'); END;"
+        ).unwrap();
+        // The product's 25 ms time budget can expire on a slow runner after
+        // the task is read but before the session directory is exhausted, and
+        // a budget stop is reported ahead of the recording failure. A wide
+        // time budget keeps each pass checking the recording-failure report.
+        registry.set_project_replay_scan_budget_for_test(
+            PROJECT_REPLAY_SCAN_ENTRY_BUDGET,
+            Duration::from_secs(60),
+        );
+        for _ in 0..2 {
+            let batch = registry.replay_session_from_disk_for_project(
+                storage.path(),
+                project.path(),
+                [session.to_string()],
+                &HashSet::new(),
+                false,
+            );
+            assert_eq!(batch.bundle_reads, [task_id]);
+            assert_eq!(
+                batch.tasks.len(),
+                1,
+                "a recording failure must not lose the live task"
+            );
+            assert_eq!(
+                batch.incomplete_reason,
+                Some("disk task database recording failed")
+            );
+        }
+        db.lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_discovery")
+            .unwrap();
+        let recorded = registry.replay_session_from_disk_for_project(
+            storage.path(),
+            project.path(),
+            [session.to_string()],
+            &HashSet::new(),
+            false,
+        );
+        assert_eq!(recorded.bundle_reads, [task_id]);
+        assert_eq!(recorded.incomplete_reason, None);
+        let next = registry.replay_session_from_disk_for_project(
+            storage.path(),
+            project.path(),
+            [session.to_string()],
+            &HashSet::new(),
+            false,
+        );
+        assert!(next.bundle_reads.is_empty());
         registry.detach();
     }
 
@@ -24673,6 +25623,12 @@ mod tests {
                     .persisted_gc_started
                     .store(true, Ordering::SeqCst);
                 if project_scoped {
+                    // This asserts the first project pass already replayed the task.
+                    // A duration limit could postpone that to a later pass.
+                    replay.set_project_replay_scan_budget_for_test(
+                        PROJECT_REPLAY_SCAN_ENTRY_BUDGET,
+                        Duration::from_secs(60),
+                    );
                     replay
                         .replay_session_for_project(storage.path(), "session", storage.path())
                         .unwrap();
@@ -24693,8 +25649,93 @@ mod tests {
                         .completion_delivered,
                     "rehydration lost the durable ack"
                 );
+                let checkpoint = crate::db::bash_tasks::get_bash_task(
+                    &db.lock().unwrap(),
+                    "opencode",
+                    "session",
+                    &task_id,
+                )
+                .unwrap()
+                .unwrap();
+                assert!(
+                    serde_json::from_str::<PersistedTask>(&checkpoint.metadata)
+                        .unwrap()
+                        .completion_delivered,
+                    "the DB snapshot must checkpoint the foreign acknowledgement"
+                );
+                let next_replay = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+                next_replay.set_harness(Harness::Opencode);
+                next_replay.set_db_pool(Arc::clone(&db));
+                next_replay
+                    .inner
+                    .persisted_gc_started
+                    .store(true, Ordering::SeqCst);
+                next_replay
+                    .replay_session_for_project(storage.path(), "session", storage.path())
+                    .unwrap();
+                assert!(
+                    next_replay.task_for_session(&task_id, "session").is_none(),
+                    "an already checkpointed terminal must not be rehydrated again"
+                );
+                assert!(next_replay.drain_completions().is_empty());
             }
         }
+    }
+
+    #[test]
+    fn project_replay_checkpoints_acknowledgement_from_the_recorded_harness() {
+        let storage = tempfile::tempdir().unwrap();
+        let (owner, db, _) = registry_with_db_and_frames(storage.path());
+        owner.set_harness(Harness::Pi);
+        let (task_id, task) =
+            insert_terminal_piped_task(&owner, &storage, "echo done", "done\n", "", false);
+        {
+            let mut queued = DeferredDbWrites::new(&owner, &task);
+            let mut state = task.lock_state().unwrap();
+            state.metadata.harness = Some("pi".to_string());
+            owner
+                .persist_task_locked(&task, &state.metadata, &mut queued)
+                .unwrap();
+        }
+        let foreign = BgTaskRegistry::default();
+        foreign.set_harness(Harness::Pi);
+        foreign.set_db_pool(Arc::clone(&db));
+        assert_eq!(
+            foreign.ack_completions_for_session(Some("session"), &[task_id.clone()]),
+            [task_id.clone()]
+        );
+
+        let replay = BgTaskRegistry::default();
+        replay.set_harness(Harness::Opencode);
+        replay.set_db_pool(Arc::clone(&db));
+        replay
+            .inner
+            .persisted_gc_started
+            .store(true, Ordering::SeqCst);
+        // This expects a single pass to reach the task and record the foreign
+        // acknowledgement. A duration limit could postpone it to a later pass.
+        replay.set_project_replay_scan_budget_for_test(
+            PROJECT_REPLAY_SCAN_ENTRY_BUDGET,
+            Duration::from_secs(60),
+        );
+        replay
+            .replay_session_for_project(storage.path(), "session", storage.path())
+            .unwrap();
+        assert!(replay.drain_completions().is_empty());
+        let checkpoint =
+            crate::db::bash_tasks::get_bash_task(&db.lock().unwrap(), "pi", "session", &task_id)
+                .unwrap()
+                .unwrap();
+        assert!(
+            serde_json::from_str::<PersistedTask>(&checkpoint.metadata)
+                .unwrap()
+                .completion_delivered
+        );
+        assert!(replay
+            .replay_session_from_db("session", Some(storage.path()))
+            .unwrap()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

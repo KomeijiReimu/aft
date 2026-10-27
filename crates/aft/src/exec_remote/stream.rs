@@ -68,6 +68,7 @@ pub trait OutputSink {
 
 #[derive(Default)]
 pub struct StreamConsumer {
+    run_cursor: Option<u64>,
     point: Option<ResumePoint>,
     accepted: bool,
     pending: BTreeMap<u64, Pending>,
@@ -85,6 +86,12 @@ enum Pending {
 impl StreamConsumer {
     pub fn new() -> Self {
         Self::default()
+    }
+    pub(crate) fn keyed_run(run_cursor: Option<u64>) -> Self {
+        Self {
+            run_cursor,
+            ..Self::default()
+        }
     }
     pub fn resume(point: ResumePoint) -> Self {
         let mut pending = point
@@ -150,7 +157,7 @@ impl StreamConsumer {
                 sink.accepted(&accepted)?;
                 self.point = Some(ResumePoint {
                     job_id: accepted.job_id,
-                    last_seq: None,
+                    last_seq: self.run_cursor,
                     gap_recovery: None,
                 });
                 self.accepted = true;

@@ -12,6 +12,220 @@ use std::sync::atomic::AtomicUsize;
 /// row, and the marker row saying the run's vector matches that chunk row.
 const ROWS_PER_ONE_CHUNK_FILE: u64 = 3;
 
+/// The test prints public setup, query answers, a v3 file inventory and exact
+/// reader-floor bytes. Query expectations come from an independent cold index,
+/// not the view.
+#[test]
+fn composition_no_marker_boundary_record() {
+    use crate::migration::prune_legacy::{
+        prune_legacy, CensusFinding, ProcessCensus, PruneExit, PruneOptions,
+    };
+    use crate::root_cache::StoragePaths;
+    struct NoProcesses;
+    impl ProcessCensus for NoProcesses {
+        fn take(&self) -> Result<Vec<CensusFinding>, String> {
+            Ok(Vec::new())
+        }
+    }
+    // Inventory names and sizes without opening another descriptor on a live
+    // SQLite file set. The reader floor is a separately encoded JSON file.
+    fn inventory(root: &Path, path: &Path, files: &mut std::collections::BTreeMap<String, u64>) {
+        if !path.exists() {
+            return;
+        }
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                inventory(root, &path, files);
+            } else {
+                files.insert(
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    std::fs::metadata(&path).unwrap().len(),
+                );
+            }
+        }
+    }
+    let mut answers = Vec::new();
+    for views in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let temp = std::fs::canonicalize(temp.path()).unwrap();
+        let storage = temp.join("storage");
+        let root = temp.join("project");
+        write_tree(&root, FILES);
+        std::fs::create_dir_all(&storage).unwrap();
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(storage.clone()),
+                ..Default::default()
+            },
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "composition-boundary", "command": "configure", "project_root": root, "storage_dir": storage,
+            "harness": "runner", "session_id": "alfonso:sidekick-00000000-0000-4001-98dd-383a2dbeca78",
+            "config": [{ "tier": "user", "source": "/u/aft.jsonc", "doc": serde_json::json!({
+                "views": { "enabled": views }, "indexes": { "trigram": false, "semantic": true, "callgraph": false },
+                "semantic": { "backend": "openai_compatible", "model": "boundary-no-network", "base_url": "http://127.0.0.1:1", "timeout_ms": 50 }
+            }).to_string() }]
+        })).unwrap();
+        let response = crate::commands::configure::handle_configure(&request, &ctx);
+        assert!(response.success, "{}", response.data);
+        crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+        assert!(
+            ctx.semantic_refresh_sender().is_none(),
+            "the sidekick fixture must not start an embedding worker"
+        );
+        let answer = if views {
+            let family = crate::search_index::artifact_cache_key(&root);
+            let scope = crate::path_identity::project_scope_key(&root);
+            let runtime = CheckoutSemantic::new(
+                &StoragePaths::same(&storage),
+                &family,
+                &scope,
+                &root,
+                producer(),
+                Weak::new(),
+            )
+            .unwrap();
+            runtime.load().unwrap();
+            refresh(&runtime, &Model::default());
+            let result = query(&runtime, "alpha cache");
+            assert!(result.complete(), "{result:?}");
+            let rows = rows(&root, &result.results);
+            let registry = super::super::registry::FamilyRegistry::open(&storage, &family).unwrap();
+            super::super::eviction::enforce(&registry, Default::default()).unwrap();
+            rows
+        } else {
+            cold(&root, "alpha cache").0
+        };
+        assert!(!answer.is_empty());
+        for _ in 0..2 {
+            let report = crate::storage_retention::run_pass_with_budget_for_test(
+                &StoragePaths::same(&storage),
+                Duration::from_secs(120),
+            );
+            assert!(report.timings_ms.contains_key("blobs_v3"), "{report:?}");
+        }
+        let floor_before = std::fs::read(storage.join("reader-floor.json")).unwrap();
+        let mut before = Default::default();
+        inventory(&storage, &storage.join("blobs/v3"), &mut before);
+        let mut out = Vec::new();
+        let exit = prune_legacy(
+            &storage,
+            &PruneOptions {
+                yes: false,
+                now: std::time::SystemTime::now(),
+            },
+            &NoProcesses,
+            None,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(exit, PruneExit::Clean);
+        assert!(String::from_utf8(out).unwrap().contains("Dry run"));
+        let mut v3 = Default::default();
+        inventory(&storage, &storage.join("blobs/v3"), &mut v3);
+        assert_eq!(before, v3, "dry-run must not mutate the v3 namespace");
+        assert_eq!(
+            std::fs::read(storage.join("reader-floor.json")).unwrap(),
+            floor_before
+        );
+        assert!(!storage.join("views-harness.marker").exists());
+        assert!(
+            !storage.join("blobs/v3").exists(),
+            "an unrouted entrypoint wrote v3 without the marker"
+        );
+        let floor = std::fs::read_to_string(storage.join("reader-floor.json")).unwrap();
+        assert!(!floor.contains("views_v3"));
+        eprintln!(
+            "COMPOSITION_BOUNDARY_RECORD {}",
+            serde_json::json!({ "views": views, "answers": answer, "v3_files": v3, "floor": floor })
+        );
+        answers.push(answer);
+    }
+    assert_eq!(answers[0], answers[1]);
+}
+
+#[test]
+fn composition_prune_dry_run_preserves_populated_v3_inventory() {
+    use crate::migration::prune_legacy::{
+        prune_legacy, CensusFinding, ProcessCensus, PruneExit, PruneOptions,
+    };
+    struct NoProcesses;
+    impl ProcessCensus for NoProcesses {
+        fn take(&self) -> Result<Vec<CensusFinding>, String> {
+            Ok(Vec::new())
+        }
+    }
+    fn inventory(root: &Path, path: &Path, out: &mut std::collections::BTreeMap<String, [u8; 32]>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                inventory(root, &path, out);
+            } else {
+                out.insert(
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    *blake3::hash(&std::fs::read(&path).unwrap()).as_bytes(),
+                );
+            }
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path();
+    let v3 = storage.join("blobs/v3/populated");
+    std::fs::create_dir_all(v3.join("views/worker")).unwrap();
+    // A legacy pruner must preserve opaque newer files, not just rows it can decode.
+    // These fixture files are opaque bytes with no live SQLite connection.
+    std::fs::write(v3.join("semantic.sqlite"), b"opaque future plane payload").unwrap();
+    std::fs::write(
+        v3.join("views/worker/manifest-future.json"),
+        br#"{"format_version":3,"entries":["kept.rs"]}"#,
+    )
+    .unwrap();
+    crate::reader_floor::raise(
+        storage,
+        &[
+            (crate::persisted_format::PersistedStore::ViewsV3Registry, 1),
+            (crate::persisted_format::PersistedStore::ViewsV3Store, 1),
+        ],
+    )
+    .unwrap();
+    let mut before = Default::default();
+    inventory(storage, &v3, &mut before);
+    assert_eq!(before.len(), 2);
+    let floor = std::fs::read(storage.join("reader-floor.json")).unwrap();
+    let mut output = Vec::new();
+    assert_eq!(
+        prune_legacy(
+            storage,
+            &PruneOptions {
+                yes: false,
+                now: std::time::SystemTime::now()
+            },
+            &NoProcesses,
+            None,
+            &mut output
+        )
+        .unwrap(),
+        PruneExit::Clean
+    );
+    let mut after = Default::default();
+    if v3.exists() {
+        inventory(storage, &v3, &mut after);
+    }
+    assert_eq!(before, after, "dry-run changed populated v3 files");
+    assert_eq!(
+        floor,
+        std::fs::read(storage.join("reader-floor.json")).unwrap()
+    );
+}
+
 #[test]
 fn lane_paused_view_fill_waits_without_rechunking_and_resumes() {
     use crate::semantic_index::{lane_pause_chunk_calls, with_lane_pause_clock, PauseRetryScope};
@@ -1075,7 +1289,7 @@ fn base_ref_does_not_inherit_private_git_administration() {
     write_tree(root.path(), FILES);
     let runtime = base_ref_runtime(storage.path(), "builder", root.path());
     refresh(&runtime, &Model::default());
-    let mut manifest = runtime.installed().generation().manifest().clone();
+    let mut manifest = runtime.installed().generation().flatten().unwrap().clone();
     let git = super::super::RelPath::from_os_path(Path::new(".git")).unwrap();
     let bytes = b"gitdir: /private/checkout/administration\n";
     manifest
@@ -1088,12 +1302,13 @@ fn base_ref_does_not_inherit_private_git_administration() {
             ),
         )
         .unwrap();
-    let snapshot = LiveDelta::new(Arc::new(OpenGeneration::new(
+    let snapshot = LiveDelta::new(Arc::new(ComposedGeneration::new(
         "git-file-builder",
         manifest,
         None,
     )))
-    .snapshot();
+    .snapshot()
+    .with_install_cut(runtime.installed().install_cut().unwrap().clone());
     runtime
         .driver()
         .install(
@@ -1104,10 +1319,11 @@ fn base_ref_does_not_inherit_private_git_administration() {
         .unwrap();
     runtime.remember_base();
     let pin = lock(&runtime.base_ref_pin).as_ref().cloned().unwrap();
-    assert!(pin.generation.manifest().get(&git).is_none());
+    assert!(pin.generation.flatten().unwrap().get(&git).is_none());
     assert!(pin
         .generation
-        .manifest()
+        .flatten()
+        .unwrap()
         .get(&super::super::RelPath::from_os_path(Path::new("src/alpha.rs")).unwrap())
         .is_some());
 }
@@ -1794,12 +2010,14 @@ fn family_fill_rechecks_completed_work_after_acquiring_claim() {
     assert_eq!(
         a.installed()
             .generation()
-            .manifest()
+            .flatten()
+            .unwrap()
             .to_json_bytes()
             .unwrap(),
         b.installed()
             .generation()
-            .manifest()
+            .flatten()
+            .unwrap()
             .to_json_bytes()
             .unwrap()
     );
@@ -1876,10 +2094,14 @@ fn completed_embedding_batches_survive_a_later_batch_failure() {
 
 #[test]
 fn repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_texts() {
+    // Eight 64-text batches still cross the seventh-call failure boundary;
+    // keep all three siblings and eight edit rounds in both workloads.
+    let stress = std::env::var("AFT_STRESS").as_deref() == Ok("1");
+    let files = if stress { 2048 } else { 512 };
     let storage = tempfile::tempdir().unwrap();
     let roots: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
     for root in &roots {
-        for i in 0..2048 {
+        for i in 0..files {
             std::fs::write(
                 root.path().join(format!("file_{i:04}.rs")),
                 format!("pub fn item_{i:04}() -> u32 {{ {i} }}\n"),
@@ -1982,12 +2204,20 @@ fn repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_te
         }
     }
     drop(embed);
-    assert_eq!(successful_texts.get(), 2056);
-    assert_eq!(new_keys, 2056);
-    assert_eq!(store.usage().unwrap().rows, 2056 * ROWS_PER_ONE_CHUNK_FILE);
-    assert_eq!(failed_texts, 321);
-    assert_eq!(model.texts(), 2377);
-    assert_eq!(model.calls(), 46);
+    let (successful, failed, sent, calls) = if stress {
+        (2056, 321, 2377, 46)
+    } else {
+        (520, 65, 585, 18)
+    };
+    assert_eq!(successful_texts.get(), successful);
+    assert_eq!(new_keys, successful);
+    assert_eq!(
+        store.usage().unwrap().rows,
+        successful as u64 * ROWS_PER_ONE_CHUNK_FILE
+    );
+    assert_eq!(failed_texts, failed);
+    assert_eq!(model.texts(), sent);
+    assert_eq!(model.calls(), calls);
     for (runtime, root) in runtimes.iter().zip(&roots) {
         assert_eq!(
             rows(root.path(), &query(runtime, "revised item").results),
@@ -1999,10 +2229,17 @@ fn repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_te
 
 #[test]
 fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admission() {
+    // Two batches retain cross-batch reuse in the default run. Nightly stress
+    // keeps the original 32-batch workload; siblings and edit rounds are equal.
+    let files = if std::env::var("AFT_STRESS").as_deref() == Ok("1") {
+        2048
+    } else {
+        128
+    };
     let storage = tempfile::tempdir().unwrap();
     let roots: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
     for root in &roots {
-        for i in 0..2048 {
+        for i in 0..files {
             std::fs::write(
                 root.path().join(format!("file_{i:04}.rs")),
                 format!("pub fn item_{i:04}() -> u32 {{ {i} }}\n"),
@@ -2026,8 +2263,8 @@ fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admissi
             .refresh(budget, &mut |texts| model.embed(texts))
             .unwrap();
         embedded_keys += report.embedded_keys;
-        assert_eq!(report.embedded_keys, if i == 0 { 2048 } else { 0 });
-        assert_eq!(report.model_calls, if i == 0 { 32 } else { 0 });
+        assert_eq!(report.embedded_keys, if i == 0 { files } else { 0 });
+        assert_eq!(report.model_calls, if i == 0 { files / 64 } else { 0 });
     }
     let store = runtimes[0]
         .owner
@@ -2077,10 +2314,13 @@ fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admissi
             assert_eq!((report.embedded_keys, report.model_calls), (0, 0));
         }
     }
-    assert_eq!(model.texts(), 2056);
-    assert_eq!(model.calls(), 40);
-    assert_eq!(embedded_keys, 2056);
-    assert_eq!(store.usage().unwrap().rows, 2056 * ROWS_PER_ONE_CHUNK_FILE);
+    assert_eq!(model.texts(), files + 8);
+    assert_eq!(model.calls(), files / 64 + 8);
+    assert_eq!(embedded_keys, files + 8);
+    assert_eq!(
+        store.usage().unwrap().rows,
+        (files + 8) as u64 * ROWS_PER_ONE_CHUNK_FILE
+    );
 
     // A source completion rejected at admission still stores its immutable
     // payload first. Retry and a sibling must reuse it, not re-embed it.
@@ -2131,9 +2371,12 @@ fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admissi
         .unwrap();
     assert_eq!((sibling.embedded_keys, sibling.model_calls), (0, 0));
     assert_eq!(model.texts(), before);
-    assert_eq!(model.texts(), 2057);
-    assert_eq!(model.calls(), 41);
-    assert_eq!(store.usage().unwrap().rows, 2057 * ROWS_PER_ONE_CHUNK_FILE);
+    assert_eq!(model.texts(), files + 9);
+    assert_eq!(model.calls(), files / 64 + 9);
+    assert_eq!(
+        store.usage().unwrap().rows,
+        (files + 9) as u64 * ROWS_PER_ONE_CHUNK_FILE
+    );
     for (runtime, root) in runtimes.iter().zip(&roots) {
         let answer = query(runtime, "revised item");
         assert!(answer.complete());
@@ -2208,7 +2451,8 @@ fn pending_semantic(runtime: &CheckoutSemantic) -> usize {
     runtime
         .installed()
         .generation()
-        .manifest()
+        .flatten()
+        .unwrap()
         .entries()
         .filter(|(_, entry)| {
             entry
@@ -2312,7 +2556,8 @@ fn large_semantic_materialization_batches_pins_and_touches() {
     let manifest = runtime
         .installed()
         .generation()
-        .manifest()
+        .flatten()
+        .unwrap()
         .to_json_bytes()
         .unwrap();
     let store = runtime
@@ -2322,7 +2567,8 @@ fn large_semantic_materialization_batches_pins_and_touches() {
     let blobs: Vec<_> = runtime
         .installed()
         .generation()
-        .manifest()
+        .flatten()
+        .unwrap()
         .ready_keys()
         .map(|key| (key, store.get(&key).unwrap().unwrap()))
         .collect();
@@ -2331,7 +2577,8 @@ fn large_semantic_materialization_batches_pins_and_touches() {
         runtime
             .installed()
             .generation()
-            .manifest()
+            .flatten()
+            .unwrap()
             .to_json_bytes()
             .unwrap(),
         manifest
@@ -2405,14 +2652,20 @@ fn large_checkout_edit_counts_source_work_and_preserves_outputs() {
         cold(&root, "rewritten item").0
     );
     let snapshot = runtime.installed();
-    let manifest = snapshot.generation().manifest().to_json_bytes().unwrap();
+    let manifest = snapshot
+        .generation()
+        .flatten()
+        .unwrap()
+        .to_json_bytes()
+        .unwrap();
     let store = runtime
         .owner
         .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
         .unwrap();
     let blobs: Vec<_> = snapshot
         .generation()
-        .manifest()
+        .flatten()
+        .unwrap()
         .ready_keys()
         .map(|key| (key, store.get(&key).unwrap().unwrap()))
         .collect();
@@ -2421,7 +2674,8 @@ fn large_checkout_edit_counts_source_work_and_preserves_outputs() {
         runtime
             .installed()
             .generation()
-            .manifest()
+            .flatten()
+            .unwrap()
             .to_json_bytes()
             .unwrap(),
         manifest

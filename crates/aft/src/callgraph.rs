@@ -3961,6 +3961,9 @@ fn walk_project_paths_filtered_while_with_builder(
     configure_builder(&mut builder);
     let filter_keep_walking = std::sync::Arc::new(keep_walking);
     let filter_budget = std::sync::Arc::clone(&filter_keep_walking);
+    // Skip nested linked worktrees of this repository: their files are indexed
+    // under their own roots. The walk root itself is always admitted (depth 0).
+    let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(root);
     let mut walker = crate::context::apply_project_ignore_rules(&mut builder, root)
         .filter_entry(move |entry| {
             #[cfg(test)]
@@ -3982,6 +3985,7 @@ fn walk_project_paths_filtered_while_with_builder(
             let file_type = entry.file_type();
             if crate::project_content::is_excluded_with_file_type(entry.path(), file_type.as_ref())
                 || !include(entry.path())
+                || crate::search_index::is_nested_worktree_entry(entry, &worktrees)
             {
                 return false;
             }

@@ -41,8 +41,11 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "content_inspector",
+ "cortexkit-agent-identity",
  "cortexkit-exec-remote-types",
  "cortexkit-paths",
+ "cortexkit-project-identity",
+ "cortexkit-role-agent-data",
  "cortexkit-role-harness",
  "cortexkit-role-tool-provider",
  "cortexkit-role-tool-provider-conformance",
@@ -603,10 +606,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
-name = "cortexkit-exec-remote-types"
-version = "0.2.13"
+name = "cortexkit-agent-identity"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15e25657c2655e2d1e3a5a744d98efcb2560990c2fd649cf938b10e2b229c4bd"
+checksum = "b6559f0fe8a15c29d3ec8cb6ea90106054ee74c23e38d9e4725a50411ec599d9"
+dependencies = [
+ "cortexkit-project-identity",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cortexkit-exec-remote-types"
+version = "0.2.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fc11cc28c2ead337d3a70e27ba1b7b6a1b70ad169ee04172186c41c5e04c2ba"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -619,6 +633,26 @@ name = "cortexkit-paths"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "30c3c61a48e327675a8baf6698cb96c6225c785a2e3988bc581b7c5305e90752"
+
+[[package]]
+name = "cortexkit-project-identity"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d621991ba599532775822fc6a9f8d30c6a042b42027550801578d28c592b6c99"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cortexkit-role-agent-data"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c974c2d1a3840050a7fb8e0e1eef98454bdee06b43dff176659a6e18735d3f6"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "cortexkit-role-harness"
@@ -3422,6 +3456,16 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "secret-rules"
+version = "0.1.0"
+dependencies = [
+ "idna",
+ "serde",
+ "serde_json",
+ "zeroize",
+]
 
 [[package]]
 name = "security-framework"

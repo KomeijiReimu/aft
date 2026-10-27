@@ -2305,6 +2305,23 @@ fn tree_files(cache: &Path, deadline: Instant) -> io::Result<Vec<(PathBuf, u64)>
     validate_tree(cache, deadline, true)
 }
 
+#[derive(Debug)]
+struct RetentionDeadline;
+
+impl std::fmt::Display for RetentionDeadline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("retention deadline reached")
+    }
+}
+
+impl std::error::Error for RetentionDeadline {}
+
+fn is_retention_deadline(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|error| error.is::<RetentionDeadline>())
+}
+
 /// A due root needs the filesystem safety checks, not payload sizes. Avoid a
 /// stat of every file merely to report bytes that the background reaper frees.
 fn validate_tree(
@@ -2333,13 +2350,13 @@ fn validate_tree_with_admission(
     while let Some(directory) = pending.pop() {
         admission()?;
         if Instant::now() >= deadline {
-            return Err(io::Error::other("retention deadline reached"));
+            return Err(io::Error::new(io::ErrorKind::TimedOut, RetentionDeadline));
         }
         let mut entries = fs::read_dir(&directory)?;
         loop {
             admission()?;
             if Instant::now() >= deadline {
-                return Err(io::Error::other("retention deadline reached"));
+                return Err(io::Error::new(io::ErrorKind::TimedOut, RetentionDeadline));
             }
             let Some(entry) = entries.next() else { break };
             let entry = entry?;
@@ -3467,7 +3484,7 @@ impl PreparedDue {
         let Self {
             directory,
             key,
-            leases,
+            mut leases,
             deadline: _,
             ..
         } = self;
@@ -3492,6 +3509,9 @@ impl PreparedDue {
         }
         yield_to_bind(&storage.durable)?;
         let phase = Instant::now();
+        for lease in &mut leases {
+            lease.stop_heartbeat_for_removal();
+        }
         retire_directory(&storage.durable, &cache)?;
         *report.timings_ms.entry("due_rename".into()).or_default() +=
             phase.elapsed().as_millis() as u64;
@@ -3700,6 +3720,20 @@ fn view_member_scopes(storage: &StoragePaths) -> io::Result<HashSet<String>> {
     Ok(scopes)
 }
 
+fn report_candidate_error(cache: &Path, error: &io::Error, report: &mut SweepReport) {
+    // An unfinished walk has not established protection. Keep its reason and
+    // mark the pass incomplete, without conflating filesystem timeouts with
+    // the collector's own deadline.
+    if is_retention_deadline(error) {
+        report.stopped_early = true;
+    } else {
+        report.skipped_protected += 1;
+    }
+    if report.errors.len() < 16 {
+        report.errors.push(format!("{}: {error}", cache.display()));
+    }
+}
+
 fn candidate(
     storage: &StoragePaths,
     roots: &mut RootIdentities,
@@ -3734,11 +3768,12 @@ fn candidate(
     if orphan {
         let mut delta = DomainReport::from_report(report).difference(&before);
         delta.examined += 1;
-        if result.is_err() {
-            // The caller adds one to skipped_protected for a candidate that
-            // returned an error, after this wrapper has run. Add the same
-            // count here so the orphan_views figures stay a subset of the
-            // pass totals rather than disagreeing with them.
+        if result
+            .as_ref()
+            .is_err_and(|error| !is_retention_deadline(error))
+        {
+            // The caller counts non-deadline errors as protected after this
+            // wrapper returns. Mirror that count in the orphan subtotal.
             delta.skipped_protected += 1;
         }
         report.orphan_views.add(&delta);
@@ -3980,6 +4015,9 @@ fn candidate_inner(
             }
         }
     } else {
+        for lease in &mut leases {
+            lease.stop_heartbeat_for_removal();
+        }
         retire_directory(&storage.durable, &cache)?;
         report.removed_bytes += before
             .iter()
@@ -4103,12 +4141,7 @@ fn due_first(
             batch,
             report,
         ) {
-            report.skipped_protected += 1;
-            if report.errors.len() < 16 {
-                report
-                    .errors
-                    .push(format!("{}: {error}", directory.join(&key).display()));
-            }
+            report_candidate_error(&directory.join(&key), &error, report);
         }
         let delta = DomainReport::from_report(report).difference(&before);
         report.due_first.add(&delta);
@@ -4227,12 +4260,7 @@ fn orphan_first(
                 due,
                 report,
             ) {
-                report.skipped_protected += 1;
-                if report.errors.len() < 16 {
-                    report
-                        .errors
-                        .push(format!("{}: {error}", item.entry.path().display()));
-                }
+                report_candidate_error(&item.entry.path(), &error, report);
             }
         }
         let delta = DomainReport::from_report(report).difference(&before);
@@ -4267,6 +4295,14 @@ fn orphan_first(
 /// One pass with an explicit time budget. Production always passes
 /// PASS_BUDGET; tests that check the entry bound pass a budget no runner can
 /// exhaust, so a slow machine cannot stop the pass by wall clock first.
+#[cfg(test)]
+pub(crate) fn run_pass_with_budget_for_test(
+    storage: &StoragePaths,
+    budget: Duration,
+) -> SweepReport {
+    run_pass_with_budget(storage, &|| false, &Instant::now, budget)
+}
+
 fn run_pass_with_budget(
     storage: &StoragePaths,
     cancelled: &dyn Fn() -> bool,
@@ -4423,12 +4459,7 @@ fn run_pass_with_root_identities(
                     &mut due,
                     &mut report,
                 ) {
-                    report.skipped_protected += 1;
-                    if report.errors.len() < 16 {
-                        report
-                            .errors
-                            .push(format!("{}: {error}", entry.path().display()));
-                    }
+                    report_candidate_error(&entry.path(), &error, &mut report);
                 }
             }
             let delta = DomainReport::from_report(&report).difference(&before);
@@ -10374,21 +10405,70 @@ mod storage_retention_tests {
         let temp = tempfile::tempdir().unwrap();
         let key = "0123456789abcdef";
         let view = cache(temp.path(), "views", key);
+        // This tests the observation grace, not how fast the runner can walk
+        // the view. Keep the production pass deadline out of both sweeps.
         // Expected: the first pass keeps the folder. A folder seen for the
         // first time may belong to a build in progress, so it is counted as
         // recent and its observation clock starts.
-        let first = run_pass(temp.path(), &|| false);
+        let first = run_pass_entry_bound(temp.path());
         assert_eq!(first.removed_roots, 0, "{first:?}");
         assert_eq!(first.orphan_views.skipped_recent, 1, "{first:?}");
         assert!(view.exists());
         // Expected: once the folder has been observed, and left unchanged, for
         // over an hour, the next pass removes it and reports its bytes.
         age_orphan(temp.path(), &view, key);
-        let second = run_pass(temp.path(), &|| false);
+        let second = run_pass_entry_bound(temp.path());
         assert_eq!(second.removed_roots, 1, "{second:?}");
         assert_eq!(second.orphan_views.removed_roots, 1, "{second:?}");
         assert!(second.orphan_views.removed_bytes > 0, "{second:?}");
         assert!(!view.exists());
+    }
+
+    #[test]
+    fn storage_retention_orphan_walk_deadline_is_incomplete_not_protected() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = "0123456789abcdef";
+        let view = cache(temp.path(), "views", key);
+        let clock = Instant::now();
+        let delay = observe_test_hook(
+            &view,
+            Arc::new(|step| {
+                if step == "walk" {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }),
+        );
+        // Hold the lane clock before its deadline so only the real-time tree
+        // walk expires, even if the runner stalls before entering the lane.
+        let stopped =
+            run_pass_with_budget(temp.path(), &|| false, &|| clock, Duration::from_millis(10));
+        drop(delay);
+        assert_eq!(stopped.examined, 1, "{stopped:?}");
+        assert!(stopped.stopped_early, "{stopped:?}");
+        assert_eq!(stopped.skipped_protected, 0, "{stopped:?}");
+        assert_eq!(stopped.orphan_views.skipped_protected, 0, "{stopped:?}");
+        assert_eq!(stopped.domains["views"].skipped_protected, 0, "{stopped:?}");
+        assert_eq!(stopped.removed_roots, 0, "{stopped:?}");
+        assert_eq!(stopped.errors.len(), 1, "{stopped:?}");
+        assert!(stopped.errors[0].contains("retention deadline reached"));
+        assert!(view.exists());
+
+        let observed = run_pass_entry_bound(temp.path());
+        assert_eq!(observed.orphan_views.skipped_recent, 1, "{observed:?}");
+        age_orphan(temp.path(), &view, key);
+        let reclaimed = run_pass_entry_bound(temp.path());
+        assert_eq!(reclaimed.orphan_views.removed_roots, 1, "{reclaimed:?}");
+        assert!(!view.exists());
+    }
+
+    #[test]
+    fn storage_retention_candidate_io_timeout_is_not_a_pass_deadline() {
+        let mut report = SweepReport::default();
+        let error = io::Error::new(io::ErrorKind::TimedOut, "filesystem probe timed out");
+        report_candidate_error(Path::new("cache"), &error, &mut report);
+        assert_eq!(report.skipped_protected, 1, "{report:?}");
+        assert!(!report.stopped_early, "{report:?}");
+        assert_eq!(report.errors, ["cache: filesystem probe timed out"]);
     }
 
     #[test]

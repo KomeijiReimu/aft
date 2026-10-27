@@ -155,9 +155,12 @@ for (const mode of [{ version: "unknown" }, { version: "11.6.0", status: 1 }]) {
     await withProbe(mode, async ({ npm, clock, calls, setMode }) => {
       expect(await lspNpmInstallInvocation(npm, "server", BEFORE, clock)).toBeNull();
       setMode({ version: "11.6.0" });
-      clock.advance(RETRY_MS);
+      clock.advance(RETRY_MS - 1);
+      expect(await lspNpmInstallInvocation(npm, "server", BEFORE, clock)).toBeNull();
+      expect(calls()).toEqual([["--version"]]);
+      clock.advance(1);
       expect(await lspNpmInstallInvocation(npm, "server", BEFORE, clock)).not.toBeNull();
-      expect(calls()).toHaveLength(2);
+      expect(calls()).toEqual([["--version"], ["--version"]]);
     });
   });
 }

@@ -107,7 +107,7 @@ pub(crate) fn generation_matches_head(generation: &str, head_fingerprint: &str) 
 }
 
 pub fn callgraph_paths_match_v2(
-    manifest: &manifest_v2::ManifestV2,
+    manifest: &snapshot::ComposedGeneration,
     root: &Path,
     paths: &[PathBuf],
 ) -> Result<bool> {

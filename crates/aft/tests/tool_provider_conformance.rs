@@ -40,6 +40,9 @@ mod aft_binary;
 /// no preset, which AFT serves as `head`).
 struct Subject {
     preset: Option<&'static str>,
+    /// Launches the provider under test with the main-thread stack Windows
+    /// gives it, instead of this host's.
+    one_mib_main_stack: bool,
     /// Stands in for the consumer's elicitation provider: the permission
     /// questions AFT files for the runner's held calls arrive here.
     stand_in: Arc<StandIn>,
@@ -48,11 +51,16 @@ impl Subject {
     fn new(preset: Option<&'static str>) -> Self {
         Self {
             preset,
+            one_mib_main_stack: false,
             stand_in: Arc::default(),
         }
     }
     fn head() -> Self {
         Self::new(None)
+    }
+    fn with_one_mib_main_stack(mut self) -> Self {
+        self.one_mib_main_stack = true;
+        self
     }
     /// The reader preset serves no shell tool, so it has no call AFT can
     /// hold, cancel or settle later.
@@ -333,6 +341,19 @@ fn prepare_provider_project(root: &Path) -> Result<(), HarnessError> {
     Ok(())
 }
 
+/// The main-thread stack the provider under test may have in this test, the
+/// size Windows reserves by default. `None` means it cannot be set here: macOS
+/// refuses to lower a forked child's stack limit (`setrlimit` fails with
+/// EINVAL), so the case runs on Linux, where the limit is lowered, and on
+/// Windows, where the binary's own reservation is checked.
+fn windows_sized_main_stack() -> Option<u64> {
+    if cfg!(target_os = "macos") {
+        None
+    } else {
+        Some(1024 * 1024)
+    }
+}
+
 fn provider_command(root: &Path, connection_path: &Path) -> Result<Command, HarnessError> {
     std::fs::create_dir_all(root).map_err(|error| {
         HarnessError::new(format!("creating provider cwd {}: {error}", root.display()))
@@ -504,6 +525,50 @@ impl Harness for Subject {
             ))
         })?;
         let mut command = provider_command(root, &connection_path)?;
+        if let Some(bytes) = windows_sized_main_stack().filter(|_| self.one_mib_main_stack) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                // The limit applies to this child only: the test runner and
+                // every worker thread keep the stack they had.
+                unsafe {
+                    command.pre_exec(move || {
+                        let mut current: libc::rlimit = std::mem::zeroed();
+                        if libc::getrlimit(libc::RLIMIT_STACK, &mut current) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        current.rlim_cur = bytes.min(current.rlim_max);
+                        if libc::setrlimit(libc::RLIMIT_STACK, &current) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+            #[cfg(windows)]
+            {
+                // A Windows main-thread stack is reserved by the executable's
+                // PE header before any code runs, so it can be checked here but
+                // not changed: this case runs only if the binary under test
+                // already reserves no more than the stack Windows gives a
+                // process by default.
+                let binary = std::fs::read(aft_binary::aft_binary()).map_err(harness_error)?;
+                let pe = u32::from_le_bytes(binary[0x3c..0x40].try_into().unwrap()) as usize;
+                assert_eq!(&binary[pe..pe + 4], b"PE\0\0");
+                // PE32+ optional header: its magic at its start, and the size
+                // of the initial stack reservation at offset 72.
+                let optional = pe + 24;
+                assert_eq!(&binary[optional..optional + 2], &[0x0b, 0x02]);
+                let reserve =
+                    u64::from_le_bytes(binary[optional + 72..optional + 80].try_into().unwrap());
+                assert!(
+                    reserve <= bytes,
+                    "this provider reserves {reserve} bytes of main-thread stack, more \
+                     than the {bytes} Windows gives by default, so it cannot run this \
+                     case here"
+                );
+            }
+        }
         let child = command.spawn().map_err(|error| {
             HarnessError::new(format!(
                 "launching {} with --subc {} in cwd {} (exe_exists={}, cwd_exists={}): {error}",
@@ -3043,6 +3108,79 @@ impl ToolProviderSubject for Subject {
     async fn settle(&self) {
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
+}
+
+/// A fresh provider must admit its very first shell call on a main-thread
+/// stack the size Windows gives it, without the test first warming any
+/// catalog, validator or code path that admission needs.
+///
+/// The stack size is set before the child is launched, never raised here and
+/// never requested from the linker. On Unix the child's stack limit is lowered
+/// to 1 MiB in `pre_exec` (see `spawn`). On Windows the main-thread stack is a
+/// fixed reservation in the executable's PE header and cannot be lowered at
+/// launch time, so `spawn` asserts that the binary already reserves no more
+/// than 1 MiB; the test runs wherever the binary under test meets that bound
+/// and says in its failure why it cannot there.
+#[tokio::test]
+async fn cold_bash_admission_on_one_mib_module_stack() {
+    if windows_sized_main_stack().is_none() {
+        eprintln!("skipped: this platform cannot give the provider a 1 MiB main-thread stack");
+        return;
+    }
+    let subject = Subject::head().with_one_mib_main_stack();
+    let root = tempfile::tempdir().unwrap();
+    let process = subject.spawn(root.path()).await.unwrap();
+    // Binding a route serves `role.describe`, which touches no catalog. The
+    // conformance `route` helper would send a readiness call first, and that
+    // call would warm admission before the call under test.
+    let route = bind_route_stamped(
+        &process,
+        &process.root.join("project"),
+        "runner",
+        "conformance-session",
+        Some(BTreeMap::from([("tool-provider".into(), "v1".into())])),
+        &subject.plain_stamp(),
+    )
+    .await
+    .unwrap();
+    // A valid bash call with an option combination translation refuses. It
+    // passes admission's schema check and stops before any shell starts, so
+    // this reply proves the admission path ran to completion. While the
+    // project is still opening its database, the call is answered without
+    // being admitted at all, so ask again until admission is the thing that
+    // answers.
+    let body = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let reply = route
+                .start(json!({
+                    "op": "tool.call", "preset": "head", "name": "bash",
+                    "arguments": {"command": "exit 7", "wait": true, "pty": true}
+                }))
+                .await
+                .terminal(Duration::from_secs(30))
+                .await;
+            let body = response_json(&reply);
+            assert_eq!(
+                reply.header.ty,
+                FrameType::Response,
+                "first bash admission on a 1 MiB main-thread stack: {body}"
+            );
+            if body["structuredContent"]["code"] != "database_initializing" {
+                break body;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the project opened its database within 30 seconds");
+    assert_eq!(
+        body["structuredContent"]["code"], "invalid_request",
+        "first bash admission on a 1 MiB main-thread stack: {body}"
+    );
+    assert_eq!(
+        body["structuredContent"]["message"],
+        "bash: wait:true cannot be used with pty:true because PTY sessions run in background"
+    );
 }
 
 /// Runs the conformance suite against the head subject (no preset sent) and

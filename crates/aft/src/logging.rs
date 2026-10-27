@@ -1608,6 +1608,24 @@ pub fn flush_durable_log(timeout: std::time::Duration) -> bool {
     done_rx.recv_timeout(timeout).unwrap_or(false)
 }
 
+/// Wait only during process exit for the queued stderr flush fence.
+/// File-log durability is a separate fence; ordinary log flushes never wait here.
+pub fn flush_stderr_on_exit(timeout: std::time::Duration) -> bool {
+    STDERR_MIRROR
+        .get()
+        .is_none_or(|mirror| mirror.drain_on_exit(timeout))
+}
+
+/// Test-only (debug builds): stop the stderr mirror from writing until
+/// [`flush_stderr_on_exit`] starts, so the lines logged in between are still
+/// queued when the exit fence runs. Without the fence they would be lost.
+#[cfg(debug_assertions)]
+pub fn hold_stderr_mirror_until_exit_fence() {
+    if let Some(mirror) = STDERR_MIRROR.get() {
+        mirror.hold_until_exit_fence();
+    }
+}
+
 /// Persist the last process-exit line without depending on the async writer.
 /// Taking its active sink prevents later rotation or reconfiguration from
 /// moving the marker. Queued diagnostics may be abandoned once their bounded

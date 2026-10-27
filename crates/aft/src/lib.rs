@@ -50,6 +50,7 @@ pub mod access_policy;
 #[cfg(test)]
 mod access_policy_tests;
 pub mod agent_child_env;
+pub mod agent_data;
 pub mod alert_records;
 pub mod alert_state;
 pub mod alias;
@@ -113,6 +114,7 @@ pub mod gh_shim_ticket;
 pub(crate) mod gh_shim_worker_broker;
 #[cfg(unix)]
 pub(crate) mod gh_shim_worker_endpoints;
+pub mod git_index_reader;
 pub(crate) mod git_probe;
 pub mod github_read;
 pub mod grep_executor;
@@ -143,6 +145,8 @@ pub mod memory;
 pub mod migrate_storage;
 pub mod migration;
 pub mod ndjson_text;
+#[cfg(test)]
+mod nested_worktree_tests;
 pub mod ort_lifecycle;
 pub mod ort_pin;
 pub(crate) mod os_metadata;
