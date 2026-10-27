@@ -9294,7 +9294,8 @@ fn scoped_rust_inspect_reports_a_removed_field_after_an_outside_edit_with_real_r
 /// loaded machine can delay it, so the inspect runs while the change is still
 /// queued. It must deliver the change itself and then report the compiler
 /// error of the check the change starts, or name that check as still
-/// running; the stale answer it used to give is a clean, complete result.
+/// running; the stale answer it used to give is a complete result without
+/// that error.
 #[test]
 fn scoped_rust_inspect_forwards_a_queued_outside_edit_before_certifying() {
     let (_temp_dir, root, lib) = single_crate_fixture("queued-outside-edit");
@@ -9303,7 +9304,14 @@ fn scoped_rust_inspect_forwards_a_queued_outside_edit_before_certifying() {
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "0");
     let warm = scoped_diagnostics_inspect(&ctx, "queued-outside-edit-warm", "src/lib.rs");
     assert!(!reported_check_still_running(&warm), "{warm:#}");
-    assert_eq!(warm["summary"]["diagnostics"]["errors"], 0, "{warm:#}");
+    // The fake's own analysis always reports a test error and warning; only
+    // a check of a file containing `fake_compile_error` adds this one.
+    assert!(
+        !diagnostic_messages_for(&warm, "src/lib.rs")
+            .iter()
+            .any(|message| message == "fake compile error"),
+        "control: the file compiles before the outside edit: {warm:#}"
+    );
 
     // Another program adds a compiler error.
     fs::write(&lib, "// fake_compile_error\npub fn f() {}\n").unwrap();
@@ -9313,7 +9321,8 @@ fn scoped_rust_inspect_forwards_a_queued_outside_edit_before_certifying() {
     let (held_tx, held_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     thread::scope(|scope| {
-        scope.spawn(|| {
+        let ctx = &ctx;
+        scope.spawn(move || {
             let _busy = ctx.lsp();
             held_tx.send(()).unwrap();
             let _ = release_rx.recv();
