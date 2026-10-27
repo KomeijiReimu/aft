@@ -353,3 +353,45 @@ async fn audit_ipv6_literal() {
         "Bearer test-key-12345678"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit_stop_during_material() {
+    let server = Server::new("plain").await;
+    let vault = Vault::new();
+    vault.block_material.store(true, Ordering::Release);
+    let (mut proxy, mut client) = launch(&server, vault.clone());
+    client.connect(false);
+    let state = proxy.state.clone();
+    let request = std::thread::spawn(move || {
+        let reply = client.request(
+            "/approved",
+            json!({"authorization":format!("Bearer {MARKER}")}),
+            "",
+        );
+        (reply, client)
+    });
+    tokio::time::timeout(Duration::from_secs(5), vault.material_entered.notified())
+        .await
+        .unwrap();
+    let stopped = std::thread::spawn(move || {
+        proxy.stop();
+        proxy
+    });
+    let latched = tokio::time::timeout(Duration::from_millis(500), async {
+        while !state.stopped.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .is_ok();
+    *vault.material_released.lock().unwrap() = true;
+    vault.release_material.notify_all();
+    let _proxy = stopped.join().unwrap();
+    let (_reply, _client) = request.join().unwrap();
+    assert!(
+        latched,
+        "stop waited for material before revoking dispatch permission"
+    );
+    assert!(server.seen.lock().is_empty());
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 1);
+}

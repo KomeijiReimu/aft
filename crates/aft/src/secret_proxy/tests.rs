@@ -24,6 +24,10 @@ struct Vault {
     refused_label: Mutex<Option<String>>,
     special: AtomicBool,
     audits: Mutex<Vec<secret_rules::audit::AuditRecordV1>>,
+    block_material: AtomicBool,
+    material_entered: tokio::sync::Notify,
+    material_released: std::sync::Mutex<bool>,
+    release_material: std::sync::Condvar,
 }
 
 impl Vault {
@@ -35,6 +39,10 @@ impl Vault {
             refused_label: Mutex::new(None),
             special: AtomicBool::new(false),
             audits: Mutex::new(Vec::new()),
+            block_material: AtomicBool::new(false),
+            material_entered: tokio::sync::Notify::new(),
+            material_released: std::sync::Mutex::new(false),
+            release_material: std::sync::Condvar::new(),
         })
     }
 }
@@ -51,6 +59,13 @@ impl SecretVault for Vault {
     ) -> Result<Material, MaterialError> {
         assert_eq!(scope.reference(), "head");
         let count = self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.block_material.load(Ordering::Acquire) {
+            self.material_entered.notify_one();
+            let mut released = self.material_released.lock().unwrap();
+            while !*released {
+                released = self.release_material.wait(released).unwrap();
+            }
+        }
         if self.denied.load(Ordering::SeqCst) || self.refused_label.lock().as_deref() == Some(label)
         {
             return Err(MaterialError::GrantLapsed);
