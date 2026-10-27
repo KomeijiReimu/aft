@@ -385,10 +385,7 @@ pub fn cache_unavailable(config: &crate::config::Config) -> Option<String> {
 /// [`cache_unavailable`] against an already-resolved cache root. The health
 /// rollup resolves each distinct root once per tick and reuses it here so a
 /// many-context tick does not re-resolve the same root once per context.
-pub fn cache_unavailable_for_root(
-    config: &crate::config::Config,
-    root: &Path,
-) -> Option<String> {
+pub fn cache_unavailable_for_root(config: &crate::config::Config, root: &Path) -> Option<String> {
     if let Some(reason) = &config.cache_config_unknown {
         return Some(format!("cache_dir_config_unknown: {reason}"));
     }

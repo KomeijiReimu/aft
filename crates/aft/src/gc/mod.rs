@@ -635,12 +635,7 @@ fn mark_live_query_pins(
     // the whole view instead of once per generation.
     let generations = entries
         .flatten()
-        .filter(|entry| {
-            entry
-                .file_type()
-                .map(|kind| kind.is_dir())
-                .unwrap_or(false)
-        })
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
         .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
         .collect::<Vec<_>>();
     let mut protect = |generation: &str, sweep: root_cache::ReadMarkerSweep| {
@@ -686,8 +681,7 @@ fn mark_live_query_pins(
         }
     };
     for generation in &generations {
-        let sweep =
-            marker_sweep.sweep_read_markers_from_readers(&pinned_readers, generation, true);
+        let sweep = marker_sweep.sweep_read_markers_from_readers(&pinned_readers, generation, true);
         protect(generation, sweep);
     }
 }
@@ -1094,10 +1088,7 @@ mod storage_retention_tests {
         let mut marker_files = 0usize;
         let mut generation_keys = BTreeMap::new();
         for (index, generation) in generations.iter().enumerate() {
-            generation_keys.insert(
-                generation.clone(),
-                BTreeSet::from([[index as u8 + 1; 32]]),
-            );
+            generation_keys.insert(generation.clone(), BTreeSet::from([[index as u8 + 1; 32]]));
             let readers = crate::root_cache::read_marker_dir(&view_dir, generation);
             // A same-host marker whose owner is long dead: stale, like the
             // malformed file beside it. Copying the live record keeps the
@@ -1197,9 +1188,6 @@ mod storage_retention_tests {
         // The pass resolves the hostname once and each live pid's start time
         // once, no matter how many generations or markers name them.
         assert_eq!(hostnames, 1, "hostname resolved once per generation");
-        assert_eq!(
-            starts, 1,
-            "one process start time resolved once per marker"
-        );
+        assert_eq!(starts, 1, "one process start time resolved once per marker");
     }
 }

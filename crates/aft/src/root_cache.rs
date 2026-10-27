@@ -1091,15 +1091,14 @@ impl ReadMarkerSweepContext {
     ) -> ReadMarkerSweep {
         let Self { hostname, started } = self;
         let result = (|| {
-            let generation = match readers
-                .repair_child_same_mount(std::ffi::OsStr::new(generation_label))
-            {
-                Ok(generation) => generation,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    return Ok(ReadMarkerSweep::default())
-                }
-                Err(error) => return Err(error),
-            };
+            let generation =
+                match readers.repair_child_same_mount(std::ffi::OsStr::new(generation_label)) {
+                    Ok(generation) => generation,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        return Ok(ReadMarkerSweep::default())
+                    }
+                    Err(error) => return Err(error),
+                };
             sweep_marker_generation_cached(
                 &generation,
                 &mut crate::bash_background::persistence::RepairBudget::new(),

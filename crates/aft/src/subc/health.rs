@@ -3189,13 +3189,7 @@ impl RollupStepTimer {
 #[derive(Default)]
 struct TickStoragePaths {
     storage: HashMap<Option<std::path::PathBuf>, std::path::PathBuf>,
-    cache: HashMap<
-        (
-            Option<std::path::PathBuf>,
-            Option<std::path::PathBuf>,
-        ),
-        std::path::PathBuf,
-    >,
+    cache: HashMap<(Option<std::path::PathBuf>, Option<std::path::PathBuf>), std::path::PathBuf>,
 }
 
 impl TickStoragePaths {
@@ -3219,10 +3213,7 @@ impl TickStoragePaths {
         resolved
     }
 
-    fn storage_paths(
-        &mut self,
-        config: &crate::config::Config,
-    ) -> crate::root_cache::StoragePaths {
+    fn storage_paths(&mut self, config: &crate::config::Config) -> crate::root_cache::StoragePaths {
         crate::root_cache::StoragePaths::new(
             self.storage_dir(config.storage_dir.as_deref()),
             self.cache_dir(config),
@@ -6703,12 +6694,8 @@ mod tests {
         }
         crate::bash_background::reset_storage_dir_calls_for_test();
         crate::project_content::reset_register_canonicalizations_for_test();
-        let rollup = build_health_diagnostic_rollup_from_actors(
-            &cache,
-            &executor,
-            &shared_app,
-            entries,
-        );
+        let rollup =
+            build_health_diagnostic_rollup_from_actors(&cache, &executor, &shared_app, entries);
         assert_eq!(
             rollup.metrics["root_count"], 32,
             "the tick must have visited every actor"
@@ -6717,8 +6704,7 @@ mod tests {
         // one standing-roots probe, which runs once per tick by construction).
         // Resolving once per context would report hundreds here.
         let resolutions = crate::bash_background::storage_dir_calls_for_test();
-        let canonicalizations =
-            crate::project_content::register_canonicalizations_for_test();
+        let canonicalizations = crate::project_content::register_canonicalizations_for_test();
         println!(
             "health tick over 32 contexts: {resolutions} storage resolutions, {canonicalizations} canonicalizations"
         );

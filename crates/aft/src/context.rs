@@ -9169,8 +9169,7 @@ impl AppContext {
     /// reuses it here so a many-context tick does not re-resolve the same
     /// root once per context.
     pub(crate) fn cache_unavailable_reason_for_root(&self, cache_dir: &Path) -> Option<String> {
-        let reason =
-            crate::root_cache::cache_unavailable_for_root(&self.config(), cache_dir)?;
+        let reason = crate::root_cache::cache_unavailable_for_root(&self.config(), cache_dir)?;
         if reason.starts_with(crate::root_cache::CACHE_DIR_BUSY)
             && !crate::provisional_identity_retry::cache_retry_pending(self)
         {
