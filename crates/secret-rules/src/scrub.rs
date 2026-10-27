@@ -2562,4 +2562,42 @@ mod tests {
             "F"
         );
     }
+
+    /// The deadline is looked at inside a long scan, not only on entry: a
+    /// scan that would take seconds stops shortly after the deadline.
+    #[test]
+    fn a_deadline_that_passes_mid_scan_stops_the_scan() {
+        // Every position starts a long partial match and no base64 run is
+        // long enough to decode, so the time goes to the position scan.
+        let key: &[u8] = b"aaaaaaaaaaaaaaab";
+        let text = b"aaaaaaaaaaaaaaa!".repeat(512 * 1024);
+        let started = std::time::Instant::now();
+        let outcome = reveal_outcome(
+            &text,
+            &[key],
+            Some(started + std::time::Duration::from_millis(50)),
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, RevealOutcome::OutOfTime);
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "stopped after {elapsed:?}"
+        );
+    }
+
+    /// A key with punctuation that a change completes far from that
+    /// punctuation is found only if the rescan region reaches past the
+    /// enclosing base64 run, by the full longest-spelling margin.
+    #[test]
+    fn the_rescan_margin_reaches_a_key_past_its_punctuation() {
+        let key: &[u8] = b"abcdef*xyzw123456";
+        assert_eq!(
+            reveal_outcome(b"intro abcdef*xyzw12345<i>6 outro", &[key], None),
+            RevealOutcome::Found
+        );
+        assert_eq!(
+            reveal_outcome(b"intro abcdef*xyzw12345<!-- -->6 outro", &[key], None),
+            RevealOutcome::Found
+        );
+    }
 }

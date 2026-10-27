@@ -864,17 +864,44 @@ impl HeldKeys {
     /// replaced by its placeholder. Text that still spells a key after that,
     /// or that cannot be scrubbed, is dropped whole.
     fn sanitize_detail(&self, detail: &str) -> String {
+        let deadline = Instant::now() + DETAIL_CHECK_LIMIT;
         match self.scrub(detail.as_bytes()) {
-            Ok(clean) if !self.reveals(&clean) => String::from_utf8_lossy(&clean).into_owned(),
+            Ok(clean) if self.reveal(&clean, deadline).is_clean() => {
+                String::from_utf8_lossy(&clean).into_owned()
+            }
             _ => String::new(),
         }
     }
 
-    /// True when `bytes` still spell a held key, as they stand or after a
-    /// URL parser or reader normalizes them, or keep decoding deeper than the
-    /// check follows (see [`secret_rules::reveals_any`]).
-    fn reveals(&self, bytes: &[u8]) -> bool {
-        secret_rules::reveals_any(bytes, &self.keys())
+    /// Whether `bytes` still spell a held key, as they stand or after a URL
+    /// parser or reader normalizes them, checked until `deadline` (see
+    /// [`secret_rules::reveal_outcome`]).
+    fn reveal(&self, bytes: &[u8], deadline: Instant) -> secret_rules::RevealOutcome {
+        secret_rules::reveal_outcome(bytes, &self.keys(), Some(deadline))
+    }
+}
+
+/// The longest the residual check of a library error's text may run; such
+/// text is short, and text the check cannot clear in time is dropped.
+const DETAIL_CHECK_LIMIT: Duration = Duration::from_millis(100);
+
+/// Refuse unless the residual check found `bytes` clean: `found` names the
+/// refusal when a key was spelled, and a check that could not finish refuses
+/// as exhausted or timed out.
+fn refuse_unless_clean(
+    outcome: secret_rules::RevealOutcome,
+    found: &str,
+    url: &str,
+) -> Result<(), UrlFetchError> {
+    match outcome {
+        secret_rules::RevealOutcome::Clean => Ok(()),
+        secret_rules::RevealOutcome::Found => Err(secret_fetch_refused(found, url)),
+        secret_rules::RevealOutcome::Exhausted => {
+            Err(secret_fetch_refused("residual_check_exhausted", url))
+        }
+        secret_rules::RevealOutcome::OutOfTime => {
+            Err(secret_fetch_refused("residual_check_timeout", url))
+        }
     }
 }
 
@@ -973,7 +1000,7 @@ fn fetch_with_secrets(
         }) {
             return Err(secret_fetch_refused("redirect_control_byte", logical_url));
         }
-        let location = scrubbed_header(&response, LOCATION, &held, logical_url)?
+        let location = scrubbed_header(&response, LOCATION, &held, logical_url, &deadline)?
             .filter(|value| value.bytes().all(|byte| (0x20..0x7f).contains(&byte)))
             .ok_or_else(|| {
                 UrlFetchError::new(format!(
@@ -992,9 +1019,11 @@ fn fetch_with_secrets(
         // lowercased, escapes are kept), which can reassemble a key the
         // header scrub did not see. Check the URL exactly as it will be
         // looked up, sent and named, before any of that happens.
-        if held.reveals(next.as_str().as_bytes()) {
-            return Err(secret_fetch_refused("redirect_discloses_key", logical_url));
-        }
+        refuse_unless_clean(
+            held.reveal(next.as_str().as_bytes(), header_check_deadline(&deadline)),
+            "redirect_discloses_key",
+            logical_url,
+        )?;
         current = next;
         hop += 1;
     };
@@ -1010,7 +1039,7 @@ fn fetch_with_secrets(
             ),
         ));
     }
-    let content_type = scrubbed_header(&response, CONTENT_TYPE, &held, logical_url)?
+    let content_type = scrubbed_header(&response, CONTENT_TYPE, &held, logical_url, &deadline)?
         .unwrap_or_else(|| "text/plain".to_string());
     // `HeaderMap::get` reads only the first field. A second Content-Encoding
     // field could name a coding behind an `identity` first one, so repeated
@@ -1018,7 +1047,8 @@ fn fetch_with_secrets(
     if response.headers().get_all(CONTENT_ENCODING).iter().count() > 1 {
         return Err(secret_fetch_refused("content_encoding", logical_url));
     }
-    let codings = match scrubbed_header(&response, CONTENT_ENCODING, &held, logical_url)? {
+    let codings = match scrubbed_header(&response, CONTENT_ENCODING, &held, logical_url, &deadline)?
+    {
         Some(value) => secret_content_codings(&value, logical_url)?,
         None if response.headers().contains_key(CONTENT_ENCODING) => {
             return Err(secret_fetch_refused("content_encoding", logical_url));
@@ -1089,26 +1119,11 @@ fn fetch_with_secrets(
     // key after those is refused, never written; so is one the check could
     // not finish, within its work budget or before its share of the call's
     // read-back reserve ran out.
-    let outcome = secret_rules::reveal_outcome(
-        &body,
-        &held.keys(),
-        Some(residual_check_deadline(&deadline)),
-    );
-    match outcome {
-        secret_rules::RevealOutcome::Clean => {}
-        secret_rules::RevealOutcome::Found => {
-            return Err(secret_fetch_refused("document_discloses_key", logical_url));
-        }
-        secret_rules::RevealOutcome::Exhausted => {
-            return Err(secret_fetch_refused(
-                "residual_check_exhausted",
-                logical_url,
-            ));
-        }
-        secret_rules::RevealOutcome::OutOfTime => {
-            return Err(secret_fetch_refused("residual_check_timeout", logical_url));
-        }
-    }
+    refuse_unless_clean(
+        held.reveal(&body, residual_check_deadline(&deadline)),
+        "document_discloses_key",
+        logical_url,
+    )?;
     let content_file = document_dir.join(format!("document{extension}"));
     write_secret_document(&content_file, &body)?;
     // The metadata sits where `download_notice` looks for it, so a truncated
@@ -1145,6 +1160,7 @@ fn scrubbed_header(
     name: reqwest::header::HeaderName,
     held: &HeldKeys,
     url: &str,
+    deadline: &FetchDeadline,
 ) -> Result<Option<String>, UrlFetchError> {
     let Some(value) = response.headers().get(&name) else {
         return Ok(None);
@@ -1152,9 +1168,11 @@ fn scrubbed_header(
     let clean = held.scrub(value.as_bytes()).map_err(scrub_refusal(url))?;
     // The scrubbed value is read, joined or quoted next; a key it still
     // spells in a form the scrub missed refuses the response instead.
-    if held.reveals(&clean) {
-        return Err(secret_fetch_refused("header_discloses_key", url));
-    }
+    refuse_unless_clean(
+        held.reveal(&clean, header_check_deadline(deadline)),
+        "header_discloses_key",
+        url,
+    )?;
     Ok(String::from_utf8(clean).ok())
 }
 
@@ -1201,10 +1219,22 @@ fn residual_check_deadline(deadline: &FetchDeadline) -> Instant {
     deadline.at + RESIDUAL_CHECK_RESERVE
 }
 
+/// When the residual check of a response header or a joined redirect URL
+/// must stop: the download deadline, since those checks run while the fetch
+/// is still downloading, or sooner in a test that injects a shorter limit.
+fn header_check_deadline(deadline: &FetchDeadline) -> Instant {
+    #[cfg(test)]
+    if let Some(limit) = TEST_RESIDUAL_LIMIT.with(std::cell::Cell::get) {
+        return Instant::now() + limit;
+    }
+    deadline.at
+}
+
 #[cfg(test)]
 thread_local! {
-    /// When set, a placeholder fetch's residual check stops this long after
-    /// it starts, so a test can reach the timeout without a slow document.
+    /// When set, each of a placeholder fetch's residual checks (headers,
+    /// redirect URLs, the document) stops this long after it starts, so a
+    /// test can reach the timeout without a slow document.
     static TEST_RESIDUAL_LIMIT: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
 }
 

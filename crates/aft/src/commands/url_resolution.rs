@@ -2345,5 +2345,39 @@ mod url_tests {
             assert!(documents.is_empty());
             assert_eq!(server.targets().len(), 2);
         }
+
+        /// The residual check on a redirect's Location header runs under the
+        /// call's deadline too: when it has run out (here injected as zero),
+        /// the redirect is refused, never followed.
+        #[test]
+        fn a_redirect_header_check_is_bounded_by_the_deadline() {
+            let fixture = fixture(Default::default());
+            let other = serve(&fixture.tls, |_| Some(markdown(b"# Other\n")));
+            let op = other.addr.port();
+            let location = format!("https://other.secret.test:{op}/v1/doc.md");
+            let api = serve(&fixture.tls, move |_| {
+                Some(http("302 Found", &[("Location", location.as_str())], b""))
+            });
+            let port = api.addr.port();
+            let url = format!("https://api.secret.test:{port}/v1/doc.md?key={PLACEHOLDER}");
+            let vault = granted_vault(rule("api.secret.test", port, "/v1"));
+            let routes = [
+                ("api.secret.test", api.addr),
+                ("other.secret.test", other.addr),
+            ];
+            let _limit =
+                crate::url_fetch::limit_secret_residual_check_for_test(std::time::Duration::ZERO);
+            let (run, documents) = run_with(
+                &fixture,
+                &vault,
+                &routes,
+                &request("outline", &url, serde_json::json!({})),
+                no_extra,
+            );
+            assert_refused_for(&run, "residual_check_timeout");
+            assert!(documents.is_empty());
+            assert_eq!(api.targets().len(), 1);
+            assert_eq!(other.connections.load(Ordering::SeqCst), 0);
+        }
     }
 }
