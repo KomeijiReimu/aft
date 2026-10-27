@@ -1073,9 +1073,10 @@ const MAX_REVEAL_VIEWS: usize = 16;
 
 /// True when `text` spells `key` in a form the scrubber recognises, either as
 /// it stands or after a recipient undoes the changes a URL parser or a reader
-/// makes without being asked: dropping control bytes such as a tab, and
-/// decoding percent-encoding any number of times (up to [`MAX_REVEAL_VIEWS`]
-/// views).
+/// makes without being asked: dropping control bytes such as a tab, decoding
+/// percent-encoding any number of times, reading Markdown backslash escapes
+/// and decoding HTML character references, in any combination (up to
+/// [`MAX_REVEAL_VIEWS`] views).
 ///
 /// The scrubber replaces a key only where it finds one, so text it passed
 /// can still carry a key that one of these changes reassembles. A caller that
@@ -1113,7 +1114,12 @@ pub fn reveals_key(text: &[u8], key: &[u8]) -> bool {
 /// One change [`reveals_key`] undoes; `None` when it would change nothing.
 type RevealTransform = fn(&[u8]) -> Option<Zeroizing<Vec<u8>>>;
 
-const REVEAL_TRANSFORMS: &[RevealTransform] = &[without_control_bytes, percent_decoded];
+const REVEAL_TRANSFORMS: &[RevealTransform] = &[
+    without_control_bytes,
+    percent_decoded,
+    markdown_unescaped,
+    html_entities_decoded,
+];
 
 /// `text` without ASCII control bytes, which a URL parser drops (a tab or a
 /// line break inside a URL) or a reader skips.
@@ -1151,6 +1157,117 @@ fn percent_decoded(text: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
         index += 1;
     }
     changed.then_some(out)
+}
+
+/// `text` with Markdown backslash escapes removed (`\*` read as `*`), the form
+/// an HTML-to-Markdown converter writes punctuation in and a reader sees
+/// through.
+fn markdown_unescaped(text: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    let escapes = |pair: &[u8]| pair[0] == b'\\' && pair[1].is_ascii_punctuation();
+    if !text.windows(2).any(escapes) {
+        return None;
+    }
+    let mut out = Zeroizing::new(Vec::with_capacity(text.len()));
+    let mut index = 0;
+    while index < text.len() {
+        if text[index] == b'\\' && text.get(index + 1).is_some_and(u8::is_ascii_punctuation) {
+            out.push(text[index + 1]);
+            index += 2;
+            continue;
+        }
+        out.push(text[index]);
+        index += 1;
+    }
+    Some(out)
+}
+
+/// Named HTML character references for ASCII characters that
+/// [`html_entities_decoded`] understands, besides the numeric forms.
+const HTML_NAMED_ENTITIES: &[(&[u8], u8)] = &[
+    (b"amp", b'&'),
+    (b"lt", b'<'),
+    (b"gt", b'>'),
+    (b"quot", b'"'),
+    (b"apos", b'\''),
+    (b"ast", b'*'),
+    (b"lowbar", b'_'),
+    (b"lsqb", b'['),
+    (b"rsqb", b']'),
+    (b"bsol", b'\\'),
+    (b"grave", b'`'),
+    (b"plus", b'+'),
+    (b"equals", b'='),
+    (b"sol", b'/'),
+    (b"colon", b':'),
+    (b"period", b'.'),
+    (b"comma", b','),
+    (b"hyphen", b'-'),
+    (b"dash", b'-'),
+    (b"tilde", b'~'),
+    (b"num", b'#'),
+    (b"percnt", b'%'),
+    (b"excl", b'!'),
+    (b"quest", b'?'),
+    (b"commat", b'@'),
+    (b"dollar", b'$'),
+    (b"Hat", b'^'),
+    (b"verbar", b'|'),
+    (b"lcub", b'{'),
+    (b"rcub", b'}'),
+    (b"lpar", b'('),
+    (b"rpar", b')'),
+    (b"semi", b';'),
+];
+
+/// `text` with HTML character references decoded: `&#42;`, `&#x2a;` and the
+/// named ones in [`HTML_NAMED_ENTITIES`]. HTML kept as it is (a page served
+/// under a source-file path) spells characters this way, and any browser or
+/// reader decodes them.
+fn html_entities_decoded(text: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    if !text.contains(&b'&') {
+        return None;
+    }
+    let mut out = Zeroizing::new(Vec::with_capacity(text.len()));
+    let mut index = 0;
+    let mut changed = false;
+    while index < text.len() {
+        if text[index] == b'&' {
+            if let Some((decoded, len)) = html_entity_at(text, index) {
+                out.extend_from_slice(&decoded);
+                index += len;
+                changed = true;
+                continue;
+            }
+        }
+        out.push(text[index]);
+        index += 1;
+    }
+    changed.then_some(out)
+}
+
+/// The character reference starting at `text[index]` (which is `&`): its
+/// UTF-8 bytes and its length including the `;`.
+fn html_entity_at(text: &[u8], index: usize) -> Option<(Vec<u8>, usize)> {
+    // The longest reference decoded here is `&#x10FFFF;` or `&percnt;`-sized
+    // names; a `;` further away ends no reference.
+    let rest = text.get(index + 1..)?;
+    let end = rest.iter().take(10).position(|byte| *byte == b';')?;
+    let body = &rest[..end];
+    let consumed = end + 2;
+    if let Some(number) = body.strip_prefix(b"#") {
+        let (digits, radix) = match number.first() {
+            Some(b'x' | b'X') => (&number[1..], 16),
+            _ => (number, 10),
+        };
+        let digits = std::str::from_utf8(digits).ok()?;
+        let code = u32::from_str_radix(digits, radix).ok()?;
+        let character = char::from_u32(code)?;
+        return Some((character.to_string().into_bytes(), consumed));
+    }
+    HTML_NAMED_ENTITIES
+        .iter()
+        .find(|(name, _)| *name == body)
+        .map(|(_, byte)| (vec![*byte], consumed))
 }
 
 #[cfg(test)]

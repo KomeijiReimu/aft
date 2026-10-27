@@ -1698,5 +1698,39 @@ mod url_tests {
             assert!(!run.response.success, "{:?}", run.response.data);
             assert_absent(&run, &documents, &[b"Gvgyr"]);
         }
+
+        /// HTML that spells one key character as an entity is decoded and
+        /// then Markdown-escaped by conversion; neither that escaped form nor
+        /// the entity form (HTML kept as is under a `.md` path) may reach the
+        /// output.
+        #[test]
+        fn entity_spelled_keys_in_html_never_reach_the_output() {
+            const K: &[u8] = b"abcdef*1234567890";
+            let fixture = fixture(Default::default());
+            let server = serve(&fixture.tls, |_| {
+                Some(http(
+                    "200 OK",
+                    &[("Content-Type", "text/html")],
+                    b"<html><body><h1>Doc</h1><p>abcdef&#42;1234567890</p></body></html>",
+                ))
+            });
+            let port = server.addr.port();
+            for path in ["/v1/page", "/v1/page.md"] {
+                let url = format!("https://api.secret.test:{port}{path}?key={PLACEHOLDER}");
+                let vault = granted_vault_with(rule("api.secret.test", port, "/v1"), K);
+                let (run, documents) = run_with(
+                    &fixture,
+                    &vault,
+                    &[("api.secret.test", server.addr)],
+                    &request("zoom", &url, serde_json::json!({"symbol": "Doc"})),
+                    no_extra,
+                );
+                assert_absent(
+                    &run,
+                    &documents,
+                    &[K, b"abcdef\\*1234567890", b"abcdef&#42;1234567890"],
+                );
+            }
+        }
     }
 }

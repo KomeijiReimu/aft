@@ -1014,6 +1014,13 @@ pub fn fetch_url_with_secrets(
         (body, content_type, extension)
     };
 
+    // The scrub replaced every spelling it recognised, but conversion and
+    // plain readers undo more (a Markdown-escaped `\*`, an HTML entity kept in
+    // a page served under a source path). A document that still spells a held
+    // key after those is refused, never written.
+    if held.reveals(&body) {
+        return Err(secret_fetch_refused("document_discloses_key", logical_url));
+    }
     let content_file = document_dir.join(format!("document{extension}"));
     write_secret_document(&content_file, &body)?;
     // The metadata sits where `download_notice` looks for it, so a truncated
@@ -3340,6 +3347,18 @@ mod tests {
         assert_eq!(code_fence_for("`inline` ``double``"), "```");
         assert_eq!(code_fence_for("```"), "````");
         assert_eq!(code_fence_for("``` and ````"), "`````");
+    }
+
+    /// htmd decodes an HTML entity into its character and then escapes that
+    /// character for Markdown, so the converted text spells a key in a form
+    /// the byte matchers alone do not recognise.
+    #[test]
+    fn html_conversion_markdown_escapes_an_entity_decoded_character() {
+        let markdown =
+            convert_html_body_to_markdown(b"<p>abcdef&#42;1234567890</p>", "https://example.test/")
+                .unwrap();
+        let text = String::from_utf8(markdown).unwrap();
+        assert!(text.contains("abcdef\\*1234567890"), "{text}");
     }
 }
 
