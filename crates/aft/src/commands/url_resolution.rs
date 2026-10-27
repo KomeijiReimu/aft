@@ -1561,6 +1561,18 @@ mod url_tests {
 
         fn no_extra(_: &mut UrlFetchOptions) {}
 
+        /// The run was refused, and for exactly `reason` (the token a
+        /// placeholder fetch writes in parentheses), not for something that
+        /// happened earlier.
+        fn assert_refused_for(run: &Run, reason: &str) {
+            assert!(!run.response.success, "{:?}", run.response.data);
+            let strings = run.strings();
+            assert!(
+                strings.contains(&format!("({reason})")),
+                "expected refusal {reason}: {strings}"
+            );
+        }
+
         /// A redirect whose Location spells the key only after URL parsing
         /// has normalized it (a tab the parser drops, a dot segment it
         /// collapses, a host name it lowercases, a second layer of percent
@@ -1570,25 +1582,29 @@ mod url_tests {
             let fixture = fixture(Default::default());
             let other = serve(&fixture.tls, |_| Some(markdown(b"# Other\n")));
             let op = other.addr.port();
-            let cases: Vec<(&'static [u8], String)> = vec![
+            let cases: Vec<(&'static [u8], String, &str)> = vec![
                 (
                     KEY,
                     format!("https://other.secret.test:{op}/v1/doc.md?leaked=fetch-\tsecret-key/0123456789+abc"),
+                    "redirect_control_byte",
                 ),
                 (
                     KEY,
                     format!("https://other.secret.test:{op}/fetch-secret-key/./0123456789+abc"),
+                    "redirect_discloses_key",
                 ),
                 (
                     b"abcdefghijklmnop",
                     "https://ABCDEFGHIJKLMNOP.attacker.test/x".to_string(),
+                    "redirect_discloses_key",
                 ),
                 (
                     b"0123456789abcdef",
                     format!("https://other.secret.test:{op}/collect?v=%2530%2531%2532%2533%2534%2535%2536%2537%2538%2539%2561%2562%2563%2564%2565%2566"),
+                    "header_discloses_key",
                 ),
             ];
-            for (key, location) in cases {
+            for (key, location, reason) in cases {
                 let shown = location.clone();
                 let api = serve(&fixture.tls, move |_| {
                     Some(http("302 Found", &[("Location", location.as_str())], b""))
@@ -1615,7 +1631,8 @@ mod url_tests {
                         }));
                     },
                 );
-                assert!(!run.response.success, "{shown:?}: {:?}", run.response.data);
+                assert_refused_for(&run, reason);
+                assert!(documents.is_empty(), "{shown:?}");
                 assert_absent(&run, &documents, &[key]);
                 assert_eq!(api.targets().len(), 1, "{shown:?}");
                 let raw = String::from_utf8_lossy(key).into_owned();
@@ -1655,6 +1672,10 @@ mod url_tests {
                 &request("zoom", &url, serde_json::json!({"symbol": "Title"})),
                 no_extra,
             );
+            assert!(run.response.success, "{}", run.strings());
+            assert_eq!(server.targets().len(), 1);
+            assert_eq!(documents.len(), 1);
+            assert!(contains(&documents[0], PLACEHOLDER.as_bytes()));
             assert_absent(&run, &documents, &[b"Njc4", K]);
 
             let other = serve(&fixture.tls, |_| Some(markdown(b"# Other\n")));
@@ -1679,7 +1700,8 @@ mod url_tests {
                 &request("outline", &url, serde_json::json!({})),
                 no_extra,
             );
-            assert!(!run.response.success, "{:?}", run.response.data);
+            assert_refused_for(&run, "header_discloses_key");
+            assert_eq!(api.targets().len(), 1);
             assert_eq!(other.connections.load(Ordering::SeqCst), 0);
         }
 
@@ -1704,6 +1726,9 @@ mod url_tests {
                 &request("zoom", &url, serde_json::json!({"symbol": "Title"})),
                 no_extra,
             );
+            assert_refused_for(&run, "material_not_admissible");
+            assert_eq!(server.targets().len(), 0, "the key was never sent");
+            assert!(documents.is_empty());
             assert_absent(&run, &documents, &[K]);
         }
 
@@ -1733,7 +1758,9 @@ mod url_tests {
                 &request("outline", &url, serde_json::json!({})),
                 no_extra,
             );
-            assert!(!run.response.success, "{:?}", run.response.data);
+            assert_refused_for(&run, "content_encoding");
+            assert_eq!(server.targets().len(), 1);
+            assert!(documents.is_empty());
             assert_absent(&run, &documents, &[b"Gvgyr"]);
         }
 
@@ -1753,7 +1780,11 @@ mod url_tests {
                 ))
             });
             let port = server.addr.port();
-            for path in ["/v1/page", "/v1/page.md"] {
+            let cases = [
+                ("/v1/page", "document_discloses_key"),
+                ("/v1/page.md", "html_served_as_source"),
+            ];
+            for (index, (path, reason)) in cases.into_iter().enumerate() {
                 let url = format!("https://api.secret.test:{port}{path}?key={PLACEHOLDER}");
                 let vault = granted_vault_with(rule("api.secret.test", port, "/v1"), K);
                 let (run, documents) = run_with(
@@ -1763,6 +1794,9 @@ mod url_tests {
                     &request("zoom", &url, serde_json::json!({"symbol": "Doc"})),
                     no_extra,
                 );
+                assert_refused_for(&run, reason);
+                assert_eq!(server.targets().len(), index + 1, "{path}");
+                assert!(documents.is_empty(), "{path}");
                 assert_absent(
                     &run,
                     &documents,
@@ -1794,8 +1828,45 @@ mod url_tests {
             );
             assert!(!run.response.success, "{:?}", run.response.data);
             assert_eq!(server.targets().len(), 1);
+            assert!(documents.is_empty());
             assert_absent(&run, &documents, &[KEY, ENCODED_KEY.as_bytes()]);
             assert!(!run.strings().contains("for url"), "{}", run.strings());
+        }
+
+        /// A body read that fails with text naming the key-bearing request
+        /// URL (injected at the call site) reaches the agent scrubbed: the
+        /// detail survives, the key does not.
+        #[test]
+        fn an_injected_body_read_error_is_scrubbed_at_the_call_site() {
+            let fixture = fixture(Default::default());
+            let server = serve(&fixture.tls, |_| Some(markdown(b"# Title\n")));
+            let port = server.addr.port();
+            let url = format!("https://api.secret.test:{port}/v1/doc.md?key={PLACEHOLDER}");
+            let vault = granted_vault(rule("api.secret.test", port, "/v1"));
+            let raw = String::from_utf8_lossy(KEY);
+            let _injected = crate::url_fetch::inject_secret_body_read_error_for_test(format!(
+                "error reading body for url (https://api.secret.test:{port}/v1/doc.md?key={ENCODED_KEY}) near {raw}"
+            ));
+            let (run, documents) = run_with(
+                &fixture,
+                &vault,
+                &[("api.secret.test", server.addr)],
+                &request("outline", &url, serde_json::json!({})),
+                no_extra,
+            );
+            assert!(!run.response.success, "{:?}", run.response.data);
+            assert_eq!(server.targets().len(), 1);
+            assert!(documents.is_empty());
+            let strings = run.strings();
+            assert!(
+                strings.contains("Failed to read response body"),
+                "{strings}"
+            );
+            assert!(
+                strings.contains(&format!("doc.md?key={PLACEHOLDER}) near {PLACEHOLDER}")),
+                "{strings}"
+            );
+            assert_absent(&run, &documents, &[KEY, ENCODED_KEY.as_bytes()]);
         }
 
         /// `material` is asked only for a hop that substitutes: not for a

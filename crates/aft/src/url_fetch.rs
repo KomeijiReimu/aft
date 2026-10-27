@@ -1040,6 +1040,12 @@ fn fetch_with_secrets(
     // A failed read's text comes from reqwest and may name the request URL,
     // which held the key; it is scrubbed like everything else read back.
     let sanitize = |detail: &str| held.sanitize_detail(detail);
+    #[cfg(test)]
+    let response: Box<dyn Read + Send> =
+        match TEST_BODY_READ_ERROR.with(|slot| slot.borrow().clone()) {
+            Some(message) => Box::new(FailingBody(message)),
+            None => Box::new(response),
+        };
     let (raw, mut download_truncated) =
         read_response_body_with(response, logical_url, &deadline, &sanitize)?;
     let raw = Zeroizing::new(raw);
@@ -1126,6 +1132,38 @@ fn scrubbed_header(
         return Err(secret_fetch_refused("header_discloses_key", url));
     }
     Ok(String::from_utf8(clean).ok())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// When set, a placeholder fetch's body read fails with this text, so a
+    /// test can check what the call site does with a library error.
+    static TEST_BODY_READ_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Make this thread's placeholder fetches fail their body read with
+/// `message` until the returned guard drops.
+#[cfg(test)]
+pub(crate) fn inject_secret_body_read_error_for_test(message: String) -> impl Drop {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_BODY_READ_ERROR.with(|slot| slot.replace(None));
+        }
+    }
+    TEST_BODY_READ_ERROR.with(|slot| slot.replace(Some(message)));
+    Restore
+}
+
+/// A response body whose every read fails with the injected text.
+#[cfg(test)]
+struct FailingBody(String);
+
+#[cfg(test)]
+impl Read for FailingBody {
+    fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::other(self.0.clone()))
+    }
 }
 
 /// A content coding a placeholder fetch can undo before scrubbing.
