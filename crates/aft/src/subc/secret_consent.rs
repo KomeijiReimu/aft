@@ -380,6 +380,15 @@ pub(crate) fn resolve_label_for_launch(
             return LaunchDecision::Refuse(crate::secret::refuse_ineligible(label, reason))
         }
     };
+    // Some vault adapters transiently receive material even at resolution.
+    // Harden here as well as at proxy startup so fetch and bash share the guard.
+    #[cfg(unix)]
+    if crate::secret_proxy::protect_secret_process().is_err() {
+        return LaunchDecision::Refuse(LabelOutcome::Refuse {
+            code: crate::secret::SECRETS_UNAVAILABLE,
+            message: crate::bash_background::secrets::PROXY_UNAVAILABLE.to_owned(),
+        });
+    }
     let resolution = vault.resolve(&scopes.authorization, label);
     let outcome = crate::secret::outcome_for(label, &resolution);
     match outcome {

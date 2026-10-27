@@ -638,7 +638,7 @@ impl SpawnPlan {
         }
         #[cfg(target_os = "macos")]
         {
-            matches!(profile.mode, SandboxMode::Strict | SandboxMode::Relaxed)
+            profile.mode == SandboxMode::Strict
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {

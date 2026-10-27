@@ -449,37 +449,106 @@ fn audit_runtime_built_unscanned_label_is_refused() {
 }
 
 #[test]
-fn audit_natural_completion_and_timeout_remove_proxy() {
-    isolated("audit_natural_completion_and_timeout_remove_proxy", || {
-        for timeout in [false, true] {
-            let f = Fixture::new();
-            let command = format!("printf '%s' \"${{SSL_CERT_FILE%/*}}\" > scratch-path; {}; : > first; while [ ! -f finish ]; do sleep 0.05; done", f.curl());
-            let extra = if timeout {
-                json!({"timeout":2500})
-            } else {
-                json!({})
-            };
-            let id = f.task(&f.launch(&command, false, extra));
-            f.wait_file("first");
-            let address = f
+fn audit_natural_completion_removes_proxy() {
+    isolated("audit_natural_completion_removes_proxy", || {
+        completion_cleanup(false)
+    });
+}
+
+#[test]
+fn audit_timeout_removes_proxy() {
+    isolated("audit_timeout_removes_proxy", || completion_cleanup(true));
+}
+
+fn completion_cleanup(timeout: bool) {
+    let f = Fixture::new();
+    let command = format!("printf '%s' \"${{SSL_CERT_FILE%/*}}\" > scratch-path; {}; : > first; while [ ! -f finish ]; do sleep 0.05; done", f.curl());
+    let extra = if timeout {
+        json!({"timeout":2500})
+    } else {
+        json!({})
+    };
+    let id = f.task(&f.launch(&command, false, extra));
+    f.wait_file("first");
+    let address = f
+        .ctx
+        .bash_background()
+        .secret_proxy_address_for_test(&id)
+        .unwrap();
+    if !timeout {
+        std::fs::write(f.root.path().join("finish"), b"go").unwrap();
+    }
+    f.wait_terminal(&id);
+    wait(|| disconnected(address));
+    wait(|| {
+        f.ctx
+            .bash_background()
+            .secret_proxy_address_for_test(&id)
+            .is_none()
+    });
+    let scratch = std::fs::read_to_string(f.root.path().join("scratch-path")).unwrap();
+    wait(|| !Path::new(&scratch).exists());
+    assert_eq!(f.vault.materials.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn audit_epoch_rebind_revokes_secret_not_ordinary_job() {
+    isolated("audit_epoch_rebind_revokes_secret_not_ordinary_job", || {
+        let f = Fixture::new();
+        let id = f.task(&f.launch(
+            &format!(
+                "{}; : > first; while [ ! -f next ]; do sleep 0.05; done; {}; : > second; sleep 30",
+                f.curl(),
+                f.curl()
+            ),
+            true,
+            json!({}),
+        ));
+        f.wait_file("first");
+        f.wait_requests(1);
+        let ordinary =
+            crate::bash_background::registry::with_scope_spawn(Some(stamp("head")), || {
+                crate::commands::bash::handle(&request("sleep 30"), &f.ctx)
+            });
+        let ordinary = f.task(&ordinary);
+        let address = f
+            .ctx
+            .bash_background()
+            .secret_proxy_address_for_test(&id)
+            .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(crate::subc::confirm_secret_rebind_for_test(
+                f.ctx.clone(),
+                stamp("head"),
+                &id,
+            ));
+        assert!(disconnected(address));
+        std::fs::write(f.root.path().join("next"), b"go").unwrap();
+        f.wait_file("second");
+        assert_eq!(f.vault.materials.load(Ordering::SeqCst), 1);
+        for task in [id, ordinary] {
+            let snapshot = f
                 .ctx
                 .bash_background()
-                .secret_proxy_address_for_test(&id)
+                .status(
+                    &task,
+                    "secret-bash",
+                    Some(f.root.path()),
+                    Some(f._storage.path()),
+                    8192,
+                )
                 .unwrap();
-            if !timeout {
-                std::fs::write(f.root.path().join("finish"), b"go").unwrap();
-            }
-            f.wait_terminal(&id);
-            wait(|| disconnected(address));
-            wait(|| {
-                f.ctx
-                    .bash_background()
-                    .secret_proxy_address_for_test(&id)
-                    .is_none()
-            });
-            let scratch = std::fs::read_to_string(f.root.path().join("scratch-path")).unwrap();
-            wait(|| !Path::new(&scratch).exists());
-            assert_eq!(f.vault.materials.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                snapshot.info.status,
+                crate::bash_background::BgTaskStatus::Running,
+                "rebind killed a command"
+            );
+            assert!(crate::bash_background::process::is_process_alive(
+                snapshot.child_pid.unwrap()
+            ));
         }
     });
 }

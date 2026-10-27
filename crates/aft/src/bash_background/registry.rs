@@ -1276,6 +1276,8 @@ struct ProjectReplayDiskBatch {
 pub(crate) struct RegistryInner {
     #[cfg(unix)]
     secret_proxies: Mutex<HashMap<String, super::secrets::SharedRuntime>>,
+    #[cfg(unix)]
+    revoked_secret_authorizations: Mutex<HashSet<(String, String, u64)>>,
     memory_monitors: Mutex<HashMap<String, super::memory_limit::Monitor>>,
     #[cfg(unix)]
     db_hint_jobs:
@@ -1912,6 +1914,8 @@ impl BgTaskRegistry {
                 memory_monitors: Mutex::new(HashMap::new()),
                 #[cfg(unix)]
                 secret_proxies: Mutex::new(HashMap::new()),
+                #[cfg(unix)]
+                revoked_secret_authorizations: Mutex::new(HashSet::new()),
                 #[cfg(unix)]
                 db_hint_jobs: Mutex::new(HashMap::new()),
                 #[cfg(unix)]
@@ -10832,12 +10836,36 @@ impl BgTaskRegistry {
     /// Find live shell tasks with a persisted daemon scope identity. Keep
     /// this off the subc frame loop: locks and process sampling may block.
     pub(crate) fn live_scope_stamps(&self) -> Vec<subc_protocol::scope::ScopeStamp> {
-        self.running_tasks()
+        let mut scopes: Vec<_> = self
+            .running_tasks()
             .into_iter()
             .filter_map(|task| {
                 let scope = task.lock_state().ok()?.metadata.scope.clone()?;
                 self.has_live_task_processes(&task.task_id, &task.session_id)
                     .then_some(scope)
+            })
+            .collect();
+        #[cfg(unix)]
+        scopes.extend(self.secret_authorization_scope_stamps());
+        scopes
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn secret_authorization_scope_stamps(
+        &self,
+    ) -> Vec<subc_protocol::scope::ScopeStamp> {
+        self.inner
+            .secret_proxies
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .map(|runtime| {
+                runtime
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .authorization
+                    .stamp()
+                    .clone()
             })
             .collect()
     }
@@ -10864,9 +10892,13 @@ impl BgTaskRegistry {
             let mut stopped = Vec::new();
             proxies.retain(|_, runtime| {
                 let proxy = runtime.lock().unwrap_or_else(|p| p.into_inner());
-                if proxy.lifetime.stamp().owner == scope.owner
-                    && proxy.lifetime.stamp().scope_ref == scope.scope_ref
-                    && proxy.lifetime.stamp().scope_epoch == scope.scope_epoch
+                if [proxy.lifetime.stamp(), proxy.authorization.stamp()]
+                    .iter()
+                    .any(|stamp| {
+                        stamp.owner == scope.owner
+                            && stamp.scope_ref == scope.scope_ref
+                            && stamp.scope_epoch == scope.scope_epoch
+                    })
                 {
                     stopped.push(runtime.clone());
                     false
@@ -10884,6 +10916,45 @@ impl BgTaskRegistry {
         }
         // Finished commands of the ended scope keep no scratch for later reads.
         self.release_scope_scratch(scope);
+    }
+
+    /// An authorization rebind invalidates secret use, not the command's own
+    /// lifetime. This secret-authorization revocation marker never kills
+    /// ordinary shell tasks.
+    #[cfg(unix)]
+    pub(crate) fn revoke_secret_authorization(&self, scope: &subc_protocol::scope::ScopeStamp) {
+        self.inner
+            .revoked_secret_authorizations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert((
+                serde_json::to_string(&scope.owner).expect("principal is JSON"),
+                scope.scope_ref.clone(),
+                scope.scope_epoch,
+            ));
+        let mut proxies = self
+            .inner
+            .secret_proxies
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut stopped = Vec::new();
+        proxies.retain(|_, runtime| {
+            let proxy = runtime.lock().unwrap_or_else(|p| p.into_inner());
+            let auth = proxy.authorization.stamp();
+            if auth.owner == scope.owner
+                && auth.scope_ref == scope.scope_ref
+                && auth.scope_epoch == scope.scope_epoch
+            {
+                stopped.push(runtime.clone());
+                false
+            } else {
+                true
+            }
+        });
+        drop(proxies);
+        for runtime in stopped {
+            runtime.lock().unwrap_or_else(|p| p.into_inner()).stop();
+        }
     }
 
     #[cfg(unix)]
@@ -10905,6 +10976,18 @@ impl BgTaskRegistry {
             let mut proxy = runtime.lock().unwrap_or_else(|p| p.into_inner());
             if self.inner.shutdown.load(Ordering::SeqCst)
                 || self.scope_revoked(proxy.lifetime.stamp())
+                || self.scope_revoked(proxy.authorization.stamp())
+                || self
+                    .inner
+                    .revoked_secret_authorizations
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains(&(
+                        serde_json::to_string(&proxy.authorization.stamp().owner)
+                            .expect("principal is JSON"),
+                        proxy.authorization.stamp().scope_ref.clone(),
+                        proxy.authorization.stamp().scope_epoch,
+                    ))
             {
                 proxy.stop();
                 return Err(super::secrets::PROXY_UNAVAILABLE.to_owned());
@@ -12052,6 +12135,8 @@ impl BgTaskRegistry {
         let task = self
             .task_for_session(task_id, session_id)
             .ok_or_else(|| RegistryError::TaskNotFound(task_id.into()))?;
+        #[cfg(unix)]
+        self.stop_secret_proxy(task_id);
         let pending_memory_reason = task
             .lock_state()
             .ok()

@@ -154,6 +154,8 @@ pub(crate) struct Runtime {
     proxy: SecretProxy,
     bundle: PathBuf,
     pub(crate) lifetime: crate::secret::SecretScope,
+    pub(crate) authorization: crate::secret::SecretScope,
+    armed: bool,
 }
 
 #[cfg(unix)]
@@ -162,14 +164,17 @@ impl Runtime {
     pub(crate) fn address(&self) -> std::net::SocketAddr {
         self.proxy.address()
     }
-    pub(crate) fn arm(&self, pid: u32) -> Result<(), String> {
+    pub(crate) fn arm(&mut self, pid: u32) -> Result<(), String> {
         self.proxy
             .arm_command(pid)
-            .map_err(|_| PROXY_UNAVAILABLE.to_owned())
+            .map_err(|_| PROXY_UNAVAILABLE.to_owned())?;
+        self.armed = true;
+        Ok(())
     }
 
     pub(crate) fn stop(&mut self) {
         self.proxy.stop();
+        let _ = std::fs::remove_file(&self.bundle);
     }
 
     pub(crate) fn exec_environment(&self) -> Vec<(String, String)> {
@@ -188,9 +193,38 @@ impl Runtime {
 }
 
 #[cfg(unix)]
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(unix)]
 pub(crate) struct Launch {
     pub(crate) preflight: Preflight,
     pub(crate) runtime: SharedRuntime,
+    adopted: bool,
+}
+
+#[cfg(unix)]
+impl Launch {
+    pub(crate) fn spawned(&mut self) {
+        self.adopted = self.runtime.lock().unwrap_or_else(|p| p.into_inner()).armed;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Launch {
+    fn drop(&mut self) {
+        let mut runtime = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.adopted {
+            // Prepared payloads can retain runtime references after a failed
+            // launch. Only a successfully registered, armed spawn transfers
+            // ownership; arming before a later startup failure is not enough.
+            runtime.stop();
+            self.preflight.plan.cleanup_unspawned();
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -241,7 +275,7 @@ pub(crate) fn authorize(
     let task = preflight.task.as_ref().expect("preflight owns layout");
     let proxy = start_proxy(ProxyConfig {
         vault,
-        authorization_scope: scopes.authorization,
+        authorization_scope: scopes.authorization.clone(),
         lifetime_scope: scopes.lifetime.clone(),
         scanned_labels: labels.to_vec(),
         grants,
@@ -261,10 +295,13 @@ pub(crate) fn authorize(
         .map_err(|_| refusal(id, labels, "secrets_unavailable", PROXY_UNAVAILABLE))?;
     Ok(Launch {
         preflight,
+        adopted: false,
         runtime: Arc::new(Mutex::new(Runtime {
             proxy,
             bundle,
             lifetime: scopes.lifetime,
+            authorization: scopes.authorization,
+            armed: false,
         })),
     })
 }
@@ -297,17 +334,47 @@ fn outcome_response(id: &str, labels: &[String], outcome: crate::secret::LabelOu
 
 #[cfg(unix)]
 fn write_bundle(path: &Path, ca: &str) -> Result<(), ()> {
-    let mut pem = native_roots()?;
+    let mut pem = Vec::new();
+    let native = zeroize::Zeroizing::new(native_roots()?);
+    append_public_certificates(&mut pem, &native)?;
     for key in TRUST_KEYS {
         // Only daemon-inherited trust paths are authority to read a file.
         // Tool env values are replaced, not read on the caller's behalf.
         if let Some(path) = std::env::var_os(key).map(PathBuf::from) {
-            pem.extend(std::fs::read(path).map_err(|_| ())?);
-            pem.push(b'\n');
+            let input = zeroize::Zeroizing::new(std::fs::read(path).map_err(|_| ())?);
+            append_public_certificates(&mut pem, &input)?;
         }
     }
-    pem.extend_from_slice(ca.as_bytes());
+    append_public_certificates(&mut pem, ca.as_bytes())?;
     crate::private_storage::write(path, pem).map_err(|_| ())
+}
+
+#[cfg(unix)]
+fn append_public_certificates(output: &mut Vec<u8>, input: &[u8]) -> Result<(), ()> {
+    use base64::Engine;
+    use rustls::pki_types::pem::PemObject;
+    let mut count = 0;
+    for certificate in rustls::pki_types::CertificateDer::pem_slice_iter(input) {
+        let certificate = certificate.map_err(|_| ())?;
+        // Extracting a trust anchor validates certificate structure without
+        // treating private-key blocks or arbitrary PEM text as public data.
+        rustls::RootCertStore::empty()
+            .add(certificate.clone())
+            .map_err(|_| ())?;
+        output.extend_from_slice(b"-----BEGIN CERTIFICATE-----\n");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(certificate.as_ref());
+        for line in encoded.as_bytes().chunks(64) {
+            output.extend_from_slice(line);
+            output.push(b'\n');
+        }
+        output.extend_from_slice(b"-----END CERTIFICATE-----\n");
+        count += 1;
+    }
+    if count == 0 {
+        Err(())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]

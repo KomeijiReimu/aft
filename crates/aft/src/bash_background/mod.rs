@@ -1369,7 +1369,11 @@ pub(crate) fn spawn_with_secrets(
         )
     };
     #[cfg(unix)]
-    if spawn_result.is_err() {
+    if spawn_result.is_ok() {
+        if let Some(launch) = secret_launch.as_mut() {
+            launch.spawned();
+        }
+    } else {
         if let Some(task) = cleanup_plan.prepared_task() {
             ctx.bash_background()
                 .stop_secret_proxy(&task.resolved_task().paths.task_id);

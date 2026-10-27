@@ -94,6 +94,27 @@ pub enum ProxyError {
     Stopped,
 }
 
+/// This protection is process-wide and intentionally irreversible. Resolution
+/// adapters can transiently receive material, so every proxy owner must prevent
+/// core dumps before starting a secret runtime.
+pub(crate) fn protect_secret_process() -> Result<(), ProxyError> {
+    #[cfg(unix)]
+    {
+        let limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) } != 0 {
+            return Err(ProxyError::Initialization);
+        }
+        #[cfg(target_os = "linux")]
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            return Err(ProxyError::Initialization);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct State {
     config: ProxyConfig,
     session: AtomicI32,
@@ -252,6 +273,7 @@ impl SecretProxy {
     }
 
     pub fn start(config: ProxyConfig) -> Result<Self, ProxyError> {
+        protect_secret_process()?;
         let upstream =
             crate::platform_tls::client_config().map_err(|_| ProxyError::Initialization)?;
         Self::start_with_tls(config, upstream)
@@ -261,6 +283,7 @@ impl SecretProxy {
         config: ProxyConfig,
         upstream: rustls::ClientConfig,
     ) -> Result<Self, ProxyError> {
+        protect_secret_process()?;
         if !cfg!(any(target_os = "linux", target_os = "macos")) {
             return Err(ProxyError::UnsupportedPlatform);
         }

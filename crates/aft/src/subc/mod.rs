@@ -255,6 +255,8 @@ mod retained_result;
 mod rich_ui;
 mod run_scope;
 mod scope_describe;
+#[cfg(all(test, unix))]
+pub(crate) use scope_describe::confirm_secret_rebind_for_test;
 #[cfg(test)]
 mod scope_workdir_tests;
 mod stall_watchdog;

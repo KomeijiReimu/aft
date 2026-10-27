@@ -3,7 +3,7 @@ use crate::protocol::RawRequest;
 use crate::secret::{Material, MaterialError, Resolution};
 use secret_rules::location::{LabelRule, Location};
 use serde_json::json;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(unix)]
 #[path = "secrets_audit_tests.rs"]
@@ -16,6 +16,7 @@ struct Vault {
     audits: Mutex<Vec<secret_rules::audit::AuditRecordV1>>,
     resolve_kinds: Mutex<Vec<String>>,
     material_kinds: Mutex<Vec<String>>,
+    expected_epoch: AtomicU64,
 }
 
 impl Vault {
@@ -27,6 +28,7 @@ impl Vault {
             audits: Mutex::new(Vec::new()),
             resolve_kinds: Mutex::new(Vec::new()),
             material_kinds: Mutex::new(Vec::new()),
+            expected_epoch: AtomicU64::new(1),
         })
     }
 }
@@ -35,7 +37,24 @@ const KEY: &[u8] = b"s4-test-api-key-0123456789";
 
 impl SecretVault for Vault {
     fn resolve(&self, scope: &crate::secret::SecretScope, label: &str) -> Resolution {
+        #[cfg(unix)]
+        {
+            let mut core: libc::rlimit = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut core) }, 0);
+            assert_eq!(
+                (core.rlim_cur, core.rlim_max),
+                (0, 0),
+                "hardening must precede vault resolution"
+            );
+            #[cfg(target_os = "linux")]
+            assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE) }, 0);
+        }
         assert_eq!(scope.reference(), "secret-bash");
+        assert_eq!(scope.owner(), "reserved:prefrontal-core");
+        assert_eq!(
+            scope.stamp().scope_epoch,
+            self.expected_epoch.load(Ordering::SeqCst)
+        );
         self.resolves.fetch_add(1, Ordering::SeqCst);
         self.resolve_kinds
             .lock()
@@ -57,11 +76,18 @@ impl SecretVault for Vault {
     fn material(
         &self,
         scope: &crate::secret::SecretScope,
-        _: &str,
-        _: &str,
+        label: &str,
+        grant_id: &str,
     ) -> Result<Material, MaterialError> {
-        assert_eq!(scope.reference(), "secret-bash");
         self.materials.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(scope.reference(), "secret-bash");
+        assert_eq!(scope.owner(), "reserved:prefrontal-core");
+        assert_eq!(
+            scope.stamp().scope_epoch,
+            self.expected_epoch.load(Ordering::SeqCst)
+        );
+        assert_eq!(label, "test");
+        assert_eq!(grant_id, "grant");
         self.material_kinds
             .lock()
             .unwrap()
@@ -393,15 +419,6 @@ fn native_pipeline() {
         (crate::config::SandboxMode::Strict, false),
         (crate::config::SandboxMode::Strict, true),
     ];
-    #[cfg(target_os = "macos")]
-    let cases = {
-        let mut cases = cases;
-        cases.extend([
-            (crate::config::SandboxMode::Relaxed, false),
-            (crate::config::SandboxMode::Relaxed, true),
-        ]);
-        cases
-    };
     let expected_requests = cases.len() * 2;
     let encodings = vec![
         std::str::from_utf8(KEY).unwrap().to_owned(),
@@ -480,7 +497,11 @@ assert len(set(paths)) == 1
 assert open(paths[0], 'rb').read().count(b'BEGIN CERTIFICATE') > 1
 assert open(sys.argv[2], 'rb').read() in open(paths[0], 'rb').read().replace(b'\n', b'').replace(b'\r', b'')
 "#).unwrap();
+    let mut expected_origins = Vec::new();
     for (index, (mode, pty)) in cases.into_iter().enumerate() {
+        vault
+            .expected_epoch
+            .store(if pty { 1 } else { index as u64 + 1 }, Ordering::SeqCst);
         #[cfg(target_os = "linux")]
         assert!(
             std::fs::metadata(format!("/proc/{}/mem", std::process::id())).is_ok(),
@@ -527,6 +548,7 @@ assert open(sys.argv[2], 'rb').read() in open(paths[0], 'rb').read().replace(b'\
         });
         assert!(response.success, "{response:?}");
         let task_id = response.data["task_id"].as_str().unwrap();
+        expected_origins.extend([task_id.to_owned(), task_id.to_owned()]);
         let address = ctx
             .bash_background()
             .secret_proxy_address_for_test(task_id)
@@ -665,7 +687,8 @@ assert open(sys.argv[2], 'rb').read() in open(paths[0], 'rb').read().replace(b'\
         assert_eq!(record.decision, secret_rules::audit::Decision::Substituted);
         assert_eq!(record.reason, secret_rules::audit::AuditReason::Matched);
         assert_eq!(record.label, "test");
-        assert!(record.origin.starts_with("bash-"));
+        assert_eq!(record.origin, expected_origins[index]);
+        assert!(!record.request_id.is_empty());
         let serialized = record.to_json_line_with_key(KEY).unwrap();
         for encoded in &encodings {
             assert!(!serialized.contains(encoded));
