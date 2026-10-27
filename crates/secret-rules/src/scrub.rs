@@ -1192,6 +1192,12 @@ pub fn reveals_key(text: &[u8], key: &[u8]) -> bool {
 
 /// True unless [`reveal_outcome`] finds `text` clean with no deadline: a text
 /// that spells a key, or that cannot be examined to the end, both count.
+///
+/// The detected spellings are exactly [`reveal_outcome`]'s. In particular,
+/// base64 whose pieces are separated by anything other than spaces, tabs and
+/// line breaks (`MDEy.MzQ1.Njc4...`) is not detected, and neither is any
+/// change outside that list. The streaming scrubber has no such check at
+/// all; the secret proxy documents what that leaves.
 pub fn reveals_any(text: &[u8], keys: &[&[u8]]) -> bool {
     !reveal_outcome(text, keys, None).is_clean()
 }

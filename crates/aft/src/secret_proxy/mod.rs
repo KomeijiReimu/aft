@@ -29,6 +29,28 @@
 //! persist or log any of them, or format key-bearing requests or responses with
 //! `Debug` or `Display`. Zeroization is defence in depth in the daemon, not a claim
 //! that third-party protocol implementations erase every transient copy.
+//!
+//! # What the response scrub does not catch
+//!
+//! Responses are scrubbed as a stream with `Scrubber::push` and `finish`, held
+//! back by a fixed window of `6k - 1` bytes for the longest installed key of
+//! `k` bytes. Unlike a placeholder URL fetch, the proxy runs no residual check
+//! over the finished response. A covered server, one this command was allowed
+//! to send the key to, can therefore make these reach the command's stdout:
+//!
+//! - Base64 of a key split by spaces, tabs or line breaks whose span, from the
+//!   first to the last character of the spelling, is longer than six times the
+//!   longest key, when a read boundary falls inside that span. Shorter split
+//!   spellings, and every other spelling in the scrubber's families (raw,
+//!   `%XX`, form, JSON escapes, hex, contiguous base64), are always caught.
+//! - Every spelling outside those families, in any chunking: nested
+//!   percent-encoding (`%2530%2531...`), HTML character references, base64
+//!   separated by vertical tab, form feed or punctuation (`MDEy.MzQ1...`),
+//!   Markdown escapes, and a key split across markup.
+//!
+//! This is accepted: that server already holds the key, and catching these in
+//! a stream would need a holdback with no bound, since such a spelling has no
+//! length limit.
 
 mod audit;
 mod limits;
