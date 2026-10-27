@@ -594,3 +594,29 @@ fn audit_epoch_rebind_revokes_secret_not_ordinary_job() {
         }
     });
 }
+
+#[test]
+fn audit_hardened_daemon_preserves_child_fd_aliases() {
+    isolated("audit_hardened_daemon_preserves_child_fd_aliases", || {
+        let f = Fixture::new();
+        let _protection = authorized(&f);
+        let id = f.task(&f.launch("printf data | cat /dev/stdin", false, json!({})));
+        f.wait_terminal(&id);
+        let snapshot = f
+            .ctx
+            .bash_background()
+            .status(
+                &id,
+                "secret-bash",
+                Some(f.root.path()),
+                Some(f._storage.path()),
+                8192,
+            )
+            .unwrap();
+        assert_eq!(snapshot.exit_code, Some(0), "{}", f.diagnostics());
+        assert_eq!(
+            std::fs::read(snapshot.output_path.unwrap()).unwrap(),
+            b"data"
+        );
+    });
+}
