@@ -734,7 +734,7 @@ impl SpawnPlan {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn secret_ptrace_scope_safe(value: Option<&str>) -> bool {
     value
         .and_then(|value| value.trim().parse::<u32>().ok())

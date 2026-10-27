@@ -286,7 +286,7 @@ pub struct SecretProxy {
 }
 
 impl SecretProxy {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn start_for_test(
         config: ProxyConfig,
         upstream: rustls::ClientConfig,

@@ -137,6 +137,7 @@ fn request(command: &str) -> RawRequest {
     serde_json::from_value(json!({"id":"secret-bash", "command":"bash", "session_id":"secret-bash", "params":{"command":command,"background":true,"compressed":false}})).unwrap()
 }
 
+#[cfg(unix)]
 fn stamp(kind: &str) -> subc_protocol::scope::ScopeStamp {
     serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"secret-bash","kind":kind,"scope_epoch":1,"owner_authorized":true})).unwrap()
 }
