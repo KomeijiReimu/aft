@@ -8,5 +8,5 @@
   "slices": [
     "flake-batch-4"
   ],
-  "note": "Test-only: timing and race fixes for merge-queue flakes (generous positive waits, waits on real signals). No product search behavior changed and no changed path matches RANKING_FENCE_PREFIXES."
+  "note": "Timing and race fixes for merge-queue flakes, plus one product fix found by a flake: runon input-capture replies always name the submitting phase. No search, ranking or routing code changes and no changed path matches RANKING_FENCE_PREFIXES."
 }
