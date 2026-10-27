@@ -411,13 +411,20 @@ fn can_start_match(key: &[u8], byte: u8) -> bool {
 }
 
 /// Every base64 token in `window` that decodes to text containing `key`, once
-/// per token.
+/// per token, sorted by start and free of overlaps.
 ///
 /// A token is the maximal run of base64 characters around the key. Decoding
 /// it once per alignment and replacing it whole keeps the work linear in the
 /// window, and covers the token's edge bytes too.
+///
+/// Base64 is often split by whitespace (wrapped lines, or groups of four
+/// separated by spaces), which a reader removes before decoding. Runs
+/// separated by short whitespace gaps are therefore also decoded as one
+/// group; a key found there replaces the runs its bytes came from, gaps
+/// included.
 fn find_base64_spans(window: &[u8], key: &[u8]) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
+    let mut runs = Vec::new();
     let mut index = 0;
     while index < window.len() {
         if !is_base64_byte(window[index]) {
@@ -428,8 +435,105 @@ fn find_base64_spans(window: &[u8], key: &[u8]) -> Vec<(usize, usize)> {
         while index < window.len() && is_base64_byte(window[index]) {
             index += 1;
         }
+        runs.push((start, index));
         if base64_run_contains(&window[start..index], key) {
             spans.push((start, index));
+        }
+    }
+    let mut first = 0;
+    while first < runs.len() {
+        let mut last = first;
+        while last + 1 < runs.len() && is_base64_gap(&window[runs[last].1..runs[last + 1].0]) {
+            last += 1;
+        }
+        if last > first {
+            spans.extend(base64_group_spans(window, &runs[first..=last], key));
+        }
+        first = last + 1;
+    }
+    spans.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for span in spans {
+        push_merged(&mut merged, span);
+    }
+    merged
+}
+
+/// The longest whitespace gap allowed between two runs of one base64 group: a
+/// `\r\n` line break or one separator. Keeping it short keeps a split
+/// spelling of the key within the scrubber's holdback window.
+const MAX_BASE64_GAP: usize = 2;
+
+fn is_base64_gap(gap: &[u8]) -> bool {
+    !gap.is_empty()
+        && gap.len() <= MAX_BASE64_GAP
+        && gap
+            .iter()
+            .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+}
+
+/// The spans of a whitespace-separated base64 group (`runs`, in order) whose
+/// decoding contains `key`, each widened to the whole runs its bytes came
+/// from.
+fn base64_group_spans(window: &[u8], runs: &[(usize, usize)], key: &[u8]) -> Vec<(usize, usize)> {
+    // The group's characters with the gaps removed, and where each run starts
+    // among them.
+    let mut chars = Zeroizing::new(Vec::new());
+    let mut run_starts = Vec::with_capacity(runs.len());
+    for &(start, end) in runs {
+        run_starts.push(chars.len());
+        chars.extend_from_slice(&window[start..end]);
+    }
+    // Most groups are ordinary words; only a group that decodes to the key
+    // at all is decoded again to find where.
+    if !base64_run_contains(&chars, key) {
+        return Vec::new();
+    }
+    let run_of = |char_index: usize| run_starts.partition_point(|start| *start <= char_index) - 1;
+    let mut spans = Vec::new();
+    for offset in 0..4 {
+        let Some(slice) = chars.get(offset..) else {
+            continue;
+        };
+        // Each decoded byte with the indexes (in `chars`) of the first and
+        // last characters it came from.
+        let mut decoded = Zeroizing::new(Vec::with_capacity(slice.len()));
+        let mut sources: Vec<(usize, usize)> = Vec::with_capacity(slice.len());
+        let mut buffer = 0u32;
+        let mut bits = 0u32;
+        let mut oldest = offset;
+        for (position, byte) in slice.iter().enumerate() {
+            let char_index = offset + position;
+            let Some(value) = base64_value(*byte) else {
+                buffer = 0;
+                bits = 0;
+                continue;
+            };
+            if bits == 0 {
+                oldest = char_index;
+            }
+            buffer = (buffer << 6) | value;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                decoded.push((buffer >> bits) as u8);
+                sources.push((oldest, char_index));
+                buffer &= (1 << bits) - 1;
+                oldest = char_index;
+            }
+        }
+        if decoded.len() < key.len() {
+            continue;
+        }
+        for start in 0..=decoded.len() - key.len() {
+            if &decoded[start..start + key.len()] != key {
+                continue;
+            }
+            // Only the runs the key's own bits came from are replaced, so a
+            // separate spelling on the next line keeps its own replacement.
+            let first_run = run_of(sources[start].0);
+            let last_run = run_of(sources[start + key.len() - 1].1);
+            spans.push((runs[first_run].0, runs[last_run].1));
         }
     }
     spans
@@ -1084,5 +1188,38 @@ mod tests {
         push_merged(&mut spans, (2, 9));
         push_merged(&mut spans, (9, 12));
         assert_eq!(spans, vec![(0, 9), (9, 12)]);
+    }
+
+    #[test]
+    fn base64_split_by_whitespace_is_scrubbed() {
+        let key = b"0123456789abcdef";
+        let inputs: [&[u8]; 3] = [
+            b"v=MDEy MzQ1 Njc4 OWFi Y2Rl Zg== end",
+            b"MDEyMzQ1\r\nNjc4OWFi\r\nY2RlZg==",
+            b"MDEy\tMzQ1\tNjc4\tOWFi\tY2Rl\tZg",
+        ];
+        for input in inputs {
+            let out = scrub_bytes(key, "test", input).unwrap();
+            let shown = String::from_utf8_lossy(&out).into_owned();
+            assert!(!out.windows(4).any(|w| w == b"Njc4"), "{shown}");
+            assert!(
+                out.windows(18).any(|w| w == b"{{ck-secret:test}}"),
+                "{shown}"
+            );
+        }
+        // Two spellings on adjacent lines are two replacements, not one.
+        let two_lines = scrub_bytes(
+            key,
+            "test",
+            b"MDEyMzQ1Njc4OWFiY2RlZg==\nMDEyMzQ1Njc4OWFiY2RlZg",
+        )
+        .unwrap();
+        assert_eq!(
+            two_lines,
+            b"{{ck-secret:test}}\n{{ck-secret:test}}".to_vec()
+        );
+        // Ordinary prose made of base64 characters is left alone.
+        let prose = b"the quick brown fox jumps over the lazy dog";
+        assert_eq!(scrub_bytes(key, "test", prose).unwrap(), prose.to_vec());
     }
 }

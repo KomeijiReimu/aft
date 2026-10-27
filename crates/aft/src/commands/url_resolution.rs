@@ -1596,5 +1596,53 @@ mod url_tests {
                 "a reassembled key reached the off-rule host"
             );
         }
+
+        /// Base64 of the key split by whitespace, in a body or (percent
+        /// encoded) in a redirect, is scrubbed or refused.
+        #[test]
+        fn whitespace_split_base64_of_the_key_is_scrubbed_or_refused() {
+            const K: &[u8] = b"0123456789abcdef";
+            let fixture = fixture(Default::default());
+            let body =
+                b"# Title\n\nMDEy MzQ1 Njc4 OWFi Y2Rl Zg==\n\nMDEyMzQ1\r\nNjc4OWFi\r\nY2RlZg==\n"
+                    .to_vec();
+            let server = serve(&fixture.tls, move |_| Some(markdown(&body)));
+            let port = server.addr.port();
+            let url = format!("https://api.secret.test:{port}/v1/doc.md?key={PLACEHOLDER}");
+            let vault = granted_vault_with(rule("api.secret.test", port, "/v1"), K);
+            let (run, documents) = run_with(
+                &fixture,
+                &vault,
+                &[("api.secret.test", server.addr)],
+                &request("zoom", &url, serde_json::json!({"symbol": "Title"})),
+                no_extra,
+            );
+            assert_absent(&run, &documents, &[b"Njc4", K]);
+
+            let other = serve(&fixture.tls, |_| Some(markdown(b"# Other\n")));
+            let op = other.addr.port();
+            let location = format!(
+                "https://other.secret.test:{op}/collect?v=MDEy%20MzQ1%20Njc4%20OWFi%20Y2Rl%20Zg=="
+            );
+            let api = serve(&fixture.tls, move |_| {
+                Some(http("302 Found", &[("Location", location.as_str())], b""))
+            });
+            let port = api.addr.port();
+            let url = format!("https://api.secret.test:{port}/v1/doc.md?key={PLACEHOLDER}");
+            let vault = granted_vault_with(rule("api.secret.test", port, "/v1"), K);
+            let routes = [
+                ("api.secret.test", api.addr),
+                ("other.secret.test", other.addr),
+            ];
+            let (run, _) = run_with(
+                &fixture,
+                &vault,
+                &routes,
+                &request("outline", &url, serde_json::json!({})),
+                no_extra,
+            );
+            assert!(!run.response.success, "{:?}", run.response.data);
+            assert_eq!(other.connections.load(Ordering::SeqCst), 0);
+        }
     }
 }
