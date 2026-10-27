@@ -18,7 +18,10 @@ pub enum MaterialRefusal {
     Empty,
     /// Fewer than [`MIN_KEY_LEN`] bytes.
     TooShort,
-    /// The key text appears inside its own label's placeholder.
+    /// The key text appears inside its own label's placeholder, or overlaps
+    /// the placeholder's start or end so that writing the placeholder next to
+    /// surrounding text could re-form the key (see
+    /// [`key_overlaps_placeholder`]).
     SubstringOfPlaceholder,
     /// A header value cannot carry this byte (CTL, or a byte above 0x7E).
     NonVisibleHeaderByte,
@@ -41,6 +44,9 @@ pub fn check_admissible(
     }
     if key.len() < MIN_KEY_LEN {
         return Err(MaterialRefusal::TooShort);
+    }
+    if key_overlaps_placeholder(key, crate::placeholder::placeholder_text(label).as_bytes()) {
+        return Err(MaterialRefusal::SubstringOfPlaceholder);
     }
     match location {
         // A header value is a byte string on the wire; anything outside the
@@ -75,6 +81,22 @@ fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+/// True when the scrubber's replacement of `key` by `placeholder` could
+/// re-form the key across the replacement's edge: the key ends with the
+/// start of the placeholder, or begins with its end.
+///
+/// The scrubber writes the placeholder in place of a match and never rescans
+/// what it wrote together with the bytes around it. For label `test`, the key
+/// `123456{{ck-secret` echoed after `123456` becomes `123456{{ck-secret:test}}`,
+/// whose first bytes are the key again. A key that contains the whole
+/// placeholder is refused by [`key_is_substring_of_placeholder`] instead.
+pub fn key_overlaps_placeholder(key: &[u8], placeholder: &[u8]) -> bool {
+    (1..=key.len().min(placeholder.len())).any(|len| {
+        key.ends_with(&placeholder[..len])
+            || key.starts_with(&placeholder[placeholder.len() - len..])
+    })
 }
 
 /// Encode `key` for `location`, or explain why the location cannot carry it.

@@ -276,14 +276,18 @@ impl MatcherSet {
     ///
     /// Refuses a label whose placeholder spells `key` (for example the key's
     /// hex or base64 as the label): the placeholder is written into responses
-    /// unscanned, so it must not carry the key it stands for.
+    /// unscanned, so it must not carry the key it stands for. Refuses too a
+    /// key that overlaps the placeholder's start or end, which the written
+    /// placeholder could re-form together with the bytes beside it.
     pub fn new(label: &str, key: &[u8]) -> Result<Self, ScrubError> {
         let matcher = Self {
             key: Zeroizing::new(key.to_vec()),
             patterns: KeyPatterns::derive(key)?,
             replacement: placeholder_for(label),
         };
-        if matcher.discloses(&matcher.replacement) {
+        if matcher.discloses(&matcher.replacement)
+            || crate::material::key_overlaps_placeholder(key, &matcher.replacement)
+        {
             return Err(ScrubError::ReplacementDisclosesKey);
         }
         Ok(matcher)
@@ -896,8 +900,14 @@ impl Scrubber {
     /// when an installed replacement spells its key. The scrubber is unchanged
     /// on refusal.
     pub fn install(&mut self, matcher: MatcherSet) -> Result<(), ScrubError> {
+        let overlaps = |key: &[u8], replacement: &[u8]| {
+            crate::material::key_overlaps_placeholder(key, replacement)
+        };
         let collides = self.matchers.iter().any(|installed| {
-            installed.discloses(&matcher.replacement) || matcher.discloses(&installed.replacement)
+            installed.discloses(&matcher.replacement)
+                || matcher.discloses(&installed.replacement)
+                || overlaps(installed.key(), &matcher.replacement)
+                || overlaps(matcher.key(), &installed.replacement)
         });
         if collides || matcher.discloses(&matcher.replacement) {
             return Err(ScrubError::ReplacementDisclosesKey);
@@ -1221,5 +1231,30 @@ mod tests {
         // Ordinary prose made of base64 characters is left alone.
         let prose = b"the quick brown fox jumps over the lazy dog";
         assert_eq!(scrub_bytes(key, "test", prose).unwrap(), prose.to_vec());
+    }
+
+    /// A key that ends with the start of a placeholder, or starts with its
+    /// end, would be re-formed by the replacement written next to it.
+    #[test]
+    fn a_key_that_overlaps_a_placeholder_is_refused() {
+        use crate::location::Location;
+        let query = Location::Query("k".into());
+        let ends_with_prefix: &[u8] = b"123456{{ck-secret";
+        let starts_with_suffix: &[u8] = b"}}0123456789abcdef";
+        for key in [ends_with_prefix, starts_with_suffix] {
+            assert!(crate::material::check_admissible(key, "test", &query).is_err());
+            assert!(MatcherSet::new("test", key).is_err());
+        }
+        if let Ok(out) = scrub_bytes(ends_with_prefix, "test", b"123456123456{{ck-secret") {
+            assert!(!out
+                .windows(ends_with_prefix.len())
+                .any(|w| w == ends_with_prefix));
+        }
+        // Overlap with another label's placeholder refuses the pair.
+        let other_overlap: &[u8] = b"0123456789{{ck-secret:other";
+        let pair = MatcherSet::new("test", other_overlap)
+            .and_then(|first| Ok((first, MatcherSet::new("other", b"fedcba9876543210")?)))
+            .and_then(|(first, second)| Scrubber::new(vec![first, second]));
+        assert!(pair.is_err());
     }
 }

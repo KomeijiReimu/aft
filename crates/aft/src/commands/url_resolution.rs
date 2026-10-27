@@ -1644,5 +1644,29 @@ mod url_tests {
             assert!(!run.response.success, "{:?}", run.response.data);
             assert_eq!(other.connections.load(Ordering::SeqCst), 0);
         }
+
+        /// A key that ends with the start of its placeholder would be
+        /// re-formed by the scrubber's own replacement; it never reaches the
+        /// response or the document.
+        #[test]
+        fn a_key_that_overlaps_its_placeholder_never_reaches_the_output() {
+            const K: &[u8] = b"123456{{ck-secret";
+            let fixture = fixture(Default::default());
+            let mut body = b"# Title\n\n123456".to_vec();
+            body.extend_from_slice(K);
+            body.extend_from_slice(b"\n");
+            let server = serve(&fixture.tls, move |_| Some(markdown(&body)));
+            let port = server.addr.port();
+            let url = format!("https://api.secret.test:{port}/v1/doc.md?key={PLACEHOLDER}");
+            let vault = granted_vault_with(rule("api.secret.test", port, "/v1"), K);
+            let (run, documents) = run_with(
+                &fixture,
+                &vault,
+                &[("api.secret.test", server.addr)],
+                &request("zoom", &url, serde_json::json!({"symbol": "Title"})),
+                no_extra,
+            );
+            assert_absent(&run, &documents, &[K]);
+        }
     }
 }

@@ -562,14 +562,17 @@ fn is_token_byte(byte: u8) -> bool {
 /// appears in. The check covers every supplied key, the rule's own included,
 /// in every spelling the scrubber recognises; such a pair refuses instead of
 /// being written. A key that contains the whole placeholder refuses too, as
-/// P3 does for a rule's own key.
+/// the admissibility check does for a rule's own key, and so does a key that
+/// overlaps the placeholder's start or end, which the written placeholder
+/// could re-form.
 fn replacement_collides(rule: &LabelRule, keys: &[(String, Vec<u8>)]) -> Option<RequestRefusal> {
     let placeholder = crate::placeholder::placeholder_text(&rule.label);
     keys.iter()
         .any(|(_, key)| {
             !key.is_empty()
                 && (crate::scrub::replacement_discloses(placeholder.as_bytes(), key)
-                    || crate::material::key_is_substring_of_placeholder(key, &rule.label))
+                    || crate::material::key_is_substring_of_placeholder(key, &rule.label)
+                    || crate::material::key_overlaps_placeholder(key, placeholder.as_bytes()))
         })
         .then_some(RequestRefusal::ReplacementDisclosesKey)
 }
