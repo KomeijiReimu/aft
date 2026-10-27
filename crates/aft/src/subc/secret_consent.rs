@@ -285,13 +285,13 @@ fn bound_codemode(
 /// A launch outcome that may end the call with `access_pending`, carrying
 /// the ask it needs answered.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct PendingSecretConsent {
+pub(crate) struct PendingSecretConsent {
     /// The ask filed under the authorization scope.
     pub(super) request: SecretConsentRequest,
     /// The label being waited on.
     pub(super) label: String,
     /// The exact message the held call returns.
-    pub(super) message: &'static str,
+    pub(crate) message: &'static str,
 }
 
 pub(super) enum SecretConsentFiling {
@@ -352,6 +352,7 @@ pub(crate) enum LaunchDecision {
         rule: secret_rules::location::LabelRule,
         /// The grant the material call names.
         grant_id: String,
+        expires_at_ms: u64,
     },
     /// The launch is held until the user answers the filed ask.
     Pending(PendingSecretConsent),
@@ -379,14 +380,20 @@ pub(crate) fn resolve_label_for_launch(
             return LaunchDecision::Refuse(crate::secret::refuse_ineligible(label, reason))
         }
     };
-    let outcome = crate::secret::outcome_for(label, &vault.resolve(&scopes.authorization, label));
+    let resolution = vault.resolve(&scopes.authorization, label);
+    let outcome = crate::secret::outcome_for(label, &resolution);
     match outcome {
-        LabelOutcome::Proceed => match vault.resolve(&scopes.authorization, label) {
-            Resolution::Granted { rule, grant_id, .. } => {
-                LaunchDecision::Proceed { rule, grant_id }
-            }
-            // A vault that grants on one call and then does not on the next is
-            // not a vault this launch can proceed on.
+        LabelOutcome::Proceed => match resolution {
+            Resolution::Granted {
+                rule,
+                grant_id,
+                expires_at_ms,
+            } => LaunchDecision::Proceed {
+                rule,
+                grant_id,
+                expires_at_ms,
+            },
+            // A Proceed outcome must correspond to the captured grant.
             other => LaunchDecision::Refuse(crate::secret::outcome_for(label, &other)),
         },
         LabelOutcome::FileConsent {
@@ -396,9 +403,15 @@ pub(crate) fn resolve_label_for_launch(
             Ok(SecretConsentFiling::Pending(pending)) => LaunchDecision::Pending(pending),
             Ok(SecretConsentFiling::Answered) => {
                 match vault.resolve(&scopes.authorization, label) {
-                    Resolution::Granted { rule, grant_id, .. } => {
-                        LaunchDecision::Proceed { rule, grant_id }
-                    }
+                    Resolution::Granted {
+                        rule,
+                        grant_id,
+                        expires_at_ms,
+                    } => LaunchDecision::Proceed {
+                        rule,
+                        grant_id,
+                        expires_at_ms,
+                    },
                     other => LaunchDecision::Refuse(crate::secret::outcome_for_second_resolve(
                         label, &other,
                     )),
@@ -420,16 +433,81 @@ pub(crate) fn resolve_label_for_launch(
 /// launch reads the answer without seeing the route identity. A launch that
 /// finds nothing installed refuses: a scope that was never resolved is not an
 /// eligible one.
-pub(super) fn current_call_scopes() -> Result<(CallScopes, EligibilityForm), Ineligibility> {
+pub(crate) fn current_call_scopes() -> Result<(CallScopes, EligibilityForm), Ineligibility> {
     CURRENT_SCOPES
         .with(|slot| slot.borrow().clone())
         .unwrap_or(Err(Ineligibility::NoScope))
 }
 
 thread_local! {
+    static CURRENT_IDENTITY: std::cell::RefCell<Option<RouteIdentity>> = const { std::cell::RefCell::new(None) };
     /// `None` while no call is being dispatched on this thread.
     static CURRENT_SCOPES: std::cell::RefCell<Option<Result<(CallScopes, EligibilityForm), Ineligibility>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// Resolve only with the identity installed by dispatch, never tool arguments.
+pub(crate) fn resolve_current_secret_label(
+    vault: &dyn crate::secret::SecretVault,
+    label: &str,
+) -> LaunchDecision {
+    CURRENT_IDENTITY.with(|slot| match slot.borrow().as_ref() {
+        Some(identity) => resolve_label_for_launch(identity, vault, label),
+        None => LaunchDecision::Refuse(crate::secret::refuse_ineligible(
+            label,
+            Ineligibility::NoScope,
+        )),
+    })
+}
+
+pub(super) fn current_identity() -> Option<RouteIdentity> {
+    CURRENT_IDENTITY.with(|slot| slot.borrow().clone())
+}
+
+pub(super) struct SecretIdentityGuard(Option<RouteIdentity>);
+
+impl SecretIdentityGuard {
+    pub(super) fn install(identity: RouteIdentity) -> Self {
+        Self::install_optional(Some(identity))
+    }
+
+    pub(super) fn install_optional(identity: Option<RouteIdentity>) -> Self {
+        Self(CURRENT_IDENTITY.with(|slot| slot.replace(identity)))
+    }
+}
+
+impl Drop for SecretIdentityGuard {
+    fn drop(&mut self) {
+        CURRENT_IDENTITY.with(|slot| slot.replace(self.0.take()));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn with_secret_identity_for_test<R>(
+    root: &std::path::Path,
+    stamp: ScopeStamp,
+    run: impl FnOnce() -> R,
+) -> R {
+    let identity = RouteIdentity(Arc::new(super::RouteIdentityData {
+        root: crate::path_identity::ProjectRootId::from_path(root).unwrap(),
+        project_root: root.to_owned(),
+        harness: "runner".into(),
+        session: "secret-bash".into(),
+        role: tool_provider::RouteRole::ToolProviderV1,
+        trust: super::BindTrust::FirstParty,
+        spawn_principal: crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+        consumer_elicitation_capable: false,
+        tool_result_body: false,
+        disabled_tools: Arc::new(vec![]),
+        scope: Some(stamp),
+        call_mode: CallMode::Classic,
+        run_scope: std::sync::OnceLock::new(),
+        made_tool_call: std::sync::atomic::AtomicBool::new(false),
+        run_owner: None,
+    }));
+    let _scopes = SecretScopeGuard::install(Some(call_scopes(&identity)));
+    let _identity = SecretIdentityGuard::install(identity);
+    run()
 }
 
 /// Installs the eligibility answer for one call and restores the previous one

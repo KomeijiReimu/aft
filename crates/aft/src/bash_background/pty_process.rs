@@ -98,6 +98,7 @@ fn reap_killed_child(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_pty_for_command(
+    registry: &super::registry::BgTaskRegistry,
     spawn_plan: &SpawnPlan,
     task_id: &str,
     session_id: &str,
@@ -126,7 +127,12 @@ pub(crate) fn spawn_pty_for_command(
         } else {
             vec![OsString::from("-c"), OsString::from(user_command)]
         };
-        let program = if memory_monitor.is_some() {
+        let program = if memory_monitor.is_some()
+            || spawn_plan
+                .prepared_task()
+                .and_then(|task| task.secret_runtime())
+                .is_some()
+        {
             let mut gated = vec![
                 OsString::from("-c"),
                 OsString::from("read -r ready || exit 125; exec \"$@\""),
@@ -140,6 +146,7 @@ pub(crate) fn spawn_pty_for_command(
             shell_path.as_os_str()
         };
         try_spawn_pty(
+            registry,
             spawn_plan,
             task_id,
             session_id,
@@ -261,6 +268,7 @@ pub(crate) fn spawn_pty_for_command(
             };
 
             try_spawn_pty(
+                registry,
                 spawn_plan,
                 task_id,
                 session_id,
@@ -312,6 +320,7 @@ fn windows_wrapper_path(
 
 #[allow(clippy::too_many_arguments)]
 fn try_spawn_pty(
+    #[cfg_attr(windows, allow(unused_variables))] registry: &super::registry::BgTaskRegistry,
     spawn_plan: &SpawnPlan,
     task_id: &str,
     session_id: &str,
@@ -390,6 +399,12 @@ fn try_spawn_pty(
         master: Some(pair.master),
     };
     let child_pid = child.child.as_ref().unwrap().process_id();
+    #[cfg(unix)]
+    registry.arm_secret_proxy(
+        spawn_plan,
+        task_id,
+        child_pid.ok_or(super::secrets::PROXY_UNAVAILABLE)?,
+    )?;
     // Preserve group identity for scratch cleanup even if setup returns no runtime.
     *spawned_pgid = child_pid.map(|pid| pid as i32);
     if let Some(monitor) = memory_monitor.as_mut() {
@@ -413,7 +428,19 @@ fn try_spawn_pty(
         .unwrap()
         .take_writer()
         .map_err(|error| format!("take PTY writer failed: {error}"))?;
-    if memory_monitor.is_some() {
+    if memory_monitor.is_some() || {
+        #[cfg(unix)]
+        {
+            spawn_plan
+                .prepared_task()
+                .and_then(|task| task.secret_runtime())
+                .is_some()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    } {
         use std::io::Write;
         #[cfg(windows)]
         if memory_file_gate {

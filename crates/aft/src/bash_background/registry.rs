@@ -1274,6 +1274,8 @@ struct ProjectReplayDiskBatch {
 }
 
 pub(crate) struct RegistryInner {
+    #[cfg(unix)]
+    secret_proxies: Mutex<HashMap<String, super::secrets::SharedRuntime>>,
     memory_monitors: Mutex<HashMap<String, super::memory_limit::Monitor>>,
     #[cfg(unix)]
     db_hint_jobs:
@@ -1908,6 +1910,8 @@ impl BgTaskRegistry {
         Self {
             inner: Arc::new(RegistryInner {
                 memory_monitors: Mutex::new(HashMap::new()),
+                #[cfg(unix)]
+                secret_proxies: Mutex::new(HashMap::new()),
                 #[cfg(unix)]
                 db_hint_jobs: Mutex::new(HashMap::new()),
                 #[cfg(unix)]
@@ -2937,6 +2941,8 @@ impl BgTaskRegistry {
     }
 
     fn post_terminal_transition(&self, task: &Arc<BgTask>, emit_frame: bool) -> Result<(), String> {
+        #[cfg(unix)]
+        self.stop_secret_proxy(&task.task_id);
         self.settle_memory_accounting(task)?;
         #[cfg(test)]
         {
@@ -4807,6 +4813,11 @@ impl BgTaskRegistry {
         };
 
         let child_pid = child.id();
+        if let Err(error) = self.arm_secret_proxy(&spawn_plan, &task_id, child_pid) {
+            super::process::terminate_pgid(child_pid as i32, None);
+            let _ = child.wait();
+            return Err(error.into());
+        }
         if let Some(mut monitor) = memory_monitor.take() {
             if let Err(error) = monitor.attach(child_pid) {
                 super::process::terminate_pgid(child_pid as i32, None);
@@ -5184,6 +5195,7 @@ impl BgTaskRegistry {
                     .map_err(|error| error.to_string())
             };
             spawn_pty_for_command(
+                self,
                 &spawn_plan,
                 &task_id,
                 &session_id,
@@ -10304,6 +10316,19 @@ impl BgTaskRegistry {
 
     pub fn detach(&self) {
         self.inner.shutdown.store(true, Ordering::SeqCst);
+        #[cfg(unix)]
+        {
+            let proxies = std::mem::take(
+                &mut *self
+                    .inner
+                    .secret_proxies
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()),
+            );
+            for runtime in proxies.into_values() {
+                runtime.lock().unwrap_or_else(|p| p.into_inner()).stop();
+            }
+        }
         if let Ok(mut tasks) = self.inner.tasks.lock() {
             for task in tasks.values() {
                 if let Ok(mut state) = task.lock_state() {
@@ -10829,11 +10854,91 @@ impl BgTaskRegistry {
                 scope.scope_ref.clone(),
                 scope.scope_epoch,
             ));
+        #[cfg(unix)]
+        {
+            let mut proxies = self
+                .inner
+                .secret_proxies
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let mut stopped = Vec::new();
+            proxies.retain(|_, runtime| {
+                let proxy = runtime.lock().unwrap_or_else(|p| p.into_inner());
+                if proxy.lifetime.stamp().owner == scope.owner
+                    && proxy.lifetime.stamp().scope_ref == scope.scope_ref
+                    && proxy.lifetime.stamp().scope_epoch == scope.scope_epoch
+                {
+                    stopped.push(runtime.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            drop(proxies);
+            for runtime in stopped {
+                runtime.lock().unwrap_or_else(|p| p.into_inner()).stop();
+            }
+        }
         if let Err(error) = self.stop_scope_tasks(scope, false, None, None) {
             log::warn!("scope revocation kill failed: {error}");
         }
         // Finished commands of the ended scope keep no scratch for later reads.
         self.release_scope_scratch(scope);
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn arm_secret_proxy(
+        &self,
+        plan: &SpawnPlan,
+        task_id: &str,
+        pid: u32,
+    ) -> Result<(), String> {
+        let Some(runtime) = plan.prepared_task().and_then(|task| task.secret_runtime()) else {
+            return Ok(());
+        };
+        let mut proxies = self
+            .inner
+            .secret_proxies
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        {
+            let mut proxy = runtime.lock().unwrap_or_else(|p| p.into_inner());
+            if self.inner.shutdown.load(Ordering::SeqCst)
+                || self.scope_revoked(proxy.lifetime.stamp())
+            {
+                proxy.stop();
+                return Err(super::secrets::PROXY_UNAVAILABLE.to_owned());
+            }
+            proxy.arm(pid)?;
+        }
+        proxies.insert(task_id.to_owned(), runtime);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn stop_secret_proxy(&self, task_id: &str) {
+        let runtime = self
+            .inner
+            .secret_proxies
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(task_id);
+        if let Some(runtime) = runtime {
+            runtime.lock().unwrap_or_else(|p| p.into_inner()).stop();
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn secret_proxy_address_for_test(
+        &self,
+        task_id: &str,
+    ) -> Option<std::net::SocketAddr> {
+        self.inner
+            .secret_proxies
+            .lock()
+            .unwrap()
+            .get(task_id)
+            .map(|runtime| runtime.lock().unwrap().address())
     }
 
     /// Cancel this scope's current tasks without ending its authority to spawn.
@@ -16600,6 +16705,7 @@ mod tests {
     fn launcher_plans_disable_pipeline_status_capture() {
         let launcher = SpawnPlan::launcher_for_test(
             crate::sandbox_profile::SandboxProfile {
+                secret_proxy: false,
                 data_policy: Default::default(),
                 v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
                 mode: crate::config::SandboxMode::Strict,

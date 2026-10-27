@@ -1627,6 +1627,10 @@ pub(super) fn submit_deferred_bash(
     let spawn_timing_for_test = timing_for_test.clone();
     let run_scope = cancel.run_scope.clone();
     let scope_stamp = cancel.scope.clone();
+    let secret_identity = super::secret_consent::current_identity();
+    let secret_scopes = secret_identity
+        .as_ref()
+        .map(super::secret_consent::call_scopes);
     let run_scoped = run_scope.is_some();
     let server_completion = server_completion || run_scoped;
     // Local startup must answer early enough for its reply to be queued and
@@ -2017,6 +2021,8 @@ pub(super) fn submit_deferred_bash(
                     };
                     let (response, storage_dir) =
                         crate::sandbox_spawn::with_authenticated_principal(spawn_principal, || {
+                            let _secret_identity = super::secret_consent::SecretIdentityGuard::install_optional(secret_identity);
+                            let _secret_scopes = super::secret_consent::SecretScopeGuard::install(secret_scopes);
                             let _grant_scope = crate::access_policy::scope_guard(grant_scope);
                             let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
                             crate::sandbox_spawn::with_worker_jail(worker_jail, || {

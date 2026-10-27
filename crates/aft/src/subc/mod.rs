@@ -232,6 +232,11 @@ mod idle_reap_frame_loop_tests;
 mod idle_root_retention_tests;
 mod perf_sweep;
 mod secret_consent;
+#[cfg(test)]
+pub(crate) use secret_consent::with_secret_identity_for_test;
+pub(crate) use secret_consent::{
+    current_call_scopes, resolve_current_secret_label, LaunchDecision,
+};
 mod standalone;
 #[doc(hidden)]
 pub use self::health::SubcTestHealthRollupProbe;
@@ -3479,6 +3484,9 @@ async fn handle_bash_elicitation_reply(
 
     if frame.header.ty == FrameType::Response && bash_elicitation_reply_is_allow(&frame.body) {
         if routes.contains_key(&key.route) {
+            let _secret_identity = secret_consent::SecretIdentityGuard::install_optional(
+                routes.get(&key.route).cloned(),
+            );
             let _grant_scope = crate::access_policy::scope_guard(
                 routes.get(&key.route).map(access_grants::policy_scope_key),
             );
@@ -10842,6 +10850,7 @@ async fn handle_tool_call(
 
         let _grant_scope =
             crate::access_policy::scope_guard(Some(access_grants::policy_scope_key(&identity)));
+        let _secret_identity = secret_consent::SecretIdentityGuard::install(identity.clone());
         let _ask_route = crate::access_policy::ask_route_guard(Some(
             access_grants::ask_route_for_call(&identity, &bare_name, &arguments),
         ));
@@ -10972,6 +10981,8 @@ async fn handle_tool_call(
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
             let _deferred_wake_scope = completion_wake.install();
             let _secret_scope = secret_consent::SecretScopeGuard::install(secret_scopes.clone());
+            let _secret_identity =
+                secret_consent::SecretIdentityGuard::install(identity_for_run.clone());
             let _grant_scope = crate::access_policy::scope_guard(Some(
                 access_grants::policy_scope_key(&identity_for_run),
             ));

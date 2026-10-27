@@ -89,6 +89,8 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     };
+    let secret_labels = crate::bash_background::secrets::labels(&params.command);
+    let has_secrets = !secret_labels.is_empty();
     // Remote runs are resolved later, but whether `bash.env` travels with the
     // job depends only on the request, so decide it up front: a `runon` job
     // receives no configured value unless the user listed the name in
@@ -101,6 +103,44 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             params.shell.is_powershell(),
         )
         .is_some();
+    if has_secrets && remote_requested {
+        return crate::bash_background::secrets::refusal(
+            &req.id,
+            &secret_labels,
+            "secrets_remote_refused",
+            crate::bash_background::secrets::REMOTE_REFUSED,
+        );
+    }
+    // Host escalation can never protect the daemon's memory, even if approved.
+    if has_secrets && (cfg!(windows) || params.sandbox.is_some()) {
+        return crate::bash_background::secrets::refusal(
+            &req.id,
+            &secret_labels,
+            "secrets_sandbox_required",
+            crate::bash_background::secrets::SANDBOX_REQUIRED,
+        );
+    }
+    #[cfg(unix)]
+    let secret_preflight = if has_secrets {
+        match crate::bash_background::secrets::preflight(
+            ctx,
+            req.session(),
+            params.pty,
+            params.background,
+        ) {
+            Ok(preflight) => Some(preflight),
+            Err(()) => {
+                return crate::bash_background::secrets::refusal(
+                    &req.id,
+                    &secret_labels,
+                    "secrets_sandbox_required",
+                    crate::bash_background::secrets::SANDBOX_REQUIRED,
+                )
+            }
+        }
+    } else {
+        None
+    };
     // A project's `bash.env` applies only while the project root is trusted at
     // the time of the call, so trusting or untrusting takes effect on the next
     // command without a reload.
@@ -154,6 +194,14 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         !project_trusted && !ctx.config().bash.project_env.is_empty(),
         &remote_env_plan,
     );
+    if has_secrets && crate::bash_background::secrets::env_conflicts(&params.env) {
+        return crate::bash_background::secrets::refusal(
+            &req.id,
+            &secret_labels,
+            "secrets_env_conflict",
+            crate::bash_background::secrets::ENV_CONFLICT,
+        );
+    }
     // The dedicated external route is defensive as well as convenient: callers
     // cannot accidentally execute Bash merely by omitting the selector.
     if req.command == "powershell" {
@@ -434,7 +482,8 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     // workdir/notes.txt — silent wrong-file mutation. Rewrite is a pure
     // optimization, so skip it and let native bash (which honors cwd) run the
     // command verbatim when the workdir differs from the project root.
-    if !params.shell.is_powershell()
+    if !has_secrets
+        && !params.shell.is_powershell()
         && ctx.config().bash.changed_files == crate::config::BashChangedFiles::Off
         && host_escalation.is_none()
         && remote.is_none()
@@ -507,6 +556,19 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         &duplicate_project_root,
         &duplicate_workdir,
     );
+    #[cfg(unix)]
+    let secret_launch = match secret_preflight {
+        Some(preflight) => match crate::bash_background::secrets::authorize(
+            &req.id,
+            &secret_labels,
+            preflight,
+            &params.env,
+        ) {
+            Ok(launch) => Some(launch),
+            Err(response) => return response,
+        },
+        None => None,
+    };
     let mut response = crate::bash_background::spawn(
         &req.id,
         req.session(),
@@ -527,6 +589,8 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         scanner_requires_approval,
         host_escalation,
         remote,
+        #[cfg(unix)]
+        secret_launch,
     );
     if response.success {
         let object = response
