@@ -2854,6 +2854,41 @@ fn audit01_warning_current_generation_publishes() {
 
 type SearchIndexSymbolFile = (PathBuf, SystemTime);
 
+/// What persisting a freshly loaded search index did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchIndexPersist {
+    /// The index had just written this exact cache itself (a cold build), so
+    /// a rewrite would only produce the same bytes again.
+    AlreadyCurrent,
+    Written,
+    Failed,
+}
+
+impl SearchIndexPersist {
+    fn succeeded(self) -> bool {
+        !matches!(self, Self::Failed)
+    }
+}
+
+/// Persist the index configure loaded. A cold build has already written
+/// `cache.bin`; rewriting it right away cost a second full publish (another
+/// copy of the file table and every posting streamed back through), so that
+/// write is skipped unless something changed since the build.
+fn persist_loaded_search_index(
+    index: &mut SearchIndex,
+    cache_dir: &Path,
+    git_head: Option<&str>,
+) -> SearchIndexPersist {
+    if index.disk_cache_is_current(cache_dir, git_head) {
+        return SearchIndexPersist::AlreadyCurrent;
+    }
+    if index.write_to_disk(cache_dir, git_head) {
+        SearchIndexPersist::Written
+    } else {
+        SearchIndexPersist::Failed
+    }
+}
+
 fn search_index_symbol_files(index: &SearchIndex) -> Vec<SearchIndexSymbolFile> {
     index
         .files
@@ -5962,7 +5997,8 @@ fn schedule_artifact_loads_admitted(
                     let published =
                         search_persist_epoch_flag.run_if_current(search_persist_epoch, || {
                             let head = index.stored_git_head().map(str::to_owned);
-                            index.write_to_disk(&cache_dir, head.as_deref())
+                            persist_loaded_search_index(&mut index, &cache_dir, head.as_deref())
+                                .succeeded()
                         });
                     persistence_succeeded = published == Some(true);
                     if published.is_none() {
@@ -9494,6 +9530,53 @@ fn callgraph_store_upgrade_required(ctx: &AppContext) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn issue1007_configure_skips_second_publish_only_when_nothing_pending() {
+        use super::{persist_loaded_search_index, SearchIndex, SearchIndexPersist};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("lib.rs"), "fn configured_marker() {}\n").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut index =
+            SearchIndex::build_with_limit_to_cache_dir(&root, 1024 * 1024, cache.path());
+        let head = index.stored_git_head().map(str::to_owned);
+        let written = std::fs::read(cache.path().join("cache.bin")).unwrap();
+
+        // Straight after a cold build the cache already holds this index.
+        assert_eq!(
+            persist_loaded_search_index(&mut index, cache.path(), head.as_deref()),
+            SearchIndexPersist::AlreadyCurrent
+        );
+        assert_eq!(
+            std::fs::read(cache.path().join("cache.bin")).unwrap(),
+            written
+        );
+
+        // A pending change is written, and only then is the cache current.
+        std::fs::write(root.join("added.rs"), "fn added_marker() {}\n").unwrap();
+        index.update_file(&root.join("added.rs"));
+        assert_eq!(
+            persist_loaded_search_index(&mut index, cache.path(), head.as_deref()),
+            SearchIndexPersist::Written
+        );
+        assert_ne!(
+            std::fs::read(cache.path().join("cache.bin")).unwrap(),
+            written
+        );
+        assert_eq!(
+            persist_loaded_search_index(&mut index, cache.path(), head.as_deref()),
+            SearchIndexPersist::AlreadyCurrent
+        );
+
+        // An index read back from disk did not write the cache, so it keeps
+        // the existing write.
+        let mut reloaded = SearchIndex::read_from_disk(cache.path(), &root).unwrap();
+        assert_eq!(
+            persist_loaded_search_index(&mut reloaded, cache.path(), head.as_deref()),
+            SearchIndexPersist::Written
+        );
+    }
+
     #[test]
     fn semantic_refresh_debounce_caps_sustained_requests() {
         let started = std::time::Instant::now();
