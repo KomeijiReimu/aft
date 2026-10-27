@@ -705,6 +705,7 @@ async fn tool_result_capability_is_selected_per_bind_not_per_call() {
 
 #[tokio::test]
 async fn tool_result_non_negotiating_routes_keep_legacy_success_and_error_bytes() {
+    let _watcher_disabled = crate::test_env::without_project_watcher();
     let project = scratch_project();
     let root = project.path().to_path_buf();
     let module_root = root.clone();
@@ -723,9 +724,9 @@ async fn tool_result_non_negotiating_routes_keep_legacy_success_and_error_bytes(
             &module_root.join("absent-connection.json"),
             App::default_shared(),
             executor,
-            |request, _| {
+            |request, ctx| {
                 if request.command == "configure" {
-                    return Response::success(request.id, json!({}));
+                    return crate::commands::configure::handle_configure(&request, ctx);
                 }
                 if request.params["file"]
                     .as_str()
@@ -744,7 +745,7 @@ async fn tool_result_non_negotiating_routes_keep_legacy_success_and_error_bytes(
                     )
                 }
             },
-            Some(module_root.join("absent-user-config.json")),
+            Some(test_support::bind_config_without_indexes(&module_root)),
             false,
             usize::MAX,
             None,
@@ -813,7 +814,12 @@ async fn tool_result_non_negotiating_routes_keep_legacy_success_and_error_bytes(
         .await
         .unwrap();
         let ack = receive(&mut daemon, 0, channel as u64).await;
-        assert_eq!(ack.header.ty, FrameType::Response);
+        assert_eq!(
+            ack.header.ty,
+            FrameType::Response,
+            "bind refused for channel {channel}: {}",
+            String::from_utf8_lossy(&ack.body)
+        );
         assert!(matches!(
             serde_json::from_slice::<ModuleControlResponse>(&ack.body).unwrap(),
             ModuleControlResponse::RouteBindAck {}
