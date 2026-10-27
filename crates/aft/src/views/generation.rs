@@ -190,6 +190,153 @@ pub(super) fn with_publication_probe<T>(view_dir: &Path, read: impl FnOnce() -> 
     read()
 }
 
+/// Disk-limit eviction refuses a view while this process has any of its
+/// SQLite files open. Cleanup reads a view's pointer on a short-lived
+/// connection, and the read before it knows whether there is anything to
+/// clean runs without the family registry barrier eviction checks under (a
+/// pass with nothing to clean leaves the registry untouched). This gate lets
+/// eviction wait for such reads to close instead of mistaking an idle view
+/// for an open one, and keeps new reads out until eviction is done.
+#[derive(Default)]
+struct CleanupReadState {
+    reading: usize,
+    excluded: bool,
+}
+
+#[derive(Default)]
+struct CleanupReadGate {
+    state: Mutex<CleanupReadState>,
+    changed: std::sync::Condvar,
+}
+
+fn cleanup_read_gate(view_dir: &Path) -> Arc<CleanupReadGate> {
+    type Key = Vec<std::ffi::OsString>;
+    static GATES: OnceLock<Mutex<HashMap<Key, Weak<CleanupReadGate>>>> = OnceLock::new();
+    let key = crate::production_storage::comparison_key(view_dir, cfg!(windows));
+    let mut gates = GATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    gates.retain(|_, gate| gate.strong_count() != 0);
+    if let Some(gate) = gates.get(&key).and_then(Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(CleanupReadGate::default());
+    gates.insert(key, Arc::downgrade(&gate));
+    gate
+}
+
+/// One cleanup read of a view's pointer, from before its connection opens
+/// until after it closes.
+struct CleanupRead {
+    gate: Arc<CleanupReadGate>,
+}
+
+impl CleanupRead {
+    fn enter(view_dir: &Path) -> Self {
+        let gate = cleanup_read_gate(view_dir);
+        {
+            let mut state = gate
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while state.excluded {
+                state = gate
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            state.reading += 1;
+        }
+        Self { gate }
+    }
+}
+
+impl Drop for CleanupRead {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.reading -= 1;
+        drop(state);
+        self.gate.changed.notify_all();
+    }
+}
+
+/// Keeps cleanup reads of one view out while held. See [`exclude_cleanup_reads`].
+pub(super) struct CleanupReadsExcluded {
+    gate: Arc<CleanupReadGate>,
+}
+
+impl Drop for CleanupReadsExcluded {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.excluded = false;
+        drop(state);
+        self.gate.changed.notify_all();
+    }
+}
+
+/// Waits until no cleanup read of `view_dir` has a connection open in this
+/// process, and keeps new ones from starting while the returned guard lives.
+/// `None` when a read is still open at `until`. Call it while holding the
+/// family registry barrier and before taking the file-identity guard: a read
+/// takes neither the barrier nor anything else eviction holds, so it always
+/// finishes, but it needs the file-identity guard to close its connection.
+pub(super) fn exclude_cleanup_reads(
+    view_dir: &Path,
+    until: Instant,
+) -> Option<CleanupReadsExcluded> {
+    let gate = cleanup_read_gate(view_dir);
+    let mut state = gate
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The registry barrier already lets only one eviction check of a view
+    // run at a time in this process; waiting here keeps that true even so.
+    while state.excluded {
+        let Some(left) = until.checked_duration_since(Instant::now()) else {
+            return None;
+        };
+        state = gate
+            .changed
+            .wait_timeout(state, left)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+    }
+    state.excluded = true;
+    #[cfg(test)]
+    if state.reading != 0 {
+        drop(state);
+        crate::storage_retention::test_hook(view_dir, "eviction-awaits-cleanup-read");
+        state = gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    while state.reading != 0 {
+        let Some(left) = until.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        state = gate
+            .changed
+            .wait_timeout(state, left)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+    }
+    let closed = state.reading == 0;
+    drop(state);
+    let excluded = CleanupReadsExcluded { gate };
+    // Dropping the guard lets waiting reads go on when this one gives up.
+    closed.then_some(excluded)
+}
+
 pub(super) fn schedule_generation_sweep(view: ViewStore) {
     let path = view.view_dir().to_path_buf();
     let jobs = GENERATION_SWEEPS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -645,45 +792,20 @@ impl ViewStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut removed = self.reap_generation_trash()?;
-        // If the registry cannot be opened, the pointer is read without its
-        // barrier and the pass fails only when there is something to clean:
-        // deleting generations needs the registry, a pass with nothing
-        // superseded does not.
-        let mut unresolved = None;
-        let resolved = match registry {
-            Some(_) => None,
-            None => self.generation_sweep_registry().unwrap_or_else(|error| {
-                unresolved = Some(error);
-                None
-            }),
-        };
-        let registry = registry.or(resolved.as_ref());
-        // Disk-limit eviction refuses a view while this process has any of
-        // its SQLite files open, and checks that under the family registry
-        // barrier. Read the pointer under that barrier too: read outside it,
-        // a pass with nothing to clean could make an idle view look open to
-        // an eviction running at the same moment. A V1 view has no registry
-        // and no disk-limit eviction, so its read needs no barrier.
-        let current = match registry {
-            Some(registry) => {
-                match self.with_cleanup_admission(Some(registry), || self.pointer_census())? {
-                    Some(census) => census.generation,
-                    // The barrier is busy or the view was evicted meanwhile;
-                    // the next pass looks again.
-                    None => return Ok(removed),
-                }
-            }
-            None => self.pointer_census()?.generation,
-        };
-        // Most passes find nothing superseded. This check then returns
-        // without opening a writable pointer connection or creating SQLite
-        // sidecar files.
-        if !self.has_superseded_artifacts(current.as_deref())? {
+        // Most passes find nothing superseded. This read-only check then
+        // returns without taking the admission barrier, opening a writable
+        // pointer connection, or creating SQLite sidecar files.
+        if !self.has_superseded_artifacts()? {
             return Ok(removed);
         }
-        if let Some(error) = unresolved {
-            return Err(error);
-        }
+        let resolved;
+        let registry = match registry {
+            Some(registry) => Some(registry),
+            None => {
+                resolved = self.generation_sweep_registry()?;
+                resolved.as_ref()
+            }
+        };
         removed.add(self.sweep_generations_bounded(registry, GENERATION_DIRECTORY_LIMIT)?);
         Ok(removed)
     }
@@ -803,9 +925,8 @@ impl ViewStore {
         }
     }
 
-    /// Whether the view directory holds files of any generation other than
-    /// `current`, the generation the pointer names.
-    fn has_superseded_artifacts(&self, current: Option<&str>) -> Result<bool> {
+    fn has_superseded_artifacts(&self) -> Result<bool> {
+        let current = self.pointer_census()?.generation;
         let (entries, reached_end) =
             bounded_directory_entries(self.view_dir(), 0, GENERATION_DIRECTORY_LIMIT)?;
         if !reached_end {
@@ -847,7 +968,7 @@ impl ViewStore {
                             .map(|(generation, _)| generation)
                     })
                 });
-            if generation.is_some_and(|generation| current != Some(generation)) {
+            if generation.is_some_and(|generation| current.as_deref() != Some(generation)) {
                 return Ok(true);
             }
         }
@@ -858,6 +979,7 @@ impl ViewStore {
     /// read-only connection that creates no WAL or SHM file and is closed
     /// before this returns.
     fn pointer_census(&self) -> Result<PointerCensus> {
+        let _read = CleanupRead::enter(self.view_dir());
         let connection = crate::db::file_identity::IdentityConnection::open_census(
             &self.pointer_path(),
             "views::generation::census_pointer",
@@ -3563,9 +3685,7 @@ mod storage_retention_tests {
         assert!(sidecar.is_file());
         fs::remove_file(view.manifest_path("g").unwrap()).unwrap();
         assert!(sidecar_scan(&view, &sidecars).is_empty());
-        assert!(view
-            .has_superseded_artifacts(view.pointer_census().unwrap().generation.as_deref())
-            .unwrap());
+        assert!(view.has_superseded_artifacts().unwrap());
         assert_eq!(view.sweep_generations().unwrap(), 1);
         assert!(!sidecar.exists());
     }
@@ -3694,9 +3814,7 @@ mod storage_retention_tests {
         }
         let limit = 8;
         assert!(fs::read_dir(&dir).unwrap().count() > limit * 4);
-        assert!(view
-            .has_superseded_artifacts(view.pointer_census().unwrap().generation.as_deref())
-            .unwrap());
+        assert!(view.has_superseded_artifacts().unwrap());
         let unshared_left = || {
             fs::read_dir(&dir).unwrap().any(|entry| {
                 let name = entry.unwrap().file_name().into_string().unwrap();

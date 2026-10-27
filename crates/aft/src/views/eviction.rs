@@ -667,6 +667,20 @@ fn open_in_process(view_dir: &Path, deadline: Option<Instant>) -> Result<bool, S
         .any(|path| crate::db::file_identity::open_connections(path) != 0))
 }
 
+/// Waits for this process's cleanup reads of the view's pointer to close and
+/// keeps new ones out while the guard lives, so that a background cleanup
+/// pass never makes an idle view look open. `None` when one is still open at
+/// the deadline, or after the registry busy timeout when there is none: the
+/// same bound eviction already accepts while it waits for the barrier.
+fn quiesce_cleanup_reads(
+    view_dir: &Path,
+    deadline: Option<Instant>,
+) -> Option<super::generation::CleanupReadsExcluded> {
+    let bound = Instant::now() + Duration::from_millis(crate::blob_store::BUSY_TIMEOUT_MS);
+    let until = deadline.map_or(bound, |deadline| deadline.min(bound));
+    super::generation::exclude_cleanup_reads(view_dir, until)
+}
+
 /// Why `member` cannot be evicted, read inside the registry barrier `tx` so
 /// that no registration can land between this check and the deletion.
 fn hold_inside_barrier(
@@ -682,6 +696,9 @@ fn hold_inside_barrier(
         Ok(true) => return Ok(Some(Hold::Protected)),
         Err(reason) => return Ok(Some(Hold::Uncertain(reason))),
     }
+    let Some(_cleanup_reads) = quiesce_cleanup_reads(&member.view_dir, deadline) else {
+        return Ok(Some(Hold::OpenInProcess));
+    };
     match open_in_process(&member.view_dir, deadline) {
         Ok(false) => Ok(None),
         Ok(true) => Ok(Some(Hold::OpenInProcess)),
@@ -1017,6 +1034,16 @@ pub fn evict_view(
             )?;
             return Ok(EvictionOutcome::Held(hold));
         }
+        // No cleanup read may open the pointer from here until the deletion
+        // is done. Taken before the file-identity guard, which a read needs
+        // to close its connection.
+        let Some(_cleanup_reads) = quiesce_cleanup_reads(&current.view_dir, deadline) else {
+            tx.execute(
+                "UPDATE members SET state = 'active' WHERE scope = ?1",
+                params![scope],
+            )?;
+            return Ok(EvictionOutcome::Held(Hold::OpenInProcess));
+        };
         // No connection may open a file of this set between the check above
         // and the deletion below.
         let _files = crate::db::file_identity::filesystem_guard();
@@ -2484,15 +2511,20 @@ mod tests {
 
     /// After every publication a background cleanup pass reads the view's
     /// pointer database to learn whether any older generation is left to
-    /// delete. Eviction refuses a view while this process has one of its
-    /// SQLite files open, and checks that while it holds the family registry
-    /// barrier. The cleanup read must therefore also hold that barrier while
-    /// its connection is open. Otherwise eviction can run its check during
-    /// the read, find the pointer open, and keep a view nobody is using.
+    /// delete, without the family registry barrier. Eviction refuses a view
+    /// while this process has one of its SQLite files open, so it must wait
+    /// for such a read to close rather than keep a view nobody is using.
     #[test]
     fn a_cleanup_pass_reading_an_idle_view_never_holds_off_its_eviction() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+
+        #[derive(Debug, PartialEq)]
+        enum Event {
+            CleanupReading,
+            EvictionWaits,
+            EnforcementDone,
+        }
 
         let storage = tempfile::tempdir().unwrap();
         let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
@@ -2501,20 +2533,24 @@ mod tests {
         // The cleanup pass the publication started is finished; the one below
         // is the only cleanup running.
         super::super::generation::wait_for_generation_sweep_for_test(&view_dir);
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (events_tx, events) = std::sync::mpsc::channel();
         let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
         let go_rx = Mutex::new(go_rx);
         let once = AtomicBool::new(false);
+        let hook_events = events_tx.clone();
         let hook = crate::storage_retention::observe_test_hook(
             &view_dir,
             Arc::new(move |step| {
                 if step == "pointer-census-open" && !once.swap(true, Ordering::SeqCst) {
-                    entered_tx.send(()).unwrap();
+                    // Hold the cleanup read open until the test lets it go.
+                    hook_events.send(Event::CleanupReading).unwrap();
                     go_rx
                         .lock()
                         .unwrap()
                         .recv_timeout(Duration::from_secs(15))
                         .unwrap();
+                } else if step == "eviction-awaits-cleanup-read" {
+                    hook_events.send(Event::EvictionWaits).unwrap();
                 }
             }),
         );
@@ -2522,29 +2558,27 @@ mod tests {
             .unwrap()
             .with_sweep_registry(registry.clone());
         super::super::generation::schedule_generation_sweep(view);
-        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-
-        // Cleanup now has the pointer open. Try to take the registry barrier
-        // the way eviction does, without waiting: it must already be taken.
-        let probe = rusqlite::Connection::open(registry.path()).unwrap();
-        probe.busy_timeout(Duration::ZERO).unwrap();
-        let barrier = probe.execute_batch("BEGIN IMMEDIATE; ROLLBACK;");
-        let open = open_in_process(&view_dir, None).unwrap();
-        go_tx.send(()).unwrap();
-        super::super::generation::wait_for_generation_sweep_for_test(&view_dir);
-        drop(hook);
-        drop(probe);
-        assert!(open, "the paused cleanup pass has the pointer open");
-        assert!(
-            barrier.is_err_and(|error| {
-                error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
-            }),
-            "cleanup had the view's pointer open outside the registry barrier"
-        );
+        let first = events.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(first, Event::CleanupReading);
+        assert!(open_in_process(&view_dir, None).unwrap());
 
         registry.set_disk_budget(budget(0, u64::MAX));
-        let report = enforce(&registry, EnforceOptions::default()).unwrap();
+        let enforcing = registry.clone();
+        let enforcement = std::thread::spawn(move || {
+            let report = enforce(&enforcing, EnforceOptions::default());
+            events_tx.send(Event::EnforcementDone).unwrap();
+            report
+        });
+        // Either eviction waits for the read, or it finished while the read
+        // was still open and so could not have evicted the view.
+        let next = events.recv_timeout(Duration::from_secs(10)).unwrap();
+        go_tx.send(()).unwrap();
+        let report = enforcement.join().unwrap().unwrap();
+        super::super::generation::wait_for_generation_sweep_for_test(&view_dir);
+        drop(hook);
+        assert_eq!(next, Event::EvictionWaits, "{:?}", report.held);
         assert_eq!(evicted(&report), ["a"], "{:?}", report.held);
+        assert!(!view_dir.exists());
     }
 
     /// A view whose session is alive stays even when it is the least
