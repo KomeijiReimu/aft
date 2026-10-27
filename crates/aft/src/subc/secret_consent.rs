@@ -26,9 +26,11 @@
 
 use super::{carrier_read_only, flow_read, tool_provider, RouteIdentity};
 use crate::secret::eligibility::{alfonso_of_kind, COMMAND_SCOPE_KINDS};
+#[cfg(test)]
+use crate::secret::withhold_consent;
 use crate::secret::{
-    file_consent, withhold_consent, CallScopes, ConsentOutcome, EligibilityForm, Ineligibility,
-    LabelOutcome, Resolution, SecretConsentRequest, SecretScope,
+    file_consent, CallScopes, ConsentOutcome, EligibilityForm, Ineligibility, LabelOutcome,
+    Resolution, SecretConsentRequest, SecretScope,
 };
 use std::sync::Arc;
 use std::time::Duration;
