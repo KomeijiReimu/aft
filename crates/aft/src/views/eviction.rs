@@ -2482,6 +2482,71 @@ mod tests {
         assert!(report.over_hard.is_empty());
     }
 
+    /// After every publication a background cleanup pass reads the view's
+    /// pointer database to learn whether any older generation is left to
+    /// delete. Eviction refuses a view while this process has one of its
+    /// SQLite files open, and checks that while it holds the family registry
+    /// barrier. The cleanup read must therefore also hold that barrier while
+    /// its connection is open. Otherwise eviction can run its check during
+    /// the read, find the pointer open, and keep a view nobody is using.
+    #[test]
+    fn a_cleanup_pass_reading_an_idle_view_never_holds_off_its_eviction() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let storage = tempfile::tempdir().unwrap();
+        let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+        idle_view(&registry, "a", 1, 4);
+        let view_dir = crate::views::registry::view_dir(registry.storage(), "a").unwrap();
+        // The cleanup pass the publication started is finished; the one below
+        // is the only cleanup running.
+        super::super::generation::wait_for_generation_sweep_for_test(&view_dir);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        let once = AtomicBool::new(false);
+        let hook = crate::storage_retention::observe_test_hook(
+            &view_dir,
+            Arc::new(move |step| {
+                if step == "pointer-census-open" && !once.swap(true, Ordering::SeqCst) {
+                    entered_tx.send(()).unwrap();
+                    go_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(15))
+                        .unwrap();
+                }
+            }),
+        );
+        let view = crate::views::ViewStore::existing_dir(view_dir.clone())
+            .unwrap()
+            .with_sweep_registry(registry.clone());
+        super::super::generation::schedule_generation_sweep(view);
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        // Cleanup now has the pointer open. Try to take the registry barrier
+        // the way eviction does, without waiting: it must already be taken.
+        let probe = rusqlite::Connection::open(registry.path()).unwrap();
+        probe.busy_timeout(Duration::ZERO).unwrap();
+        let barrier = probe.execute_batch("BEGIN IMMEDIATE; ROLLBACK;");
+        let open = open_in_process(&view_dir, None).unwrap();
+        go_tx.send(()).unwrap();
+        super::super::generation::wait_for_generation_sweep_for_test(&view_dir);
+        drop(hook);
+        drop(probe);
+        assert!(open, "the paused cleanup pass has the pointer open");
+        assert!(
+            barrier.is_err_and(|error| {
+                error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
+            }),
+            "cleanup had the view's pointer open outside the registry barrier"
+        );
+
+        registry.set_disk_budget(budget(0, u64::MAX));
+        let report = enforce(&registry, EnforceOptions::default()).unwrap();
+        assert_eq!(evicted(&report), ["a"], "{:?}", report.held);
+    }
+
     /// A view whose session is alive stays even when it is the least
     /// recently bound and the limit is not met without it.
     #[test]

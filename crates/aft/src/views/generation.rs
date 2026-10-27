@@ -836,6 +836,8 @@ impl ViewStore {
             &self.pointer_path(),
             "views::generation::census_pointer",
         )?;
+        #[cfg(test)]
+        crate::storage_retention::test_hook(self.view_dir(), "pointer-census-open");
         Ok(read_pointer_census(&connection)?)
     }
 
