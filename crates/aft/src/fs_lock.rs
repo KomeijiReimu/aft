@@ -4403,6 +4403,70 @@ mod tests {
     }
 
     #[test]
+    fn valid_same_owner_replacement_refreshes_within_stale_bound() {
+        let (_dir, path) = test_lock_path();
+        let config = test_config();
+        let guard = acquire_with_config(
+            &path,
+            None,
+            LockConfig {
+                heartbeat_interval_ms: 60_000,
+                ..config
+            },
+        )
+        .expect("acquire lease");
+        let held_identity = LeaseFileIdentity::of_file(
+            guard
+                .heartbeat_file
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .file(),
+        );
+        let mut restored = guard.metadata.clone();
+        restored.heartbeat_at_ms = now_ms().saturating_sub(1_000_000);
+        let replacement = path.with_extension("replacement");
+        fs::write(&replacement, lock_metadata_bytes(&restored).unwrap()).unwrap();
+        // Do not release or re-index the kept handle: an atomic replacement by
+        // another process cannot notify this process's lease registry either.
+        rename_over(&replacement, &path).expect("replace valid same-owner lease");
+        let live_identity = LeaseFileIdentity::of_path(&path).expect("replacement identity");
+        assert_ne!(held_identity, Some(live_identity));
+
+        let _ = io_ledger::take();
+        let started = Instant::now();
+        let result = guard.pump.heartbeat_once();
+        let elapsed = started.elapsed();
+        let on_disk = read_lock_metadata(&path).expect("independent path read");
+        let cost = io_ledger::take();
+        eprintln!(
+            "valid replacement beat: elapsed={elapsed:?} result={result:?} held={held_identity:?} live={live_identity:?} sentinel={} observed={} cost={cost:?}",
+            restored.heartbeat_at_ms, on_disk.heartbeat_at_ms
+        );
+        assert!(
+            elapsed < Duration::from_millis(config.stale_heartbeat_ms),
+            "same-owner replacement delayed a beat beyond its stale bound: {elapsed:?}"
+        );
+        result.expect("refresh replacement through reopened handle");
+        assert!(on_disk.heartbeat_at_ms > restored.heartbeat_at_ms);
+        assert!(lock_identity_matches(&on_disk, &guard.metadata));
+        assert_eq!((cost.opens, cost.closes), (1, 1));
+        let reopened_identity = LeaseFileIdentity::of_file(
+            guard
+                .heartbeat_file
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .file(),
+        );
+        assert_eq!(reopened_identity, Some(live_identity));
+        guard.pump.heartbeat_once().expect("healthy next beat");
+        assert_beat_opens_no_descriptor(&io_ledger::take());
+    }
+
+    #[test]
     fn heartbeat_survives_transient_malformed_and_recovers() {
         // Regression: a single transient failure (e.g. a read that races a
         // concurrent writer and sees a momentarily-unparseable file) used to
