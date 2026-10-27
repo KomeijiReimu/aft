@@ -17,6 +17,15 @@ const MAX_FILE_BYTES: usize = 256 * 1024;
 const MAX_RENDER_TIME: Duration = Duration::from_secs(2);
 // Shared by both Git queries, including process startup and pipe collection.
 const GIT_CAPTURE_LIMIT: Duration = Duration::from_secs(1);
+
+#[cfg(test)]
+thread_local! {
+    /// Lets a correctness test give the git before-image capture an ample
+    /// budget on its own thread, so a loaded runner's slow git startup cannot
+    /// turn the result into the over-budget path the test is not about.
+    pub(crate) static TEST_GIT_CAPTURE_BUDGET: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
 const HEADER: &str =
     "Files changed while the command ran (changes by other processes may be included):";
 const DIRTY: &str = "no diff: it had uncommitted changes before the command";
@@ -824,6 +833,8 @@ impl GitStart {
             .filter(|value| *value <= 30_000)
             .map(Duration::from_millis)
             .unwrap_or(budget);
+        #[cfg(test)]
+        let budget = TEST_GIT_CAPTURE_BUDGET.with(|slot| slot.get()).unwrap_or(budget);
         Self::read_with_git(root, budget, |directory, args, deadline| {
             crate::revision_read::bounded_git_bytes(directory, args, deadline, MAX_REPORT_BYTES)
         })
