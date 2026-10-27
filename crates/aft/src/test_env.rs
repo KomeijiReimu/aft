@@ -108,6 +108,21 @@ pub(crate) fn without_storage_override() -> StorageOverrideGuard {
     }
 }
 
+/// Keep transport fixtures from starting project watchers unrelated to their
+/// protocol assertions. Restore the setting before releasing the shared env lock.
+pub(crate) struct ProjectWatcherDisabledGuard {
+    _setting: ScopedEnvVar,
+    _lock: ProcessEnvLockGuard,
+}
+
+pub(crate) fn without_project_watcher() -> ProjectWatcherDisabledGuard {
+    let lock = process_env_lock();
+    ProjectWatcherDisabledGuard {
+        _setting: ScopedEnvVar::set("AFT_TEST_DISABLE_FILE_WATCHER", "1"),
+        _lock: lock,
+    }
+}
+
 struct ScopedEnvVar {
     key: &'static str,
     previous: Option<OsString>,

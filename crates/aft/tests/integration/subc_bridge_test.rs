@@ -706,6 +706,10 @@ impl BridgeState {
 }
 
 fn configure_bridge_context(req: &RawRequest, ctx: &AppContext) -> Response {
+    let configured = aft::commands::configure::handle_configure(req, ctx);
+    if !configured.success {
+        return configured;
+    }
     let root = match req.params.get("project_root").and_then(Value::as_str) {
         Some(root) => std::path::PathBuf::from(root),
         None => {
@@ -1666,6 +1670,20 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     install_bridge_state(Arc::clone(&state));
 
     let roots = SubcBridgeTestRoots::new();
+    // Bind actors start with default configuration, so the entry context's
+    // explicit storage path alone does not isolate their database or recovery.
+    // Give this serialized fixture a private process-wide storage selection.
+    let _fixture_storage = if _env_guards
+        .iter()
+        .any(|guard| guard.key == "AFT_STORAGE_DIR")
+    {
+        None
+    } else {
+        Some(set_test_env(
+            "AFT_STORAGE_DIR",
+            &roots.storage.path().to_string_lossy(),
+        ))
+    };
     // Strict untrusted routes re-exec the native launcher. This fixture runs the
     // bridge in libtest, so use the real binary without bypassing confinement.
     #[cfg(unix)]
@@ -2469,9 +2487,9 @@ fn subc_bridge_duplicate_routebind_rejects_in_flight_bind() {
 }
 
 #[test]
-fn subc_bridge_tool_call_before_bind_ack_is_route_not_bound() {
+fn subc_bridge_tool_call_before_bind_ack_is_held_until_written() {
     run_subc_bridge_test(
-        "subc_bridge_tool_call_before_bind_ack_is_route_not_bound",
+        "subc_bridge_tool_call_before_bind_ack_is_held_until_written",
         Duration::from_secs(30),
         drive_pending_bind_tool_call_daemon,
         |_, _, _| {},
@@ -3856,7 +3874,7 @@ static S1_ATTACKER_CONFIG_REACHED_DISPATCH: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 const S1_ATTACKER_MARKER: &str = "S1_ATTACKER_SECRET_ENV";
 
-fn s1_guard_dispatch(req: RawRequest, _ctx: &AppContext) -> Response {
+fn s1_guard_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     // The RouteBind reconcile dispatches a clean `configure` (no marker); only a
     // forwarded tool-call `configure` would carry the marker. If the marker ever
     // arrives here, the fail-closed gate failed and the cap was bypassed.
@@ -3865,6 +3883,7 @@ fn s1_guard_dispatch(req: RawRequest, _ctx: &AppContext) -> Response {
         if raw.contains(S1_ATTACKER_MARKER) {
             S1_ATTACKER_CONFIG_REACHED_DISPATCH.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+        return aft::commands::configure::handle_configure(&req, ctx);
     }
     Response::success(req.id, json!({}))
 }
@@ -3949,7 +3968,8 @@ fn subc_rejects_forwarded_configure_tool_call_in_production() {
         heavy_permits: 1,
         drr_quantum: 1,
     }));
-    let user_config_path = storage.path().join("nonexistent-user-aft.jsonc");
+    let user_config_path = storage.path().join("user-aft.jsonc");
+    std::fs::write(&user_config_path, r#"{"indexes":{"trigram":false,"semantic":false,"callgraph":false},"views":{"enabled":false}}"#).unwrap();
 
     // PRODUCTION entry — passthrough is OFF.
     run_subc_mode(
@@ -6498,7 +6518,13 @@ async fn drive_back_to_back_binds_beside_held_mutating_job(input: FakeDaemonInpu
     release_tx.send(()).unwrap();
     held.recv_timeout(Duration::from_secs(5)).unwrap();
     let health = health.expect("the frame loop must service health while the writer is held");
-    assert_eq!((health.header.channel, health.header.corr), (0, 40));
+    assert_eq!(
+        (health.header.channel, health.header.corr),
+        (0, 40),
+        "first control frame while Mutating was held: header={:?} body={}",
+        health.header,
+        String::from_utf8_lossy(&health.body)
+    );
     let mut acks = HashSet::new();
     while acks.len() < 2 {
         let ack = read_frame_timeout(&mut stream, "deferred bind ack").await;
@@ -7407,7 +7433,6 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
         inner.slow_configure_started > slow_bind_base
     });
 
-    let release_turn = probe.hold_reliable_push_turn_for_test(19);
     let flood_prefix = "routebind-priority-flood";
     let flood_count = 1024_u64;
     send_tool_call(
@@ -7418,6 +7443,34 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
         json!({ "prefix": flood_prefix, "count": flood_count }),
     )
     .await;
+    // Confirm flood pressure before holding the loop. The independent ACK lane
+    // may overtake proxied frames once configure completes, and the held batch
+    // need not be visible on the socket until the loop resumes.
+    let mut flood_seen = 0_u64;
+    let mut flood_response_seen = false;
+    while flood_seen == 0 {
+        let frame =
+            read_any_frame_timeout(&mut stream, "flood pressure before bind completion").await;
+        match frame.header.ty {
+            FrameType::Push => {
+                let body: Value = serde_json::from_slice(&frame.body).unwrap();
+                if push_type(&body) == Some("bash_completed")
+                    && push_task_id(&body).is_some_and(|task| task.starts_with(flood_prefix))
+                {
+                    flood_seen += 1;
+                }
+            }
+            FrameType::Response if frame.header.corr == 901 => flood_response_seen = true,
+            other => panic!("unexpected frame before bind completion: {other:?}"),
+        }
+    }
+    let root_id = ProjectRootId::from_path(&root1).expect("root1 id");
+    let ctx = executor.actor_context(&root_id).expect("root1 actor");
+    let release_turn = probe.hold_reliable_push_turn_for_test(19);
+    assert!(emit_push_frame(
+        &ctx,
+        bash_completed_push("routebind-priority-turn-hold", "session-1")
+    ));
     expect_priority_event(&mut events, SubcLifecycleEvent::ReliablePushTurnHeld).await;
 
     // Hold the loop at a turn boundary, not the configure worker: completion
@@ -7428,8 +7481,6 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
         SubcLifecycleEvent::RouteBindCompletionQueued { corr: 19 },
     )
     .await;
-    let root_id = ProjectRootId::from_path(&root1).expect("root1 id");
-    let ctx = executor.actor_context(&root_id).expect("root1 actor");
     let ready_task = "routebind-priority-ready";
     assert!(emit_push_frame(
         &ctx,
@@ -7470,8 +7521,6 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
         &ctx,
         bash_completed_push(after_ack_task, "session-1")
     ));
-    let mut flood_seen = 0_u64;
-    let mut flood_response_seen = false;
     let mut ack_seen = false;
     let mut ready_seen = false;
     let mut after_ack_seen = false;
@@ -7590,8 +7639,8 @@ async fn drive_pending_bind_tool_call_daemon(input: FakeDaemonInput) {
         ..
     } = open_fake_daemon_session(input).await;
 
-    // P5b B2 finding (d): a route-channel tool call sent before its bind ack is
-    // a protocol error and remains route_not_bound while the bind is pending.
+    // Candidate calls wait for bind authority instead of racing configure and
+    // receiving an unbound-route error before its bind ACK finishes writing.
     let pending_tool_base = state.begin_slow_configure_wave();
     send_route_bind_with_doc(
         &mut stream,
@@ -7608,10 +7657,13 @@ async fn drive_pending_bind_tool_call_daemon(input: FakeDaemonInput) {
         inner.slow_configure_started > pending_tool_base
     });
     send_tool_call(&mut stream, 12, 1201, "echo", json!({ "case": "fast" })).await;
-    expect_error_frame(&mut stream, 12, 1201, "route_not_bound").await;
     state.release_slow_configures();
     state.wait_for_slow_configure_finished(pending_tool_base + 1);
     expect_route_bind_ack(&mut stream, 1200).await;
+    let response = read_frame_timeout(&mut stream, "held candidate response").await;
+    assert_eq!(response.header.ty, FrameType::Response);
+    assert_eq!(response.header.channel, 12);
+    assert_eq!(response.header.corr, 1201);
 
     send_connection_goodbye(&mut stream).await;
 }
@@ -7658,9 +7710,7 @@ async fn drive_goodbye_cancels_pending_bind_daemon(input: FakeDaemonInput) {
             .expect("goodbye barrier ping"),
     )
     .await;
-    let pong = read_frame_timeout(&mut stream, "goodbye barrier pong").await;
-    assert_eq!(pong.header.ty, FrameType::Pong, "{:?}", pong.header);
-    assert_eq!(pong.header.corr, 1109);
+    expect_cancelled_bind_with_control_reply(&mut stream, 110, 1109, FrameType::Pong).await;
     // NO manual release: the Goodbye's operational cancellation must itself
     // settle the stuck configure, or this test proves only bookkeeping.
     state.wait_for_slow_configure_finished(goodbye_bind_base + 1);
@@ -7805,7 +7855,7 @@ async fn drive_cancelled_first_bind_does_not_orphan_later_bind_daemon(input: Fak
     // NO manual release: cancelling route 20's configure must free the
     // mutating lane so route 21's queued configure runs and acks.
     state.wait_for_slow_configure_finished(slow_bind_base + 1);
-    expect_route_bind_ack(&mut stream, 210).await;
+    expect_cancelled_bind_with_control_reply(&mut stream, 200, 210, FrameType::Response).await;
     send_tool_call(&mut stream, 21, 211, "echo", json!({ "case": "fast" })).await;
     let joined = read_frame_timeout(&mut stream, "post-cancel sibling bind response").await;
     assert_eq!(joined.header.channel, 21);
@@ -7930,12 +7980,12 @@ async fn drive_goodbye_removes_queued_bind_daemon(input: FakeDaemonInput) {
             .expect("queued-cancel barrier ping"),
     )
     .await;
-    let pong = read_frame_timeout(&mut stream, "queued-cancel barrier pong").await;
-    assert_eq!(pong.header.ty, FrameType::Pong, "{:?}", pong.header);
+    expect_cancelled_bind_with_control_reply(&mut stream, 410, 412, FrameType::Pong).await;
 
     // Cancel the first via Goodbye too; operational cancellation settles it.
     send_route_goodbye(&mut stream, 40, 401).await;
     state.wait_for_slow_configure_finished(slow_bind_base + 1);
+    expect_route_bind_error(&mut stream, 400, "cancelled").await;
     assert_eq!(
         state.slow_configure_started_count(),
         slow_bind_base + 1,
@@ -11041,6 +11091,22 @@ fn minimal_bind_doc() -> Value {
     })
 }
 
+fn write_bind_project_config(root: &std::path::Path, doc: &Value) {
+    let path = root.join(".cortexkit").join("aft.jsonc");
+    let parent = path.parent().expect("project config parent");
+    std::fs::create_dir_all(parent).expect("create .cortexkit dir");
+    // An earlier bind may be reading this path while the next bind is sent.
+    // Publish a complete sibling file instead of truncating the live document.
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).expect("create project config temp");
+    std::io::Write::write_all(
+        &mut temporary,
+        &serde_json::to_vec(doc).expect("serialize bind doc"),
+    )
+    .expect("write project config temp");
+    temporary.persist(&path).expect("publish project config");
+}
+
 fn subc_mcp_principal() -> Principal {
     Principal::Reserved {
         module_id: "subc-mcp".to_string(),
@@ -11086,14 +11152,7 @@ async fn send_route_bind_with_elicitation_capability(
     corr: u64,
     root: &std::path::Path,
 ) {
-    let project_cfg = root.join(".cortexkit").join("aft.jsonc");
-    std::fs::create_dir_all(project_cfg.parent().expect("cortexkit dir parent"))
-        .expect("create .cortexkit dir");
-    std::fs::write(
-        &project_cfg,
-        serde_json::to_string(&minimal_bind_doc()).expect("serialize bind doc"),
-    )
-    .expect("write project config");
+    write_bind_project_config(root, &minimal_bind_doc());
 
     let body = ModuleControlRequest::RouteBind {
         route_channel,
@@ -14237,14 +14296,7 @@ async fn send_route_bind_with_harness_session_principal_and_doc_epoch(
     // to the project config file so it reaches handle_control_request's local
     // read. The wire `config` is still attached but no longer consulted by
     // production; keeping it asserts it's harmlessly ignored.
-    let project_cfg = root.join(".cortexkit").join("aft.jsonc");
-    std::fs::create_dir_all(project_cfg.parent().expect("cortexkit dir parent"))
-        .expect("create .cortexkit dir");
-    std::fs::write(
-        &project_cfg,
-        serde_json::to_string(&doc).expect("serialize bind doc"),
-    )
-    .expect("write project config");
+    write_bind_project_config(root, &doc);
 
     let request = ModuleControlRequest::RouteBind {
         route_channel,
@@ -14838,11 +14890,50 @@ fn extract_bash_task_id(text: &str) -> String {
 
 async fn expect_route_bind_ack(stream: &mut tokio::net::TcpStream, corr: u64) {
     let frame = read_frame_timeout(stream, "RouteBindAck").await;
-    assert_eq!(frame.header.ty, FrameType::Response);
+    assert_eq!(
+        frame.header.ty,
+        FrameType::Response,
+        "bind corr={corr}: header={:?} body={}",
+        frame.header,
+        String::from_utf8_lossy(&frame.body)
+    );
     assert_eq!(frame.header.channel, 0);
     assert_eq!(frame.header.corr, corr);
     let ack: ModuleControlResponse = serde_json::from_slice(&frame.body).expect("ack body");
     assert_eq!(ack, ModuleControlResponse::RouteBindAck {});
+}
+
+async fn expect_cancelled_bind_with_control_reply(
+    stream: &mut tokio::net::TcpStream,
+    bind_corr: u64,
+    other_corr: u64,
+    other_type: FrameType,
+) {
+    // Pong uses the priority lane and the sibling ACK is independent. Neither
+    // ordering is promised, but the cancelled bind must answer exactly once.
+    let mut seen = HashSet::new();
+    for _ in 0..2 {
+        let frame = read_frame_timeout(stream, "cancelled bind and control reply").await;
+        assert_eq!(frame.header.channel, 0);
+        assert!(seen.insert(frame.header.corr), "duplicate control reply");
+        if frame.header.corr == bind_corr {
+            assert_error_frame(&frame, 0, bind_corr, "cancelled");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&frame.body).unwrap()["message"],
+                "request cancelled"
+            );
+        } else {
+            assert_eq!(frame.header.corr, other_corr);
+            assert_eq!(frame.header.ty, other_type);
+            if other_type == FrameType::Response {
+                assert_eq!(
+                    serde_json::from_slice::<ModuleControlResponse>(&frame.body).unwrap(),
+                    ModuleControlResponse::RouteBindAck {}
+                );
+            }
+        }
+    }
+    assert_eq!(seen, HashSet::from([bind_corr, other_corr]));
 }
 
 async fn expect_route_bind_error(stream: &mut tokio::net::TcpStream, corr: u64, code: &str) {

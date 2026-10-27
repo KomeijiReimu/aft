@@ -98,6 +98,55 @@ fn staged_sources_are_cleared_at_entry_and_on_unwind() {
 }
 
 #[test]
+fn prepared_bind_watches_keep_the_captured_source() {
+    const NAME: &str = "config_live::tests::prepared_bind_watches_keep_the_captured_source";
+    const CHILD: &str = "AFT_TEST_PREPARED_WATCH_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--color=never"])
+            .env(CHILD, "1")
+            .env_remove("AFT_TEST_DISABLE_FILE_WATCHER")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            "watch child failed: {:?} {:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let _git_env = crate::test_env::hermetic_git_env_guard();
+    let fixture = Fixture::new(
+        r#"{"indexes":{"trigram":false,"semantic":false,"callgraph":false},"views":{"enabled":false}}"#,
+        None,
+    );
+    let legacy = fixture.root.join(".pi/aft.jsonc");
+    write(&legacy, r#"{"callgraph_chunk_size":7}"#);
+    let prepared = crate::subc_config::PreparedBindConfig::read(
+        Some(&fixture.user_path),
+        &fixture.root,
+        &crate::harness::Harness::Pi,
+    )
+    .unwrap();
+    write(&fixture.project_path, r#"{"callgraph_chunk_size":9}"#);
+    std::fs::remove_file(&legacy).unwrap();
+    enable_config_watches_for_test();
+    let request: RawRequest = serde_json::from_value(json!({"id":"prepared-watch","command":"configure","project_root":fixture.root,"harness":"pi","cortexkit_user_config_path":fixture.user_path})).unwrap();
+    let response = crate::subc_config::with_prepared_bind_config(prepared, || {
+        crate::commands::configure::handle_configure(&request, &fixture.ctx)
+    });
+    assert!(response.success, "{}", response.data);
+    fixture.ctx.config_live().wait_for_watch_attachment();
+    let watches = fixture.ctx.config_live().watches.lock();
+    assert_eq!(
+        watches.project_fallback.as_ref().unwrap().file(),
+        legacy.as_path()
+    );
+}
+
+#[test]
 fn inspect_categories_and_lsp_idle_reload_without_restart() {
     let fixture = Fixture::new(r#"{"lsp":{"idle_minutes":60}}"#, None);
     write(

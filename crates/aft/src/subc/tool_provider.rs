@@ -1768,6 +1768,28 @@ async fn kill_on_owning_root(
 }
 
 impl LedgerEdge {
+    #[cfg(test)]
+    pub(super) fn retain_shell_for_egress_test(
+        &self,
+        root: crate::path_identity::ProjectRootId,
+        route: super::RouteChannel,
+        corr: u64,
+    ) {
+        self.calls.lock().unwrap().insert(
+            (route, corr),
+            LedgerCall {
+                root,
+                key: crate::db::call_ledger::Key {
+                    carrier: "egress-test".into(),
+                    call_key: "held-detach".into(),
+                },
+                shell: true,
+                detached: false,
+                expires_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
+                withdrawn: None,
+            },
+        );
+    }
     pub(super) fn new() -> (
         std::sync::Arc<Self>,
         tokio::sync::mpsc::UnboundedReceiver<super::DecodedFrame>,

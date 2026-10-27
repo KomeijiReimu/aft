@@ -12,7 +12,7 @@
 use super::*;
 use base64::Engine;
 
-const HARNESS: &str = "test-harness";
+const HARNESS: &str = "runner";
 const SESSION: &str = "page-session";
 const CORE_CHANNEL: u16 = 12;
 const OTHER_CHANNEL: u16 = 13;

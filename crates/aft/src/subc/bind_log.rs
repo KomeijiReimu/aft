@@ -67,6 +67,8 @@ mod tests {
             .unwrap();
             handle_control_request(
                 &writer,
+                &writer,
+                &A0Egress::new(writer.clone(), completion.clone()),
                 &frame,
                 &app,
                 &executor,
