@@ -41,7 +41,7 @@ fn fresh_wait_releases_manager_and_requires_each_producer_version() {
     let pre = {
         let mut lsp = manager.lock();
         for key in &keys {
-            let mut client = LspClient::spawn(
+            let mut client = LspClient::spawn_with_reclaim_root(
                 key.kind.clone(),
                 key.root.clone(),
                 Path::new("sh"),
@@ -49,6 +49,8 @@ fn fresh_wait_releases_manager_and_requires_each_producer_version() {
                 &HashMap::new(),
                 lsp.event_sender_for_test(),
                 LspChildRegistry::new(),
+                None,
+                false,
             )
             .unwrap();
             client.set_rust_analyzer_quiescent(true);
