@@ -1530,6 +1530,9 @@ impl RouteIdentity {
 #[derive(Debug)]
 struct RouteIdentityData {
     root: ProjectRootId,
+    /// Resolved scope workdir, or the legacy bind root when no workdir is stamped.
+    /// The daemon's project id is retained alongside it in `scope.project_id`;
+    /// persisted state continues to use the root path, not that id.
     project_root: PathBuf,
     harness: String,
     session: String,
@@ -7731,6 +7734,47 @@ fn normalized_scope_workdir(workdir: &Path) -> Option<PathBuf> {
     }
 }
 
+fn resolve_route_project_root(
+    identity: &subc_protocol::BindIdentity,
+    scope: Option<&subc_protocol::scope::ScopeStamp>,
+) -> PathBuf {
+    match scope.and_then(|stamp| stamp.workdir.as_deref()) {
+        Some(workdir) => {
+            let workdir = Path::new(workdir);
+            // Invalid stamped paths still go through bind validation; they must
+            // never select a different project through the compatibility fallback.
+            normalized_scope_workdir(workdir).unwrap_or_else(|| workdir.to_path_buf())
+        }
+        None => legacy_unstamped_bind_project_root(identity),
+    }
+}
+
+// Older daemons and session hosts do not always stamp a workdir. Remove this
+// compatibility fallback when BindIdentity no longer carries project_root.
+fn legacy_unstamped_bind_project_root(identity: &subc_protocol::BindIdentity) -> PathBuf {
+    identity.project_root.clone()
+}
+
+fn log_route_project_key_change(
+    identity: &subc_protocol::BindIdentity,
+    project_root: &Path,
+    route: RouteChannel,
+) {
+    // Catalog and consent keys use literal display strings. Compare those strings
+    // so aliases that canonicalize to one folder still produce a key-change log.
+    let bind_key = identity.project_root.display().to_string();
+    let resolved_key = project_root.display().to_string();
+    if bind_key != resolved_key {
+        crate::slog_info!(
+            "subc route project key changed: bind_project_root={} resolved_project_root={} session={} route={}",
+            bind_key,
+            resolved_key,
+            identity.session,
+            route,
+        );
+    }
+}
+
 const MAX_SCOPE_WORKDIR_DIAGNOSTICS: usize = 2;
 
 #[derive(Default)]
@@ -8132,6 +8176,7 @@ async fn handle_control_request(
                 .await;
             }
 
+            let bind_project_root = resolve_route_project_root(&identity, scope.as_ref());
             let mut bind_root_id = None;
             if let Some(installed_epoch) = installed_route_epochs.get(&route_channel).copied() {
                 if installed_epoch >= epoch {
@@ -8145,7 +8190,7 @@ async fn handle_control_request(
                     .await;
                 }
 
-                let replacement_root = match ProjectRootId::from_path(&identity.project_root) {
+                let replacement_root = match ProjectRootId::from_path(&bind_project_root) {
                     Ok(root_id) => root_id,
                     Err(error) => {
                         return send_route_bind_error(
@@ -8202,7 +8247,7 @@ async fn handle_control_request(
                 Some(root_id) => root_id,
                 None => match {
                     metrics.mark_frame_loop_wait("disk/canonicalize_root", None);
-                    ProjectRootId::from_path(&identity.project_root)
+                    ProjectRootId::from_path(&bind_project_root)
                 } {
                     Ok(root_id) => root_id,
                     Err(error) => {
@@ -8217,11 +8262,11 @@ async fn handle_control_request(
                     }
                 },
             };
+            log_route_project_key_change(&identity, &bind_project_root, route_id);
 
-            // Reconcile RootConfig: build a configure request from the bind
-            // identity + forwarded config tiers and run it through the executor.
+            // Reconcile RootConfig using the resolved project and the local
+            // config tiers, then run it through the executor.
             let request_id = format!("subc-bind-{route_channel}");
-            let bind_project_root = identity.project_root.clone();
             let bind_harness = identity.harness.clone();
             let bind_session = identity.session.clone();
             let bind_principal_id = principal_id(&principal);
