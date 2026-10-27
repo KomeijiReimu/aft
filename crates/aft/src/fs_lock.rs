@@ -1033,10 +1033,10 @@ fn log_transient_heartbeat_failure(
 ///   inode, or on Windows volume serial number and file index). Unix reads both
 ///   with a stat; Windows reads the descriptor's identity from its own handle
 ///   and opens the path for attributes only, so that arm does take one
-///   short-lived handle per beat. A different file means another owner
-///   reclaimed the lease and renamed its own over the path, so the beat reports
-///   `NotOwner` and the heartbeat stops rather than refresh the orphan the
-///   handle still holds.
+///   short-lived handle per beat. A different file retires the old handle. If
+///   the path still carries this guard's owner identity, the beat reopens it
+///   immediately; a different owner stops the heartbeat instead of refreshing
+///   the orphan the handle still holds.
 ///   When the handle was released by a replacement, the next beat opens the path
 ///   again. Releases happen on the heartbeat thread, or on the thread running a
 ///   replacement through `with_lease_handles_closed`.
@@ -1048,10 +1048,6 @@ fn log_transient_heartbeat_failure(
 struct HeartbeatPump {
     path: PathBuf,
     slot: usize,
-    /// How long one beat keeps retrying (reopening the lease and reading it
-    /// again) before it reports the failure. When no beat is running, the handle
-    /// simply stays open between beats.
-    idle: Duration,
     /// Full owner identity, recorded at attach. The path can later hold a
     /// different owner: a reclaim by any process mints a new epoch, so a path
     /// whose identity no longer matches was released and re-indexed for its new
@@ -1112,7 +1108,6 @@ impl Clone for HeartbeatPump {
         Self {
             path: self.path.clone(),
             slot: self.slot,
-            idle: self.idle,
             owner: Mutex::new(
                 self.owner
                     .lock()
@@ -1150,7 +1145,6 @@ impl HeartbeatPump {
             Self {
                 path: path.to_path_buf(),
                 slot,
-                idle: Duration::from_millis(HEARTBEAT_INTERVAL_MS),
                 owner: Mutex::new(owner.clone()),
                 visible: AtomicBool::new(true),
                 #[cfg(test)]
@@ -1182,8 +1176,7 @@ impl HeartbeatPump {
         if !self.is_visible() {
             return Err(HeartbeatError::NotPumped);
         }
-        let deadline = Instant::now() + self.idle;
-        let mut wait_logged = false;
+        let mut reopened = false;
         loop {
             let handle = {
                 let registry = lease_files()
@@ -1208,7 +1201,18 @@ impl HeartbeatPump {
                     if self.release_if_reclaimed() {
                         return Err(HeartbeatError::NotOwner);
                     }
-                    self.index(&handle);
+                    // A same-owner replacement is already safe to reopen. An
+                    // extra heartbeat-interval sleep here leaves the live path
+                    // stale even though the inode change was detected. Retry
+                    // once now; repeated replacements remain transient and are
+                    // retried by the normal heartbeat loop without spinning.
+                    if reopened {
+                        return Err(HeartbeatError::Io(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "lease replaced repeatedly during heartbeat",
+                        )));
+                    }
+                    reopened = true;
                 }
                 // A partial rewrite does not prove ownership was lost. Retire
                 // the descriptor so the next scheduled beat opens the live
@@ -1221,18 +1225,6 @@ impl HeartbeatPump {
                 }
                 Err(error) => return Err(error),
             }
-            if Instant::now() >= deadline {
-                return Err(HeartbeatError::NotOwner);
-            }
-            if !wait_logged {
-                wait_logged = true;
-                slog_warn!(
-                    "filesystem lock at {} is being rewritten in this process; \
-                     heartbeat retrying",
-                    self.path.display()
-                );
-            }
-            thread::sleep(self.idle);
         }
     }
 
@@ -1261,13 +1253,6 @@ impl HeartbeatPump {
             }
         }
         heartbeat_once(&self.path, &owner, handle)
-    }
-
-    /// Keep this process's lease index pointing at the handle the heartbeat
-    /// holds. Another thread's replacement looks the lease up here to know which
-    /// descriptor it has to release before it renames the lease.
-    fn index(&self, handle: &Arc<Mutex<Option<LeaseFile>>>) {
-        register_lease_slot(self.slot, &self.path, handle);
     }
 
     /// Release the lease descriptor but keep the slot registered, so the next
@@ -4398,6 +4383,70 @@ mod tests {
         let recovery = io_ledger::take();
         assert_eq!((recovery.opens, recovery.closes), (1, 0));
 
+        guard.pump.heartbeat_once().expect("healthy next beat");
+        assert_beat_opens_no_descriptor(&io_ledger::take());
+    }
+
+    #[test]
+    fn valid_same_owner_replacement_refreshes_within_stale_bound() {
+        let (_dir, path) = test_lock_path();
+        let config = test_config();
+        let guard = acquire_with_config(
+            &path,
+            None,
+            LockConfig {
+                heartbeat_interval_ms: 60_000,
+                ..config
+            },
+        )
+        .expect("acquire lease");
+        let held_identity = LeaseFileIdentity::of_file(
+            guard
+                .heartbeat_file
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .file(),
+        );
+        let mut restored = guard.metadata.clone();
+        restored.heartbeat_at_ms = now_ms().saturating_sub(1_000_000);
+        let replacement = path.with_extension("replacement");
+        fs::write(&replacement, lock_metadata_bytes(&restored).unwrap()).unwrap();
+        // Do not release or re-index the kept handle: an atomic replacement by
+        // another process cannot notify this process's lease registry either.
+        rename_over(&replacement, &path).expect("replace valid same-owner lease");
+        let live_identity = LeaseFileIdentity::of_path(&path).expect("replacement identity");
+        assert_ne!(held_identity, Some(live_identity));
+
+        let _ = io_ledger::take();
+        let started = Instant::now();
+        let result = guard.pump.heartbeat_once();
+        let elapsed = started.elapsed();
+        let on_disk = read_lock_metadata(&path).expect("independent path read");
+        let cost = io_ledger::take();
+        eprintln!(
+            "valid replacement beat: elapsed={elapsed:?} result={result:?} held={held_identity:?} live={live_identity:?} sentinel={} observed={} cost={cost:?}",
+            restored.heartbeat_at_ms, on_disk.heartbeat_at_ms
+        );
+        assert!(
+            elapsed < Duration::from_millis(config.stale_heartbeat_ms),
+            "same-owner replacement delayed a beat beyond its stale bound: {elapsed:?}"
+        );
+        result.expect("refresh replacement through reopened handle");
+        assert!(on_disk.heartbeat_at_ms > restored.heartbeat_at_ms);
+        assert!(lock_identity_matches(&on_disk, &guard.metadata));
+        assert_eq!((cost.opens, cost.closes), (1, 1));
+        let reopened_identity = LeaseFileIdentity::of_file(
+            guard
+                .heartbeat_file
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .file(),
+        );
+        assert_eq!(reopened_identity, Some(live_identity));
         guard.pump.heartbeat_once().expect("healthy next beat");
         assert_beat_opens_no_descriptor(&io_ledger::take());
     }
