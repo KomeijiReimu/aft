@@ -1048,6 +1048,9 @@ mod tests {
                 metadata.duration_ms = None;
                 metadata.exit_code = None;
                 metadata.completion_preview = None;
+                // Read-only restore probes: no timeout or process group can
+                // stand in for a live child, so point at this process.
+                metadata.child_pid = Some(std::process::id());
             }
             write_task_at(&layout, &metadata).unwrap();
             fs::write(&layout.paths.stdout, "done\n").unwrap();
