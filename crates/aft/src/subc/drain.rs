@@ -333,6 +333,13 @@ impl HeldBashCalls {
         }
     }
 
+    /// The phase a held call was last set to, if it is still tracked. The
+    /// foreground-wait event reports this same phase so a test waiting on the
+    /// event sees exactly what a drain census taken next would report.
+    pub(super) fn phase(&self, route: RouteChannel, corr: u64) -> Option<BashHoldPhase> {
+        self.lock().get(&(route, corr)).map(|call| call.phase)
+    }
+
     pub(super) fn remove(&self, route: RouteChannel, corr: u64) {
         self.lock().remove(&(route, corr));
     }

@@ -2896,18 +2896,13 @@ async fn run_deferred_bash_wait(
             format_context: format_context.clone(),
         },
     );
-    // The phase was set when the spawn reported its foreground control; the
-    // detach target above is what moves the census off `bash:spawning`.
-    // Publish both together so a test waiting on this event sees exactly what
-    // a drain census taken next would report for this call.
-    {
-        let foreground_phase = if detach_on_user_message {
-            drain::BashHoldPhase::Wait
-        } else if block_to_completion {
-            drain::BashHoldPhase::Block
-        } else {
-            drain::BashHoldPhase::Foreground
-        };
+    // The phase was set when the spawn reported its foreground control (from
+    // `blocking_intent`, not the capped `block_to_completion` flag this wait
+    // receives); the detach target above is what moves the census off
+    // `bash:spawning`. Publish the stored phase together with the detach so a
+    // test waiting on this event sees exactly what a drain census taken next
+    // would report for this call.
+    if let Some(foreground_phase) = metrics.held_bash_calls.phase(route, corr) {
         if let Ok(guard) = metrics.lifecycle_probe.lock() {
             if let Some(probe) = guard.as_ref() {
                 probe.bash_foreground_wait(route, corr, foreground_phase.label());
