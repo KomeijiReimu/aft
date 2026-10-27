@@ -2328,7 +2328,9 @@ fn is_private_ipv6(ip: Ipv6Addr) -> bool {
     }
 
     let first = segments[0];
-    (0xfe80..=0xfebf).contains(&first) || (0xfc00..=0xfdff).contains(&first) || first >= 0xff00
+    // fe80::/10 link-local, fec0::/10 deprecated site-local (still routed
+    // inside some networks), fc00::/7 unique local, ff00::/8 multicast.
+    (0xfe80..=0xfeff).contains(&first) || (0xfc00..=0xfdff).contains(&first) || first >= 0xff00
 }
 
 const BINARY_SNIFF_PREFIX: usize = 8 * 1024;
@@ -3482,6 +3484,15 @@ mod tests {
         assert!(text.contains("timed out"), "{text}");
         assert!(!text.contains("for url"), "{text}");
         assert!(!text.contains("fetch-secret-key"), "{text}");
+    }
+
+    #[test]
+    fn deprecated_site_local_ipv6_is_private() {
+        for address in ["fec0::1", "feff::1", "fef0:1::1"] {
+            let ip: IpAddr = address.parse().unwrap();
+            assert!(is_private_ip(ip), "{address}");
+        }
+        assert!(!is_private_ip("2606:4700::1".parse().unwrap()));
     }
 }
 
