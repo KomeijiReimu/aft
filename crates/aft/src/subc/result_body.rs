@@ -5,8 +5,9 @@ use std::cell::Cell;
 use crate::protocol::Response;
 
 pub(crate) const RESULT_FORMAT: &str = "tool-result/v1";
-// Enable only after consumers and the tool-provider dependency use RESULT_FORMAT.
-pub(super) const DECLARE_RESULT_FORMAT: bool = false;
+// Catalog declarations advertise support; replies follow each route's negotiated
+// capability. Routes that do not request RESULT_FORMAT keep their legacy bodies.
+pub(super) const DECLARE_RESULT_FORMAT: bool = true;
 pub(crate) const MAX_RESULT_BYTES: usize = cortexkit_role_tool_provider::result::MAX_RESULT_BYTES;
 pub(crate) const FALLBACK_ERROR_CODE: &str = "tool_error";
 pub(crate) const TOO_LARGE_SENTENCE: &str =
