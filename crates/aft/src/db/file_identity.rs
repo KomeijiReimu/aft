@@ -431,7 +431,8 @@ impl IdentityConnection {
         let _guard = filesystem_guard();
         crate::private_storage::prepare_sqlite(path.as_ref(), flags)?;
         // A `file:` URI is SQLite syntax, not a filesystem path, so it is
-        // passed through; every plain path gets the long-path spelling.
+        // passed through; plain paths go through `sqlite_open_path`, which
+        // adds the Windows long-path spelling when a path needs it.
         let sqlite_path = if flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_URI)
             && path.as_ref().to_string_lossy().starts_with("file:")
         {
