@@ -1341,15 +1341,20 @@ mod tests {
         assert!(!stat.matches_stat(&observed));
     }
 
-    #[cfg(unix)]
     #[test]
     fn real_git_preserves_non_utf8_paths() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
         let dir = fixture(ObjectFormat::Sha1);
         let name = b"non-utf8-\xff";
-        fs::write(dir.path().join(OsStr::from_bytes(name)), b"raw\n").unwrap();
-        git(dir.path(), &["add", "."], &[]);
+        // Stage the entry through git's own index input instead of creating
+        // the file: macOS (APFS) and Windows refuse non-UTF-8 file names, but
+        // an index can still carry one from a commit made elsewhere.
+        let oid = git(dir.path(), &["hash-object", "-w", "--stdin"], b"raw\n").stdout;
+        let mut line = b"100644 ".to_vec();
+        line.extend_from_slice(String::from_utf8(oid).unwrap().trim().as_bytes());
+        line.push(b'\t');
+        line.extend_from_slice(name);
+        line.push(b'\n');
+        git(dir.path(), &["update-index", "--add", "--index-info"], &line);
         git(dir.path(), &["update-index", "--index-version", "4"], &[]);
         assert!(snapshot(dir.path(), ObjectFormat::Sha1)
             .entries
