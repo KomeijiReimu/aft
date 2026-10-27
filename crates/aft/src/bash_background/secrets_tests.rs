@@ -325,6 +325,10 @@ fn native_pipeline() {
     let storage = tempfile::tempdir().unwrap();
     let _launcher = native_launcher(root.path());
     let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "AFT bash fixture upstream CA");
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
     let ca_key = rcgen::KeyPair::generate().unwrap();
@@ -469,12 +473,7 @@ assert open(paths[0], 'rb').read().count(b'BEGIN CERTIFICATE') > 1
             config.sandbox.profile.worker = mode;
         });
         let gate = root.path().join(format!("go-{index}"));
-        let trust = if cfg!(target_os = "macos") {
-            "--cacert \"$CURL_CA_BUNDLE\""
-        } else {
-            ""
-        };
-        let command = format!("while [ ! -f '{}' ]; do sleep 0.05; done; test -n \"$HTTPS_PROXY\" && test \"$HTTPS_PROXY\" = \"$https_proxy\" && test \"$HTTP_PROXY\" = \"$http_proxy\" && test -z \"${{NO_PROXY+x}}\" && test -z \"${{no_proxy+x}}\" && test -z \"${{ALL_PROXY+x}}\" && test -z \"${{all_proxy+x}}\" || exit 70; printf 'proxy-env-ok\\n' >&2; curl {trust} --connect-timeout 5 --max-time 10 --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; curl {trust} --connect-timeout 5 --max-time 10 --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; sleep 30", gate.display(), vault.port, vault.port);
+        let command = format!("while [ ! -f '{}' ]; do sleep 0.05; done; test -n \"$HTTPS_PROXY\" && test \"$HTTPS_PROXY\" = \"$https_proxy\" && test \"$HTTP_PROXY\" = \"$http_proxy\" && test -z \"${{NO_PROXY+x}}\" && test -z \"${{no_proxy+x}}\" && test -z \"${{ALL_PROXY+x}}\" && test -z \"${{all_proxy+x}}\" || exit 70; printf 'proxy-env-ok\\n' >&2; curl --connect-timeout 5 --max-time 10 --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; curl --connect-timeout 5 --max-time 10 --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; sleep 30", gate.display(), vault.port, vault.port);
         let command = format!(
             "python3 '{}' {} || exit 71; printf 'memory-and-bundle-ok\\n' >&2; {command}",
             memory_probe.display(),

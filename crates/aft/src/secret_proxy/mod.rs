@@ -210,8 +210,15 @@ impl State {
     fn tls_for(&self, host: &str) -> Result<rustls::ServerConfig, ()> {
         let host = network_host(host);
         let key = KeyPair::generate().map_err(|_| ())?;
-        let cert = CertificateParams::new(vec![host.to_owned()])
-            .map_err(|_| ())?
+        // Distinct issuer/leaf names and an issuing-key identifier keep clients
+        // from treating the leaf as self-issued or choosing another bundle CA.
+        let mut params = CertificateParams::new(vec![host.to_owned()]).map_err(|_| ())?;
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, host);
+        params.use_authority_key_identifier_extension = true;
+        let cert = params
             .signed_by(&key, &self.ca, &self.ca_key)
             .map_err(|_| ())?;
         let der = Zeroizing::new(key.serialize_der());
@@ -275,6 +282,10 @@ impl SecretProxy {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut params =
             CertificateParams::new(Vec::new()).map_err(|_| ProxyError::Initialization)?;
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "AFT per-command secret proxy CA");
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![
             rcgen::KeyUsagePurpose::KeyCertSign,
