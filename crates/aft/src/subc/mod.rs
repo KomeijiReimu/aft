@@ -19684,6 +19684,7 @@ mod tests {
     fn slow_pending_bind_warning_carries_the_bind_session_not_the_last_served() {
         let (_dir, root) = test_root("route-bind-slow-warn-session");
         let pending_bind = |corr: u64, session: Option<&str>| PendingBind {
+            ack_publication: None,
             bind_root_id: root.clone(),
             inserted_new_actor: false,
             cancelled: false,
