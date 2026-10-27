@@ -2628,7 +2628,7 @@ pub(crate) fn process_alive(_pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::BufRead;
+    use std::io::{BufRead, Write};
     use std::process::{Child, ChildStdin, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Barrier};
@@ -3951,9 +3951,137 @@ mod tests {
         remove_lock_file(&path).expect("cleanup synthetic lock");
     }
 
-    /// Run a helper path in its own process using the Rust test binary under a
-    /// stdio harness, so a test can observe what a *separate* process sees.
-    fn spawn_test_harness(mode: &str, path: &Path) -> (Child, ChildStdin, mpsc::Receiver<String>) {
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct HeartbeatObservation {
+        step: usize,
+        observed_at_ms: u64,
+        heartbeat_at_ms: Option<u64>,
+        volume: Option<u64>,
+        inode: Option<u64>,
+        modified_at_ms: Option<u64>,
+        error: Option<String>,
+    }
+
+    fn observe_heartbeat(path: &Path, step: usize) -> HeartbeatObservation {
+        let mut observation = HeartbeatObservation {
+            step,
+            observed_at_ms: now_ms(),
+            heartbeat_at_ms: None,
+            volume: None,
+            inode: None,
+            modified_at_ms: None,
+            error: None,
+        };
+        let mut file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) => {
+                observation.error = Some(error.to_string());
+                return observation;
+            }
+        };
+        // Identity and contents come from the same open, including if the path
+        // is atomically replaced while the observer is reading it.
+        if let Some(identity) = LeaseFileIdentity::of_file(&file) {
+            observation.volume = Some(identity.volume);
+            observation.inode = Some(identity.file);
+        }
+        observation.modified_at_ms = file
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_millis() as u64);
+        let mut bytes = Vec::new();
+        match file.read_to_end(&mut bytes) {
+            Ok(_) => match serde_json::from_slice::<LockMetadata>(&bytes) {
+                Ok(metadata) => observation.heartbeat_at_ms = Some(metadata.heartbeat_at_ms),
+                Err(error) => observation.error = Some(error.to_string()),
+            },
+            Err(error) => observation.error = Some(error.to_string()),
+        }
+        observation
+    }
+
+    struct HeartbeatHarness {
+        child: Child,
+        input: Option<ChildStdin>,
+        lines: mpsc::Receiver<String>,
+        reader: Option<JoinHandle<()>>,
+        transcript: Vec<String>,
+    }
+
+    impl HeartbeatHarness {
+        fn read_observation(
+            &mut self,
+            prefix: &str,
+            deadline: Instant,
+        ) -> Result<HeartbeatObservation, String> {
+            loop {
+                let line = self
+                    .lines
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .map_err(|error| format!("observer response: {error}"))?;
+                self.transcript.push(line.clone());
+                if let Some(json) = line.strip_prefix(prefix) {
+                    return serde_json::from_str(json)
+                        .map_err(|error| format!("observer JSON: {error}"));
+                }
+            }
+        }
+
+        fn observe(
+            &mut self,
+            step: usize,
+            deadline: Instant,
+        ) -> Result<HeartbeatObservation, String> {
+            let input = self.input.as_mut().expect("observer input is open");
+            writeln!(input, "{step}").map_err(|error| error.to_string())?;
+            input.flush().map_err(|error| error.to_string())?;
+            self.read_observation("sample:", deadline)
+        }
+
+        fn diagnostics(&self, path: &Path, guard: &LockGuard, step: usize) -> String {
+            let held_identity = guard.heartbeat_file.try_lock().ok().and_then(|mut slot| {
+                slot.as_mut()
+                    .and_then(|lease| LeaseFileIdentity::of_file(lease.file()))
+            });
+            format!(
+                "parent={:?} held_identity={held_identity:?} stopped={} visible={}\nchild observations:\n{}",
+                observe_heartbeat(path, step),
+                guard.pump.heartbeat_stopped(),
+                guard.heartbeat_is_visible(),
+                self.transcript.join("\n")
+            )
+        }
+
+        fn finish(&mut self) -> std::process::ExitStatus {
+            self.input.take();
+            let status = self.child.wait().expect("observer exit");
+            self.reader.take().unwrap().join().expect("observer reader");
+            self.transcript.extend(self.lines.try_iter());
+            status
+        }
+    }
+
+    impl Drop for HeartbeatHarness {
+        fn drop(&mut self) {
+            // An assertion can unwind before normal EOF/wait cleanup. Reap the
+            // observer and join its stdout reader before the owner releases the
+            // lease, so no child retains the test runner's inherited stderr.
+            self.input.take();
+            if !matches!(self.child.try_wait(), Ok(Some(_))) {
+                let _ = self.child.kill();
+            }
+            let _ = self.child.wait();
+            if let Some(reader) = self.reader.take() {
+                let _ = reader.join();
+            }
+        }
+    }
+
+    /// Run the Rust test binary as an independent lease observer. Each request
+    /// opens the lease afresh and returns its content timestamp and file identity.
+    fn spawn_test_harness(mode: &str, path: &Path) -> HeartbeatHarness {
         let mut command = std::process::Command::new(std::env::current_exe().expect("test exe"));
         command
             .args(["--exact", HARNESS_TEST, "--nocapture", "--test-threads=1"])
@@ -3972,7 +4100,7 @@ mod tests {
         let stdin = child.stdin.take().expect("harness stdin");
         let stdout = child.stdout.take().expect("harness stdout");
         let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
+        let reader = thread::spawn(move || {
             for line in io::BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
                 if sender.send(line).is_err() {
@@ -3980,84 +4108,113 @@ mod tests {
                 }
             }
         });
-        (child, stdin, receiver)
-    }
-
-    /// Reads harness stdout lines until one starts with `ready:`, returning the
-    /// timestamp it reports. A panic message from the harness process is
-    /// surfaced instead of timing out.
-    fn await_harness_ready(writes_at_ms: u64, seen: &mut mpsc::Receiver<String>) -> u64 {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            match seen.recv_timeout(Duration::from_millis(100)) {
-                Ok(line) => {
-                    if let Some(stamp) = line.strip_prefix("ready:") {
-                        let stamp = stamp.trim().parse().expect("ready timestamp");
-                        assert!(
-                            stamp >= writes_at_ms,
-                            "the other process saw heartbeat {stamp} older than ours {writes_at_ms}"
-                        );
-                        return stamp;
-                    }
-                    if line.contains("panicked") || line.contains("test result: FAILED") {
-                        panic!("harness process failed: {line}");
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
+        HeartbeatHarness {
+            child,
+            input: Some(stdin),
+            lines: receiver,
+            reader: Some(reader),
+            transcript: Vec::new(),
         }
-        panic!("harness process never reported its view of the lease");
     }
 
-    /// Another process must see `heartbeat_at_ms` advance, even while this
-    /// process keeps its lease open between beats. The harness process watches
-    /// the lease for several beats and requires at least one advance; this test
-    /// also re-reads the lease itself and requires it to move forward on every
-    /// step.
-    ///
-    /// Deliberately breaking the heartbeat (returning before the beat in
-    /// `HeartbeatPump::heartbeat_once`) leaves the timestamp frozen, and the
-    /// harness reports no change, which fails this test.
+    /// Another process must see background heartbeats through the kept handle.
+    /// A beat interval is not a scheduling guarantee: allow progress within the
+    /// configured stale bound, and never substitute a parent-side read for the
+    /// observer's actual timestamp and inode.
     #[test]
     fn separate_process_sees_heartbeat_advance() {
         if std::env::var_os(HARNESS_TEST).is_some() {
             return;
         }
+        assert_separate_process_heartbeat_advances(test_config());
+    }
+
+    #[test]
+    fn separate_process_waits_for_heartbeat_within_stale_bound() {
+        assert_separate_process_heartbeat_advances(LockConfig {
+            heartbeat_interval_ms: 400,
+            ..test_config()
+        });
+    }
+
+    fn assert_separate_process_heartbeat_advances(config: LockConfig) {
         let (_dir, path) = test_lock_path();
-        let guard = acquire_with_config(&path, None, test_config()).expect("acquire lock");
+        let guard = acquire_with_config(&path, None, config).expect("acquire lock");
         guard.heartbeat_once().expect("initial beat");
-        let visible_in_process = read_lock_metadata(&path)
-            .expect("read lease")
-            .heartbeat_at_ms;
-        let (mut child, stdin, mut harness_lines) = spawn_test_harness(HARNESS_MODE_INSPECT, &path);
-        let first_visible = await_harness_ready(visible_in_process, &mut harness_lines);
-        let mut previous = first_visible;
-        // Four beats at the test interval (25ms); the stale bound is 2s, so a
-        // heartbeat this process really refreshes moves well inside it.
-        for step in 0..4 {
-            thread::sleep(Duration::from_millis(
-                test_config().heartbeat_interval_ms * 6,
-            ));
-            let seen = read_lock_metadata(&path)
-                .expect("read lease")
-                .heartbeat_at_ms;
-            assert!(
-                seen > previous,
-                "the other process saw the lease heartbeat stall at {seen} after step {step}"
-            );
-            previous = seen;
+        let mut harness = spawn_test_harness(HARNESS_MODE_INSPECT, &path);
+        let ready = harness
+            .read_observation("ready:", Instant::now() + Duration::from_secs(10))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "observer startup failed: {error}\n{}",
+                    harness.diagnostics(&path, &guard, 0)
+                )
+            });
+        let mut previous = ready.heartbeat_at_ms.unwrap_or_else(|| {
+            panic!(
+                "observer could not read initial lease\n{}",
+                harness.diagnostics(&path, &guard, 0)
+            )
+        });
+        for step in 1..=4 {
+            let deadline = Instant::now() + Duration::from_millis(config.stale_heartbeat_ms);
+            loop {
+                let observation = harness.observe(step, deadline).unwrap_or_else(|error| {
+                    panic!(
+                        "observer step {step} failed: {error}\n{}",
+                        harness.diagnostics(&path, &guard, step)
+                    )
+                });
+                if let Some(seen) = observation.heartbeat_at_ms.filter(|seen| *seen > previous) {
+                    eprintln!("heartbeat observer advanced: {observation:?}");
+                    previous = seen;
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "observer heartbeat did not advance from {previous} within {}ms at step {step}\n{}",
+                    config.stale_heartbeat_ms,
+                    harness.diagnostics(&path, &guard, step)
+                );
+                thread::sleep(
+                    Duration::from_millis(25)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
         }
-        // Close the harness's stdin and drain its output before waiting, so it
-        // never writes into a pipe whose reader has gone.
-        drop(stdin);
-        while harness_lines
-            .recv_timeout(Duration::from_millis(200))
-            .is_ok()
-        {}
-        let status = child.wait().expect("harness exit");
-        assert!(status.success(), "harness process failed: {status:?}");
-        drop(guard);
+        let status = harness.finish();
+        assert!(
+            status.success(),
+            "observer failed: {status:?}\n{}",
+            harness.diagnostics(&path, &guard, 4)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn separate_process_harness_drop_reaps_observer() {
+        let (_dir, path) = test_lock_path();
+        write_synthetic_lock(&path, &current_process_metadata());
+        let mut harness = spawn_test_harness(HARNESS_MODE_INSPECT, &path);
+        harness
+            .read_observation("ready:", Instant::now() + Duration::from_secs(10))
+            .expect("observer ready");
+        let pid = harness.child.id() as libc::pid_t;
+        drop(harness);
+        let mut status = 0;
+        // SAFETY: pid names the child this test just spawned; status is a valid
+        // out pointer. A completed Drop must already have waited for this child.
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        let error = io::Error::last_os_error().raw_os_error();
+        if waited == 0 {
+            // SAFETY: only our still-running child can be waitable under pid.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, &mut status, 0);
+            }
+        }
+        assert_eq!(waited, -1, "observer survived harness drop");
+        assert_eq!(error, Some(libc::ECHILD), "observer was not reaped");
     }
 
     /// A replacement by another part of this process must leave the owner's
@@ -4124,29 +4281,19 @@ mod tests {
         println!("mode:{mode:?} path={}", path.display());
         match mode.to_string_lossy().as_ref() {
             HARNESS_MODE_INSPECT => {
-                let first = read_lock_metadata(&path).expect("read lease as a separate process");
-                println!("ready:{}", first.heartbeat_at_ms);
-                let mut seen = first.heartbeat_at_ms;
-                // Watch for a few beats. Every read here is this process's own
-                // open of the lease file, so what it sees is what the owner's
-                // heartbeat has made visible to any other process.
-                let deadline = Instant::now()
-                    + Duration::from_millis(test_config().heartbeat_interval_ms * 40);
-                while Instant::now() < deadline {
-                    thread::sleep(Duration::from_millis(
-                        test_config().heartbeat_interval_ms * 2,
-                    ));
-                    if let Ok(metadata) = read_lock_metadata(&path) {
-                        if metadata.heartbeat_at_ms > seen {
-                            println!("moved:{}", metadata.heartbeat_at_ms);
-                            seen = metadata.heartbeat_at_ms;
-                        }
-                    }
-                }
-                assert!(
-                    seen > first.heartbeat_at_ms,
-                    "the lease heartbeat never advanced for this process"
+                println!(
+                    "ready:{}",
+                    serde_json::to_string(&observe_heartbeat(&path, 0)).unwrap()
                 );
+                io::stdout().flush().unwrap();
+                for line in io::stdin().lock().lines() {
+                    let step = line.unwrap().parse().expect("observation step");
+                    println!(
+                        "sample:{}",
+                        serde_json::to_string(&observe_heartbeat(&path, step)).unwrap()
+                    );
+                    io::stdout().flush().unwrap();
+                }
             }
             other => panic!("unknown harness mode {other}"),
         }
