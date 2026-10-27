@@ -37,6 +37,10 @@ struct FakeState {
     asks: HashMap<String, String>,
     /// Settled replies per elicitation id.
     answers: HashMap<String, Value>,
+    /// Asks withdrawn through `consent.withdraw`: a later `consent.await`
+    /// for the same id reports `access_withdrawn`, like Cingulate, so a
+    /// sibling covered by a folder grant resumes without a second answer.
+    withdrawn: std::collections::HashSet<String>,
     macos: bool,
     cards: HashMap<(String, String), String>,
     next_id: usize,
@@ -254,11 +258,26 @@ impl FakeCingulate {
                     ));
                 }
                 assert!(params["timeout_ms"].as_u64().unwrap() <= 120_000);
-                Ok(state.answers.get(id).cloned())
+                if let Some(answer) = state.answers.get(id) {
+                    return Ok(Some(answer.clone()));
+                }
+                if state.withdrawn.contains(id) {
+                    return Ok(Some(
+                        json!({"state":"refused:access_withdrawn","outcome":"access_withdrawn","code":"access_withdrawn"}),
+                    ));
+                }
+                Ok(None)
             }
             "consent.withdraw" => {
                 if let Some(id) = params["elicitation_id"].as_str() {
                     state.cards.retain(|_, card| card != id);
+                    // Withdrawing an already-settled ask returns its recorded
+                    // outcome (the race guard); only a still-open ask settles
+                    // as withdrawn, matching Cingulate's settled-withdraw reply.
+                    if let Some(answer) = state.answers.get(id).cloned() {
+                        return Ok(Some(answer));
+                    }
+                    state.withdrawn.insert(id.to_string());
                 }
                 Ok(Some(
                     json!({"state":"refused:access_withdrawn","outcome":"access_withdrawn","code":"access_withdrawn"}),
@@ -980,6 +999,345 @@ async fn consent_answer_within_the_budget_runs_the_held_call() {
     // allow_scope with no answered_by is the head's answer; the head holds the
     // path, so the scope grant is installed on the worker's scope.
     assert_eq!(f.worker_grants().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn consent_covering_withdraw_log_names_grant_without_raw_path() {
+    let grant = AccessGrant {
+        path: crate::access_policy::policy_path(Path::new("/tmp/scope")),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Read,
+    };
+    let ((), lines) = crate::logging::capture_log_lines(|| {
+        crate::log_ctx::with_session(Some("worker".to_string()), || {
+            log_covered_withdrawn("worker", "acc_718", "acc_717", &grant);
+        });
+    });
+    let covered: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("consent covering grant withdrew covered ask"))
+        .collect();
+    assert_eq!(covered.len(), 1, "{lines:?}");
+    let line = covered[0];
+    assert!(line.starts_with("INFO "), "{line}");
+    assert!(line.contains("ask=acc_718"), "{line}");
+    assert!(line.contains("covered_by=acc_717"), "{line}");
+    assert!(line.contains("kind=subtree"), "{line}");
+    let hash = line.split_once("path_hash=").unwrap().1;
+    assert_eq!(hash.len(), 12, "{line}");
+    assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()), "{line}");
+    assert!(!line.contains("/tmp/scope"), "{line}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_folder_grant_settles_and_withdraws_covered_sibling() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let _probe = DirectoryScopeProbeBudgetOverride::generous();
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_secs(5)));
+    let sub = f.head_root.join("sharedir");
+    std::fs::create_dir_all(&sub).unwrap();
+    let a = sub.join("a.txt");
+    let b = sub.join("b.txt");
+    std::fs::write(&a, "a contents\n").unwrap();
+    std::fs::write(&b, "b contents\n").unwrap();
+    let mut rx1 = f.send_read(&f.worker, &a, 901).await;
+    let mut rx2 = f.send_read(&f.worker, &b, 902).await;
+    wait_for(|| f.fake.calls("consent.request").len() >= 2).await;
+    let requests = f.fake.calls("consent.request");
+    assert_eq!(requests.len(), 2);
+    let key1 = requests[0]["call_key"].as_str().unwrap().to_string();
+    // let _key2 = requests[1]["call_key"].as_str().unwrap().to_string();
+    let before: std::collections::HashSet<String> = f
+        .asks()
+        .into_iter()
+        .filter_map(|record| record.elicitation_id)
+        .collect();
+    assert_eq!(before.len(), 2);
+    f.fake.answer(
+        &key1,
+        json!({"state": "settled", "outcome": "allow_scope", "answered_by": "user"}),
+    );
+    let r1 = tokio::time::timeout(Duration::from_secs(10), rx1.recv())
+        .await
+        .expect("covering call resumes")
+        .expect("writer stays open");
+    let r2 = tokio::time::timeout(Duration::from_secs(10), rx2.recv())
+        .await
+        .expect("covered sibling resumes without a second answer")
+        .expect("writer stays open");
+    let v1: Value = serde_json::from_slice(&r1.body).unwrap();
+    let v2: Value = serde_json::from_slice(&r2.body).unwrap();
+    assert!(text(&v1).contains("a contents"), "{v1}");
+    assert!(text(&v2).contains("b contents"), "{v2}");
+    assert_eq!(f.worker_grants().len(), 1);
+    let grant = &f.worker_grants()[0];
+    assert_eq!(grant.kind, GrantKind::Subtree);
+    let withdraws = f.fake.calls("consent.withdraw");
+    assert_eq!(
+        withdraws.len(),
+        1,
+        "one covered card is withdrawn {withdraws:?}"
+    );
+    let withdrawn = withdraws[0]["elicitation_id"].as_str().unwrap();
+    assert!(
+        before.contains(withdrawn),
+        "withdrawn ask was pending {withdrawn:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_folder_grant_leaves_uncovered_asks_pending() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    // Sibling folder: a grant for one directory never covers another.
+    {
+        let _probe = DirectoryScopeProbeBudgetOverride::generous();
+        let f = fixture(FakeCingulate::up());
+        set_hold_budget_for_test(Some(Duration::from_millis(600)));
+        let sub_a = f.head_root.join("sub_a");
+        let sub_b = f.head_root.join("sub_b");
+        std::fs::create_dir_all(&sub_a).unwrap();
+        std::fs::create_dir_all(&sub_b).unwrap();
+        let a = sub_a.join("a.txt");
+        let b = sub_b.join("b.txt");
+        std::fs::write(&a, "a contents\n").unwrap();
+        std::fs::write(&b, "b contents\n").unwrap();
+        let mut rx1 = f.send_read(&f.worker, &a, 911).await;
+        let mut rx2 = f.send_read(&f.worker, &b, 912).await;
+        wait_for(|| f.fake.calls("consent.request").len() >= 2).await;
+        let key1 = f.fake.calls("consent.request")[0]["call_key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        f.fake.answer(
+            &key1,
+            json!({"state": "settled", "outcome": "allow_scope", "answered_by": "user"}),
+        );
+        let r1 = tokio::time::timeout(Duration::from_secs(10), rx1.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let v1: Value = serde_json::from_slice(&r1.body).unwrap();
+        assert!(text(&v1).contains("a contents"), "{v1}");
+        let r2 = tokio::time::timeout(Duration::from_secs(10), rx2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let v2: Value = serde_json::from_slice(&r2.body).unwrap();
+        assert_eq!(code(&v2), "access_pending", "sibling stays pending {v2}");
+        assert!(
+            f.fake.calls("consent.withdraw").is_empty(),
+            "no withdraw for sibling"
+        );
+    }
+    // Different operation: a read folder grant never covers a write ask.
+    {
+        let _probe = DirectoryScopeProbeBudgetOverride::generous();
+        let f = fixture(FakeCingulate::up());
+        set_hold_budget_for_test(Some(Duration::from_millis(600)));
+        let sub = f.head_root.join("opdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        let a = sub.join("a.txt");
+        let b = sub.join("b.txt");
+        std::fs::write(&a, "a contents\n").unwrap();
+        std::fs::write(&b, "old\n").unwrap();
+        let mut rx1 = f.send_read(&f.worker, &a, 913).await;
+        let mut rx2 = f
+            .send_tool(
+                &f.worker,
+                "write",
+                json!({"path": b, "content": "new\n"}),
+                914,
+                scope_dispatch,
+            )
+            .await;
+        wait_for(|| f.fake.calls("consent.request").len() >= 2).await;
+        let requests = f.fake.calls("consent.request");
+        let read_key = requests
+            .iter()
+            .find(|request| request["operation"] == json!("read"))
+            .unwrap()["call_key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        f.fake.answer(
+            &read_key,
+            json!({"state": "settled", "outcome": "allow_scope", "answered_by": "user"}),
+        );
+        let r1 = tokio::time::timeout(Duration::from_secs(10), rx1.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let v1: Value = serde_json::from_slice(&r1.body).unwrap();
+        assert!(text(&v1).contains("a contents"), "{v1}");
+        let r2 = tokio::time::timeout(Duration::from_secs(10), rx2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let v2: Value = serde_json::from_slice(&r2.body).unwrap();
+        assert_eq!(code(&v2), "access_pending", "write stays pending {v2}");
+        assert!(
+            f.fake.calls("consent.withdraw").is_empty(),
+            "no withdraw for write"
+        );
+    }
+    // Another session: same scope and path, different harness session.
+    {
+        let _probe = DirectoryScopeProbeBudgetOverride::generous();
+        let f = fixture(FakeCingulate::up());
+        set_hold_budget_for_test(Some(Duration::from_millis(600)));
+        let sub = f.head_root.join("sessdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        let a = sub.join("a.txt");
+        let b = sub.join("b.txt");
+        std::fs::write(&a, "a contents\n").unwrap();
+        std::fs::write(&b, "b contents\n").unwrap();
+        let mut other = identity(&f.worker.project_root, f.worker.scope.clone());
+        let inner = Arc::get_mut(&mut other.0).unwrap();
+        inner.session = "other-session".into();
+        if let AuthenticatedPrincipal::RouteBind { session_id, .. } = &mut inner.spawn_principal {
+            *session_id = "other-session".into();
+        }
+        let mut rx1 = f.send_read(&f.worker, &a, 915).await;
+        let mut rx2 = f.send_read(&other, &b, 916).await;
+        wait_for(|| f.fake.calls("consent.request").len() >= 2).await;
+        let key1 = f.fake.calls("consent.request")[0]["call_key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        f.fake.answer(
+            &key1,
+            json!({"state": "settled", "outcome": "allow_scope", "answered_by": "user"}),
+        );
+        let r1 = tokio::time::timeout(Duration::from_secs(10), rx1.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let v1: Value = serde_json::from_slice(&r1.body).unwrap();
+        assert!(text(&v1).contains("a contents"), "{v1}");
+        let r2 = tokio::time::timeout(Duration::from_secs(10), rx2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let v2: Value = serde_json::from_slice(&r2.body).unwrap();
+        assert_eq!(
+            code(&v2),
+            "access_pending",
+            "other session stays pending {v2}"
+        );
+        assert!(
+            f.fake.calls("consent.withdraw").is_empty(),
+            "no withdraw across sessions"
+        );
+    }
+    // Another epoch: same session and path shape, different scope epoch.
+    {
+        let _probe = DirectoryScopeProbeBudgetOverride::generous();
+        let f = fixture(FakeCingulate::up());
+        set_hold_budget_for_test(Some(Duration::from_millis(600)));
+        let sub = f.head_root.join("epochdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        let a = sub.join("a.txt");
+        let b = sub.join("b.txt");
+        std::fs::write(&a, "a contents\n").unwrap();
+        std::fs::write(&b, "b contents\n").unwrap();
+        let epoch8: subc_protocol::scope::ScopeStamp = serde_json::from_value(json!({
+            "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+            "ref": "worker",
+            "scope_epoch": 8,
+            "kind": "worker",
+            "parent": {"owner": {"kind": "reserved", "module_id": "prefrontal-core"}, "ref": "head", "scope_epoch": 7},
+            "owner_authorized": true,
+        }))
+        .unwrap();
+        let other = identity(&f.worker.project_root, Some(epoch8));
+        let mut rx1 = f.send_read(&f.worker, &a, 917).await;
+        let mut rx2 = f.send_read(&other, &b, 918).await;
+        wait_for(|| f.fake.calls("consent.request").len() >= 2).await;
+        let key1 = f.fake.calls("consent.request")[0]["call_key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        f.fake.answer(
+            &key1,
+            json!({"state": "settled", "outcome": "allow_scope", "answered_by": "user"}),
+        );
+        let r1 = tokio::time::timeout(Duration::from_secs(10), rx1.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let v1: Value = serde_json::from_slice(&r1.body).unwrap();
+        assert!(text(&v1).contains("a contents"), "{v1}");
+        let r2 = tokio::time::timeout(Duration::from_secs(10), rx2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let v2: Value = serde_json::from_slice(&r2.body).unwrap();
+        assert_eq!(
+            code(&v2),
+            "access_pending",
+            "other epoch stays pending {v2}"
+        );
+        assert!(
+            f.fake.calls("consent.withdraw").is_empty(),
+            "no withdraw across epochs"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_folder_grant_withdraw_race_uses_recorded_outcome() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let _probe = DirectoryScopeProbeBudgetOverride::generous();
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_secs(5)));
+    let sub = f.head_root.join("racedir");
+    std::fs::create_dir_all(&sub).unwrap();
+    let a = sub.join("a.txt");
+    let b = sub.join("b.txt");
+    std::fs::write(&a, "a contents\n").unwrap();
+    std::fs::write(&b, "b contents\n").unwrap();
+    let mut rx1 = f.send_read(&f.worker, &a, 921).await;
+    let mut rx2 = f.send_read(&f.worker, &b, 922).await;
+    wait_for(|| f.fake.calls("consent.request").len() >= 2).await;
+    let requests = f.fake.calls("consent.request");
+    let key1 = requests[0]["call_key"].as_str().unwrap().to_string();
+    let key2 = requests[1]["call_key"].as_str().unwrap().to_string();
+    // Hold the sibling's denial inside its finish so the covering grant's
+    // withdraw finds it still live: the withdraw then returns the settled
+    // record (like settled-withdraw-reply) and must not override it.
+    let gate = FinishGateOverride::install("subc-41-922", false);
+    f.fake
+        .answer(&key2, json!({"state": "settled", "outcome": "deny"}));
+    f.fake.answer(
+        &key1,
+        json!({"state": "settled", "outcome": "allow_scope", "answered_by": "user"}),
+    );
+    wait_for(|| gate.0.entered.load(Ordering::SeqCst)).await;
+    // The covering grant is stored while the sibling is still live, so a
+    // withdraw is attempted for it even though it already settled.
+    wait_for(|| !f.fake.calls("consent.withdraw").is_empty()).await;
+    gate.release();
+    let r1 = tokio::time::timeout(Duration::from_secs(10), rx1.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let r2 = tokio::time::timeout(Duration::from_secs(10), rx2.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let v1: Value = serde_json::from_slice(&r1.body).unwrap();
+    let v2: Value = serde_json::from_slice(&r2.body).unwrap();
+    assert!(text(&v1).contains("a contents"), "covering still runs {v1}");
+    assert_eq!(
+        code(&v2),
+        "access_declined",
+        "recorded denial wins over covering grant {v2}"
+    );
 }
 
 struct FinishGate {
@@ -4280,6 +4638,54 @@ fn consent_vectors_settled_allow_without_answered_by_is_the_head() {
     assert!(decode_record(&json!({"outcome": "allow_once"})).is_err());
     assert!(decode_elicitation_id(&json!({"id": "acc_1"})).is_err());
     assert!(decode_result(br#"{"elicitation_id":"acc_1"}"#).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn consent_vectors_folder_grant_withdraw() {
+    // Owner withdraws settle as `access_withdrawn` on AFT's normal route;
+    // withdrawing an already-settled ask returns its own settled record for
+    // the race guard; a non-owner gets `elicitation_not_owner`.
+    for (name, id) in [
+        ("scope-owner-withdraw-request.json", "acc_5"),
+        ("non-owner-withdraw-request.json", "acc_5"),
+        ("settled-withdraw-request.json", "acc_4"),
+    ] {
+        assert_eq!(
+            encode("consent.withdraw", &json!({"elicitation_id": id})).unwrap(),
+            vector(name),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        decode_record(&decode_result(&vector("scope-owner-withdraw-reply.json")).unwrap()).unwrap(),
+        Settlement::Refused("access_withdrawn".into())
+    );
+    assert_eq!(
+        decode_record(&decode_result(&vector("settled-withdraw-reply.json")).unwrap()).unwrap(),
+        Settlement::Allow {
+            scope: false,
+            by_user: true
+        }
+    );
+    let refusal: Value =
+        serde_json::from_slice(&vector("non-owner-withdraw-refusal.json")).unwrap();
+    assert_eq!(refusal["code"], json!("elicitation_not_owner"));
+    let notice = vector_json("notice-owner-withdrawn.json");
+    assert_eq!(notice["purpose"], json!("withdrawn"));
+    assert_eq!(notice["elicitation_id"], json!("acc_5"));
+    assert_eq!(notice["asker"]["scope_ref"], json!("worker"));
+    assert_eq!(notice["asker"]["scope_epoch"], json!(3));
+    let stamps = vector_json("withdraw-bind-stamps.json");
+    assert_eq!(
+        stamps["scope-owner-withdraw"],
+        json!("reserved:prefrontal-core")
+    );
+    assert_eq!(stamps["non-owner-withdraw"], json!("reserved:basal"));
+    assert_eq!(
+        stamps["settled-withdraw"],
+        json!("reserved:prefrontal-core")
+    );
 }
 
 #[cfg(unix)]
