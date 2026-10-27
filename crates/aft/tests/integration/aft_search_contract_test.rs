@@ -3462,6 +3462,12 @@ fn issue_826_lane_footer_agrees_with_a_degraded_answer() {
 /// The trigram lane is not resident but its saved cache is valid. Planning
 /// treats that lane as still loading and answers from a filesystem scan; the
 /// footer used to call it ready beside `Search status: fully degraded`.
+///
+/// The search request would otherwise start reloading the saved cache itself.
+/// That reload usually finishes inside the request, but on a loaded machine it
+/// can still be running when the footer is written, which then truthfully
+/// says `trigram: building`. The test holds the reload back so the footer
+/// always describes a valid cache that is not resident.
 #[test]
 fn issue_826_trigram_footer_agrees_with_a_scan_answer() {
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
@@ -3473,12 +3479,25 @@ fn issue_826_trigram_footer_agrees_with_a_scan_answer() {
     let canonical = std::fs::canonicalize(project.path()).expect("canonical root");
     ctx.set_canonical_cache_root(canonical.clone());
     ctx.memoized_artifact_cache_key(&canonical);
+    ctx.defer_query_search_index_reloads_for_test();
     install_ready_semantic_lane(&ctx, project.path());
 
     let (rendered, response) =
         render_search(handle_semantic_search(&request("needle_symbol"), &ctx));
     handle.join().expect("embedding server thread");
 
+    assert!(
+        ctx.search_index_rx()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+            && ctx
+                .search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+        "the request must not have started loading the saved trigram cache"
+    );
     assert_eq!(response["success"], true, "{response}");
     assert_eq!(response["fully_degraded"], true, "{response}");
     assert!(
