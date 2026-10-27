@@ -2299,12 +2299,11 @@ async fn exec_remote_bash_raw_utf8_pipeline_and_workspace_changes() {
         Some("ran remotely on ck-motor (job 0192a64a-1234-7000-8000-000000000001)")
     );
     // The changed file is named after the output, and it was not copied back.
+    // The runner never fills the Git, untracked-file, or ignored-write
+    // reports, so their absence stays silent.
     assert!(
         done.output_preview.ends_with(
-            "These files changed on the server and were NOT copied back:\n  generated.txt\n\
-             git state: not reported by the runner\n\
-             untracked files: not reported by the runner\n\
-             ignored writes: not reported by the runner"
+            "These files changed on the server and were NOT copied back:\n  generated.txt"
         ),
         "{}",
         done.output_preview
@@ -5725,14 +5724,10 @@ async fn runon_sends_the_whole_compound_line_remote_exactly_as_written() {
         Some("ran remotely on ck-motor (job 0192a64a-1234-7000-8000-000000000001)"),
         "{rendered}"
     );
-    // A report without a changed-file list says so, after the output.
+    // A report without a changed-file list says so, after the output. The
+    // other workspace reports stay silent when absent.
     assert!(
-        rendered.ends_with(
-            "changed files: not reported by the runner\n\
-             git state: not reported by the runner\n\
-             untracked files: not reported by the runner\n\
-             ignored writes: not reported by the runner"
-        ),
+        rendered.ends_with("changed files: not reported by the runner"),
         "{rendered}"
     );
 }
@@ -6252,15 +6247,12 @@ fn published_report_vectors_render_changes_say_nothing_when_empty_and_name_what_
     let unchanged = report_vector("unchanged");
     assert!(unchanged.git_state_changed.is_some());
     assert_eq!(render_terminal_report(&unchanged), None);
-    // Absent (an older runner): each missing report is named on its own line.
+    // Absent (an older runner): only the missing changed-file list is named.
+    // The Git, untracked-file, and ignored-write reports stay silent when
+    // absent because the runner never fills them.
     assert_eq!(
         render_terminal_report(&report_vector("older-runner")).as_deref(),
-        Some(
-            "These files changed on the server and were NOT copied back:\n  result.txt\n\
-             git state: not reported by the runner\n\
-             untracked files: not reported by the runner\n\
-             ignored writes: not reported by the runner"
-        )
+        Some("These files changed on the server and were NOT copied back:\n  result.txt")
     );
     // A detached HEAD has no ref on either side, so no ref line; an index
     // tree that became available counts as changed.
@@ -6274,6 +6266,28 @@ fn published_report_vectors_render_changes_say_nothing_when_empty_and_name_what_
             .contains("  notes.txt\n  (the runner listed only some of them; more were created)\n"),
         "{truncated}"
     );
+}
+
+#[test]
+fn unreported_git_untracked_and_ignored_reports_stay_silent() {
+    // The build-server runner never fills the Git, untracked-file, or
+    // ignored-write fields, so their absence carries no information and
+    // renders nothing. Only a missing changed-file list is still named.
+    let mut changed = TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 1, 0, 0);
+    changed.workspace_changes = Some(vec!["result.txt".into()]);
+    let changed = render_terminal_report(&changed).unwrap();
+    assert_eq!(
+        changed,
+        "These files changed on the server and were NOT copied back:\n  result.txt"
+    );
+    assert!(!changed.contains("not reported by the runner"), "{changed}");
+    let mut missing = TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 1, 0, 0);
+    missing.workspace_changes = None;
+    let missing = render_terminal_report(&missing).unwrap();
+    assert_eq!(missing, "changed files: not reported by the runner");
+    assert!(!missing.contains("git state"), "{missing}");
+    assert!(!missing.contains("untracked files"), "{missing}");
+    assert!(!missing.contains("ignored writes"), "{missing}");
 }
 
 #[tokio::test]
