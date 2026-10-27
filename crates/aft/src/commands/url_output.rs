@@ -73,8 +73,12 @@ pub(crate) fn redact_url_cache_paths(
     ));
     roots.dedup();
     for root in roots {
-        let cache_dir = root.join("url_cache").to_string_lossy().into_owned();
-        redact_cache_paths_in_value(&mut response.data, &cache_dir);
+        // A placeholder fetch's private document lives beside the URL cache
+        // and is redacted the same way.
+        for folder in ["url_cache", crate::url_fetch::SECRET_FETCH_DIR] {
+            let cache_dir = root.join(folder).to_string_lossy().into_owned();
+            redact_cache_paths_in_value(&mut response.data, &cache_dir);
+        }
     }
 }
 
@@ -491,5 +495,46 @@ mod tests {
         assert!(!message.contains("url_cache"), "{message}");
         assert!(!message.contains("c7502988ff3e8388.md"), "{message}");
         assert!(!message.contains("0123456789abcdef.md"), "{message}");
+    }
+
+    /// A placeholder fetch's private document lives beside the URL cache, and
+    /// its path is redacted the same way.
+    #[test]
+    fn url_responses_redact_placeholder_fetch_document_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("private-storage");
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(storage.clone()),
+                ..Default::default()
+            },
+        );
+        let req = serde_json::from_value(serde_json::json!({
+            "id": "secret-fetch-redaction",
+            "command": "outline",
+            "file": "https://example.com/docs.md?key={{ck-secret:test}}"
+        }))
+        .unwrap();
+        let document = ctx
+            .cache_dir()
+            .join(crate::url_fetch::SECRET_FETCH_DIR)
+            .join("0123456789abcdef")
+            .join("document.md");
+        let mut response = Response::error(
+            "secret-fetch-redaction",
+            "parse_error",
+            format!("syntax errors in {}", document.display()),
+        );
+
+        redact_url_cache_paths(&req, &ctx, &mut response);
+
+        let message = response.data["message"].as_str().unwrap();
+        assert!(message.contains("the requested URL"), "{message}");
+        assert!(
+            !message.contains(crate::url_fetch::SECRET_FETCH_DIR),
+            "{message}"
+        );
+        assert!(!message.contains("document.md"), "{message}");
     }
 }
