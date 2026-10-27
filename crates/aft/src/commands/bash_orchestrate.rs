@@ -1011,6 +1011,9 @@ pub(crate) const REMOTE_INPUT_CAPTURE_WARNING: &str = "The runner hasn't confirm
 /// Accepted stream record confirms input capture. The warning tells the caller to
 /// wait for the job to be queued or running, which is true only for a task still
 /// in flight; a reply that already carries a finished status is returned as is.
+/// A live reply always names the phase, even when the reply it wraps carries
+/// no phase of its own (the worker-limit and drain-detach replies only carry
+/// `status`), so an agent waiting on acceptance never sees a phaseless task.
 pub(crate) fn with_capture_warning(response: &Response) -> Response {
     let mut response = Response {
         id: response.id.clone(),
@@ -1022,9 +1025,7 @@ pub(crate) fn with_capture_warning(response: &Response) -> Response {
     }
     response.data["status"] = json!("starting");
     response.data["phase"] = json!("submitting");
-    if response.data.get("remote_phase").is_some() {
-        response.data["remote_phase"] = json!("submitting");
-    }
+    response.data["remote_phase"] = json!("submitting");
     let field =
         if response.data.get("output").is_none() && response.data.get("output_preview").is_some() {
             "output_preview"
@@ -1599,6 +1600,26 @@ mod tests {
             remote_job_id: None,
             remote_phase_note: None,
         }
+    }
+
+    #[test]
+    fn capture_warning_names_submitting_phase_without_a_prior_phase() {
+        // The worker-limit and drain-detach replies wrapped for an unaccepted
+        // runon task carry `status` but no phase of their own. The capture
+        // reply built from them must still name the phase, so an agent that
+        // timed out waiting for acceptance never sees a phaseless task.
+        let base = Response::success(
+            "uncaptured",
+            json!({"task_id": "task", "status": "running", "output": "launch"}),
+        );
+        let reply = with_capture_warning(&base);
+        assert_eq!(reply.data["status"], "starting", "{reply:?}");
+        assert_eq!(reply.data["phase"], "submitting", "{reply:?}");
+        assert_eq!(reply.data["remote_phase"], "submitting", "{reply:?}");
+        assert!(reply.data["output"]
+            .as_str()
+            .unwrap()
+            .ends_with(REMOTE_INPUT_CAPTURE_WARNING));
     }
 
     #[test]

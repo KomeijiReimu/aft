@@ -482,6 +482,28 @@ fn delay_watcher_unit_for_test() {
 #[cfg(not(test))]
 fn delay_watcher_unit_for_test() {}
 
+#[cfg(test)]
+thread_local! {
+    static WATCHER_RECEIVE_TEST_DELAY: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+}
+
+/// Stand in for an expensive receive step (per-path LSP applicability checks
+/// on a large batch) by advancing the pinned drain clock.
+#[cfg(test)]
+fn delay_watcher_receive_for_test() {
+    let delay = WATCHER_RECEIVE_TEST_DELAY.with(std::cell::Cell::get);
+    if !delay.is_zero() {
+        WATCHER_DRAIN_TEST_NOW.with(|clock| {
+            if let Some(now) = clock.get() {
+                clock.set(Some(now + delay));
+            }
+        });
+    }
+}
+
+#[cfg(not(test))]
+fn delay_watcher_receive_for_test() {}
+
 pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
     crate::commands::configure::drain_deferred_configure_maintenance(ctx);
 }
@@ -3732,6 +3754,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     // packages are often gitignored but still change which
                     // TypeScript server a file gets.
                     ctx.lsp_note_watcher_batch(&paths, content_only);
+                    delay_watcher_receive_for_test();
                     if !state.rescan_required {
                         let mut accepted = false;
                         state.pending_paths.extend(
@@ -4160,9 +4183,13 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         }
     }
 
-    if matches!(state.phase, WatcherDrainPhase::Apply { .. })
-        && watcher_drain_elapsed(started) < WATCHER_DRAIN_SLICE_BUDGET
-    {
+    // Enter the apply phase even when receiving and batching already used the
+    // whole slice budget. Each apply step checks the deadline only after it has
+    // applied a path, so a late entry applies exactly one path and returns.
+    // Skipping the apply phase here instead let a slice return with nothing
+    // applied, and a steady stream of watcher events whose receive cost alone
+    // fills the budget would then starve the queued batch on every slice.
+    if matches!(state.phase, WatcherDrainPhase::Apply { .. }) {
         apply_watcher_slice(ctx, &mut state, started);
     }
 
@@ -8906,6 +8933,79 @@ mod watcher_slice_tests {
 
     fn clear_watcher_unit_test_seam() {
         set_watcher_unit_test_seam(Duration::ZERO, None);
+    }
+
+    #[test]
+    fn watcher_slice_applies_a_path_when_receiving_exhausts_the_budget() {
+        // Every slice receives one new event whose processing alone uses the
+        // whole slice budget (the pinned clock advances by the budget). The
+        // queued batch must still move forward by one path per slice instead
+        // of waiting for the event stream to go quiet.
+        struct ResetReceiveDelay;
+        impl Drop for ResetReceiveDelay {
+            fn drop(&mut self) {
+                WATCHER_RECEIVE_TEST_DELAY.with(|delay| delay.set(Duration::ZERO));
+            }
+        }
+        let _clock = WatcherDrainTestClock::freeze();
+        WATCHER_RECEIVE_TEST_DELAY.with(|delay| delay.set(WATCHER_DRAIN_SLICE_BUDGET));
+        let _reset = ResetReceiveDelay;
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, tx) = context_with_watcher(temp.path());
+        let batch = 4;
+        tx.send(WatcherDispatchEvent::Paths(
+            (0..batch)
+                .map(|index| temp.path().join(format!("first-{index}.rs")))
+                .collect(),
+        ))
+        .unwrap();
+        let apply_position = |ctx: &AppContext| {
+            let slice = ctx.watcher_drain_slice().lock();
+            let state = slice.as_ref().expect("watcher continuation is retained");
+            let WatcherDrainPhase::Apply {
+                stage, remaining, ..
+            } = &state.phase
+            else {
+                panic!("the first batch must still be applying");
+            };
+            (*stage, *remaining, state.pending_paths.len())
+        };
+
+        let outcome = drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        assert_eq!(outcome.processed, batch);
+        assert!(outcome.has_more);
+        assert_eq!(
+            apply_position(&ctx),
+            (WatcherDrainApplyPhase::PendingTier2, batch - 1, 0),
+            "a slice whose receive step used the budget must still apply one path"
+        );
+
+        for slice in 1..batch {
+            tx.send(WatcherDispatchEvent::Paths(vec![temp
+                .path()
+                .join(format!("later-{slice}.rs"))]))
+                .unwrap();
+            assert!(drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more);
+            assert_eq!(
+                apply_position(&ctx),
+                (
+                    WatcherDrainApplyPhase::PendingTier2,
+                    batch - 1 - slice,
+                    slice
+                ),
+                "slice {slice} under sustained events must apply one more path"
+            );
+        }
+        // The emptied stage hands the batch to the next one on the next slice.
+        tx.send(WatcherDispatchEvent::Paths(vec![temp
+            .path()
+            .join("later-final.rs")]))
+            .unwrap();
+        drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        assert_eq!(
+            apply_position(&ctx),
+            (WatcherDrainApplyPhase::PendingIndexes, batch, batch)
+        );
     }
 
     #[test]
