@@ -274,7 +274,13 @@ jobs:
       - name: Publication input gate
         run: |
           set -euo pipefail
-          git fetch --force origin refs/tags/v0.48.1:refs/tags/v0.48.1
+          # A runner that briefly cannot reach github.com must not fail the
+          # merge-queue group: retry the tag fetch before giving up.
+          for attempt in 1 2 3; do
+            git fetch --force origin refs/tags/v0.48.1:refs/tags/v0.48.1 && break
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            sleep 20
+          done
           node scripts/release-gate-v049.mjs --check-inputs
 
       - name: Cargo build (debug — needed by plugin e2e tests)
