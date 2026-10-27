@@ -551,6 +551,18 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                             lock_contended: false,
                         },
                     }
+                } else if matches!(status, SemanticIndexStatus::Ready { .. })
+                    && self.ctx.checkout_semantic().active()
+                {
+                    // A started views-on lane with no loaded view yet (loading,
+                    // or failed to load) has nothing to serve, and the legacy
+                    // index is never the views-on lane's source.
+                    SemanticReadiness {
+                        status,
+                        snapshot: None,
+                        evicted: true,
+                        lock_contended: false,
+                    }
                 } else if matches!(status, SemanticIndexStatus::Ready { .. }) {
                     match try_read_with_budget(
                         self.ctx.semantic_index(),
