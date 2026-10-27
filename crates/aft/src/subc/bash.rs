@@ -3933,8 +3933,13 @@ mod grant_path_tests {
         metadata.session_id = session.into();
         metadata.task_id = task.into();
         metadata.harness = Some("opencode".into());
-        let row =
-            crate::db::rich_ui::task_row_for_test(&metadata, "opencode", "completed", Some(7), true);
+        let row = crate::db::rich_ui::task_row_for_test(
+            &metadata,
+            "opencode",
+            "completed",
+            Some(7),
+            true,
+        );
         let stored = {
             let conn = db.lock().unwrap();
             crate::db::rich_ui::upsert_task_row_with_view(&conn, &row, &metadata).unwrap();

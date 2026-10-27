@@ -968,7 +968,8 @@ mod tests {
             std::fs::write(&resolved.paths.stdout, "durable worker output\n").unwrap();
             std::fs::write(&resolved.paths.stderr, "").unwrap();
             std::fs::write(&resolved.paths.exit, "1\n").unwrap();
-            let row = crate::db::rich_ui::task_row_for_test(&metadata, "runner", "failed", Some(1), true);
+            let row =
+                crate::db::rich_ui::task_row_for_test(&metadata, "runner", "failed", Some(1), true);
             let conn = db.lock().unwrap();
             crate::db::rich_ui::upsert_task_row_with_view(&conn, &row, &metadata).unwrap();
             let stored = crate::db::rich_ui::view_record_json(&conn, "runner", SESSION, TASK)
@@ -1032,8 +1033,7 @@ mod tests {
         assert_eq!(response.data["view"]["task_id"], TASK);
         // The extra member leaves the rendered output bytes unchanged.
         assert_eq!(
-            response.data["output"],
-            legacy.data["output"],
+            response.data["output"], legacy.data["output"],
             "view must not change content"
         );
         // A carried (observation-only) read keeps its ordinary result shape.

@@ -6090,7 +6090,10 @@ mod tests {
         let (resolved, task) = counted_task(directory.path());
         assert!(task.schema_pin.is_none());
         let mut value = serde_json::to_value(&task).unwrap();
-        assert!(value.get("schema_pin").is_none(), "pinless tasks omit the field");
+        assert!(
+            value.get("schema_pin").is_none(),
+            "pinless tasks omit the field"
+        );
         // A file written before the field existed reads with no pin.
         value.as_object_mut().unwrap().remove("schema_pin");
         std::fs::write(&resolved.paths.json, serde_json::to_vec(&value).unwrap()).unwrap();

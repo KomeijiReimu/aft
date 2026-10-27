@@ -1031,7 +1031,8 @@ mod tests {
                 crate::db::open(&root.path().join("aft.db")).unwrap(),
             ));
             ctx.set_db(std::sync::Arc::clone(&db));
-            ctx.bash_background().set_db_pool(std::sync::Arc::clone(&db));
+            ctx.bash_background()
+                .set_db_pool(std::sync::Arc::clone(&db));
             ctx.bash_background().set_harness(Harness::Opencode);
             let task_storage = storage.join(Harness::Opencode.storage_segment());
             let layout = create_task_layout(&task_storage, VIEW_SESSION, VIEW_TASK).unwrap();
@@ -1113,15 +1114,13 @@ mod tests {
         assert_eq!(response.data["view"]["schema_pin"], fixture.pin);
         // The extra member leaves the model-visible content bytes unchanged.
         let context = crate::subc_format::FormatContext::default();
-        let with_view = crate::subc_format::format_response_with_context("bash_status", &response, &context);
-        let plain = Response::success(
-            &response.id,
-            {
-                let mut data = response.data.clone();
-                data.as_object_mut().unwrap().remove("view");
-                data
-            },
-        );
+        let with_view =
+            crate::subc_format::format_response_with_context("bash_status", &response, &context);
+        let plain = Response::success(&response.id, {
+            let mut data = response.data.clone();
+            data.as_object_mut().unwrap().remove("view");
+            data
+        });
         let without_view =
             crate::subc_format::format_response_with_context("bash_status", &plain, &context);
         assert_eq!(with_view, without_view);

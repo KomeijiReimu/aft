@@ -170,13 +170,12 @@ pub(crate) fn set_test_view_manifest_for_test(manifest: Option<ViewManifest>) {
 #[cfg(test)]
 pub(crate) fn test_view_manifest_for_test() -> ViewManifest {
     use sha2::{Digest, Sha256};
-    let row_bytes =
-        include_bytes!("../../tests/fixtures/rich_ui/placeholder-row.json").to_vec();
-    let page_bytes =
-        include_bytes!("../../tests/fixtures/rich_ui/placeholder-page.json").to_vec();
-    let pins: Vec<String> =
-        serde_json::from_slice(include_bytes!("../../tests/fixtures/rich_ui/bash-pins.json"))
-            .unwrap();
+    let row_bytes = include_bytes!("../../tests/fixtures/rich_ui/placeholder-row.json").to_vec();
+    let page_bytes = include_bytes!("../../tests/fixtures/rich_ui/placeholder-page.json").to_vec();
+    let pins: Vec<String> = serde_json::from_slice(include_bytes!(
+        "../../tests/fixtures/rich_ui/bash-pins.json"
+    ))
+    .unwrap();
     assert!(!pins.is_empty(), "frozen pins fixture must not be empty");
     let digest = |bytes: &[u8]| format!("sha256:{:x}", Sha256::digest(bytes));
     ViewManifest {
@@ -194,17 +193,16 @@ pub(crate) fn terminal_task_metadata_for_test(
     pin: Option<&str>,
 ) -> crate::bash_background::persistence::PersistedTask {
     use crate::bash_background::BgTaskStatus;
-    let mut metadata =
-        crate::bash_background::persistence::PersistedTask::starting(
-            "bash-0123456789abcdef".into(),
-            "session".into(),
-            "exit 0".into(),
-            std::path::PathBuf::from("/work"),
-            Some(std::path::PathBuf::from("/work")),
-            None,
-            true,
-            true,
-        );
+    let mut metadata = crate::bash_background::persistence::PersistedTask::starting(
+        "bash-0123456789abcdef".into(),
+        "session".into(),
+        "exit 0".into(),
+        std::path::PathBuf::from("/work"),
+        Some(std::path::PathBuf::from("/work")),
+        None,
+        true,
+        true,
+    );
     metadata.schema_pin = pin.map(str::to_string);
     metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
     metadata
@@ -360,8 +358,8 @@ pub(crate) fn write_view_record(
         &manifest.row_digest,
         &manifest.page_digest,
     );
-    let record_text =
-        serde_json::to_string(&record).map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?;
+    let record_text = serde_json::to_string(&record)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?;
     conn.execute_batch("SAVEPOINT view_record")?;
     let outcome = (|| -> rusqlite::Result<bool> {
         conn.execute(
@@ -397,9 +395,18 @@ pub(crate) fn write_view_record(
             params![harness, session_id, task_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        let stored_record: serde_json::Value = serde_json::from_str(&stored.0)
-            .map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, error.into()))?;
-        Ok(stored_record.get("schema_pin").and_then(|value| value.as_str()) == Some(pin)
+        let stored_record: serde_json::Value =
+            serde_json::from_str(&stored.0).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    error.into(),
+                )
+            })?;
+        Ok(stored_record
+            .get("schema_pin")
+            .and_then(|value| value.as_str())
+            == Some(pin)
             && stored.1 == manifest.row_digest
             && stored.2 == manifest.page_digest)
     })();
@@ -409,8 +416,7 @@ pub(crate) fn write_view_record(
             Ok(created)
         }
         Err(error) => {
-            let _ =
-                conn.execute_batch("ROLLBACK TO view_record; RELEASE view_record;");
+            let _ = conn.execute_batch("ROLLBACK TO view_record; RELEASE view_record;");
             crate::slog_warn!(
                 "view record write failed for {task_id}: {error}; bash_tasks upsert still commits"
             );
@@ -466,11 +472,10 @@ pub(crate) fn view_record_json(
     .transpose()
 }
 
-/// Stored bytes for one template digest, if any.
-pub(crate) fn template_bytes(
-    conn: &Connection,
-    digest: &str,
-) -> rusqlite::Result<Option<Vec<u8>>> {
+/// Stored bytes for one template digest, if any. Only tests read templates
+/// until the chunk-query slice serves them; the allow stays until then.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn template_bytes(conn: &Connection, digest: &str) -> rusqlite::Result<Option<Vec<u8>>> {
     conn.query_row(
         "SELECT bytes FROM rich_ui_templates WHERE digest = ?1",
         [digest],
@@ -508,8 +513,12 @@ pub(crate) fn prune_orphaned_templates(
           AND digest NOT IN ({placeholders})"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let params = shipped.iter().map(|digest| digest as &dyn rusqlite::ToSql).collect::<Vec<_>>();
-    stmt.execute(rusqlite::params_from_iter(params)).map(|count| count as usize)
+    let params = shipped
+        .iter()
+        .map(|digest| digest as &dyn rusqlite::ToSql)
+        .collect::<Vec<_>>();
+    stmt.execute(rusqlite::params_from_iter(params))
+        .map(|count| count as usize)
 }
 
 #[cfg(test)]
@@ -729,13 +738,17 @@ mod tests {
     }
 
     fn record_count(conn: &Connection) -> i64 {
-        conn.query_row("SELECT count(*) FROM bash_view_records", [], |row| row.get(0))
-            .unwrap()
+        conn.query_row("SELECT count(*) FROM bash_view_records", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
     }
 
     fn template_count(conn: &Connection) -> i64 {
-        conn.query_row("SELECT count(*) FROM rich_ui_templates", [], |row| row.get(0))
-            .unwrap()
+        conn.query_row("SELECT count(*) FROM rich_ui_templates", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
     }
 
     #[test]
@@ -762,8 +775,15 @@ mod tests {
         assert!(view_manifest_for_writing().is_none());
         let conn = migrated_memory_conn();
         let metadata = terminal_task_metadata_for_test(Some("sha256:abc"));
-        assert!(!write_view_record(&conn, "harness", "session", &metadata.task_id, &metadata, None)
-            .unwrap());
+        assert!(!write_view_record(
+            &conn,
+            "harness",
+            "session",
+            &metadata.task_id,
+            &metadata,
+            None
+        )
+        .unwrap());
         assert_eq!(record_count(&conn), 0);
         assert_eq!(template_count(&conn), 0);
     }
@@ -777,12 +797,26 @@ mod tests {
         // A running task gets no record.
         let mut running = terminal_task_metadata_for_test(Some(&pin));
         running.status = BgTaskStatus::Running;
-        assert!(!write_view_record(&conn, "harness", "session", &running.task_id, &running, None)
-            .unwrap());
+        assert!(!write_view_record(
+            &conn,
+            "harness",
+            "session",
+            &running.task_id,
+            &running,
+            None
+        )
+        .unwrap());
         // A pinless terminal call gets no record.
         let pinless = terminal_task_metadata_for_test(None);
-        assert!(!write_view_record(&conn, "harness", "session", &pinless.task_id, &pinless, None)
-            .unwrap());
+        assert!(!write_view_record(
+            &conn,
+            "harness",
+            "session",
+            &pinless.task_id,
+            &pinless,
+            None
+        )
+        .unwrap());
         // A pin the manifest does not publish gets no record.
         let unlisted = terminal_task_metadata_for_test(Some(
             "sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -845,11 +879,15 @@ mod tests {
         assert_eq!(stored["templates"]["row"], manifest.row_digest);
         assert_eq!(stored["templates"]["page"], manifest.page_digest);
         assert_eq!(
-            template_bytes(&conn, &manifest.row_digest).unwrap().as_deref(),
+            template_bytes(&conn, &manifest.row_digest)
+                .unwrap()
+                .as_deref(),
             Some(manifest.row_bytes.as_slice())
         );
         assert_eq!(
-            template_bytes(&conn, &manifest.page_digest).unwrap().as_deref(),
+            template_bytes(&conn, &manifest.page_digest)
+                .unwrap()
+                .as_deref(),
             Some(manifest.page_bytes.as_slice())
         );
     }
@@ -858,8 +896,7 @@ mod tests {
     /// stored record keeps its original pin and digests, and the old bytes
     /// stay readable.
     fn upgraded_manifest(previous: &ViewManifest) -> ViewManifest {
-        let mut row_value: serde_json::Value =
-            serde_json::from_slice(&previous.row_bytes).unwrap();
+        let mut row_value: serde_json::Value = serde_json::from_slice(&previous.row_bytes).unwrap();
         row_value["source"] = serde_json::json!("upgraded");
         let row_bytes = serde_json::to_vec(&row_value).unwrap();
         let mut page_value: serde_json::Value =
@@ -882,13 +919,27 @@ mod tests {
         let _writing = enable_test_view_writing_for_test(manifest.clone());
         let conn = migrated_memory_conn();
         let metadata = terminal_task_metadata_for_test(Some(&pin));
-        assert!(write_view_record(&conn, "harness", "session", &metadata.task_id, &metadata, None)
-            .unwrap());
+        assert!(write_view_record(
+            &conn,
+            "harness",
+            "session",
+            &metadata.task_id,
+            &metadata,
+            None
+        )
+        .unwrap());
         // After the upgrade the same pin still validates, but the terminal
         // re-upsert must not change the stored pin or digests.
         set_test_view_manifest_for_test(Some(upgraded_manifest(&manifest)));
-        assert!(!write_view_record(&conn, "harness", "session", &metadata.task_id, &metadata, None)
-            .unwrap());
+        assert!(!write_view_record(
+            &conn,
+            "harness",
+            "session",
+            &metadata.task_id,
+            &metadata,
+            None
+        )
+        .unwrap());
         let stored = view_record_json(&conn, "harness", "session", &metadata.task_id)
             .unwrap()
             .unwrap();
@@ -896,7 +947,9 @@ mod tests {
         assert_eq!(stored["templates"]["row"], manifest.row_digest);
         assert_eq!(stored["templates"]["page"], manifest.page_digest);
         assert_eq!(
-            template_bytes(&conn, &manifest.row_digest).unwrap().as_deref(),
+            template_bytes(&conn, &manifest.row_digest)
+                .unwrap()
+                .as_deref(),
             Some(manifest.row_bytes.as_slice()),
             "old template bytes stay readable"
         );
@@ -904,8 +957,15 @@ mod tests {
         let mut dropped = upgraded_manifest(&manifest);
         dropped.pins.clear();
         set_test_view_manifest_for_test(Some(dropped));
-        assert!(!write_view_record(&conn, "harness", "session", &metadata.task_id, &metadata, None)
-            .unwrap());
+        assert!(!write_view_record(
+            &conn,
+            "harness",
+            "session",
+            &metadata.task_id,
+            &metadata,
+            None
+        )
+        .unwrap());
     }
 
     #[test]
@@ -941,13 +1001,7 @@ mod tests {
         assert_eq!(template_count(&conn), 0);
     }
 
-    fn seed_view_record(
-        conn: &Connection,
-        harness: &str,
-        session: &str,
-        task: &str,
-        pin: &str,
-    ) {
+    fn seed_view_record(conn: &Connection, harness: &str, session: &str, task: &str, pin: &str) {
         let mut metadata = terminal_task_metadata_for_test(Some(pin));
         metadata.session_id = session.into();
         metadata.task_id = task.into();
@@ -977,10 +1031,14 @@ mod tests {
                 .unwrap(),
                 1
             );
-            assert!(view_record_json(&conn, "opencode", "session", "bash-0000000000000001")
+            assert!(
+                view_record_json(&conn, "opencode", "session", "bash-0000000000000001")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(template_bytes(&conn, &manifest.row_digest)
                 .unwrap()
-                .is_none());
-            assert!(template_bytes(&conn, &manifest.row_digest).unwrap().is_some());
+                .is_some());
         }
         // Orphan and old-id retirement delete the exact identity.
         {
@@ -997,10 +1055,14 @@ mod tests {
                 .unwrap(),
                 1
             );
-            assert!(view_record_json(&conn, "opencode", "session", "bash-0000000000000002")
+            assert!(
+                view_record_json(&conn, "opencode", "session", "bash-0000000000000002")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(template_bytes(&conn, &manifest.row_digest)
                 .unwrap()
-                .is_none());
-            assert!(template_bytes(&conn, &manifest.row_digest).unwrap().is_some());
+                .is_some());
         }
         // The 30-day prune of a delivered terminal row whose layout is gone.
         {
@@ -1021,10 +1083,14 @@ mod tests {
             let removed =
                 super::super::bash_tasks::delete_prepared_terminal_rows(&conn, prepared).unwrap();
             assert_eq!(removed.removed, 1);
-            assert!(view_record_json(&conn, "opencode", "session", "bash-0000000000000003")
+            assert!(
+                view_record_json(&conn, "opencode", "session", "bash-0000000000000003")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(template_bytes(&conn, &manifest.row_digest)
                 .unwrap()
-                .is_none());
-            assert!(template_bytes(&conn, &manifest.row_digest).unwrap().is_some());
+                .is_some());
         }
     }
 
@@ -1037,7 +1103,8 @@ mod tests {
         seed_view_record(&conn, "opencode", "session", "bash-0000000000000004", &pin);
         // Shared digests: a second project references the same bytes.
         seed_view_record(&conn, "opencode", "other", "bash-0000000000000005", &pin);
-        let unreferenced = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let unreferenced =
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
         conn.execute(
             "INSERT INTO rich_ui_templates(digest, bytes) VALUES (?1, ?2)",
             rusqlite::params![unreferenced, vec![1u8]],
@@ -1057,10 +1124,14 @@ mod tests {
             "bash-0000000000000004",
         )
         .unwrap();
-        assert!(template_bytes(&conn, &manifest.row_digest).unwrap().is_some());
+        assert!(template_bytes(&conn, &manifest.row_digest)
+            .unwrap()
+            .is_some());
         // The tick removes the unreferenced bytes but keeps referenced ones.
         super::super::compression_events::prune_retention_tick(&mut conn, 1).unwrap();
-        assert!(template_bytes(&conn, &manifest.row_digest).unwrap().is_some());
+        assert!(template_bytes(&conn, &manifest.row_digest)
+            .unwrap()
+            .is_some());
         assert!(template_bytes(&conn, unreferenced).unwrap().is_none());
         assert!(
             template_bytes(&conn, shipped).unwrap().is_none(),
@@ -1072,7 +1143,10 @@ mod tests {
             rusqlite::params![unreferenced, vec![1u8]],
         )
         .unwrap();
-        assert_eq!(prune_orphaned_templates(&conn, &[unreferenced.to_string()]).unwrap(), 0);
+        assert_eq!(
+            prune_orphaned_templates(&conn, &[unreferenced.to_string()]).unwrap(),
+            0
+        );
         assert!(template_bytes(&conn, unreferenced).unwrap().is_some());
         // Deleting the last referencing row makes the shared bytes eligible.
         super::super::bash_tasks::delete_bash_task(
@@ -1083,8 +1157,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(prune_orphaned_templates(&conn, &[]).unwrap(), 3);
-        assert!(template_bytes(&conn, &manifest.row_digest).unwrap().is_none());
-        assert!(template_bytes(&conn, &manifest.page_digest).unwrap().is_none());
+        assert!(template_bytes(&conn, &manifest.row_digest)
+            .unwrap()
+            .is_none());
+        assert!(template_bytes(&conn, &manifest.page_digest)
+            .unwrap()
+            .is_none());
         assert!(template_bytes(&conn, unreferenced).unwrap().is_none());
     }
 

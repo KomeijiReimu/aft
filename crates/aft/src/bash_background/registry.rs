@@ -3631,9 +3631,7 @@ impl BgTaskRegistry {
         match crate::db::rich_ui::view_record_json(&conn, &harness, session_id, task_id) {
             Ok(record) => record,
             Err(error) => {
-                crate::slog_warn!(
-                    "view record read failed for {task_id}: {error}"
-                );
+                crate::slog_warn!("view record read failed for {task_id}: {error}");
                 None
             }
         }
@@ -3658,11 +3656,7 @@ impl BgTaskRegistry {
     /// record omit it instead; the phone falls back to its pinned template.
     /// Carrier reads never call this: observation-only handlers skip it, so
     /// carried calls keep their ordinary result shape without `view`.
-    pub(crate) fn attach_terminal_view(
-        &self,
-        data: &mut serde_json::Value,
-        session_id: &str,
-    ) {
+    pub(crate) fn attach_terminal_view(&self, data: &mut serde_json::Value, session_id: &str) {
         let view = (|| -> Option<serde_json::Value> {
             let map = data.as_object()?;
             if !Self::response_status_is_terminal(
@@ -3673,9 +3667,7 @@ impl BgTaskRegistry {
             if !crate::subc::result_body::active() {
                 return None;
             }
-            let task_id = map
-                .get("task_id")
-                .and_then(|value| value.as_str())?;
+            let task_id = map.get("task_id").and_then(|value| value.as_str())?;
             self.terminal_view_record(session_id, task_id)
         })();
         let Some(view) = view else {
@@ -3687,9 +3679,9 @@ impl BgTaskRegistry {
             };
             map.insert("view".to_string(), view);
         }
-        if serde_json::to_vec(data).is_ok_and(|body| {
-            body.len() >= crate::subc::result_body::MAX_RESULT_BYTES
-        }) {
+        if serde_json::to_vec(data)
+            .is_ok_and(|body| body.len() >= crate::subc::result_body::MAX_RESULT_BYTES)
+        {
             data.as_object_mut().and_then(|map| map.remove("view"));
         }
     }
@@ -26771,10 +26763,13 @@ mod a02_tests {
         }
     }
 
-    fn view_test_registry(db_path: &std::path::Path) -> (super::BgTaskRegistry, std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>) {
-        let pool = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::db::open(db_path).unwrap(),
-        ));
+    fn view_test_registry(
+        db_path: &std::path::Path,
+    ) -> (
+        super::BgTaskRegistry,
+        std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
+    ) {
+        let pool = std::sync::Arc::new(std::sync::Mutex::new(crate::db::open(db_path).unwrap()));
         let registry = super::BgTaskRegistry::default();
         registry.set_db_pool(std::sync::Arc::clone(&pool));
         (registry, pool)
@@ -26821,8 +26816,7 @@ mod a02_tests {
                 &pin,
             );
             assert_eq!(
-                registry
-                    .terminal_view_record("worker-session", "bash-0000000000000021"),
+                registry.terminal_view_record("worker-session", "bash-0000000000000021"),
                 Some(stored)
             );
             assert!(registry
@@ -26985,12 +26979,16 @@ mod a02_tests {
             assert_eq!(stored["schema_pin"], pin);
         });
         let conn = pool.lock().unwrap();
-        assert!(crate::db::rich_ui::template_bytes(&conn, &manifest.row_digest)
-            .unwrap()
-            .is_some());
-        assert!(crate::db::rich_ui::template_bytes(&conn, &manifest.page_digest)
-            .unwrap()
-            .is_some());
+        assert!(
+            crate::db::rich_ui::template_bytes(&conn, &manifest.row_digest)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            crate::db::rich_ui::template_bytes(&conn, &manifest.page_digest)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
