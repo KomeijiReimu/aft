@@ -16,11 +16,22 @@ use htmd::{
 };
 use markup5ever_rcdom::{Node, NodeData};
 use reqwest::blocking::{Client, Response as HttpResponse};
-use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION, USER_AGENT};
+use reqwest::header::{
+    ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, LOCATION, USER_AGENT,
+};
 use reqwest::redirect::Policy;
+use secret_rules::audit::{AuditReason, AuditRecordV1, Decision};
+use secret_rules::location::{
+    evaluate_request_with_connect, location_kind_token, LabelOutcome, LabelRule, Location,
+    RequestView,
+};
+use secret_rules::material::{check_admissible, encode_for_location};
+use secret_rules::scrub::{MatcherSet, ScrubError, Scrubber};
+use secret_rules::target::{normalize_request_target, ConnectAuthority, RequestTarget, RuleTarget};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
+use zeroize::Zeroizing;
 
 use crate::parser::detect_language;
 
@@ -91,6 +102,10 @@ pub struct UrlFetchOptions {
     /// connecting, standing in for a host that does not answer the connect.
     #[doc(hidden)]
     pub connect_delay: Option<Duration>,
+    /// Test hook: the TLS configuration to use instead of the platform
+    /// verifier, so a test can trust a local HTTPS server's certificate.
+    #[doc(hidden)]
+    pub tls_config: Option<rustls::ClientConfig>,
 }
 
 /// A host name lookup: the host's addresses, or the lookup's error.
@@ -148,6 +163,15 @@ impl UrlFetchError {
         Self {
             code: "url_fetch_timeout",
             phase: Some(phase),
+            ..Self::new(message)
+        }
+    }
+
+    /// A placeholder fetch refused by its secret rules or the vault, with the
+    /// secret reply code (`secret_refused`, `secrets_unavailable`, ...).
+    fn secret(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
             ..Self::new(message)
         }
     }
@@ -697,6 +721,656 @@ pub fn cached_url_document(
     Ok(Some(cached))
 }
 
+/// Folder, under the cache root, that holds the private per-call folders of
+/// placeholder fetches. It is a sibling of the URL cache, never inside it.
+pub(crate) const SECRET_FETCH_DIR: &str = "url_secret_fetch";
+
+/// The start of every refusal a placeholder fetch makes on its own (as opposed
+/// to a refusal the vault decided). One constant so the wording is reviewed
+/// once; the message goes on to name a stable reason token and the URL as the
+/// agent wrote it, with the placeholder and never a key.
+pub(crate) const SECRET_FETCH_REFUSED: &str =
+    "Secret placeholder fetch refused; no request carrying the secret was sent";
+
+/// A stand-in key used only to plan where a placeholder fetch would
+/// substitute. Real vault bytes are asked for only once a rule matches.
+const SECRET_PLANNING_KEY: &[u8] = b"url-fetch-planning-value-0000";
+
+/// The most content codings a placeholder fetch decodes from one response.
+const MAX_SECRET_CODINGS: usize = 4;
+
+/// Every label of a well-formed placeholder in `url`, in order and without
+/// repeats, or `None` when the URL mentions no placeholder at all.
+///
+/// A percent-encoded placeholder counts as well as a literal one, because a
+/// query value is compared after decoding. `Some` with no labels means the URL
+/// mentions the placeholder prefix only in a malformed way: such a URL still
+/// takes the placeholder path (no cache, no web-view rewrite), it just has
+/// nothing to substitute.
+pub(crate) fn secret_labels_in_url(url: &str) -> Option<Vec<String>> {
+    if !secret_rules::placeholder::contains_placeholder_prefix_loose(url) {
+        return None;
+    }
+    let decoded = percent_decode_path_segment(url);
+    let mut labels: Vec<String> = Vec::new();
+    for text in [url, decoded.as_str()] {
+        for placeholder in secret_rules::placeholder::scan(text) {
+            if !labels.iter().any(|label| label == placeholder.label) {
+                labels.push(placeholder.label.to_string());
+            }
+        }
+    }
+    Some(labels)
+}
+
+/// Create the private folder one placeholder fetch writes its document into,
+/// under `storage_dir` but outside the URL cache. The caller owns the folder
+/// and deletes it when its call returns.
+pub(crate) fn create_secret_fetch_dir(storage_dir: &Path) -> Result<PathBuf, UrlFetchError> {
+    let parent = storage_dir.join(SECRET_FETCH_DIR);
+    let failed = |error: io::Error| {
+        UrlFetchError::new(format!(
+            "Failed to create a private folder for a placeholder fetch under {}: {error}",
+            parent.display()
+        ))
+    };
+    crate::private_storage::open_dir(storage_dir, &parent).map_err(failed)?;
+    let dir = parent.join(random_nonce());
+    // `create_dir` fails when the folder exists, so no other call shares it.
+    crate::private_storage::create_dir(&dir).map_err(failed)?;
+    Ok(dir)
+}
+
+/// What a placeholder fetch may do with its secrets.
+pub struct SecretFetch<'a> {
+    /// The vault `material` and `audit` go to.
+    pub vault: &'a dyn crate::secret::SecretVault,
+    /// The call's authorization scope; `None` only when the URL holds no
+    /// well-formed placeholder, in which case nothing is resolved or audited.
+    pub authorization: Option<crate::secret::SecretScope>,
+    /// Every label found in the URL, in order. Each has a rule in `rules`.
+    pub labels: Vec<String>,
+    /// The rule the vault granted for each label, carrying its grant id.
+    pub rules: Vec<LabelRule>,
+    /// The fetch call's id: audit records name it, plus the hop index.
+    pub call_id: String,
+}
+
+/// Keys the vault released during one placeholder fetch. They are kept, wiped
+/// on drop, only until the fetch returns, so every header and body read after
+/// a key was sent is scrubbed of it.
+#[derive(Default)]
+struct HeldKeys(Vec<(String, Zeroizing<Vec<u8>>)>);
+
+impl HeldKeys {
+    fn matchers(&self) -> Result<Vec<MatcherSet>, ScrubError> {
+        self.0
+            .iter()
+            .map(|(label, key)| MatcherSet::new(label, key))
+            .collect()
+    }
+
+    /// Hold `key` for `label`, refusing a key whose matcher would collide with
+    /// one already held (the scrubber could then write one key into a reply).
+    fn hold(&mut self, label: &str, key: &[u8]) -> Result<(), ScrubError> {
+        if self
+            .0
+            .iter()
+            .any(|(held, bytes)| held == label && bytes.as_slice() == key)
+        {
+            return Ok(());
+        }
+        let mut matchers = self.matchers()?;
+        matchers.push(MatcherSet::new(label, key)?);
+        Scrubber::new(matchers)?;
+        self.0
+            .push((label.to_string(), Zeroizing::new(key.to_vec())));
+        Ok(())
+    }
+
+    /// `bytes` with every held key replaced by its label's placeholder.
+    fn scrub(&self, bytes: &[u8]) -> Result<Vec<u8>, ScrubError> {
+        let mut scrubber = Scrubber::new(self.matchers()?)?;
+        let mut clean = scrubber.push(bytes);
+        clean.extend_from_slice(&scrubber.finish());
+        Ok(clean)
+    }
+
+    fn keys(&self) -> Vec<&[u8]> {
+        self.0.iter().map(|(_, key)| key.as_slice()).collect()
+    }
+}
+
+fn secret_fetch_refused(reason: &str, url: &str) -> UrlFetchError {
+    UrlFetchError::secret(
+        crate::secret::SECRET_REFUSED,
+        format!("{SECRET_FETCH_REFUSED} ({reason}): {url}"),
+    )
+}
+
+fn scrub_refusal(url: &str) -> impl Fn(ScrubError) -> UrlFetchError + '_ {
+    move |_| secret_fetch_refused("scrubber_unavailable", url)
+}
+
+/// Fetch `logical_url`, a URL that mentions a secret placeholder, into
+/// `document_dir` and return the converted document's path.
+///
+/// The URL cache is never read or written, and the web-view rewrite is
+/// skipped, so the URL the vault's rule is matched against is the one the
+/// agent gave. Every hop, redirects included, is checked against the private
+/// address policy and then evaluated from scratch against the granted rules:
+/// only a hop a rule covers gets a copy of the URL with the key in its query.
+/// Every response header this function reads (`Location` first of all) and
+/// the body are scrubbed of each key released so far before they are used, and
+/// every message names `logical_url` (or a scrubbed redirect target), never a
+/// URL that held a key.
+pub fn fetch_url_with_secrets(
+    logical_url: &str,
+    document_dir: &Path,
+    options: UrlFetchOptions,
+    secrets: &SecretFetch<'_>,
+) -> Result<PathBuf, UrlFetchError> {
+    let mut current = Url::parse(logical_url)
+        .map_err(|_| UrlFetchError::new(format!("Invalid URL: {logical_url}")))?;
+    // A fragment never reaches a server, and a rule never matches one.
+    current.set_fragment(None);
+    let start = current.clone();
+    let deadline = FetchDeadline::for_current_call();
+    let approved = Arc::new(ApprovedHosts::default());
+    let progress = Arc::new(ConnectProgress::default());
+    let client = build_client(&options, Arc::clone(&approved), Arc::clone(&progress))?;
+    let mut held = HeldKeys::default();
+    let mut hop = 0;
+    let response = loop {
+        validate_public_url(&current, &options, &deadline, &approved)?;
+        let outbound = secret_hop(&current, hop, secrets, &mut held)?;
+        let sent = send_request(
+            &client,
+            outbound.as_ref().unwrap_or(&current),
+            Some(current.as_str()),
+            &deadline,
+            &progress,
+        );
+        // Wipe this function's copy of the key-bearing URL now that it is sent.
+        drop(outbound.map(|url| Zeroizing::new(String::from(url))));
+        let response = sent?;
+        if !response.status().is_redirection() {
+            break response;
+        }
+        if hop == MAX_REDIRECTS {
+            return Err(UrlFetchError::new(format!(
+                "Too many redirects fetching {logical_url}"
+            )));
+        }
+        let location = scrubbed_header(&response, LOCATION, &held, logical_url)?
+            .filter(|value| {
+                value
+                    .bytes()
+                    .all(|byte| byte == b'\t' || (0x20..0x7f).contains(&byte))
+            })
+            .ok_or_else(|| {
+                UrlFetchError::new(format!(
+                    "Redirect from {} missing Location header",
+                    current.as_str()
+                ))
+            })?;
+        current = current.join(&location).map_err(|error| {
+            UrlFetchError::new(format!(
+                "Invalid redirect Location '{location}' from {}: {error}",
+                current.as_str()
+            ))
+        })?;
+        current.set_fragment(None);
+        hop += 1;
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(UrlFetchError::http_status(
+            status.as_u16(),
+            format!(
+                "HTTP {} {} fetching {logical_url}",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("")
+            ),
+        ));
+    }
+    let content_type = scrubbed_header(&response, CONTENT_TYPE, &held, logical_url)?
+        .unwrap_or_else(|| "text/plain".to_string());
+    let codings = match scrubbed_header(&response, CONTENT_ENCODING, &held, logical_url)? {
+        Some(value) => secret_content_codings(&value, logical_url)?,
+        None if response.headers().contains_key(CONTENT_ENCODING) => {
+            return Err(secret_fetch_refused("content_encoding", logical_url));
+        }
+        None => Vec::new(),
+    };
+    let (extension, from_source_path) = resolve_fetch_extension(&start, &content_type)
+        .ok_or_else(|| {
+            UrlFetchError::new(format!(
+                "Unsupported content type '{content_type}' for {logical_url}. Supported: text/html, text/markdown, application/json, text/plain; source files via URL path extension (e.g. .rs, .ts, .mjs)"
+            ))
+        })?;
+    let total_bytes = codings
+        .is_empty()
+        .then(|| response.content_length())
+        .flatten();
+    let (raw, mut download_truncated) = read_response_body(response, logical_url, &deadline)?;
+    let raw = Zeroizing::new(raw);
+    let decoded = decode_secret_body(&raw, &codings, &mut download_truncated, logical_url)?;
+    let mut body = held.scrub(&decoded).map_err(scrub_refusal(logical_url))?;
+    drop(decoded);
+    let downloaded_bytes = body.len();
+    if download_truncated {
+        if let Err(error) = std::str::from_utf8(&body) {
+            if error.error_len().is_none() {
+                body.truncate(error.valid_up_to());
+            }
+        }
+    }
+    if from_source_path && body_contains_nul_in_prefix(&body) {
+        return Err(UrlFetchError::new(format!(
+            "Binary content detected for source URL {logical_url}"
+        )));
+    }
+    let (body, content_type, extension) = if extension == ".html" {
+        // Converting HTML can decode entities into new text, so the converted
+        // document is scrubbed again before it is written.
+        let markdown = convert_html_body_to_markdown(&body, logical_url)?;
+        (
+            held.scrub(&markdown).map_err(scrub_refusal(logical_url))?,
+            CONVERTED_MARKDOWN_CONTENT_TYPE.to_string(),
+            ".md",
+        )
+    } else {
+        (body, content_type, extension)
+    };
+
+    let content_file = document_dir.join(format!("document{extension}"));
+    write_secret_document(&content_file, &body)?;
+    // The metadata sits where `download_notice` looks for it, so a truncated
+    // download is disclosed exactly as a cached one is.
+    let meta = CacheMeta {
+        url: logical_url.to_string(),
+        content_type,
+        extension: extension.to_string(),
+        fetched_at: now_ms(),
+        download_truncated,
+        downloaded_bytes,
+        total_bytes,
+    };
+    let meta_bytes = serde_json::to_vec(&meta).map_err(|error| {
+        UrlFetchError::new(format!("Failed to encode URL fetch metadata: {error}"))
+    })?;
+    write_secret_document(&content_file.with_extension("meta.json"), &meta_bytes)?;
+    Ok(content_file)
+}
+
+fn write_secret_document(path: &Path, bytes: &[u8]) -> Result<(), UrlFetchError> {
+    crate::private_storage::write(path, bytes).map_err(|error| {
+        UrlFetchError::new(format!(
+            "Failed to write placeholder fetch document {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+/// A response header's value, scrubbed of every held key before anything
+/// reads it; `None` when the header is absent or not text.
+fn scrubbed_header(
+    response: &HttpResponse,
+    name: reqwest::header::HeaderName,
+    held: &HeldKeys,
+    url: &str,
+) -> Result<Option<String>, UrlFetchError> {
+    let Some(value) = response.headers().get(&name) else {
+        return Ok(None);
+    };
+    let clean = held.scrub(value.as_bytes()).map_err(scrub_refusal(url))?;
+    Ok(String::from_utf8(clean).ok())
+}
+
+/// A content coding a placeholder fetch can undo before scrubbing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretCoding {
+    Identity,
+    Gzip,
+    Deflate,
+    Brotli,
+}
+
+/// The codings a response declares, in the order they were applied. A server
+/// may encode the body although the request asked for `identity`; any coding
+/// this function cannot undo refuses the document, because an encoded key
+/// cannot be scrubbed.
+fn secret_content_codings(value: &str, url: &str) -> Result<Vec<SecretCoding>, UrlFetchError> {
+    let mut codings = Vec::new();
+    for token in value.split(',').map(str::trim) {
+        let coding = if token.eq_ignore_ascii_case("identity") {
+            SecretCoding::Identity
+        } else if token.eq_ignore_ascii_case("gzip") || token.eq_ignore_ascii_case("x-gzip") {
+            SecretCoding::Gzip
+        } else if token.eq_ignore_ascii_case("deflate") {
+            SecretCoding::Deflate
+        } else if token.eq_ignore_ascii_case("br") {
+            SecretCoding::Brotli
+        } else {
+            return Err(secret_fetch_refused("content_encoding", url));
+        };
+        if codings.len() >= MAX_SECRET_CODINGS {
+            return Err(secret_fetch_refused("content_encoding", url));
+        }
+        codings.push(coding);
+    }
+    Ok(codings)
+}
+
+/// Undo `codings` (last applied first), keeping at most
+/// [`MAX_RESPONSE_BYTES`] of output. A body whose download was cut short keeps
+/// what decoded before the cut; any other decoding failure refuses it.
+fn decode_secret_body(
+    body: &[u8],
+    codings: &[SecretCoding],
+    truncated: &mut bool,
+    url: &str,
+) -> Result<Zeroizing<Vec<u8>>, UrlFetchError> {
+    use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZlibDecoder};
+    use tokio::io::{AsyncRead, BufReader};
+
+    let mut data = Zeroizing::new(body.to_vec());
+    for coding in codings.iter().rev() {
+        let input: &[u8] = &data;
+        let reader: std::pin::Pin<Box<dyn AsyncRead + Send + '_>> = match coding {
+            SecretCoding::Identity => continue,
+            SecretCoding::Gzip => {
+                let mut decoder = GzipDecoder::new(BufReader::new(input));
+                decoder.multiple_members(true);
+                Box::pin(decoder)
+            }
+            SecretCoding::Deflate => Box::pin(ZlibDecoder::new(BufReader::new(input))),
+            SecretCoding::Brotli => Box::pin(BrotliDecoder::new(BufReader::new(input))),
+        };
+        let input_truncated = *truncated;
+        let (output, cut) = drain_decoder(reader, input_truncated).map_err(|()| {
+            UrlFetchError::new(format!("Failed to decode the response body for {url}"))
+        })?;
+        if cut {
+            *truncated = true;
+        }
+        data = output;
+    }
+    Ok(data)
+}
+
+/// Read a decoder over an in-memory body to its end, keeping at most
+/// [`MAX_RESPONSE_BYTES`]. Returns the output and whether the ceiling cut it.
+/// A body whose download was already cut (`input_truncated`) ends mid-stream;
+/// what decoded before the cut is kept as a usable prefix.
+fn drain_decoder(
+    mut reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + '_>>,
+    input_truncated: bool,
+) -> Result<(Zeroizing<Vec<u8>>, bool), ()> {
+    use std::future::Future;
+    use tokio::io::AsyncReadExt;
+
+    let mut output = Zeroizing::new(Vec::new());
+    let polled = {
+        let decoding = async {
+            let mut buffer = Zeroizing::new(vec![0u8; 16 * 1024]);
+            loop {
+                match reader.read(&mut buffer).await {
+                    Ok(0) => return Ok(false),
+                    Ok(count) => {
+                        let room = (MAX_RESPONSE_BYTES as usize).saturating_sub(output.len());
+                        output.extend_from_slice(&buffer[..count.min(room)]);
+                        if count > room {
+                            return Ok(true);
+                        }
+                    }
+                    Err(_) if input_truncated => return Ok(false),
+                    Err(_) => return Err(()),
+                }
+            }
+        };
+        // The input is already in memory, so no read ever waits: one poll
+        // runs the decoder to its end without an async runtime.
+        let mut decoding = std::pin::pin!(decoding);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        decoding.as_mut().poll(&mut context)
+    };
+    match polled {
+        std::task::Poll::Ready(Ok(cut)) => Ok((output, cut)),
+        std::task::Poll::Ready(Err(())) | std::task::Poll::Pending => Err(()),
+    }
+}
+
+/// Decide one hop of a placeholder fetch (M3: every hop is a new request).
+///
+/// Returns the URL to send when a rule substitutes a key into this hop, or
+/// `None` to send `current` itself, whose placeholders then go out literally.
+/// Only `query` rules substitute; a rule with any other location leaves its
+/// placeholder literal. Each scanned label gets one audit record for the hop,
+/// and a hop whose records cannot be written is not sent.
+fn secret_hop(
+    current: &Url,
+    hop: usize,
+    secrets: &SecretFetch<'_>,
+    held: &mut HeldKeys,
+) -> Result<Option<Url>, UrlFetchError> {
+    let logical = current.as_str();
+    let path = current.path();
+    let target = match current.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_string(),
+    };
+    // Only an HTTPS hop can carry a key (M1).
+    let authority = (current.scheme() == "https")
+        .then(|| current.host_str().zip(current.port_or_known_default()))
+        .flatten()
+        .and_then(|(host, port)| {
+            secret_rules::target::canonical_host(host)
+                .ok()
+                .map(|host| ConnectAuthority { host, port })
+        });
+    let Some(authority) = authority else {
+        emit_hop_audit(secrets, held, hop, None, |_| {
+            (Decision::Literal, AuditReason::OutOfScope)
+        })
+        .map_err(|_| secret_fetch_refused("audit_unavailable", logical))?;
+        return Ok(None);
+    };
+    let refused = |held: &HeldKeys, reason: &str| {
+        let _ = emit_hop_audit(secrets, held, hop, Some(&authority), |_| {
+            (Decision::Refused, AuditReason::Refused)
+        });
+        secret_fetch_refused(reason, logical)
+    };
+
+    let rules: Vec<LabelRule> = secrets
+        .rules
+        .iter()
+        .filter(|rule| matches!(rule.location, Location::Query(_)))
+        .cloned()
+        .collect();
+    let request = RequestTarget {
+        host: authority.host.clone(),
+        port: authority.port,
+        scheme: "https",
+        target: &target,
+    };
+    let matched: Vec<bool> = rules
+        .iter()
+        .map(|rule| {
+            request
+                .matches(&RuleTarget {
+                    host: &rule.host,
+                    port: rule.port,
+                    path_prefix: &rule.path_prefix,
+                })
+                .is_ok()
+        })
+        .collect();
+    // Plan with a stand-in key first: the rules decide where a key would go,
+    // and refuse an ambiguous request, before the vault releases anything.
+    let planning: Vec<(String, Vec<u8>)> = rules
+        .iter()
+        .map(|rule| (rule.label.clone(), SECRET_PLANNING_KEY.to_vec()))
+        .collect();
+    let view = RequestView::new(&target, Vec::new());
+    let plan = evaluate_request_with_connect(&view, &authority, &rules, &planning);
+    if let Some(refusal) = plan.refusal {
+        return Err(refused(&*held, refusal.reason()));
+    }
+
+    let mut materials = Vec::with_capacity(rules.len());
+    for (rule, matched) in rules.iter().zip(&matched) {
+        if !matched {
+            materials.push(None);
+            continue;
+        }
+        let Some(scope) = secrets.authorization.as_ref() else {
+            return Err(refused(&*held, "missing_material"));
+        };
+        let material = match secrets.vault.material(scope, &rule.label, &rule.grant_id) {
+            Ok(material) => material,
+            Err(error) => {
+                let _ = emit_hop_audit(secrets, held, hop, Some(&authority), |_| {
+                    (Decision::Refused, AuditReason::Refused)
+                });
+                return Err(
+                    match crate::secret::outcome_for_material(&rule.label, &error) {
+                        crate::secret::LabelOutcome::Refuse { code, message } => {
+                            UrlFetchError::secret(code, message)
+                        }
+                        _ => secret_fetch_refused("missing_material", logical),
+                    },
+                );
+            }
+        };
+        if check_admissible(material.expose(), &rule.label, &rule.location).is_err() {
+            return Err(refused(&*held, "material_not_admissible"));
+        }
+        // The matcher is installed before any byte of this hop is sent.
+        if held.hold(&rule.label, material.expose()).is_err() {
+            return Err(refused(&*held, "replacement_discloses_key"));
+        }
+        materials.push(Some(material));
+    }
+
+    let query_start = path.len() + 1;
+    let mut edits: Vec<(usize, usize, Zeroizing<Vec<u8>>)> = Vec::new();
+    for ((rule, outcome), material) in rules.iter().zip(&plan.labels).zip(&materials) {
+        if let LabelOutcome::Substituted {
+            byte_start,
+            byte_end,
+            ..
+        } = outcome
+        {
+            let (Some(material), true) = (material, *byte_start >= query_start) else {
+                return Err(refused(&*held, "missing_material"));
+            };
+            let encoded = encode_for_location(material.expose(), &rule.label, &rule.location)
+                .map_err(|_| refused(&*held, "material_not_admissible"))?;
+            edits.push((
+                byte_start - query_start,
+                byte_end - query_start,
+                Zeroizing::new(encoded),
+            ));
+        }
+    }
+    let decide = |label: &str| -> (Decision, AuditReason) {
+        let outcome = rules
+            .iter()
+            .position(|rule| rule.label == label)
+            .and_then(|index| plan.labels.get(index));
+        match outcome {
+            Some(LabelOutcome::Substituted { .. }) => (Decision::Substituted, AuditReason::Matched),
+            Some(LabelOutcome::NotWholeValue) => (Decision::Literal, AuditReason::NotWholeValue),
+            _ => (Decision::Literal, AuditReason::OutOfScope),
+        }
+    };
+    if edits.is_empty() {
+        emit_hop_audit(secrets, held, hop, Some(&authority), decide)
+            .map_err(|_| secret_fetch_refused("audit_unavailable", logical))?;
+        return Ok(None);
+    }
+
+    edits.sort_by_key(|(start, _, _)| *start);
+    let query = current.query().unwrap_or_default().as_bytes();
+    let mut substituted = Zeroizing::new(Vec::with_capacity(query.len() + 64));
+    let mut cursor = 0;
+    for (start, end, replacement) in &edits {
+        substituted.extend_from_slice(&query[cursor..*start]);
+        substituted.extend_from_slice(replacement);
+        cursor = *end;
+    }
+    substituted.extend_from_slice(&query[cursor..]);
+    let Ok(substituted) = std::str::from_utf8(&substituted) else {
+        return Err(refused(&*held, "malformed_query"));
+    };
+    // M2: the path sent with a key is the normalized path the rule matched,
+    // never another spelling of it.
+    let Ok(normalized) = normalize_request_target(path) else {
+        return Err(refused(&*held, "malformed_path"));
+    };
+    let Ok(wire_path) = std::str::from_utf8(&normalized.wire) else {
+        return Err(refused(&*held, "malformed_path"));
+    };
+    let mut outbound = current.clone();
+    outbound.set_path(wire_path);
+    outbound.set_query(Some(substituted));
+    emit_hop_audit(secrets, held, hop, Some(&authority), decide)
+        .map_err(|_| secret_fetch_refused("audit_unavailable", logical))?;
+    Ok(Some(outbound))
+}
+
+/// One audit record per scanned label for one hop. A record is handed to the
+/// vault only after the crate's writer checked it against every held key.
+fn emit_hop_audit(
+    secrets: &SecretFetch<'_>,
+    held: &HeldKeys,
+    hop: usize,
+    authority: Option<&ConnectAuthority>,
+    decide: impl Fn(&str) -> (Decision, AuditReason),
+) -> Result<(), ()> {
+    let origin = format!("{}#{hop}", secrets.call_id);
+    let keys = held.keys();
+    let mut failed = false;
+    for label in &secrets.labels {
+        let (decision, reason) = decide(label);
+        let mut record = AuditRecordV1::new(
+            crate::secret::now_ms(),
+            label,
+            decision,
+            reason,
+            &secrets.call_id,
+            &origin,
+        )
+        .with_scope(
+            secrets
+                .authorization
+                .as_ref()
+                .map(crate::secret::SecretScope::to_scope_ref),
+        );
+        let rule = secrets.rules.iter().find(|rule| &rule.label == label);
+        if let (Some(authority), Some(rule)) = (authority, rule) {
+            record = record.with_rule(
+                &authority.host,
+                authority.port,
+                &rule.path_prefix,
+                location_kind_token(&rule.location),
+            );
+        }
+        if record.to_json_line_with_keys(&keys).is_err() || secrets.vault.audit(&record).is_err() {
+            failed = true;
+        }
+    }
+    if failed {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
 /// What a cleanup sweep learned from one metadata file, kept so the next sweep
 /// can skip re-reading it. `len` and `modified` identify the file version the
 /// fetch time was read from: the cache rewrites metadata only through a rename
@@ -1049,23 +1723,43 @@ fn send_with_transient_retries(
     deadline: &FetchDeadline,
     progress: &ConnectProgress,
 ) -> Result<HttpResponse, UrlFetchError> {
+    send_request(client, target, None, deadline, progress)
+}
+
+/// [`send_with_transient_retries`] for one request. With `shown` set, the
+/// request carries a substituted secret: every message names `shown` (the
+/// placeholder URL) instead of `target`, reqwest errors lose their URL before
+/// they are read, and the request asks for an unencoded response so the body
+/// can be scrubbed byte for byte.
+fn send_request(
+    client: &Client,
+    target: &Url,
+    shown: Option<&str>,
+    deadline: &FetchDeadline,
+    progress: &ConnectProgress,
+) -> Result<HttpResponse, UrlFetchError> {
+    let named = shown.unwrap_or(target.as_str());
     let mut attempt = 0;
     loop {
         let remaining = deadline.remaining();
         if remaining.is_zero() {
-            return Err(deadline.timeout_error(FetchPhase::Connect, target.as_str()));
+            return Err(deadline.timeout_error(FetchPhase::Connect, named));
         }
         // A per-request timeout replaces reqwest's default 30 s, which would
         // otherwise let one silent server hold each attempt for 30 s.
         progress.begin_attempt();
-        let result = client
+        let mut request = client
             .get(target.clone())
             .header(USER_AGENT, USER_AGENT_VALUE)
             .header(ACCEPT, ACCEPT_HEADER)
-            .timeout(remaining.min(HEADERS_TIMEOUT))
-            .send();
-        let error = match result {
+            .timeout(remaining.min(HEADERS_TIMEOUT));
+        if shown.is_some() {
+            request = request.header(ACCEPT_ENCODING, "identity");
+        }
+        let error = match request.send() {
             Ok(response) => return Ok(response),
+            // A reqwest error prints the request URL, which here holds the key.
+            Err(error) if shown.is_some() => error.without_url(),
             Err(error) => error,
         };
         let phase = error
@@ -1085,11 +1779,10 @@ fn send_with_transient_retries(
             continue;
         }
         if let Some(phase) = phase {
-            return Err(request_timeout_error(&error, phase, deadline, target));
+            return Err(request_timeout_error(&error, phase, deadline, named));
         }
         return Err(UrlFetchError::new(format!(
-            "Failed to fetch {}: {}",
-            target.as_str(),
+            "Failed to fetch {named}: {}",
             reqwest_error_detail(&error)
         )));
     }
@@ -1112,10 +1805,10 @@ fn request_timeout_error(
     error: &reqwest::Error,
     phase: FetchPhase,
     deadline: &FetchDeadline,
-    target: &Url,
+    target: &str,
 ) -> UrlFetchError {
     if deadline.expired() {
-        return deadline.timeout_error(phase, target.as_str());
+        return deadline.timeout_error(phase, target);
     }
     let limit = match phase {
         FetchPhase::Dns | FetchPhase::Connect => CONNECT_TIMEOUT,
@@ -1127,7 +1820,7 @@ fn request_timeout_error(
             "URL fetch timed out in the {} phase after the {}ms limit fetching {}: {}",
             phase.as_str(),
             limit.as_millis(),
-            target.as_str(),
+            target,
             reqwest_error_detail(error)
         ),
     )
@@ -1166,9 +1859,12 @@ fn build_client(
         })
         .dns_resolver(Arc::new(resolver));
 
-    let tls_config = crate::platform_tls::client_config().map_err(|error| {
-        UrlFetchError::new(format!("Failed to configure URL fetch TLS: {error}"))
-    })?;
+    let tls_config = match &options.tls_config {
+        Some(config) => config.clone(),
+        None => crate::platform_tls::client_config().map_err(|error| {
+            UrlFetchError::new(format!("Failed to configure URL fetch TLS: {error}"))
+        })?,
+    };
 
     builder
         .use_preconfigured_tls(tls_config)
