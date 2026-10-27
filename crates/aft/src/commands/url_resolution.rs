@@ -1954,5 +1954,103 @@ mod url_tests {
             assert_eq!(server.targets().len(), 0, "nothing may be sent");
             assert_absent(&run, &documents, &[K_A, K_B]);
         }
+
+        /// `key` percent-encoded `layers` times.
+        fn nested_percent(key: &[u8], layers: usize) -> String {
+            let mut text: String = key.iter().map(|byte| format!("%{byte:02X}")).collect();
+            for _ in 1..layers {
+                text = text.replace('%', "%25");
+            }
+            text
+        }
+
+        /// A key percent-encoded many times over in a redirect is refused:
+        /// found when its layers can be undone, and refused anyway when there
+        /// are more layers than the check undoes.
+        #[test]
+        fn deeply_percent_encoded_keys_in_a_redirect_are_refused() {
+            const K: &[u8] = b"0123456789abcdef";
+            let fixture = fixture(Default::default());
+            let other = serve(&fixture.tls, |_| Some(markdown(b"# Other\n")));
+            let op = other.addr.port();
+            for layers in [16, 17, 33] {
+                let location = format!(
+                    "https://other.secret.test:{op}/collect?v={}",
+                    nested_percent(K, layers)
+                );
+                let api = serve(&fixture.tls, move |_| {
+                    Some(http("302 Found", &[("Location", location.as_str())], b""))
+                });
+                let port = api.addr.port();
+                let url = format!("https://api.secret.test:{port}/v1/doc.md?key={PLACEHOLDER}");
+                let vault = granted_vault_with(rule("api.secret.test", port, "/v1"), K);
+                let routes = [
+                    ("api.secret.test", api.addr),
+                    ("other.secret.test", other.addr),
+                ];
+                let (run, _) = run_with(
+                    &fixture,
+                    &vault,
+                    &routes,
+                    &request("outline", &url, serde_json::json!({})),
+                    no_extra,
+                );
+                assert!(!run.response.success, "L{layers}: {:?}", run.response.data);
+                assert!(
+                    run.strings().contains("(header_discloses_key)"),
+                    "L{layers}: {}",
+                    run.strings()
+                );
+                assert_eq!(api.targets().len(), 1, "L{layers}");
+            }
+            assert_eq!(other.connections.load(Ordering::SeqCst), 0);
+        }
+
+        /// Ordinary documents full of the spellings the residual check undoes
+        /// (`%20` links, `&amp;`, Markdown `\*` escapes, HTML markup) are not
+        /// refused.
+        #[test]
+        fn ordinary_html_and_markdown_documents_are_not_refused() {
+            let markdown_doc = "# Start\n\nIntro.\n\n".to_string()
+                + &"See [the docs](https://example.com/a%20b/c%2Fd?x=1&amp;y=2) and \
+                 [more](docs/My%20Page.md).\n\nUse \\*args and \\_private names, 5 \\* 3 = 15.\n\n\
+                 Ben &amp; Jerry &lt;tag&gt; &#169; 2024 &mdash; fine.\n\n```\nlet s = \"%41%42\";\n```\n\n\
+                 ## Usage\n\nRun `cargo test -- --nocapture`.\n"
+                    .repeat(40);
+            let html_doc = format!(
+                "<!doctype html><html><head><title>Docs</title></head><body><h1>Start</h1>{}</body></html>",
+                "<p>Read <a href=\"/a%20b/c?x=1&amp;y=2\">the&nbsp;guide</a> &amp; <em>enjoy</em> \
+                 &lt;code&gt; &#8212; <code>a * b</code>, <span>left</span><span>right</span>.</p>\n"
+                    .repeat(200)
+            );
+            let fixture = fixture(Default::default());
+            let (md, html) = (markdown_doc.clone(), html_doc.clone());
+            let server = serve(&fixture.tls, move |target| {
+                if target.starts_with("/v1/page") {
+                    Some(http(
+                        "200 OK",
+                        &[("Content-Type", "text/html")],
+                        html.as_bytes(),
+                    ))
+                } else {
+                    Some(markdown(md.as_bytes()))
+                }
+            });
+            let port = server.addr.port();
+            for (path, symbol) in [("/v1/doc.md", "Start"), ("/v1/page", "Start")] {
+                let url = format!("https://api.secret.test:{port}{path}?key={PLACEHOLDER}");
+                let vault = granted_vault(rule("api.secret.test", port, "/v1"));
+                let (run, documents) = run_with(
+                    &fixture,
+                    &vault,
+                    &[("api.secret.test", server.addr)],
+                    &request("zoom", &url, serde_json::json!({"symbol": symbol})),
+                    no_extra,
+                );
+                assert!(run.response.success, "{path}: {}", run.strings());
+                assert_eq!(documents.len(), 1, "{path}");
+            }
+            assert_eq!(server.targets().len(), 2);
+        }
     }
 }

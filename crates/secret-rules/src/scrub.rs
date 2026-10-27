@@ -1069,60 +1069,114 @@ pub fn scrub_bytes(key: &[u8], label: &str, input: &[u8]) -> Result<Vec<u8>, Scr
     Ok(out)
 }
 
-/// The most decoded views [`reveals_key`] examines for one text, the text
-/// itself included. Each layer of percent-encoding is one view, so this also
-/// bounds how many nested layers are undone.
-const MAX_REVEAL_VIEWS: usize = 16;
+/// The most layers one reveal chain undoes. Text that still changes after
+/// this many layers of one chain is treated as revealing a key (fail closed):
+/// no ordinary document nests an encoding this deep, and stopping early would
+/// let one more layer carry a key past the check.
+pub const MAX_REVEAL_DEPTH: usize = 32;
 
 /// True when `text` spells `key` in a form the scrubber recognises, either as
 /// it stands or after a recipient undoes the changes a URL parser or a reader
-/// makes without being asked: dropping control bytes such as a tab, decoding
-/// percent-encoding any number of times, reading Markdown backslash escapes
-/// and decoding HTML character references, in any combination (up to
-/// [`MAX_REVEAL_VIEWS`] views).
+/// makes without being asked; see [`reveals_any`].
+pub fn reveals_key(text: &[u8], key: &[u8]) -> bool {
+    reveals_any(text, &[key])
+}
+
+/// True when `text` spells any of `keys` in a form the scrubber recognises,
+/// as it stands or after a recipient undoes the changes a URL parser or a
+/// reader makes without being asked: dropping control bytes such as a tab,
+/// decoding percent-encoding, reading Markdown backslash escapes and decoding
+/// HTML character references.
 ///
 /// The scrubber replaces a key only where it finds one, so text it passed
 /// can still carry a key that one of these changes reassembles. A caller that
 /// is about to send or show text it cannot scrub again (a redirect target, a
 /// finished document) checks it here and refuses it rather than trusting the
 /// earlier scrub.
-pub fn reveals_key(text: &[u8], key: &[u8]) -> bool {
-    if key.is_empty() {
+///
+/// Each change is undone repeatedly in its own chain, and all of them
+/// together in one more chain, so nested layers (a key percent-encoded
+/// seventeen times) and mixed layers (an entity inside an escape) are both
+/// followed to the end. Each chain stops when nothing changes any more. A
+/// chain's depth is spent only by text that keeps changing at every layer:
+/// ordinary text decodes once (a `%20`, an `&amp;`, a `\*`) and is then left
+/// alone. A chain still changing after [`MAX_REVEAL_DEPTH`] layers makes this
+/// return true, so a spelling nested deeper than the check undoes is refused
+/// rather than trusted.
+pub fn reveals_any(text: &[u8], keys: &[&[u8]]) -> bool {
+    let keys: Vec<(&[u8], Vec<Zeroizing<Vec<u8>>>)> = keys
+        .iter()
+        .filter(|key| !key.is_empty())
+        .map(|key| {
+            let literals = KeyPatterns::derive(key)
+                .map(|patterns| patterns.patterns)
+                .unwrap_or_default();
+            (*key, literals)
+        })
+        .collect();
+    if keys.is_empty() {
         return false;
     }
-    let literals = KeyPatterns::derive(key)
-        .map(|patterns| patterns.patterns)
-        .unwrap_or_default();
-    let mut views: Vec<Zeroizing<Vec<u8>>> = vec![Zeroizing::new(text.to_vec())];
-    let mut index = 0;
-    while index < views.len() {
-        if !find_key_spans(&views[index], key, &literals).is_empty() {
-            return true;
-        }
-        for transform in REVEAL_TRANSFORMS {
-            if views.len() >= MAX_REVEAL_VIEWS {
+    let found = |view: &[u8]| {
+        keys.iter()
+            .any(|(key, literals)| !find_key_spans(view, key, literals).is_empty())
+    };
+    if found(text) {
+        return true;
+    }
+    for chain in REVEAL_CHAINS {
+        // Only the current layer is kept: memory stays at two copies of the
+        // text whatever the depth.
+        let mut layer: Option<Zeroizing<Vec<u8>>> = None;
+        for depth in 1..=MAX_REVEAL_DEPTH {
+            let current = layer.as_ref().map_or(text, |layer| layer.as_slice());
+            let Some(next) = chain(current) else {
                 break;
+            };
+            if found(&next) {
+                return true;
             }
-            if let Some(next) = transform(&views[index]) {
-                if !views.iter().any(|view| view.as_slice() == next.as_slice()) {
-                    views.push(next);
-                }
+            if depth == MAX_REVEAL_DEPTH && chain(&next).is_some() {
+                return true;
             }
+            layer = Some(next);
         }
-        index += 1;
     }
     false
 }
 
-/// One change [`reveals_key`] undoes; `None` when it would change nothing.
+/// One change [`reveals_any`] undoes; `None` when it would change nothing.
 type RevealTransform = fn(&[u8]) -> Option<Zeroizing<Vec<u8>>>;
 
+/// The single changes, each also undone repeatedly in a chain of its own.
 const REVEAL_TRANSFORMS: &[RevealTransform] = &[
     without_control_bytes,
     percent_decoded,
     markdown_unescaped,
     html_entities_decoded,
 ];
+
+/// The chains [`reveals_any`] follows: every single change on its own, then
+/// all of them applied in turn at every layer.
+const REVEAL_CHAINS: &[RevealTransform] = &[
+    without_control_bytes,
+    percent_decoded,
+    markdown_unescaped,
+    html_entities_decoded,
+    all_reveal_transforms,
+];
+
+/// Every [`REVEAL_TRANSFORMS`] change applied once, in order.
+fn all_reveal_transforms(text: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    let mut changed: Option<Zeroizing<Vec<u8>>> = None;
+    for transform in REVEAL_TRANSFORMS {
+        let current = changed.as_ref().map_or(text, |changed| changed.as_slice());
+        if let Some(next) = transform(current) {
+            changed = Some(next);
+        }
+    }
+    changed
+}
 
 /// `text` without ASCII control bytes, which a URL parser drops (a tab or a
 /// line break inside a URL) or a reader skips.
@@ -1410,5 +1464,33 @@ mod tests {
             assert_eq!(out, k_a, "split at {split}");
             assert!(crate::material::check_admissible(&out, "test", &query).is_err());
         }
+    }
+
+    fn nested_percent(key: &[u8], layers: usize) -> Vec<u8> {
+        let mut text: String = key.iter().map(|byte| format!("%{byte:02X}")).collect();
+        for _ in 1..layers {
+            text = text.replace('%', "%25");
+        }
+        text.into_bytes()
+    }
+
+    #[test]
+    fn reveal_check_fails_closed_on_deep_nesting_but_passes_ordinary_text() {
+        let key = b"0123456789abcdef";
+        for layers in [1, 2, 16, 17, 31, 32, 33, 64] {
+            let mut url = b"https://other.test/c?v=".to_vec();
+            url.extend_from_slice(&nested_percent(key, layers));
+            assert!(reveals_key(&url, key), "L{layers}");
+        }
+        // Deep nesting of something that is not the key is refused too once
+        // it goes past what the check undoes.
+        let mut deep = b"x=".to_vec();
+        deep.extend_from_slice(&nested_percent(b"fedcba9876543210", 64));
+        assert!(reveals_key(&deep, key));
+        // Ordinary text with every transform present, many times over.
+        let ordinary = "Read [docs](https://example.com/a%20b/c%2Fd?x=1&amp;y=2), \\*args, \
+             Ben &amp; Jerry &lt;b&gt; &#169;, `\"%41%42\"`, <span>left</span><em>right</em>.\n\t\n"
+            .repeat(5000);
+        assert!(!reveals_key(ordinary.as_bytes(), key));
     }
 }

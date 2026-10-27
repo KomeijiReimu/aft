@@ -867,12 +867,10 @@ impl HeldKeys {
     }
 
     /// True when `bytes` still spell a held key, as they stand or after a
-    /// URL parser or reader normalizes them (see
-    /// [`secret_rules::reveals_key`]).
+    /// URL parser or reader normalizes them, or keep decoding deeper than the
+    /// check follows (see [`secret_rules::reveals_any`]).
     fn reveals(&self, bytes: &[u8]) -> bool {
-        self.0
-            .iter()
-            .any(|(_, key)| secret_rules::reveals_key(bytes, key))
+        secret_rules::reveals_any(bytes, &self.keys())
     }
 }
 

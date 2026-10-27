@@ -37,7 +37,10 @@ pub use placeholder::{
 pub use redirect::{
     evaluate_redirect, location_mentions, resolve_location, split_absolute, RedirectOutcome,
 };
-pub use scrub::{reveals_key, scrub_bytes, KeyPatterns, MatcherSet, ScrubError, Scrubber};
+pub use scrub::{
+    reveals_any, reveals_key, scrub_bytes, KeyPatterns, MatcherSet, ScrubError, Scrubber,
+    MAX_REVEAL_DEPTH,
+};
 pub use target::{
     authority_matches_connect, canonical_host, canonicalize_path, normalize_path_prefix,
     normalize_request_target, path_covers, ConnectAuthority, NormalizedPath, RequestTarget,
