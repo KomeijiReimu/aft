@@ -469,9 +469,14 @@ assert open(paths[0], 'rb').read().count(b'BEGIN CERTIFICATE') > 1
             config.sandbox.profile.worker = mode;
         });
         let gate = root.path().join(format!("go-{index}"));
-        let command = format!("while [ ! -f '{}' ]; do sleep 0.05; done; test -n \"$HTTPS_PROXY\" && test \"$HTTPS_PROXY\" = \"$https_proxy\" && test \"$HTTP_PROXY\" = \"$http_proxy\" && test -z \"${{NO_PROXY+x}}\" && test -z \"${{no_proxy+x}}\" && test -z \"${{ALL_PROXY+x}}\" && test -z \"${{all_proxy+x}}\" || exit 70; curl --connect-timeout 5 --max-time 10 --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; curl --connect-timeout 5 --max-time 10 --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; sleep 30", gate.display(), vault.port, vault.port);
+        let trust = if cfg!(target_os = "macos") {
+            "--cacert \"$CURL_CA_BUNDLE\""
+        } else {
+            ""
+        };
+        let command = format!("while [ ! -f '{}' ]; do sleep 0.05; done; test -n \"$HTTPS_PROXY\" && test \"$HTTPS_PROXY\" = \"$https_proxy\" && test \"$HTTP_PROXY\" = \"$http_proxy\" && test -z \"${{NO_PROXY+x}}\" && test -z \"${{no_proxy+x}}\" && test -z \"${{ALL_PROXY+x}}\" && test -z \"${{all_proxy+x}}\" || exit 70; printf 'proxy-env-ok\\n' >&2; curl {trust} --connect-timeout 5 --max-time 10 --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; curl {trust} --connect-timeout 5 --max-time 10 --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; sleep 30", gate.display(), vault.port, vault.port);
         let command = format!(
-            "python3 '{}' {} || exit 71; {command}",
+            "python3 '{}' {} || exit 71; printf 'memory-and-bundle-ok\\n' >&2; {command}",
             memory_probe.display(),
             std::process::id()
         );
@@ -522,17 +527,33 @@ assert open(paths[0], 'rb').read().count(b'BEGIN CERTIFICATE') > 1
         while seen.load(Ordering::SeqCst) < (index + 1) * 2 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(
-            seen.load(Ordering::SeqCst),
-            (index + 1) * 2,
-            "command failed before upstream: {:?}",
-            ctx.bash_background().status(
+        let diagnostic = ctx
+            .bash_background()
+            .status(
                 task_id,
                 "secret-bash",
                 Some(root.path()),
                 Some(storage.path()),
-                0
+                8192,
             )
+            .map(|snapshot| {
+                let output = |path: Option<String>| {
+                    path.and_then(|path| std::fs::read_to_string(path).ok())
+                        .unwrap_or_default()
+                };
+                format!(
+                    "status={:?}, exit={:?}\nstdout:\n{}\nstderr:\n{}",
+                    snapshot.info.status,
+                    snapshot.exit_code,
+                    output(snapshot.output_path),
+                    output(snapshot.stderr_path)
+                )
+            })
+            .unwrap_or_else(|| "task no longer registered".into());
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            (index + 1) * 2,
+            "command failed before upstream:\n{diagnostic}"
         );
         let snapshot = loop {
             let snapshot = ctx
