@@ -126,7 +126,7 @@ where
         let mut retry = HashMap::new();
         let mut pending = HashSet::new();
         let mut next_poll: HashMap<_, tokio::time::Instant> = HashMap::new();
-        let mut secret_authorizations = HashSet::new();
+        let mut secret_authorizations: HashSet<(String, String, u64)> = HashSet::new();
         let mut inflight = tokio::task::JoinSet::new();
         let mut next_scan = tokio::time::Instant::now() + interval;
         loop {

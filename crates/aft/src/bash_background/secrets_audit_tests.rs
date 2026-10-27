@@ -36,6 +36,7 @@ struct Fixture {
     stop: Arc<AtomicBool>,
     server: Option<std::thread::JoinHandle<()>>,
     _launcher: Box<dyn std::any::Any>,
+    tasks: Mutex<Vec<String>>,
 }
 impl Fixture {
     fn new() -> Self {
@@ -138,6 +139,7 @@ impl Fixture {
             stop,
             server: Some(server),
             _launcher: Box::new(launcher),
+            tasks: Mutex::new(Vec::new()),
         }
     }
     fn curl(&self) -> String {
@@ -175,14 +177,54 @@ impl Fixture {
         })
     }
     fn wait_file(&self, name: &str) {
-        wait(|| self.root.path().join(name).exists());
+        let until = Instant::now() + Duration::from_secs(10);
+        while !self.root.path().join(name).exists() {
+            assert!(
+                Instant::now() < until,
+                "missing {name}: {}",
+                self.diagnostics()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
     fn wait_requests(&self, count: usize) {
         wait(|| self.seen.lock().unwrap().len() >= count);
     }
     fn task(&self, response: &Response) -> String {
         assert!(response.success, "{response:?}");
-        response.data["task_id"].as_str().unwrap().to_owned()
+        let id = response.data["task_id"].as_str().unwrap().to_owned();
+        self.tasks.lock().unwrap().push(id.clone());
+        id
+    }
+    fn diagnostics(&self) -> String {
+        self.tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|id| {
+                self.ctx.bash_background().status(
+                    id,
+                    "secret-bash",
+                    Some(self.root.path()),
+                    Some(self._storage.path()),
+                    8192,
+                )
+            })
+            .map(|snapshot| {
+                let output = |path: Option<String>| {
+                    path.and_then(|path| std::fs::read_to_string(path).ok())
+                        .unwrap_or_default()
+                };
+                format!(
+                    "status={:?} exit={:?}\nstdout:{}\nstderr:{}",
+                    snapshot.info.status,
+                    snapshot.exit_code,
+                    output(snapshot.output_path),
+                    output(snapshot.stderr_path)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
     fn wait_terminal(&self, id: &str) {
         wait(|| {
@@ -438,9 +480,9 @@ fn audit_runtime_built_unscanned_label_is_refused() {
         let command = format!(": '{{{{ck-secret:test}}}}'; H='{{{{ck-secret:un''scanned}}}}'; curl --http1.1 --silent --fail --max-time 2 -H \"Authorization: Bearer $H\" https://localhost:{}/api; code=$?; printf '%s' \"$code\" > result", f.vault.port);
         let id = f.task(&f.launch(&command, false, json!({})));
         f.wait_terminal(&id);
-        assert_ne!(
+        assert_eq!(
             std::fs::read_to_string(f.root.path().join("result")).unwrap(),
-            "0"
+            "22"
         );
         assert_eq!(f.vault.resolves.load(Ordering::SeqCst), 1);
         assert_eq!(f.vault.materials.load(Ordering::SeqCst), 0);

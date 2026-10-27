@@ -4530,10 +4530,6 @@ fn build_linux_profile(
         "/dev/tty",
         "/dev/ptmx",
         "/dev/pts",
-        "/dev/fd",
-        "/dev/stdin",
-        "/dev/stdout",
-        "/dev/stderr",
     ] {
         if let Some(path) = canonicalize_existing_static(Path::new(path))? {
             intended.push(IntendedReadGrant {
@@ -4543,6 +4539,9 @@ fn build_linux_profile(
             });
         }
     }
+    // Do not canonicalize /dev/fd or the stdio links in the daemon: they name
+    // its /proc/<pid>/fd entries, which a non-dumpable daemon hides from the
+    // launcher. The /proc rule and payload/device rules cover child targets.
     if let Some(path) = canonicalize_existing_static(Path::new("/var"))? {
         intended.push(IntendedReadGrant {
             path,
