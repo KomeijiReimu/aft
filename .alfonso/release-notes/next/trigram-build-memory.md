@@ -1,0 +1,1 @@
+- Building the text search index for a folder with very many files now uses much less memory, and the background symbol warm-up stops when the folder is closed or its indexes are released.
