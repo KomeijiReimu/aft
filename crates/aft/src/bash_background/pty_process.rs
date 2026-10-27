@@ -147,7 +147,14 @@ pub(crate) fn spawn_pty_for_command(
                 OsString::from("aft-memory-gate"),
             ];
             if secret_ready {
-                gated.push(paths.io_dir.join("secret-ready").into_os_string());
+                // The child can write command scratch, not task-record paths.
+                gated.push(
+                    spawn_plan
+                        .temp_dir()
+                        .ok_or(super::secrets::PROXY_UNAVAILABLE)?
+                        .join("secret-ready")
+                        .into_os_string(),
+                );
             }
             gated.push(shell_path.as_os_str().to_owned());
             gated.append(&mut args);
@@ -420,7 +427,10 @@ fn try_spawn_pty(
         // forked non-dumpable child is not inspectable until exec resets its
         // state. The AFT-supplied shell gate writes readiness before waiting
         // for the release line; user command execution follows that wait.
-        let ready = paths.io_dir.join("secret-ready");
+        let ready = spawn_plan
+            .temp_dir()
+            .ok_or(super::secrets::PROXY_UNAVAILABLE)?
+            .join("secret-ready");
         let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if std::fs::read(&ready).ok().as_deref() == Some(b"ready") {
