@@ -4686,6 +4686,10 @@ pub struct AppContext {
     lsp_watcher_forward_slot: crate::lsp::manager::WatcherForwardSlot,
     /// How many of those helper threads were started, for tests.
     lsp_watcher_forward_helpers_spawned: AtomicUsize,
+    /// Held by tests to keep that helper thread from forwarding anything
+    /// (see [`Self::pause_lsp_watcher_forwarding_for_test`]); never held
+    /// otherwise.
+    lsp_watcher_forward_pause: Arc<parking_lot::Mutex<()>>,
     #[cfg(test)]
     lsp_classified_watcher_forwards: parking_lot::Mutex<Option<Vec<Vec<PathBuf>>>>,
     /// Document and configuration-file changes waiting for the LSP manager
@@ -5475,6 +5479,7 @@ impl AppContext {
             lsp_post_edit_worker_running: Arc::new(AtomicBool::new(false)),
             lsp_watcher_forward_slot: Default::default(),
             lsp_watcher_forward_helpers_spawned: AtomicUsize::new(0),
+            lsp_watcher_forward_pause: Arc::default(),
             #[cfg(test)]
             lsp_classified_watcher_forwards: Default::default(),
             lsp_pending_change_slot: Default::default(),
@@ -14490,10 +14495,12 @@ impl AppContext {
         drop(slot);
         let manager = Arc::clone(&self.lsp_manager);
         let forward_slot = Arc::clone(&self.lsp_watcher_forward_slot);
+        let pause = Arc::clone(&self.lsp_watcher_forward_pause);
         match std::thread::Builder::new()
             .name("aft-lsp-watched-files".into())
-            .spawn(move || crate::lsp::manager::run_watcher_forward_helper(&manager, &forward_slot))
-        {
+            .spawn(move || {
+                crate::lsp::manager::run_watcher_forward_helper(&manager, &forward_slot, &pause)
+            }) {
             Ok(_) => {
                 self.lsp_watcher_forward_helpers_spawned
                     .fetch_add(1, Ordering::Relaxed);
@@ -14504,6 +14511,45 @@ impl AppContext {
                 crate::slog_warn!("could not reach LSP servers after a watcher change: {error}");
             }
         }
+    }
+
+    /// Forward the watcher changes still queued for the LSP manager (see
+    /// [`Self::lsp_forward_or_queue_watcher_changes`]) now, waiting for its
+    /// lock, instead of leaving them to the helper thread.
+    ///
+    /// Diagnostics readers call this first. A change that is still queued has
+    /// not reached the language servers: rust-analyzer has neither heard of
+    /// it nor been asked for the `cargo check` it needs, so nothing marks its
+    /// published results as describing the files before the change, and a
+    /// reader would certify them as current. Once forwarded, the check the
+    /// change asked for counts as running until it reports.
+    ///
+    /// The backlog is taken while holding the manager lock, the order the
+    /// helper uses, so changes reach the servers in the order they were
+    /// queued. The slot itself stays in place: the helper still owns it,
+    /// finds it empty, and clears it.
+    pub(crate) fn lsp_forward_queued_watcher_changes(&self) {
+        let reloads = {
+            let mut lsp = self.lsp_manager.lock();
+            let Some(backlog) = self
+                .lsp_watcher_forward_slot
+                .lock()
+                .as_mut()
+                .map(std::mem::take)
+            else {
+                return;
+            };
+            backlog.apply(&mut lsp)
+        };
+        crate::lsp::manager::spawn_watcher_rust_workspace_reloads(&self.lsp_manager, reloads);
+    }
+
+    /// Keep the helper thread that forwards queued watcher changes from
+    /// forwarding anything until the returned guard is dropped, so a test
+    /// can act while a change waits in the queue.
+    #[doc(hidden)]
+    pub fn pause_lsp_watcher_forwarding_for_test(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.lsp_watcher_forward_pause.lock()
     }
 
     /// How many helper threads have waited for the LSP manager lock on behalf

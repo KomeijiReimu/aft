@@ -8181,12 +8181,18 @@ impl WatcherForwardBacklog {
 /// the manager lock, forward everything queued, and repeat while drains
 /// queued more meanwhile. Clearing the slot under its lock when nothing is
 /// left is what lets the next contended drain start a new helper, so no
-/// change is stranded and at most one helper exists at a time.
+/// change is stranded and at most one helper exists at a time. A diagnostics
+/// reader can empty the slot first (see
+/// `AppContext::lsp_forward_queued_watcher_changes`); the helper then finds
+/// nothing left and clears it. `pause` is held only by tests, to keep the
+/// helper waiting.
 pub(crate) fn run_watcher_forward_helper(
     manager: &Arc<parking_lot::Mutex<LspManager>>,
     slot: &WatcherForwardSlot,
+    pause: &parking_lot::Mutex<()>,
 ) {
     loop {
+        drop(pause.lock());
         let mut lsp = manager.lock();
         let backlog = {
             let mut guard = slot.lock();

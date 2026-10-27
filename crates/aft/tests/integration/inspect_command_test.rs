@@ -9287,6 +9287,134 @@ fn scoped_rust_inspect_reports_a_removed_field_after_an_outside_edit_with_real_r
     assert_removed_field_reported(&after);
 }
 
+/// When a watcher drain forwards an outside edit while another thread holds
+/// the LSP manager, the change waits in a queue for a helper thread, and
+/// until that helper runs rust-analyzer has not heard of the edit, so no
+/// `cargo check` is expected for it. The helper is held here, the way a
+/// loaded machine can delay it, so the inspect runs while the change is still
+/// queued. It must deliver the change itself and then report the compiler
+/// error of the check the change starts, or name that check as still
+/// running; the stale answer it used to give is a complete result without
+/// that error.
+#[test]
+fn scoped_rust_inspect_forwards_a_queued_outside_edit_before_certifying() {
+    let (_temp_dir, root, lib) = single_crate_fixture("queued-outside-edit");
+    let ctx = configured_context_with_diagnostics_timeout(&root, 40_000);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "0");
+    let warm = scoped_diagnostics_inspect(&ctx, "queued-outside-edit-warm", "src/lib.rs");
+    assert!(!reported_check_still_running(&warm), "{warm:#}");
+    // The fake's own analysis always reports a test error and warning; only
+    // a check of a file containing `fake_compile_error` adds this one.
+    assert!(
+        !diagnostic_messages_for(&warm, "src/lib.rs")
+            .iter()
+            .any(|message| message == "fake compile error"),
+        "control: the file compiles before the outside edit: {warm:#}"
+    );
+
+    // Another program adds a compiler error.
+    fs::write(&lib, "// fake_compile_error\npub fn f() {}\n").unwrap();
+    let paused = queue_watcher_change_for_held_helper(&ctx, &lib);
+
+    let after = scoped_diagnostics_inspect(&ctx, "queued-outside-edit-after", "src/lib.rs");
+    drop(paused);
+    if reported_check_still_running(&after) {
+        return;
+    }
+    let text = after["text"].as_str().expect("rendered text");
+    assert!(
+        diagnostic_messages_for(&after, "src/lib.rs")
+            .iter()
+            .any(|message| message == "fake compile error"),
+        "the compiler error of the outside edit is missing: {text}\n{after:#}"
+    );
+}
+
+/// Forward the watcher's change to `path` while another thread holds the LSP
+/// manager, so it is queued for the helper thread, and keep that helper from
+/// delivering it until the returned guard is dropped.
+fn queue_watcher_change_for_held_helper<'a>(
+    ctx: &'a AppContext,
+    path: &Path,
+) -> parking_lot::MutexGuard<'a, ()> {
+    let paused = ctx.pause_lsp_watcher_forwarding_for_test();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    thread::scope(|scope| {
+        scope.spawn(move || {
+            let _busy = ctx.lsp();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().unwrap();
+        ctx.lsp_forward_watcher_file_events(&[path.to_path_buf()]);
+        release_tx.send(()).unwrap();
+    });
+    assert!(
+        ctx.lsp_watcher_forward_pending_for_test(),
+        "control: the change must still be queued"
+    );
+    paused
+}
+
+/// `lsp_diagnostics` reads the same check state as inspect, so a change
+/// still queued for the held helper thread must not be answered from
+/// rust-analyzer's results for the file before it: the answer reports the
+/// compiler error of the check the change starts, or is incomplete with the
+/// note that the check is still running.
+#[test]
+fn rust_lsp_diagnostics_forwards_a_queued_outside_edit_before_answering() {
+    let (_temp_dir, root, lib) = single_crate_fixture("queued-outside-edit-lsp");
+    let ctx = configured_context_with_diagnostics_timeout(&root, 40_000);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "0");
+    let lsp_diagnostics = |id: &str| -> Value {
+        serde_json::to_value(aft::commands::lsp_diagnostics::handle_lsp_diagnostics(
+            &request(json!({
+                "id": id,
+                "command": "lsp_diagnostics",
+                "file": lib.display().to_string(),
+                "wait_ms": 10_000,
+            })),
+            &ctx,
+        ))
+        .expect("response serializes")
+    };
+    let compiler_error_reported = |response: &Value| {
+        response["diagnostics"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|diagnostic| diagnostic["message"] == "fake compile error")
+    };
+    let warm = lsp_diagnostics("queued-outside-edit-lsp-warm");
+    assert_eq!(warm["success"], true, "{warm:#}");
+    assert!(
+        !compiler_error_reported(&warm),
+        "control: the file compiles before the outside edit: {warm:#}"
+    );
+
+    // Another program adds a compiler error.
+    fs::write(&lib, "// fake_compile_error\npub fn f() {}\n").unwrap();
+    let paused = queue_watcher_change_for_held_helper(&ctx, &lib);
+
+    let after = lsp_diagnostics("queued-outside-edit-lsp-after");
+    drop(paused);
+    assert_eq!(after["success"], true, "{after:#}");
+    if after["complete"] == false && after["note"].as_str().is_some() {
+        assert_eq!(
+            after["note"], "rust-analyzer: cargo check still running; retry",
+            "{after:#}"
+        );
+        return;
+    }
+    assert!(
+        compiler_error_reported(&after),
+        "the compiler error of the outside edit is missing: {after:#}"
+    );
+}
+
 /// The opposite direction: a compiler error present when rust-analyzer
 /// starts (its first `cargo check` reports it) is then fixed with an AFT
 /// edit. `use of moved value` comes only from the compiler, never from
