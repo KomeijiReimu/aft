@@ -279,23 +279,34 @@ impl LexicalView {
                 policy: self.policy,
             }
             .family_key();
+            // A live entry whose payload row the family's store already held
+            // when it was reconciled (another view of the family stored the
+            // same bytes) carries only that row's key; read the row.
+            let mut stored_row = false;
             let payload = match snapshot.source(&path) {
-                Source::Live(entry) => entry
-                    .attachments
-                    .get(&FamilyPlane::Trigram)
-                    .and_then(|value| value.downcast_ref::<Attachment>())
-                    .filter(|attachment| {
-                        attachment.content == content
-                            && attachment.policy == self.policy.fingerprint()
-                    })
-                    .map(|attachment| attachment.payload.clone()),
+                Source::Live(entry) => match entry.attachments.get(&FamilyPlane::Trigram) {
+                    Some(value) => match value.downcast_ref::<Attachment>() {
+                        Some(attachment) => Some(attachment)
+                            .filter(|attachment| {
+                                attachment.content == content
+                                    && attachment.policy == self.policy.fingerprint()
+                            })
+                            .map(|attachment| attachment.payload.clone()),
+                        None => {
+                            stored_row = true;
+                            None
+                        }
+                    },
+                    None => None,
+                },
                 _ => None,
             };
             let payload = match payload {
                 Some(payload) => payload,
                 None => {
-                    if snapshot.plane_readiness(&path, FamilyPlane::Trigram)
-                        != Some(&super::readiness::PlaneState::ready(&key))
+                    if !stored_row
+                        && snapshot.plane_readiness(&path, FamilyPlane::Trigram)
+                            != Some(&super::readiness::PlaneState::ready(&key))
                     {
                         return Err(format!("lexical payload not ready: {}", absolute.display()));
                     }
