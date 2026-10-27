@@ -143,10 +143,7 @@ fn read_tiers_from(
         // Shared open: on Windows no reader of this file may block a tool that
         // replaces it while this handle lives.
         let read = crate::config::open_config_file(user_path)
-            .and_then(|file| crate::subc_config::read_bounded_config(
-                file,
-                CONFIG_READ_LIMIT,
-            ));
+            .and_then(|file| crate::subc_config::read_bounded_config(file, CONFIG_READ_LIMIT));
         if !matches!(&read, Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
             let doc =
                 read.unwrap_or_else(|error| format!("unreadable user configuration: {error}"));
@@ -159,10 +156,7 @@ fn read_tiers_from(
     }
 
     if let Ok(doc) = crate::config::open_config_file(project_config_path)
-        .and_then(|file| crate::subc_config::read_bounded_config(
-            file,
-            CONFIG_READ_LIMIT,
-        ))
+        .and_then(|file| crate::subc_config::read_bounded_config(file, CONFIG_READ_LIMIT))
     {
         tiers.push(ConfigTier {
             tier: "project".to_string(),
@@ -217,10 +211,7 @@ pub fn catalog_disabled_tools(user_config_path: Option<&Path>) -> Vec<String> {
         .and_then(|path| {
             migrate_user_file(path);
             let doc = crate::config::open_config_file(path)
-                .and_then(|file| crate::subc_config::read_bounded_config(
-                    file,
-                    CONFIG_READ_LIMIT,
-                ))
+                .and_then(|file| crate::subc_config::read_bounded_config(file, CONFIG_READ_LIMIT))
                 .ok()?;
             Some(ConfigTier {
                 tier: "user".to_string(),
