@@ -148,7 +148,7 @@ impl Wire {
             target,
             identity: subc_protocol::BindIdentity::new(
                 &self.root,
-                "occipital-test",
+                "runner",
                 &format!("session-{channel}"),
             ),
             principal: Some(principal),
