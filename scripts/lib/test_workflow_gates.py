@@ -672,7 +672,9 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(job["env"]["CARGO_INCREMENTAL"], "0")
         self.assertNotIn("CARGO_PROFILE_TEST_CODEGEN_UNITS", job["env"])
-        self.assertEqual(job["timeout-minutes"], "30")
+        # 45 minutes: the split build still runs 19-28 min, and a slow
+        # macOS runner has reached 30.
+        self.assertEqual(job["timeout-minutes"], "45")
         cargo_steps = [step["run"] for step in job["steps"] if "run" in step]
         build_steps = [command for command in cargo_steps if command.startswith("cargo ")]
         self.assertEqual(len(build_steps), 3)
