@@ -3953,7 +3953,10 @@ fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
     if std::path::Path::new("armed").exists() {
         let out = std::env::var("OUT_DIR").unwrap();
-        std::fs::write("check-started", &out).unwrap();
+        // Rename into place so the test never reads the file between its
+        // creation and the write (it once read an empty path that way).
+        std::fs::write("check-started.tmp", &out).unwrap();
+        std::fs::rename("check-started.tmp", "check-started").unwrap();
         std::thread::sleep(std::time::Duration::from_secs(8));
     }
 }
