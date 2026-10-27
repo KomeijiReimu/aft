@@ -1000,6 +1000,7 @@ fn lifecycle_pty_setup_failure_terminates_and_reaps_child() {
         .with(|failure| *failure.borrow_mut() = Some((dir.path().join("ready"), pid.clone())));
     let mut spawned_pgid = None;
     let result = try_spawn_pty(
+        &super::registry::BgTaskRegistry::new(Default::default()),
         &SpawnPlan::Unsandboxed,
         "bash-0000000000000901",
         "session",
@@ -1041,6 +1042,7 @@ fn approved_pty_worker_admission_failure(worker: super::worker_thread::Worker) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         super::worker_thread::with_refusal(worker, || {
             try_spawn_pty(
+                &super::registry::BgTaskRegistry::new(Default::default()),
                 &SpawnPlan::Unsandboxed,
                 "bash-0000000000000010",
                 "session",

@@ -272,6 +272,14 @@ fn secret_bash_real_plan_precedence_and_untrusted_request_scope() {
         assert_eq!(code(&reply), Some("secrets_env_conflict"));
     }
     assert_eq!(vault.resolves.load(Ordering::SeqCst), 0);
+    ctx.update_config(|config| {
+        config
+            .bash
+            .env
+            .insert("NO_PROXY".into(), "localhost".into());
+    });
+    let reply = with_vault(vault.clone(), || crate::commands::bash::handle(&req, &ctx));
+    assert_eq!(code(&reply), Some("secrets_env_conflict"));
 }
 
 #[cfg(unix)]
@@ -335,8 +343,18 @@ fn native_pipeline() {
     let vault = Vault::new(listener.local_addr().unwrap().port());
     let seen = Arc::new(AtomicUsize::new(0));
     let seen_server = seen.clone();
-    let encoded = base64::engine::general_purpose::STANDARD.encode(KEY);
-    let body = format!("{}\n{encoded}\n", std::str::from_utf8(KEY).unwrap());
+    let encodings = vec![
+        std::str::from_utf8(KEY).unwrap().to_owned(),
+        base64::engine::general_purpose::STANDARD.encode(KEY),
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(KEY),
+        base64::engine::general_purpose::URL_SAFE.encode(KEY),
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(KEY),
+        KEY.iter().map(|byte| format!("{byte:02x}")).collect(),
+        KEY.iter().map(|byte| format!("{byte:02X}")).collect(),
+        KEY.iter().map(|byte| format!("%{byte:02X}")).collect(),
+        KEY.iter().map(|byte| format!("%{byte:02x}")).collect(),
+    ];
+    let body = encodings.join("\n");
     let server = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(30);
         while seen_server.load(Ordering::SeqCst) < 4 && Instant::now() < deadline {
@@ -379,19 +397,59 @@ fn native_pipeline() {
         assert_eq!(seen_server.load(Ordering::SeqCst), 4);
     });
     let ctx = context(root.path(), storage.path());
+    let memory_probe = root.path().join("memory-probe.py");
+    std::fs::write(&memory_probe, r#"import ctypes, os, sys
+pid = int(sys.argv[1])
+if sys.platform == 'darwin':
+    lib = ctypes.CDLL('/usr/lib/libSystem.B.dylib')
+    port = ctypes.c_uint(0)
+    assert lib.task_for_pid(lib.mach_task_self(), pid, ctypes.byref(port)) != 0, 'daemon task port exposed'
+else:
+    try:
+        f = open('/proc/%d/mem' % pid, 'rb')
+    except PermissionError:
+        pass
+    else:
+        f.close()
+        raise AssertionError('daemon memory exposed')
+    assert ctypes.CDLL(None).ptrace(16, pid, 0, 0) == -1, 'daemon ptrace exposed'
+paths = [os.environ[k] for k in ['SSL_CERT_FILE', 'CURL_CA_BUNDLE', 'NODE_EXTRA_CA_CERTS', 'REQUESTS_CA_BUNDLE', 'GIT_SSL_CAINFO']]
+assert len(set(paths)) == 1
+assert open(paths[0], 'rb').read().count(b'BEGIN CERTIFICATE') > 1
+"#).unwrap();
     for (index, pty) in [false, true].into_iter().enumerate() {
         let gate = root.path().join(format!("go-{index}"));
         let command = format!("while [ ! -f '{}' ]; do sleep 0.05; done; test \"$HTTPS_PROXY\" = \"$https_proxy\" && test \"$HTTP_PROXY\" = \"$http_proxy\" && test -z \"${{NO_PROXY+x}}\" && test -z \"${{no_proxy+x}}\" && test -z \"${{ALL_PROXY+x}}\" && test -z \"${{all_proxy+x}}\" || exit 70; curl --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; curl --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; sleep 30", gate.display(), vault.port, vault.port);
+        let command = format!(
+            "python3 '{}' {} || exit 71; {command}",
+            memory_probe.display(),
+            std::process::id()
+        );
         let mut req = request(&command);
         req.params["params"]["pty"] = json!(pty);
+        req.params["params"]["env"] =
+            json!({"SSL_CERT_FILE":"/must-not-read-tool-supplied-trust-path"});
         let mut lifetime = stamp("worker");
         lifetime.scope_epoch = index as u64 + 1;
-        let response = with_vault(vault.clone(), || {
-            crate::subc::with_secret_identity_for_test(root.path(), lifetime.clone(), || {
-                super::super::registry::with_scope_spawn(Some(lifetime.clone()), || {
-                    crate::commands::bash::handle(&req, &ctx)
-                })
+        if pty {
+            lifetime = serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"secret-run","kind":"ephemeral","scope_epoch":1,"owner_authorized":true,"parent":{"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"secret-bash","scope_epoch":1},"parent_state":"linked"})).unwrap();
+        }
+        let launch = || {
+            super::super::registry::with_scope_spawn(Some(lifetime.clone()), || {
+                crate::commands::bash::handle(&req, &ctx)
             })
+        };
+        let response = with_vault(vault.clone(), || {
+            if pty {
+                crate::subc::with_secret_bound_identity_for_test(
+                    root.path(),
+                    stamp("head"),
+                    lifetime.clone(),
+                    launch,
+                )
+            } else {
+                crate::subc::with_secret_identity_for_test(root.path(), lifetime.clone(), launch)
+            }
         });
         assert!(response.success, "{response:?}");
         let task_id = response.data["task_id"].as_str().unwrap();
@@ -415,6 +473,41 @@ fn native_pipeline() {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(seen.load(Ordering::SeqCst), (index + 1) * 2);
+        let snapshot = loop {
+            let snapshot = ctx
+                .bash_background()
+                .status(
+                    task_id,
+                    "secret-bash",
+                    Some(root.path()),
+                    Some(storage.path()),
+                    0,
+                )
+                .unwrap();
+            assert!(!snapshot
+                .output_preview
+                .contains(std::str::from_utf8(KEY).unwrap()));
+            if snapshot
+                .output_preview
+                .matches("{{ck-secret:test}}")
+                .count()
+                >= encodings.len() * 2
+            {
+                break snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "proxy output missing: {snapshot:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let pid = snapshot.child_pid.unwrap() as i32;
+        assert_eq!(
+            unsafe { libc::getsid(pid) },
+            pid,
+            "command must lead its own session"
+        );
+        assert_eq!(unsafe { libc::getpgid(pid) }, pid);
         ctx.bash_background().kill_scope(&lifetime);
         assert!(
             std::net::TcpStream::connect(address).is_err(),
@@ -423,22 +516,32 @@ fn native_pipeline() {
     }
     server.join().unwrap();
     assert_eq!(vault.materials.load(Ordering::SeqCst), 4);
-    fn scan(path: &Path, encoded: &[u8]) {
+    for record in vault.audits.lock().unwrap().iter() {
+        let serialized = record.to_json_line_with_key(KEY).unwrap();
+        for encoded in &encodings {
+            assert!(!serialized.contains(encoded));
+        }
+    }
+    fn scan(path: &Path, encodings: &[String]) {
         for entry in std::fs::read_dir(path).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {
-                scan(&path, encoded);
+                scan(&path, encodings);
             } else if let Ok(bytes) = std::fs::read(&path) {
                 assert!(
                     !bytes.windows(KEY.len()).any(|window| window == KEY),
                     "key on disk at {}",
                     path.display()
                 );
-                assert!(
-                    !bytes.windows(encoded.len()).any(|window| window == encoded),
-                    "encoded key on disk at {}",
-                    path.display()
-                );
+                for encoded in encodings {
+                    assert!(
+                        !bytes
+                            .windows(encoded.len())
+                            .any(|window| window == encoded.as_bytes()),
+                        "encoded key on disk at {}",
+                        path.display()
+                    );
+                }
                 if path
                     .file_name()
                     .is_some_and(|name| name == "environment.bin")
@@ -451,5 +554,5 @@ fn native_pipeline() {
             }
         }
     }
-    scan(storage.path(), encoded.as_bytes());
+    scan(storage.path(), &encodings);
 }

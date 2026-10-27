@@ -569,7 +569,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         },
         None => None,
     };
-    let mut response = crate::bash_background::spawn(
+    let mut response = crate::bash_background::spawn_with_secrets(
         &req.id,
         req.session(),
         &execution_command,

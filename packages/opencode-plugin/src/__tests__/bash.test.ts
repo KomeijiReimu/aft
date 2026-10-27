@@ -716,13 +716,16 @@ describe("OpenCode bash adapter", () => {
     for (const command of ["printf '{{ck-secret:test}}'", "printf '{{ck-secret:malformed'"]) {
       const ask = mockAsk();
       const { tool: bash } = createHarness(
-        () => { throw new BridgeTransportUnavailableError("offline"); },
+        () => {
+          throw new BridgeTransportUnavailableError("offline");
+        },
         undefined,
         false,
         { bash: { host_fallback: true } } as PluginContext["config"],
       );
-      await expect(bash.execute({ command }, createMockSdkContext({ ask })))
-        .rejects.toThrow("Secret placeholder commands cannot run through the host fallback.");
+      await expect(bash.execute({ command }, createMockSdkContext({ ask }))).rejects.toThrow(
+        "Secret placeholder commands cannot run through the host fallback.",
+      );
       expect(ask).not.toHaveBeenCalled();
     }
   });

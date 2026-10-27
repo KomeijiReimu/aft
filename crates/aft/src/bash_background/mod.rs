@@ -1056,7 +1056,7 @@ impl TaskSlot {
 /// background feature and takes a background slot. A foreground command
 /// (`false`, and not a PTY) always starts; see [`TaskSlot::Foreground`].
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn(
+pub(crate) fn spawn_with_secrets(
     request_id: &str,
     session_id: &str,
     command: &str,
@@ -1423,6 +1423,54 @@ pub(crate) fn spawn(
             }
         }
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn(
+    request_id: &str,
+    session_id: &str,
+    command: &str,
+    shell: BashShell,
+    shell_path: PathBuf,
+    workdir: Option<PathBuf>,
+    env: Option<HashMap<String, String>>,
+    hard_kill: HardKill,
+    ctx: &AppContext,
+    require_background_flag: bool,
+    notify_on_completion: bool,
+    compressed: bool,
+    pty: bool,
+    pty_rows: u16,
+    pty_cols: u16,
+    scanner_report: Vec<PermissionAsk>,
+    scanner_requires_approval: bool,
+    host_escalation: Option<HostEscalationAttempt>,
+    remote: Option<RemoteLaunch>,
+) -> Response {
+    spawn_with_secrets(
+        request_id,
+        session_id,
+        command,
+        shell,
+        shell_path,
+        workdir,
+        env,
+        hard_kill,
+        ctx,
+        require_background_flag,
+        notify_on_completion,
+        compressed,
+        pty,
+        pty_rows,
+        pty_cols,
+        scanner_report,
+        scanner_requires_approval,
+        host_escalation,
+        remote,
+        #[cfg(unix)]
+        None,
+    )
 }
 
 /// Decide, in one place, whether a jailed worker's shell receives the host-local

@@ -464,6 +464,48 @@ pub(super) fn current_identity() -> Option<RouteIdentity> {
     CURRENT_IDENTITY.with(|slot| slot.borrow().clone())
 }
 
+pub(crate) fn current_secret_audit_scope() -> Option<SecretScope> {
+    current_call_scopes()
+        .ok()
+        .map(|(scopes, _)| scopes.authorization)
+        .or_else(|| {
+            current_identity()
+                .and_then(|identity| identity.scope.as_ref().map(SecretScope::from_stamp))
+        })
+}
+
+#[cfg(test)]
+pub(super) struct SecretContextRestoreCheck {
+    scopes: Result<(CallScopes, EligibilityForm), Ineligibility>,
+    had_identity: bool,
+}
+
+#[cfg(test)]
+impl SecretContextRestoreCheck {
+    pub(super) fn new() -> Self {
+        Self {
+            scopes: current_call_scopes(),
+            had_identity: current_identity().is_some(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for SecretContextRestoreCheck {
+    fn drop(&mut self) {
+        assert_eq!(
+            current_call_scopes(),
+            self.scopes,
+            "secret scopes leaked on the executor thread"
+        );
+        assert_eq!(
+            current_identity().is_some(),
+            self.had_identity,
+            "secret identity leaked on the executor thread"
+        );
+    }
+}
+
 pub(super) struct SecretIdentityGuard(Option<RouteIdentity>);
 
 impl SecretIdentityGuard {
@@ -488,7 +530,15 @@ pub(crate) fn with_secret_identity_for_test<R>(
     stamp: ScopeStamp,
     run: impl FnOnce() -> R,
 ) -> R {
-    let identity = RouteIdentity(Arc::new(super::RouteIdentityData {
+    let identity = RouteIdentity(Arc::new(test_identity_data(root, stamp)));
+    let _scopes = SecretScopeGuard::install(Some(call_scopes(&identity)));
+    let _identity = SecretIdentityGuard::install(identity);
+    run()
+}
+
+#[cfg(test)]
+fn test_identity_data(root: &std::path::Path, stamp: ScopeStamp) -> super::RouteIdentityData {
+    super::RouteIdentityData {
         root: crate::path_identity::ProjectRootId::from_path(root).unwrap(),
         project_root: root.to_owned(),
         harness: "runner".into(),
@@ -504,7 +554,30 @@ pub(crate) fn with_secret_identity_for_test<R>(
         run_scope: std::sync::OnceLock::new(),
         made_tool_call: std::sync::atomic::AtomicBool::new(false),
         run_owner: None,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn with_secret_bound_identity_for_test<R>(
+    root: &std::path::Path,
+    head: ScopeStamp,
+    lifetime: ScopeStamp,
+    run: impl FnOnce() -> R,
+) -> R {
+    let head = RouteIdentity(Arc::new(test_identity_data(root, head)));
+    let mut data = test_identity_data(root, lifetime);
+    data.call_mode = CallMode::Codemode;
+    data.run_owner = Some(Arc::new(super::codemode::RunOwner {
+        agent_id: "secret-agent".into(),
+        run_id: "secret-run".into(),
+        head: head.clone(),
+        run_route: super::RouteChannel {
+            channel: 7,
+            epoch: 1,
+        },
+        run_principal: head.spawn_principal.clone(),
     }));
+    let identity = RouteIdentity(Arc::new(data));
     let _scopes = SecretScopeGuard::install(Some(call_scopes(&identity)));
     let _identity = SecretIdentityGuard::install(identity);
     run()

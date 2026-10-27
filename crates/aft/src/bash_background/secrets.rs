@@ -56,9 +56,7 @@ pub(crate) fn vault() -> Arc<dyn SecretVault> {
 
 pub(crate) fn refusal(id: &str, labels: &[String], code: &str, message: &str) -> Response {
     let vault = vault();
-    let scope = crate::subc::current_call_scopes()
-        .ok()
-        .map(|(scopes, _)| scopes.authorization.to_scope_ref());
+    let scope = crate::subc::current_secret_audit_scope().map(|scope| scope.to_scope_ref());
     for label in labels {
         let mut record = secret_rules::audit::AuditRecordV1::new(
             crate::secret::now_ms(),
@@ -175,6 +173,9 @@ pub(crate) fn authorize(
     mut preflight: Preflight,
     env: &HashMap<String, String>,
 ) -> Result<Launch, Response> {
+    if env_conflicts(env) {
+        return Err(refusal(id, labels, "secrets_env_conflict", ENV_CONFLICT));
+    }
     let (scopes, _) = crate::subc::current_call_scopes().map_err(|reason| {
         outcome_response(
             id,
@@ -229,7 +230,7 @@ pub(crate) fn authorize(
         .temp_dir()
         .ok_or_else(|| refusal(id, labels, "secrets_sandbox_required", SANDBOX_REQUIRED))?
         .join("secret-trust.pem");
-    write_bundle(&bundle, proxy.ca_pem(), env)
+    write_bundle(&bundle, proxy.ca_pem())
         .map_err(|_| refusal(id, labels, "secrets_unavailable", PROXY_UNAVAILABLE))?;
     Ok(Launch {
         preflight,
@@ -252,14 +253,12 @@ fn outcome_response(id: &str, labels: &[String], outcome: crate::secret::LabelOu
 }
 
 #[cfg(unix)]
-fn write_bundle(path: &Path, ca: &str, env: &HashMap<String, String>) -> Result<(), ()> {
+fn write_bundle(path: &Path, ca: &str) -> Result<(), ()> {
     let mut pem = native_roots()?;
     for key in TRUST_KEYS {
-        if let Some(path) = env
-            .get(key)
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os(key).map(PathBuf::from))
-        {
+        // Only daemon-inherited trust paths are authority to read a file.
+        // Tool env values are replaced, not read on the caller's behalf.
+        if let Some(path) = std::env::var_os(key).map(PathBuf::from) {
             pem.extend(std::fs::read(path).map_err(|_| ())?);
             pem.push(b'\n');
         }

@@ -233,9 +233,11 @@ mod idle_root_retention_tests;
 mod perf_sweep;
 mod secret_consent;
 #[cfg(test)]
+pub(crate) use secret_consent::with_secret_bound_identity_for_test;
+#[cfg(test)]
 pub(crate) use secret_consent::with_secret_identity_for_test;
 pub(crate) use secret_consent::{
-    current_call_scopes, resolve_current_secret_label, LaunchDecision,
+    current_call_scopes, current_secret_audit_scope, resolve_current_secret_label, LaunchDecision,
 };
 mod standalone;
 #[doc(hidden)]
