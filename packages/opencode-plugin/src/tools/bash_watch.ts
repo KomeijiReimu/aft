@@ -147,7 +147,7 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
         ),
       timeoutMs: optionalInt(1, 1800000).describe(WATCH_TIMEOUT_PARAM_DESCRIPTION),
       deliver: z
-        .enum(["each_line"])
+        .literal("each_line")
         .optional()
         .describe(
           "Async-only: batch every matching complete line, fold consecutive duplicates, and report cap drops with byte offsets.",

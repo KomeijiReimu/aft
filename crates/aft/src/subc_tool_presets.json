@@ -154,9 +154,7 @@
         "deliver": {
           "description": "Rejected: this watch always waits synchronously; deliver requires background:true with an async notification channel.",
           "type": "string",
-          "enum": [
-            "each_line"
-          ]
+          "const": "each_line"
         },
         "once": {
           "description": "Accepted for compatibility; only an async watch reads it.",
