@@ -1044,8 +1044,56 @@ async fn proxy_scope_stop_closes_listener_and_open_connections() {
     );
     proxy.stop_if_scope_ended(&scope("head"));
     assert!(!proxy.state.stopped.load(Ordering::Acquire));
+    // Hold a connection the proxy accepts but never serves: the CONNECT
+    // headers stay incomplete, so no dispatch (and no vault call) can
+    // happen before the stop below, however the accept race resolves.
+    let mut held = TcpStream::connect(proxy.address()).await.unwrap();
+    let _ = held
+        .write_all(b"CONNECT 127.0.0.1:9 HTTP/1.1\r\nHost: 127.0.0.1:9\r\n")
+        .await;
     proxy.stop_if_scope_ended(&scope("run"));
-    assert!(TcpStream::connect(proxy.address()).await.is_err());
+    assert!(proxy.state.stopped.load(Ordering::Acquire));
+    // stop() joins the serve thread, which drops the only listener fd, so
+    // the listener is closed before stop() returns and a fresh connect is
+    // normally refused. One can still succeed when the kernel completed
+    // the handshake before the close or the ephemeral port was recycled;
+    // such a socket must never be served: no success response, no vault.
+    if let Ok(mut stray) = TcpStream::connect(proxy.address()).await {
+        let url = proxy.proxy_url();
+        let token = url
+            .strip_prefix("http://")
+            .and_then(|rest| rest.split_once(":@"))
+            .map(|(token, _)| token.to_owned());
+        if let Some(token) = token {
+            let credentials = base64::engine::general_purpose::STANDARD.encode(format!("{token}:"));
+            let authority = server.address;
+            let _ = stray
+                .write_all(
+                    format!(
+                        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\
+                         Proxy-Authorization: Basic {credentials}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        }
+        let mut reply = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), stray.read_to_end(&mut reply)).await;
+        assert!(
+            !reply.starts_with(b"HTTP/1.1 200"),
+            "post-stop connection was served: {}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+    // The held pre-stop connection is closed by the stop instead of being
+    // served: the read ends (EOF or reset) rather than hanging, and the
+    // vault saw nothing from it.
+    let mut buf = Vec::new();
+    let closed = tokio::time::timeout(Duration::from_secs(5), held.read_to_end(&mut buf)).await;
+    assert!(
+        closed.is_ok(),
+        "stop must close the accepted-but-unserved connection"
+    );
     assert_eq!(
         client.request(
             "/approved",
