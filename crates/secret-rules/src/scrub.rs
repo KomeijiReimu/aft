@@ -426,9 +426,20 @@ fn can_start_match(key: &[u8], byte: u8) -> bool {
 ///
 /// Base64 is often split by whitespace (wrapped lines, or groups of four
 /// separated by spaces), which a reader removes before decoding. Runs
-/// separated by short whitespace gaps are therefore also decoded as one
+/// separated by whitespace of any length are therefore also decoded as one
 /// group; a key found there replaces the runs its bytes came from, gaps
 /// included.
+///
+/// In a stream, a split spelling is caught whenever it fits in the holdback
+/// window ([`overlap_for`], `6k - 1` bytes for a `k`-byte key), because the
+/// window is matched whole before anything is released. A `k`-byte key needs
+/// at most `ceil(4k / 3) + 3` base64 characters at any alignment, which
+/// leaves `6k - 1 - ceil(4k / 3) - 3` bytes (70 for a 16-byte key) for the
+/// gaps: a two-byte gap after every character, or a three-space gap between
+/// four-character groups, always fits. A spelling whose gaps are longer than
+/// that is caught only when it arrives within one push; a placeholder fetch
+/// scrubs the whole body in one push and also checks the finished document
+/// with [`reveals_any`].
 fn find_base64_spans(window: &[u8], key: &[u8]) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     let mut runs = Vec::new();
@@ -466,14 +477,10 @@ fn find_base64_spans(window: &[u8], key: &[u8]) -> Vec<(usize, usize)> {
     merged
 }
 
-/// The longest whitespace gap allowed between two runs of one base64 group: a
-/// `\r\n` line break or one separator. Keeping it short keeps a split
-/// spelling of the key within the scrubber's holdback window.
-const MAX_BASE64_GAP: usize = 2;
-
+/// True when `gap`, the bytes between two base64 runs, is whitespace a
+/// reader removes before decoding (of any length).
 fn is_base64_gap(gap: &[u8]) -> bool {
     !gap.is_empty()
-        && gap.len() <= MAX_BASE64_GAP
         && gap
             .iter()
             .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
@@ -1492,5 +1499,21 @@ mod tests {
              Ben &amp; Jerry &lt;b&gt; &#169;, `\"%41%42\"`, <span>left</span><em>right</em>.\n\t\n"
             .repeat(5000);
         assert!(!reveals_key(ordinary.as_bytes(), key));
+    }
+
+    #[test]
+    fn base64_split_by_long_whitespace_runs_is_scrubbed() {
+        let key = b"0123456789abcdef";
+        let inputs: [&[u8]; 3] = [
+            b"MDEy   MzQ1   Njc4   OWFi   Y2Rl   Zg==",
+            b"MDEyMzQ1\r\n\r\n\r\nNjc4OWFi\n\n\n\nY2RlZg==",
+            b"MDEy \t \t MzQ1Njc4OWFiY2RlZg",
+        ];
+        for input in inputs {
+            let out = scrub_bytes(key, "test", input).unwrap();
+            let shown = String::from_utf8_lossy(&out).into_owned();
+            assert!(!out.windows(4).any(|w| w == b"Njc4"), "{shown}");
+            assert!(reveals_key(input, key));
+        }
     }
 }
