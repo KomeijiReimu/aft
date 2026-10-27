@@ -520,16 +520,19 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
         ) {
             Some(status) => {
                 let status = status.clone();
-                // A views-on root reports its checkout view's last built
-                // index. A readiness sample runs on the search path, so it
-                // never builds one: the fill worker builds it before the
-                // lane is served and after every fill, and a search builds
-                // it if it is still out of date. Views-off roots never have
-                // a checkout view.
+                // A views-on root reports the index its checkout view serves
+                // for the installed snapshot. The fill worker builds it
+                // before the lane is served and after every fill, so a sample
+                // normally finds it built, possibly out of date (the search
+                // itself rebuilds an out-of-date one). Between a publication
+                // and the worker's rebuild there is none; `serving_index`
+                // then builds it, because without a snapshot the semantic
+                // lane would silently drop out of this search. Views-off
+                // roots never have a checkout view.
                 let checkout_index = matches!(status, SemanticIndexStatus::Ready { .. })
                     .then(|| self.ctx.checkout_semantic_runtime())
                     .flatten()
-                    .and_then(|runtime| runtime.cached_index());
+                    .and_then(|runtime| runtime.serving_index());
                 if let Some(index) = checkout_index {
                     SemanticReadiness {
                         status,
@@ -9912,8 +9915,8 @@ mod tests {
     }
 
     /// A readiness sample runs on the search path, so it reports the views-on
-    /// checkout index the worker last built and never builds one, even when
-    /// that index is out of date for the installed snapshot.
+    /// checkout index the worker last built for the installed snapshot and
+    /// does not rebuild it, even when that index is out of date.
     #[test]
     fn readiness_sample_never_builds_the_checkout_semantic_index() {
         use extensions::ReadinessSource as _;
