@@ -190,6 +190,154 @@ pub(super) fn with_publication_probe<T>(view_dir: &Path, read: impl FnOnce() -> 
     read()
 }
 
+/// Disk-limit eviction refuses a view while this process has any of its
+/// SQLite files open. Cleanup reads a view's pointer on a short-lived
+/// connection, and the read before it knows whether there is anything to
+/// clean runs without the family registry barrier eviction checks under (a
+/// pass with nothing to clean leaves the registry untouched). This gate lets
+/// eviction wait for such reads to close instead of mistaking an idle view
+/// for an open one, and keeps new reads out until eviction is done.
+#[derive(Default)]
+struct CleanupReadState {
+    reading: usize,
+    excluded: bool,
+}
+
+#[derive(Default)]
+struct CleanupReadGate {
+    state: Mutex<CleanupReadState>,
+    changed: std::sync::Condvar,
+}
+
+fn cleanup_read_gate(view_dir: &Path) -> Arc<CleanupReadGate> {
+    type Key = Vec<std::ffi::OsString>;
+    static GATES: OnceLock<Mutex<HashMap<Key, Weak<CleanupReadGate>>>> = OnceLock::new();
+    let key = crate::production_storage::comparison_key(view_dir, cfg!(windows));
+    let mut gates = GATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    gates.retain(|_, gate| gate.strong_count() != 0);
+    if let Some(gate) = gates.get(&key).and_then(Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(CleanupReadGate::default());
+    gates.insert(key, Arc::downgrade(&gate));
+    gate
+}
+
+/// One cleanup read of a view's pointer, from before its connection opens
+/// until after it closes.
+struct CleanupRead {
+    gate: Arc<CleanupReadGate>,
+}
+
+impl CleanupRead {
+    fn enter(view_dir: &Path) -> Self {
+        let gate = cleanup_read_gate(view_dir);
+        {
+            let mut state = gate
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while state.excluded {
+                state = gate
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            state.reading += 1;
+        }
+        Self { gate }
+    }
+}
+
+impl Drop for CleanupRead {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.reading -= 1;
+        drop(state);
+        self.gate.changed.notify_all();
+    }
+}
+
+/// Keeps cleanup reads of one view out while held. See [`exclude_cleanup_reads`].
+pub(super) struct CleanupReadsExcluded {
+    gate: Arc<CleanupReadGate>,
+}
+
+impl Drop for CleanupReadsExcluded {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.excluded = false;
+        drop(state);
+        self.gate.changed.notify_all();
+    }
+}
+
+/// Waits until no cleanup read of `view_dir` is in progress in this process,
+/// and keeps new ones from starting while the returned guard lives. `None`
+/// when a read (or another exclusion) remains at `until`. Call it while
+/// holding the family registry barrier and before taking the file-identity
+/// guard: a read counts as in progress before it takes that guard to open
+/// its connection, and it never needs the barrier, so in this order every
+/// read being waited for can finish.
+pub(super) fn exclude_cleanup_reads(
+    view_dir: &Path,
+    until: Instant,
+) -> Option<CleanupReadsExcluded> {
+    let gate = cleanup_read_gate(view_dir);
+    let mut state = gate
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The registry barrier already lets only one eviction check of a view
+    // run at a time in this process; waiting here keeps that true even so.
+    while state.excluded {
+        let Some(left) = until.checked_duration_since(Instant::now()) else {
+            return None;
+        };
+        state = gate
+            .changed
+            .wait_timeout(state, left)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+    }
+    state.excluded = true;
+    #[cfg(test)]
+    if state.reading != 0 {
+        drop(state);
+        crate::storage_retention::test_hook(view_dir, "eviction-awaits-cleanup-read");
+        state = gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    while state.reading != 0 {
+        let Some(left) = until.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        state = gate
+            .changed
+            .wait_timeout(state, left)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+    }
+    let closed = state.reading == 0;
+    drop(state);
+    let excluded = CleanupReadsExcluded { gate };
+    // Dropping the guard lets waiting reads go on when this one gives up.
+    closed.then_some(excluded)
+}
+
 pub(super) fn schedule_generation_sweep(view: ViewStore) {
     let path = view.view_dir().to_path_buf();
     let jobs = GENERATION_SWEEPS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -832,10 +980,13 @@ impl ViewStore {
     /// read-only connection that creates no WAL or SHM file and is closed
     /// before this returns.
     fn pointer_census(&self) -> Result<PointerCensus> {
+        let _read = CleanupRead::enter(self.view_dir());
         let connection = crate::db::file_identity::IdentityConnection::open_census(
             &self.pointer_path(),
             "views::generation::census_pointer",
         )?;
+        #[cfg(test)]
+        crate::storage_retention::test_hook(self.view_dir(), "pointer-census-open");
         Ok(read_pointer_census(&connection)?)
     }
 
