@@ -18264,12 +18264,6 @@ mod tests {
         let (registry, db, _) = registry_with_db_and_frames(storage.path());
         let session = "recording-failure-session";
         let task_id = "bash-000000000000face";
-        // Below, each pass is expected to read and retry this one task. A duration
-        // limit could stop the scan before it reads the task at all.
-        registry.set_project_replay_scan_budget_for_test(
-            PROJECT_REPLAY_SCAN_ENTRY_BUDGET,
-            Duration::from_secs(60),
-        );
         write_running_project_task(storage.path(), project.path(), session, task_id);
         db.lock().unwrap().execute_batch(
             "CREATE TRIGGER reject_discovery BEFORE INSERT ON bash_tasks BEGIN SELECT RAISE(FAIL, 'fixture recording refused'); END;"
