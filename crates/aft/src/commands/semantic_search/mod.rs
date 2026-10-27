@@ -15145,15 +15145,28 @@ mod tests {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let started = std::time::Instant::now();
-        let response = response_value(handle_semantic_search(
-            &semantic_request("contention_marker", 5),
-            &ctx,
-        ));
+        // A first-search wait far longer than the time bound below: if the
+        // search ever waited out that budget on the writer-held index instead
+        // of degrading at once, the bound fails.
+        let response =
+            with_first_search_index_load_wait_budget_for_test(Duration::from_secs(120), || {
+                response_value(handle_semantic_search(
+                    &semantic_request("contention_marker", 5),
+                    &ctx,
+                ))
+            });
         drop(writer_guard);
 
+        // The property is that a contended index degrades with a disclosure
+        // instead of blocking: this thread holds the write lock until the
+        // search returns, so a search that blocked on it would never return,
+        // and one that waited out the first-search budget would take 120 s.
+        // The bound sits far above the product's per-read 250 ms artifact
+        // budget so that a loaded runner's slowness cannot fail it.
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "contended search exceeded bounded response time"
+            elapsed < Duration::from_secs(30),
+            "contended search took {elapsed:?}, far past its bounded response time: {response:#?}"
         );
         assert_eq!(response["success"], true);
         assert_eq!(response["lexical_only_fallback"], true);
