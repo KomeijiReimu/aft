@@ -520,16 +520,19 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
         ) {
             Some(status) => {
                 let status = status.clone();
-                // A views-on root reports its checkout view's last built
-                // index. A readiness sample runs on the search path, so it
-                // never builds one: the fill worker builds it before the
-                // lane is served and after every fill, and a search builds
-                // it if it is still out of date. Views-off roots never have
-                // a checkout view.
+                // A views-on root reports the index its checkout view serves
+                // for the installed snapshot. The fill worker builds it
+                // before the lane is served and after every fill, so a sample
+                // normally finds it built, possibly out of date (the search
+                // itself rebuilds an out-of-date one). Between a publication
+                // and the worker's rebuild there is none; `serving_index`
+                // then builds it, because without a snapshot the semantic
+                // lane would silently drop out of this search. Views-off
+                // roots never have a checkout view.
                 let checkout_index = matches!(status, SemanticIndexStatus::Ready { .. })
                     .then(|| self.ctx.checkout_semantic_runtime())
                     .flatten()
-                    .and_then(|runtime| runtime.cached_index());
+                    .and_then(|runtime| runtime.serving_index());
                 if let Some(index) = checkout_index {
                     SemanticReadiness {
                         status,
@@ -9912,8 +9915,8 @@ mod tests {
     }
 
     /// A readiness sample runs on the search path, so it reports the views-on
-    /// checkout index the worker last built and never builds one, even when
-    /// that index is out of date for the installed snapshot.
+    /// checkout index the worker last built for the installed snapshot and
+    /// does not rebuild it, even when that index is out of date.
     #[test]
     fn readiness_sample_never_builds_the_checkout_semantic_index() {
         use extensions::ReadinessSource as _;
@@ -9965,6 +9968,72 @@ mod tests {
             runtime.plane().overlay_builds(),
             builds,
             "a readiness sample built the checkout semantic index"
+        );
+    }
+
+    /// After a fill is folded into a new generation, the worker installs that
+    /// generation before it rebuilds the scored index. A search in that window
+    /// must still see the views-on semantic lane as ready: with no snapshot the
+    /// engine plans no semantic lane and answers lexical hits only, with no
+    /// symbol names or previews, while the reply still says `semantic: ready`.
+    #[test]
+    fn readiness_sample_serves_a_freshly_published_checkout_view() {
+        use extensions::ReadinessSource as _;
+        let project = tempfile::tempdir().expect("project");
+        let storage = tempfile::tempdir().expect("storage");
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn needle() -> u8 {\n    1\n}\n").unwrap();
+        let ctx = test_context(&root);
+        let slot = ctx.checkout_semantic();
+        let (epoch, _wake) = slot.begin();
+        let runtime = Arc::new(
+            crate::views::semantic_runtime::CheckoutSemantic::new(
+                &crate::root_cache::StoragePaths::same(storage.path()),
+                "family",
+                "scope",
+                &root,
+                crate::views::semantic::SemanticProducer::current(
+                    "readiness-model",
+                    crate::semantic_index::EmbedTextCaps::default(),
+                ),
+                Arc::downgrade(slot),
+            )
+            .unwrap(),
+        );
+        runtime.load().unwrap();
+        // Fill and fold, which publishes and installs a new generation, without
+        // the scored-index rebuild the worker runs afterwards.
+        let published_before = runtime.installed().generation().name().to_owned();
+        runtime
+            .refresh(
+                crate::views::semantic::FillBudget::default(),
+                &mut |texts: Vec<String>| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
+            )
+            .unwrap();
+        assert_ne!(
+            runtime.installed().generation().name(),
+            published_before,
+            "the fill must publish a new generation"
+        );
+        assert!(slot.install(epoch, Arc::clone(&runtime)));
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
+
+        let source = RuntimeReadinessSource { ctx: &ctx };
+        let observation = source.sample();
+        let sampled = observation
+            .semantic
+            .snapshot
+            .as_ref()
+            .and_then(extensions::SemanticSnapshot::index)
+            .map(|index| index as *const crate::semantic_index::SemanticIndex);
+        assert!(
+            sampled.is_some(),
+            "a freshly published checkout view must report as ready"
+        );
+        assert_eq!(
+            sampled,
+            Some(Arc::as_ptr(&runtime.index().unwrap())),
+            "readiness must hold the index that search scores for the installed snapshot"
         );
     }
 
