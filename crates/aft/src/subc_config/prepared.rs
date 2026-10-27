@@ -148,8 +148,8 @@ fn unknown(path: &Path, error: &std::io::Error) -> ConfigObservationError {
 }
 
 fn observe(path: &Path, tier: &str) -> Result<ConfigObservation, ConfigObservationError> {
-    // Shared open: on Windows another handle on the file must not block a
-    // replacement of it while the bind reads this file.
+    // Shared open: on Windows this handle shares delete, so a tool may replace
+    // the file while the bind reads it instead of being refused access.
     let file = match crate::config::open_config_file(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
