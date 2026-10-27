@@ -33,7 +33,9 @@ use crate::secret::{
 use std::sync::Arc;
 use std::time::Duration;
 use subc_protocol::call_mode::CallMode;
-use subc_protocol::scope::{ScopeKind, ScopeStamp};
+use subc_protocol::scope::ScopeKind;
+#[cfg(test)]
+use subc_protocol::scope::ScopeStamp;
 
 const SECRET_CONSENT_TIMEOUT: Duration = Duration::from_secs(10);
 
