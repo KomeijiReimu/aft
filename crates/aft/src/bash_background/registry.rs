@@ -1155,7 +1155,14 @@ pub enum WatchdogPassCause {
 }
 
 const PROJECT_REPLAY_SCAN_ENTRY_BUDGET: usize = 512;
+// Public only so integration tests can name the production entry budget when
+// they widen the scan for a test that expects one pass to finish. The store
+// for a test-set budget is compiled out of that test build, where the setter
+// falls back to this value anyway.
+#[cfg(any(test, feature = "test-timing-hooks"))]
 pub(crate) const PROJECT_REPLAY_SCAN_TIME_BUDGET: Duration = Duration::from_millis(25);
+#[cfg(not(any(test, feature = "test-timing-hooks")))]
+const PROJECT_REPLAY_SCAN_TIME_BUDGET: Duration = Duration::from_millis(25);
 const PROJECT_REPLAY_RETRY_INITIAL: Duration = Duration::from_millis(500);
 const PROJECT_REPLAY_RETRY_MAX: Duration = Duration::from_secs(5);
 
@@ -2258,7 +2265,11 @@ impl BgTaskRegistry {
         }
     }
 
-    #[cfg(test)]
+    /// Shorten the per-pass work, or give it a duration a loaded machine cannot
+    /// exhaust, for tests that depend on how much of the scan one pass covers.
+    /// The library test build reads the stored limits; any other build ignores
+    /// them and keeps the production limits.
+    #[cfg(any(test, feature = "test-timing-hooks"))]
     pub(crate) fn set_project_replay_scan_budget_for_test(
         &self,
         entries: usize,
