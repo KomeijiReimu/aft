@@ -2425,20 +2425,19 @@ fn worker_codemode_run_cannot_see_or_kill_the_heads_bash_tasks() {
         "worker-run-head-tasks",
         Duration::from_secs(30),
         |input| async move {
-            *OBSERVED_TASK
-                .get_or_init(|| Mutex::new(None))
-                .lock()
-                .unwrap() = None;
             let mut daemon = open_scope_daemon_session(input).await;
             bind_head(&mut daemon.stream, &daemon.root1, 1, "head-session").await;
             bind_worker(&mut daemon.stream, &daemon.root2, 2).await;
             bind_run(&mut daemon.stream, &daemon.root1, 4, worker_run_stamp()).await;
-            // The head starts a background task in its own session.
+            // The head starts a background task in its own session. The comment
+            // names a path in this test's own root, so the observed-task lookup
+            // finds this task and not another test's.
+            let marker = daemon.root1.join("head-background-task");
             call(
                 &mut daemon.stream,
                 1,
                 100,
-                json!({"command":"sleep 30", "background":true}),
+                json!({"command": format!("sleep 30 # {}", marker.display()), "background":true}),
             )
             .await;
             let launch = read_frame_timeout(&mut daemon.stream, "head background launch").await;
@@ -2448,13 +2447,7 @@ fn worker_codemode_run_cannot_see_or_kill_the_heads_bash_tasks() {
                 "{}",
                 String::from_utf8_lossy(&launch.body)
             );
-            let (registry, task) = OBSERVED_TASK
-                .get()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .clone()
-                .unwrap();
+            let (registry, task) = observed_task(&marker).await;
             assert!(registry
                 .status(&task, "head-session", None, None, 0)
                 .is_some());
