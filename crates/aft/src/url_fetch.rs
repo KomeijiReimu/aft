@@ -176,6 +176,15 @@ impl UrlFetchError {
         }
     }
 
+    /// This error reworded for a refusal that came after a request carrying a
+    /// key was sent; any other error is returned unchanged.
+    fn after_secret_sent(mut self) -> Self {
+        if let Some(rest) = self.message.strip_prefix(SECRET_FETCH_REFUSED) {
+            self.message = format!("{SECRET_FETCH_REFUSED_AFTER_SEND}{rest}");
+        }
+        self
+    }
+
     fn http_status(status: u16, message: impl Into<String>) -> Self {
         Self {
             status: Some(status),
@@ -726,11 +735,18 @@ pub fn cached_url_document(
 pub(crate) const SECRET_FETCH_DIR: &str = "url_secret_fetch";
 
 /// The start of every refusal a placeholder fetch makes on its own (as opposed
-/// to a refusal the vault decided). One constant so the wording is reviewed
-/// once; the message goes on to name a stable reason token and the URL as the
-/// agent wrote it, with the placeholder and never a key.
+/// to a refusal the vault decided) before any request carrying a key was sent.
+/// One constant so the wording is reviewed once; the message goes on to name a
+/// stable reason token and the URL as the agent wrote it, with the
+/// placeholder and never a key.
 pub(crate) const SECRET_FETCH_REFUSED: &str =
     "Secret placeholder fetch refused; no request carrying the secret was sent";
+
+/// The start of the same refusals once a request carrying a key has been sent:
+/// the response (or a later hop) was refused, so the claim above would be
+/// false.
+pub(crate) const SECRET_FETCH_REFUSED_AFTER_SEND: &str =
+    "Secret placeholder fetch stopped after a request carrying the secret was sent; its response was not used";
 
 /// A stand-in key used only to plan where a placeholder fetch would
 /// substitute. Real vault bytes are asked for only once a rule matches.
@@ -889,6 +905,27 @@ pub fn fetch_url_with_secrets(
     options: UrlFetchOptions,
     secrets: &SecretFetch<'_>,
 ) -> Result<PathBuf, UrlFetchError> {
+    let key_sent = std::cell::Cell::new(false);
+    fetch_with_secrets(logical_url, document_dir, options, secrets, &key_sent).map_err(|error| {
+        // A refusal written as "nothing was sent" is reworded once a request
+        // carrying the key has gone out.
+        if key_sent.get() {
+            error.after_secret_sent()
+        } else {
+            error
+        }
+    })
+}
+
+/// [`fetch_url_with_secrets`], recording in `key_sent` when a request that
+/// carried a key has been sent (or attempted).
+fn fetch_with_secrets(
+    logical_url: &str,
+    document_dir: &Path,
+    options: UrlFetchOptions,
+    secrets: &SecretFetch<'_>,
+    key_sent: &std::cell::Cell<bool>,
+) -> Result<PathBuf, UrlFetchError> {
     let mut current = Url::parse(logical_url)
         .map_err(|_| UrlFetchError::new(format!("Invalid URL: {logical_url}")))?;
     // A fragment never reaches a server, and a rule never matches one.
@@ -903,6 +940,9 @@ pub fn fetch_url_with_secrets(
     let response = loop {
         validate_public_url(&current, &options, &deadline, &approved)?;
         let outbound = secret_hop(&current, hop, secrets, &mut held)?;
+        if outbound.is_some() {
+            key_sent.set(true);
+        }
         let sent = send_request(
             &client,
             outbound.as_ref().unwrap_or(&current),

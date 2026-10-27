@@ -1844,5 +1844,67 @@ mod url_tests {
                 ]
             );
         }
+
+        /// A failure after the key was already sent must not claim that no
+        /// request carrying it was sent.
+        #[test]
+        fn a_failure_after_the_key_was_sent_does_not_claim_nothing_was_sent() {
+            let fixture = fixture(Default::default());
+            let server = serve(&fixture.tls, |_| {
+                Some(http(
+                    "200 OK",
+                    &[
+                        ("Content-Type", "text/markdown"),
+                        ("Content-Encoding", "zstd"),
+                    ],
+                    b"# Title\n",
+                ))
+            });
+            let port = server.addr.port();
+            let url = format!("https://api.secret.test:{port}/v1/doc.md?key={PLACEHOLDER}");
+            let vault = granted_vault(rule("api.secret.test", port, "/v1"));
+            let (run, _) = run_with(
+                &fixture,
+                &vault,
+                &[("api.secret.test", server.addr)],
+                &request("outline", &url, serde_json::json!({})),
+                no_extra,
+            );
+            assert!(!run.response.success);
+            assert_eq!(
+                server.targets(),
+                vec![format!("/v1/doc.md?key={ENCODED_KEY}")]
+            );
+            let strings = run.strings();
+            assert!(
+                !strings.contains("no request carrying the secret was sent"),
+                "{strings}"
+            );
+            assert!(
+                strings.contains(crate::url_fetch::SECRET_FETCH_REFUSED_AFTER_SEND),
+                "{strings}"
+            );
+
+            // A refusal before anything was sent keeps saying so.
+            let duplicate = format!(
+                "https://api.secret.test:{port}/v1/doc.md?key={PLACEHOLDER}&key={PLACEHOLDER}"
+            );
+            let vault = granted_vault(rule("api.secret.test", port, "/v1"));
+            let (run, _) = run_with(
+                &fixture,
+                &vault,
+                &[("api.secret.test", server.addr)],
+                &request("outline", &duplicate, serde_json::json!({})),
+                no_extra,
+            );
+            assert!(!run.response.success);
+            assert!(
+                run.strings()
+                    .contains(crate::url_fetch::SECRET_FETCH_REFUSED),
+                "{}",
+                run.strings()
+            );
+            assert_eq!(server.targets().len(), 1, "the duplicate was never sent");
+        }
     }
 }
