@@ -141,6 +141,29 @@ async fn route_bash(
     corr: u64,
     arguments: Value,
 ) {
+    route_cancel_test_tool(
+        executor,
+        root,
+        connection_cancel,
+        bash_tx,
+        corr,
+        "bash",
+        arguments,
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+async fn route_cancel_test_tool(
+    executor: &Arc<Executor>,
+    root: &ProjectRootId,
+    connection_cancel: &PersistentCancelSignal,
+    bash_tx: &mpsc::Sender<bash::BashDeferredCompletion>,
+    corr: u64,
+    name: &str,
+    arguments: Value,
+) -> mpsc::Receiver<Frame> {
     let identity = RouteIdentity(Arc::new(RouteIdentityData {
         root: root.clone(),
         project_root: root.as_path().into(),
@@ -165,10 +188,10 @@ async fn route_bash(
         41,
         1,
         corr,
-        serde_json::to_vec(&json!({"name": "bash", "arguments": arguments})).unwrap(),
+        serde_json::to_vec(&json!({"name": name, "arguments": arguments})).unwrap(),
     )
     .unwrap();
-    let (writer, _replies) = mpsc::channel(8);
+    let (writer, replies) = mpsc::channel(8);
     let (touch_tx, _touch_rx) = mpsc::channel(8);
     let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
     let deferred_tx = super::DeferredResponseSender {
@@ -200,7 +223,12 @@ async fn route_bash(
         &mut HashMap::new(),
         &mut HashMap::new(),
         &mut HashMap::new(),
-        |request, ctx| crate::commands::bash::handle(&request, ctx),
+        |request, ctx| match request.command.as_str() {
+            "bash" => crate::commands::bash::handle(&request, ctx),
+            "bash_status" => crate::commands::bash_status::handle(&request, ctx),
+            "read" => crate::commands::read::handle_read(&request, ctx),
+            other => panic!("unexpected cancelled-call test command: {other}"),
+        },
         &deferred_tx,
         false,
         1024 * 1024,
@@ -209,6 +237,7 @@ async fn route_bash(
     )
     .await
     .unwrap();
+    replies
 }
 
 /// The text and response data of the next bash call answered on `bash_rx`.
@@ -222,6 +251,126 @@ async fn next_bash_reply(
         .expect("bash reply");
     let text = done.text_for_test().expect("bash result").to_string();
     (text, done.response_for_test().data.clone())
+}
+
+#[cfg(unix)]
+async fn next_cancel_test_tool_reply(replies: &mut mpsc::Receiver<Frame>) -> String {
+    let reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .expect("tool call settles")
+        .expect("tool call reply");
+    let body: Value = serde_json::from_slice(&reply.payload).unwrap();
+    body["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("tool reply has no text: {body}"))
+        .to_string()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelled_call_notice_appears_on_read_once() {
+    cancelled_call_notice_read_case(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelled_call_notice_survives_native_status_and_appears_on_read_once() {
+    cancelled_call_notice_read_case(true).await;
+}
+
+#[cfg(unix)]
+async fn cancelled_call_notice_read_case(poll_native: bool) {
+    struct Shutdown(Arc<AppContext>);
+    impl Drop for Shutdown {
+        fn drop(&mut self) {
+            self.0.bash_background().shutdown();
+        }
+    }
+    let (dir, root) = test_support::test_root("cancelled-call-read");
+    let ctx = cancel_test_context(&root, &dir.path().join("storage"));
+    let _shutdown = Shutdown(Arc::clone(&ctx));
+    let executor = Arc::new(Executor::new());
+    assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+    let (bash_tx, mut bash_rx) = mpsc::channel(8);
+    let connection = PersistentCancelSignal::new();
+    route_bash(
+        &executor,
+        &root,
+        &connection,
+        &bash_tx,
+        1,
+        json!({"command": "sleep 60", "background": true}),
+    )
+    .await;
+    let (_, data) = next_bash_reply(&mut bash_rx).await;
+    let task_id = data["task_id"].as_str().expect("background task id");
+    ctx.bash_background()
+        .note_cancelled_call(task_id, CANCEL_SESSION);
+    let notice = format!("task {task_id} from your cancelled call is still running; check it with bash_status or stop it with bash_kill");
+
+    if poll_native {
+        let mut plumbing = route_cancel_test_tool(
+            &executor,
+            &root,
+            &connection,
+            &bash_tx,
+            2,
+            "bash_status",
+            json!({"task_id": task_id}),
+        )
+        .await;
+        let text = next_cancel_test_tool_reply(&mut plumbing).await;
+        assert!(!text.contains("cancelled call"), "{text}");
+    }
+
+    let path = root.as_path().join("notice.txt");
+    std::fs::write(&path, "file contents").unwrap();
+    let mut read = route_cancel_test_tool(
+        &executor,
+        &root,
+        &connection,
+        &bash_tx,
+        3,
+        "read",
+        json!({"path": path}),
+    )
+    .await;
+    let text = next_cancel_test_tool_reply(&mut read).await;
+    assert!(text.contains("file contents"), "{text}");
+    assert_eq!(text.matches(&notice).count(), 1, "{text}");
+
+    let mut status = route_cancel_test_tool(
+        &executor,
+        &root,
+        &connection,
+        &bash_tx,
+        4,
+        "bash_status",
+        json!({"taskId": task_id}),
+    )
+    .await;
+    let text = next_cancel_test_tool_reply(&mut status).await;
+    assert!(!text.contains("cancelled call"), "{text}");
+
+    // The agent's taskId spelling must receive notices; the plugin's task_id poll must not.
+    ctx.bash_background()
+        .note_cancelled_call(task_id, CANCEL_SESSION);
+    let mut status = route_cancel_test_tool(
+        &executor,
+        &root,
+        &connection,
+        &bash_tx,
+        5,
+        "bash_status",
+        json!({"taskId": task_id}),
+    )
+    .await;
+    let text = next_cancel_test_tool_reply(&mut status).await;
+    assert_eq!(text.matches(&notice).count(), 1, "{text}");
+    assert!(ctx
+        .bash_background()
+        .take_cancelled_call_notices(CANCEL_SESSION)
+        .is_empty());
 }
 
 /// A `wait: true` call whose transport is lost while the command still runs
