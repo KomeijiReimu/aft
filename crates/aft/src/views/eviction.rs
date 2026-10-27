@@ -1035,8 +1035,8 @@ pub fn evict_view(
             return Ok(EvictionOutcome::Held(hold));
         }
         // No cleanup read may open the pointer from here until the deletion
-        // is done. Taken before the file-identity guard, which a read needs
-        // to close its connection.
+        // is done. Taken before the file-identity guard: a read counts as in
+        // progress before it takes that guard to open its connection.
         let Some(_cleanup_reads) = quiesce_cleanup_reads(&current.view_dir, deadline) else {
             tx.execute(
                 "UPDATE members SET state = 'active' WHERE scope = ?1",

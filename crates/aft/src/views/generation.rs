@@ -283,12 +283,13 @@ impl Drop for CleanupReadsExcluded {
     }
 }
 
-/// Waits until no cleanup read of `view_dir` has a connection open in this
-/// process, and keeps new ones from starting while the returned guard lives.
-/// `None` when a read is still open at `until`. Call it while holding the
-/// family registry barrier and before taking the file-identity guard: a read
-/// takes neither the barrier nor anything else eviction holds, so it always
-/// finishes, but it needs the file-identity guard to close its connection.
+/// Waits until no cleanup read of `view_dir` is in progress in this process,
+/// and keeps new ones from starting while the returned guard lives. `None`
+/// when a read (or another exclusion) remains at `until`. Call it while
+/// holding the family registry barrier and before taking the file-identity
+/// guard: a read counts as in progress before it takes that guard to open
+/// its connection, and it never needs the barrier, so in this order every
+/// read being waited for can finish.
 pub(super) fn exclude_cleanup_reads(
     view_dir: &Path,
     until: Instant,
