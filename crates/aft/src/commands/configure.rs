@@ -14266,9 +14266,12 @@ mod tests {
             "project_root": canonical_root,
             "storage_dir": storage.path(),
             "harness": "opencode",
+            // The views runtime, which runs the import, loads only when a
+            // semantic or call-graph index is enabled; the lexical view alone
+            // needs no runtime.
             "config": [user_tier(json!({
                 "views": { "enabled": true },
-                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
+                "indexes": { "trigram": false, "semantic": false, "callgraph": true }
             }))]
         });
 
@@ -14996,21 +14999,30 @@ mod tests {
         assert!(ctx.cache_unavailable_reason().is_none());
         assert!(ctx.cache_dir().ends_with("offline-volume/aft"));
         let _ = ctx.flush_search_index_on_graceful_shutdown();
-        assert!(ctx
-            .search_index()
-            .read()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|index| index.ready));
+        // With views on, the legacy search index is never built or written:
+        // the checkout's lexical view is the trigram cache, and it must be
+        // usable and persisted under the recovered cache directory.
+        let lexical = ctx.lexical_view_snapshot("grep");
+        assert!(
+            matches!(lexical, Some(Ok(_))),
+            "{:?}",
+            lexical.map(|result| result.err())
+        );
         let key = ctx.memoized_artifact_cache_key(&ctx.canonical_cache_root());
         assert!(
             ctx.cache_dir()
-                .join("index")
-                .join(key)
-                .join("cache.bin")
+                .join("blobs/v3")
+                .join(&key)
+                .join("trigram.sqlite")
                 .is_file(),
             "normal cold initialization must persist the recovered trigram cache"
         );
+        assert!(!ctx
+            .cache_dir()
+            .join("index")
+            .join(key)
+            .join("cache.bin")
+            .exists());
         assert_eq!(
             ctx.try_health_snapshot(&project).cache_unavailable_reason,
             None
@@ -24579,7 +24591,9 @@ mod tests {
         assert!(ctx.config().indexes.semantic);
         assert!(ctx.config().indexes.callgraph);
         assert!(ctx.config().views.enabled);
-        assert!(ctx.search_index_rx().read().unwrap().is_some());
+        // With views on, the checkout's lexical view replaces the legacy
+        // search loader, so trigram work for this root is the lexical view.
+        assert!(ctx.lexical_views_enabled());
         assert!(ctx.semantic_index_rx().lock().is_some());
         super::drain_deferred_configure_maintenance(&ctx);
         assert!(ctx.watcher_runtime_active());

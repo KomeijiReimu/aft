@@ -107,7 +107,14 @@ impl LexicalSnapshotSource for CheckoutLexicalSource {
         self.driver
             .install(&self.access, &snapshot, revision)
             .map_err(|error| error.to_string())?;
-        Ok(self.driver.installed_snapshot())
+        // Read the installed cut directly, as the call-graph source does.
+        // `installed_snapshot` marks a checkout without a steady watcher
+        // subscription (no watcher, an unproved or incomplete one, or an
+        // unsupported filesystem) overflowed at once. That mark only decides
+        // that the next bind must walk the whole checkout again; this cut was
+        // just verified against the disk, so it is safe to serve.
+        let (snapshot, _) = self.driver.installed_cut();
+        Ok(snapshot)
     }
 
     fn record_change(&self, path: &Path) {
@@ -234,17 +241,31 @@ impl LexicalView {
         result
     }
 
+    /// A watcher event or an AFT write can land between a bind's install and
+    /// the read of its cut, leaving a path in the fresh cut unverified. Bind
+    /// again, a bounded number of times: each bind re-reads such paths from
+    /// disk. Only a checkout that keeps changing through every attempt is
+    /// refused.
+    fn verified_snapshot(&self) -> Result<Snapshot, String> {
+        const ATTEMPTS: usize = 3;
+        for _ in 0..ATTEMPTS {
+            let snapshot = self.acquire()?;
+            if snapshot.pending_intent().next().is_none()
+                && snapshot.watcher() == WatcherState::Healthy
+            {
+                return Ok(snapshot);
+            }
+        }
+        Err("lexical view has unverified writes".into())
+    }
+
     fn project(&self) -> Result<crate::search_index::SearchIndexSnapshot, String> {
         use super::segment_store::PayloadSource;
         let _query = self
             .query
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let snapshot = self.acquire()?;
-        if snapshot.pending_intent().next().is_some() || snapshot.watcher() != WatcherState::Healthy
-        {
-            return Err("lexical view has unverified writes".into());
-        }
+        let snapshot = self.verified_snapshot()?;
         let mut source = None;
         let mut rows = Vec::new();
         for (path, disk) in snapshot.membership() {
@@ -1595,10 +1616,60 @@ mod tests {
         }
     }
 
+    /// A checkout with no steady watcher subscription (no watcher, an
+    /// unproved one, or an unsupported filesystem) is still served: every
+    /// query binds strictly against the disk and answers from that cut,
+    /// including edits no watcher reported.
+    #[test]
+    fn lexical_view_without_a_watcher_subscription_serves_each_strict_bind() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(temp.path()).unwrap();
+        let root = base.join("project");
+        let storage = base.join("storage");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.rs"), "fn first_needle() {}\n").unwrap();
+        assert!(crate::watcher_backend::subscription::status(&root).is_none());
+        let view = LexicalView::new(
+            root.clone(),
+            crate::root_cache::StoragePaths::same(&storage),
+            "lexical-unwatched".into(),
+            TrigramPolicy {
+                max_file_size: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let first = view.snapshot().unwrap();
+        assert_eq!(
+            first
+                .grep("first_needle", true, &[], &[], &root, 10)
+                .unwrap()
+                .matches
+                .len(),
+            1
+        );
+        assert!(view.is_ready());
+        // No event is recorded for this edit: only the strict bind sees it.
+        fs::write(root.join("b.rs"), "fn second_needle() {}\n").unwrap();
+        let second = view.snapshot().unwrap();
+        assert_eq!(
+            second
+                .grep("second_needle", true, &[], &[], &root, 10)
+                .unwrap()
+                .matches
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn lexical_views_projection_matches_legacy_masks_ranks_and_membership() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("project");
+        // Production views are opened on the canonical checkout root, which
+        // is also the root the legacy index reports paths under. A plain
+        // temporary path can spell that root differently: on macOS it goes
+        // through the `/var` -> `/private/var` symlink, and on Windows the
+        // canonical form is the `\\?\` verbatim path.
+        let root = fs::canonicalize(temp.path()).unwrap().join("project");
         let storage = temp.path().join("storage");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/a.rs"), "fn needle_alpha() {}\nneedle beta\n").unwrap();

@@ -285,7 +285,8 @@ fn drain(ctx: &AppContext) {
 }
 
 /// Waits until the views-on lane is loaded and every semantic file of the
-/// checkout has current vectors.
+/// checkout has current vectors, and the lexical lane answers from the
+/// checkout's lexical view.
 fn wait_views_filled(ctx: &AppContext) {
     let deadline = Instant::now() + DEADLINE;
     loop {
@@ -295,13 +296,7 @@ fn wait_views_filled(ctx: &AppContext) {
                 .search(&vector("probe"), 1, &|_| true)
                 .is_ok_and(|answer| answer.complete())
         });
-        let lexical = ctx
-            .search_index()
-            .read()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|index| index.ready);
-        if complete && lexical {
+        if complete && lexical_view_serves(ctx) {
             return;
         }
         assert!(
@@ -311,6 +306,18 @@ fn wait_views_filled(ctx: &AppContext) {
         );
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// With views on, the legacy search index is never loaded: the lexical lane
+/// is the checkout's lexical view, bound on demand by each query. A grep that
+/// succeeds and counts as a lexical-view route shows that lane is ready.
+fn lexical_view_serves(ctx: &AppContext) -> bool {
+    let before = ctx.lexical_view_route_counts()[0];
+    let answer = aft::commands::grep::handle_grep(
+        &request(json!({"id": "lexical-ready", "command": "grep", "pattern": "fn"})),
+        ctx,
+    );
+    answer.success && ctx.lexical_view_route_counts()[0] > before
 }
 
 fn wait_legacy_ready(ctx: &AppContext) {
