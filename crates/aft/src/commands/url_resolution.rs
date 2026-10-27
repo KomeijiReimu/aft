@@ -2221,5 +2221,75 @@ mod url_tests {
                 assert_eq!(server.targets().len(), index + 1, "{path}");
             }
         }
+
+        /// A body built to keep the residual check decoding (alphanumeric
+        /// lines with a thirty-layer percent tail; it needs no knowledge of
+        /// the key) is refused for running out of time, close to the call's
+        /// deadline, not after minutes of work.
+        #[test]
+        fn a_hostile_body_is_refused_when_the_residual_check_runs_out_of_time() {
+            let mut body = b"# Title\n\n".to_vec();
+            while body.len() < (1 << 20) {
+                body.extend_from_slice(b"ABCDEFGHIJKLMNOP\n");
+            }
+            body.push(b'%');
+            for _ in 0..30 {
+                body.extend_from_slice(b"25");
+            }
+            body.extend_from_slice(b"41\n");
+            let fixture = fixture(Default::default());
+            let server = serve(&fixture.tls, move |_| Some(markdown(&body)));
+            let port = server.addr.port();
+            let url = format!("https://api.secret.test:{port}/v1/doc.md?key={PLACEHOLDER}");
+            let vault = granted_vault(rule("api.secret.test", port, "/v1"));
+            let started = std::time::Instant::now();
+            let (run, documents) = run_with(
+                &fixture,
+                &vault,
+                &[("api.secret.test", server.addr)],
+                &request("outline", &url, serde_json::json!({})),
+                no_extra,
+            );
+            let elapsed = started.elapsed();
+            assert!(!run.response.success, "{:?}", run.response.data);
+            let strings = run.strings();
+            assert!(
+                strings.contains("(residual_check_timeout)")
+                    || strings.contains("(residual_check_exhausted)"),
+                "{strings}"
+            );
+            assert!(documents.is_empty());
+            assert_eq!(server.targets().len(), 1);
+            assert!(
+                elapsed < std::time::Duration::from_secs(10),
+                "the refusal took {elapsed:?}"
+            );
+        }
+
+        /// When the residual check's share of the reserve runs out (here
+        /// injected as zero), the document is refused as unexamined, never
+        /// passed.
+        #[test]
+        fn an_expired_residual_check_refuses_the_document() {
+            let fixture = fixture(Default::default());
+            let server = serve(&fixture.tls, |_| {
+                Some(markdown(b"# Title\n\nPlain text.\n"))
+            });
+            let port = server.addr.port();
+            let url = format!("https://api.secret.test:{port}/v1/doc.md?key={PLACEHOLDER}");
+            let vault = granted_vault(rule("api.secret.test", port, "/v1"));
+            let _limit =
+                crate::url_fetch::limit_secret_residual_check_for_test(std::time::Duration::ZERO);
+            let (run, documents) = run_with(
+                &fixture,
+                &vault,
+                &[("api.secret.test", server.addr)],
+                &request("outline", &url, serde_json::json!({})),
+                no_extra,
+            );
+            assert_refused_for(&run, "residual_check_timeout");
+            assert!(documents.is_empty());
+            assert_eq!(server.targets().len(), 1);
+        }
     }
 }

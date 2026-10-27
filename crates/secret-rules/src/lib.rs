@@ -38,8 +38,8 @@ pub use redirect::{
     evaluate_redirect, location_mentions, resolve_location, split_absolute, RedirectOutcome,
 };
 pub use scrub::{
-    reveals_any, reveals_key, scrub_bytes, KeyPatterns, MatcherSet, ScrubError, Scrubber,
-    MAX_REVEAL_DEPTH,
+    reveal_outcome, reveals_any, reveals_key, scrub_bytes, KeyPatterns, MatcherSet, RevealOutcome,
+    ScrubError, Scrubber, MAX_REVEAL_DEPTH,
 };
 pub use target::{
     authority_matches_connect, canonical_host, canonicalize_path, normalize_path_prefix,

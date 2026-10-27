@@ -25,6 +25,7 @@ use crate::material::percent_encode_form;
 use crate::placeholder::PLACEHOLDER_PREFIX;
 use crate::work::Counted;
 use std::collections::BTreeMap;
+use std::time::Instant;
 use zeroize::Zeroizing;
 
 /// Why a key cannot be turned into scrub patterns.
@@ -649,10 +650,14 @@ fn push_merged(spans: &mut Vec<(usize, usize)>, span: (usize, usize)) {
 
 /// A `%XX` run at `index` that decodes to the key, with either hex case and any
 /// selection of escapes.
+///
+/// The match families compare as they decode, without building the decoded
+/// bytes: most positions fail on their first byte, and the scan runs at every
+/// candidate position, so an allocation per position would dominate it.
 fn match_percent(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
     let mut cursor = index;
-    let mut decoded = Zeroizing::new(Vec::with_capacity(key.len()));
-    while cursor < window.len() && decoded.len() < key.len() {
+    let mut matched = 0;
+    while cursor < window.len() && matched < key.len() {
         let byte = window[cursor];
         let value = if byte == b'%' {
             let (value, len) = decode_percent(window, cursor)?;
@@ -662,21 +667,16 @@ fn match_percent(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
             cursor += 1;
             byte
         };
-        // Stop at the first byte that differs from the key: most positions
-        // fail on their first byte, which keeps the scan close to linear.
-        if value != key[decoded.len()] {
+        if value != key[matched] {
             return None;
         }
-        decoded.push(value);
+        matched += 1;
     }
 
     // The holdback keeps the window's last byte beyond any match that ends in
     // the released part, so a match that ends at the very end of the window is
     // still complete here; it is simply re-checked on the next call.
-    if decoded.as_slice() == key {
-        return Some(cursor);
-    }
-    None
+    (matched == key.len()).then_some(cursor)
 }
 
 /// A form-encoded run: like percent, but `+` decodes to a space when the key
@@ -686,8 +686,8 @@ fn match_form(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
         return None;
     }
     let mut cursor = index;
-    let mut decoded = Zeroizing::new(Vec::with_capacity(key.len()));
-    while cursor < window.len() && decoded.len() < key.len() {
+    let mut matched = 0;
+    while cursor < window.len() && matched < key.len() {
         let byte = window[cursor];
         let value = if byte == b'%' {
             let (value, len) = decode_percent(window, cursor)?;
@@ -701,34 +701,36 @@ fn match_form(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
                 byte
             }
         };
-        if value != key[decoded.len()] {
+        if value != key[matched] {
             return None;
         }
-        decoded.push(value);
+        matched += 1;
     }
-    (decoded.as_slice() == key).then_some(cursor)
+    (matched == key.len()).then_some(cursor)
 }
 
 /// A JSON string body starting at `index` that unescapes to the key.
 fn match_json(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
     let mut cursor = index;
-    let mut decoded = Zeroizing::new(Vec::with_capacity(key.len() + 4));
-    while cursor < window.len() && decoded.len() < key.len() {
+    let mut matched = 0;
+    while cursor < window.len() && matched < key.len() {
         let byte = window[cursor];
-        let before = decoded.len();
         if byte == b'\\' {
             let (value, len) = decode_json_escape(window, cursor)?;
-            decoded.extend_from_slice(&value);
+            if !key[matched..].starts_with(&value) {
+                return None;
+            }
+            matched += value.len();
             cursor += len;
         } else {
-            decoded.push(byte);
+            if byte != key[matched] {
+                return None;
+            }
+            matched += 1;
             cursor += 1;
         }
-        if !key[before..].starts_with(&decoded[before..]) {
-            return None;
-        }
     }
-    (decoded.as_slice() == key).then_some(cursor)
+    (matched == key.len()).then_some(cursor)
 }
 
 /// A hex run at `index` in any case that decodes to the key.
@@ -736,17 +738,14 @@ fn match_hex(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
     let needed = key.len() * 2;
     let end = index.checked_add(needed)?;
     let run = window.get(index..end)?;
-    let mut decoded = Zeroizing::new(Vec::with_capacity(key.len()));
-    for pair in run.chunks(2) {
+    for (pair, expected) in run.chunks(2).zip(key) {
         let high = crate::placeholder::hex_value(pair[0])?;
         let low = crate::placeholder::hex_value(pair[1])?;
-        let value = (high << 4) | low;
-        if value != key[decoded.len()] {
+        if (high << 4) | low != *expected {
             return None;
         }
-        decoded.push(value);
     }
-    (decoded.as_slice() == key).then_some(end)
+    Some(end)
 }
 
 /// True when decoding the whole `run` (with either alphabet, `+`/`/` and
@@ -1142,12 +1141,12 @@ pub fn scrub_bytes(key: &[u8], label: &str, input: &[u8]) -> Result<Vec<u8>, Scr
 }
 
 /// The most layers one reveal chain undoes. Text that still changes after
-/// this many layers of one chain is treated as revealing a key (fail closed):
-/// no ordinary document nests an encoding this deep, and stopping early would
-/// let one more layer carry a key past the check.
+/// this many layers of one chain is treated as unexaminable and refused
+/// (fail closed): no ordinary document nests an encoding this deep, and
+/// stopping early would let one more layer carry a key past the check.
 pub const MAX_REVEAL_DEPTH: usize = 32;
 
-/// The most bytes [`reveals_any`] examines across all of its layers, as a
+/// The most bytes [`reveal_outcome`] scans across all of its layers, as a
 /// multiple of the text's length (or of [`REVEAL_WORK_FLOOR`] for short
 /// text). Ordinary text costs a handful of layers; text that needs more than
 /// this is refused rather than examined further.
@@ -1158,87 +1157,462 @@ const REVEAL_WORK_FACTOR: usize = 48;
 /// limit.
 const REVEAL_WORK_FLOOR: usize = 64 * 1024;
 
+/// How many bytes a scan covers between two looks at the deadline.
+const DEADLINE_STRIDE: usize = 64 * 1024;
+
+/// What [`reveal_outcome`] decided about a text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevealOutcome {
+    /// No held key is spelled, after every layer was followed to its end.
+    Clean,
+    /// A held key is spelled, as the text stands or after some layers.
+    Found,
+    /// A chain was still changing after [`MAX_REVEAL_DEPTH`] layers, or the
+    /// layers together exceeded the work budget. The text is not known to be
+    /// clean and must be refused.
+    Exhausted,
+    /// The deadline passed before the check finished. The text is not known
+    /// to be clean and must be refused.
+    OutOfTime,
+}
+
+impl RevealOutcome {
+    /// True only when the text was examined to the end and holds no key.
+    pub fn is_clean(self) -> bool {
+        self == RevealOutcome::Clean
+    }
+}
+
 /// True when `text` spells `key` in a form the scrubber recognises, either as
 /// it stands or after a recipient undoes the changes a URL parser or a reader
-/// makes without being asked; see [`reveals_any`].
+/// makes without being asked; see [`reveal_outcome`].
 pub fn reveals_key(text: &[u8], key: &[u8]) -> bool {
     reveals_any(text, &[key])
 }
 
-/// True when `text` spells any of `keys` in a form the scrubber recognises,
-/// as it stands or after a recipient undoes the changes a URL parser or a
-/// reader makes without being asked: dropping control bytes such as a tab,
-/// decoding percent-encoding, reading Markdown backslash escapes, decoding
-/// HTML character references (with or without the closing `;` for numeric
-/// ones) and removing inline HTML tags.
+/// True unless [`reveal_outcome`] finds `text` clean with no deadline: a text
+/// that spells a key, or that cannot be examined to the end, both count.
+pub fn reveals_any(text: &[u8], keys: &[&[u8]]) -> bool {
+    !reveal_outcome(text, keys, None).is_clean()
+}
+
+/// Whether `text` spells any of `keys` in a form the scrubber recognises, as
+/// it stands or after a recipient undoes the changes a URL parser or a reader
+/// makes without being asked: dropping control bytes such as a tab, decoding
+/// percent-encoding, reading Markdown backslash escapes, decoding HTML
+/// character references (with or without the closing `;` for numeric ones)
+/// and removing inline HTML tags.
 ///
 /// The scrubber replaces a key only where it finds one, so text it passed
 /// can still carry a key that one of these changes reassembles. A caller that
 /// is about to send or show text it cannot scrub again (a redirect target, a
-/// finished document) checks it here and refuses it rather than trusting the
-/// earlier scrub.
+/// finished document) checks it here and refuses it unless the outcome is
+/// [`RevealOutcome::Clean`].
 ///
 /// Each change is undone repeatedly in its own chain, and all of them
 /// together in one more chain, so nested layers (a key percent-encoded
 /// seventeen times) and mixed layers (an entity inside an escape) are both
-/// followed to the end. Each chain stops when nothing changes any more. A
-/// chain's depth is spent only by text that keeps changing at every layer:
-/// ordinary text decodes once (a `%20`, an `&amp;`, a `\*`) and is then left
-/// alone. A chain still changing after [`MAX_REVEAL_DEPTH`] layers makes this
-/// return true, so a spelling nested deeper than the check undoes is refused
-/// rather than trusted, and so does text whose layers together exceed
-/// [`REVEAL_WORK_FACTOR`] times its length. Memory stays at the text plus two
-/// layers and the scan of one layer, each no larger than the text.
-pub fn reveals_any(text: &[u8], keys: &[&[u8]]) -> bool {
-    let keys: Vec<(&[u8], Vec<Zeroizing<Vec<u8>>>)> = keys
-        .iter()
-        .filter(|key| !key.is_empty())
-        .map(|key| {
-            let literals = KeyPatterns::derive(key)
-                .map(|patterns| patterns.patterns)
-                .unwrap_or_default();
-            (*key, literals)
-        })
-        .collect();
-    if keys.is_empty() {
-        return false;
+/// followed to the end. A chain stops when nothing changes any more, and a
+/// layer rescans only the regions its change touched (widened by the
+/// longest spelling of any key and to the enclosing base64 group); the rest
+/// was examined in an earlier layer. All keys are checked in one pass. A
+/// chain still changing after [`MAX_REVEAL_DEPTH`] layers, or more scanning
+/// than [`REVEAL_WORK_FACTOR`] times the text's length, gives
+/// [`RevealOutcome::Exhausted`]; a `deadline` that passes gives
+/// [`RevealOutcome::OutOfTime`]. Memory stays at the text plus two layers and
+/// the scan of one layer, each no larger than the text.
+///
+/// Not detected: base64 split by anything other than spaces, tabs and line
+/// breaks (`MDEy.MzQ1.Njc4...`, or vertical tab and form feed outside the
+/// control-byte layer), and any change outside the list above.
+pub fn reveal_outcome(text: &[u8], keys: &[&[u8]], deadline: Option<Instant>) -> RevealOutcome {
+    let needles = Needles::new(keys);
+    if needles.is_empty() {
+        return RevealOutcome::Clean;
     }
-    let found = |view: &[u8]| {
-        keys.iter()
-            .any(|(key, literals)| !find_key_spans(view, key, literals).is_empty())
-    };
-    if found(text) {
-        return true;
-    }
+    let clock = Clock(deadline);
     let budget = REVEAL_WORK_FACTOR.saturating_mul(text.len().max(REVEAL_WORK_FLOOR));
     let mut spent = text.len();
+    match needles.held_in(text, &clock) {
+        Err(OutOfTime) => return RevealOutcome::OutOfTime,
+        Ok(true) => return RevealOutcome::Found,
+        Ok(false) => {}
+    }
     for chain in REVEAL_CHAINS {
         // Only the current layer is kept: memory stays at two copies of the
         // text whatever the depth.
-        let mut layer: Option<Zeroizing<Vec<u8>>> = None;
+        let mut layer: Option<Layer> = None;
         for depth in 1..=MAX_REVEAL_DEPTH {
-            let current = layer.as_ref().map_or(text, |layer| layer.as_slice());
+            if clock.expired() {
+                return RevealOutcome::OutOfTime;
+            }
+            let current = layer.as_ref().map_or(text, |layer| layer.text.as_slice());
             let Some(next) = chain(current) else {
                 break;
             };
-            spent = spent.saturating_add(next.len());
+            let regions = rescan_regions(&next.text, &next.changed, needles.margin);
+            spent = spent.saturating_add(regions.iter().map(|(lo, hi)| hi - lo).sum::<usize>());
             if spent > budget {
-                return true;
+                return RevealOutcome::Exhausted;
             }
-            if found(&next) {
-                return true;
+            for (lo, hi) in regions {
+                match needles.held_in(&next.text[lo..hi], &clock) {
+                    Err(OutOfTime) => return RevealOutcome::OutOfTime,
+                    Ok(true) => return RevealOutcome::Found,
+                    Ok(false) => {}
+                }
             }
-            if depth == MAX_REVEAL_DEPTH && chain(&next).is_some() {
-                return true;
+            if depth == MAX_REVEAL_DEPTH && chain(&next.text).is_some() {
+                return RevealOutcome::Exhausted;
             }
             layer = Some(next);
         }
     }
-    false
+    RevealOutcome::Clean
 }
 
-/// One change [`reveals_any`] undoes; `None` when it would change nothing.
-type RevealTransform = fn(&[u8]) -> Option<Zeroizing<Vec<u8>>>;
+/// Raised when a check's deadline passes.
+struct OutOfTime;
+
+/// A check's optional deadline.
+struct Clock(Option<Instant>);
+
+impl Clock {
+    fn expired(&self) -> bool {
+        self.0.is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    fn check(&self) -> Result<(), OutOfTime> {
+        if self.expired() {
+            Err(OutOfTime)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// The keys one check looks for, prepared once.
+struct Needles<'k> {
+    keys: Vec<Needle<'k>>,
+    /// Bytes where a spelling of any key can begin.
+    starts: [bool; 256],
+    /// The longest source span any key's spelling can take.
+    margin: usize,
+    /// The shortest key, which bounds how short a base64 run can hold one.
+    shortest: usize,
+}
+
+/// One key with its literal spellings and the bytes they can begin with.
+struct Needle<'k> {
+    key: &'k [u8],
+    literals: Vec<Zeroizing<Vec<u8>>>,
+    starts: [bool; 256],
+}
+
+impl<'k> Needles<'k> {
+    fn new(keys: &[&'k [u8]]) -> Self {
+        const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+        const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+        let mut all = [false; 256];
+        let mut prepared = Vec::with_capacity(keys.len());
+        for key in keys.iter().copied().filter(|key| !key.is_empty()) {
+            let literals = KeyPatterns::derive(key)
+                .map(|patterns| patterns.patterns)
+                .unwrap_or_default();
+            // Every family's spelling begins with an escape introducer, the
+            // key's first byte, the hex digit of its first byte's high
+            // nibble, form's `+` for a leading space, or a literal's first
+            // byte; see `try_match_at`.
+            let mut starts = [false; 256];
+            for byte in [
+                b'%',
+                b'\\',
+                key[0],
+                HEX_LOWER[usize::from(key[0] >> 4)],
+                HEX_UPPER[usize::from(key[0] >> 4)],
+            ] {
+                starts[usize::from(byte)] = true;
+            }
+            if key[0] == b' ' {
+                starts[usize::from(b'+')] = true;
+            }
+            for literal in &literals {
+                if let Some(first) = literal.first() {
+                    starts[usize::from(*first)] = true;
+                }
+            }
+            for (slot, start) in all.iter_mut().zip(starts) {
+                *slot |= start;
+            }
+            prepared.push(Needle {
+                key,
+                literals,
+                starts,
+            });
+        }
+        Self {
+            margin: prepared
+                .iter()
+                .map(|needle| max_consumed_len(needle.key.len()))
+                .max()
+                .unwrap_or(0),
+            shortest: prepared
+                .iter()
+                .map(|needle| needle.key.len())
+                .min()
+                .unwrap_or(0),
+            keys: prepared,
+            starts: all,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// True when `view` spells any key in a form the scrubber matches: the
+    /// same families as [`find_key_spans`], found in one pass for all keys.
+    fn held_in(&self, view: &[u8], clock: &Clock) -> Result<bool, OutOfTime> {
+        if self.base64_held_in(view, clock)? {
+            return Ok(true);
+        }
+        for (index, byte) in view.iter().enumerate() {
+            if index % DEADLINE_STRIDE == 0 {
+                clock.check()?;
+            }
+            if !self.starts[usize::from(*byte)] {
+                continue;
+            }
+            for needle in &self.keys {
+                if needle.starts[usize::from(*byte)]
+                    && try_match_at(view, index, needle.key, &needle.literals).is_some()
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// True when a base64 run, or a group of runs separated by whitespace,
+    /// decodes to text holding any key (see [`find_base64_spans`]).
+    fn base64_held_in(&self, view: &[u8], clock: &Clock) -> Result<bool, OutOfTime> {
+        let mut chars = Zeroizing::new(Vec::new());
+        let mut decoded = Zeroizing::new(Vec::new());
+        let mut since_check = 0usize;
+        let mut index = 0;
+        while index < view.len() {
+            if !is_base64_byte(view[index]) {
+                index += 1;
+                continue;
+            }
+            let group_start = index;
+            let mut runs = 0usize;
+            let mut has_padding = false;
+            chars.clear();
+            let group_end = loop {
+                let start = index;
+                while index < view.len() && is_base64_byte(view[index]) {
+                    index += 1;
+                }
+                runs += 1;
+                has_padding |= view[start..index].contains(&b'=');
+                chars.extend_from_slice(&view[start..index]);
+                let run_end = index;
+                let mut next = index;
+                while next < view.len() && is_base64_gap_byte(view[next]) {
+                    next += 1;
+                }
+                if next > run_end && next < view.len() && is_base64_byte(view[next]) {
+                    index = next;
+                } else {
+                    break run_end;
+                }
+            };
+            since_check += group_end - group_start;
+            if since_check >= DEADLINE_STRIDE {
+                since_check = 0;
+                clock.check()?;
+            }
+            if self.decodes_to_a_key(&chars, &mut decoded) {
+                return Ok(true);
+            }
+            // Padding inside a group restarts decoding at a fixed phase, so a
+            // run after it may hold a key only its own alignments reveal;
+            // without padding the group's four alignments cover every run.
+            if runs > 1 && has_padding {
+                let mut at = group_start;
+                while at < group_end {
+                    if !is_base64_byte(view[at]) {
+                        at += 1;
+                        continue;
+                    }
+                    let start = at;
+                    while at < group_end && is_base64_byte(view[at]) {
+                        at += 1;
+                    }
+                    if self.decodes_to_a_key(&view[start..at], &mut decoded) {
+                        return Ok(true);
+                    }
+                }
+            }
+            index = group_end;
+        }
+        chars.iter_mut().for_each(|byte| *byte = 0);
+        Ok(false)
+    }
+
+    /// True when `run` decodes, at any of its four alignments, to text
+    /// holding any key. `decoded` is a reused buffer.
+    fn decodes_to_a_key(&self, run: &[u8], decoded: &mut Zeroizing<Vec<u8>>) -> bool {
+        if run.len() * 6 / 8 < self.shortest {
+            return false;
+        }
+        for offset in 0..4 {
+            let Some(slice) = run.get(offset..) else {
+                continue;
+            };
+            decoded.iter_mut().for_each(|byte| *byte = 0);
+            decoded.clear();
+            let mut buffer = 0u32;
+            let mut bits = 0u32;
+            for byte in slice {
+                let Some(value) = base64_value(*byte) else {
+                    buffer = 0;
+                    bits = 0;
+                    continue;
+                };
+                buffer = (buffer << 6) | value;
+                bits += 6;
+                if bits >= 8 {
+                    bits -= 8;
+                    decoded.push((buffer >> bits) as u8);
+                    buffer &= (1 << bits) - 1;
+                }
+            }
+            for needle in &self.keys {
+                let key = needle.key;
+                if decoded.len() >= key.len()
+                    && decoded.windows(key.len()).any(|window| window == key)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// The regions of `text` to rescan after a change touched the `changed`
+/// ranges: each widened by `margin` (the longest source span a key spelling
+/// can take) and then to the whole base64 group it touches, merged and
+/// sorted. A spelling outside them is unchanged from the previous layer,
+/// which was already examined. Linear in the text.
+fn rescan_regions(text: &[u8], changed: &[(usize, usize)], margin: usize) -> Vec<(usize, usize)> {
+    let is_group_byte = |byte: u8| is_base64_byte(byte) || is_base64_gap_byte(byte);
+    let mut regions: Vec<(usize, usize)> = Vec::new();
+    for &(start, end) in changed {
+        let mut lo = start.saturating_sub(margin);
+        let mut hi = end.saturating_add(margin).min(text.len());
+        let floor = regions.last().map_or(0, |last| last.1);
+        if lo > floor {
+            while lo > floor && is_group_byte(text[lo - 1]) {
+                lo -= 1;
+            }
+        }
+        if let Some(last) = regions.last_mut() {
+            if lo <= last.1 {
+                lo = last.0;
+                hi = hi.max(last.1);
+                regions.pop();
+            }
+        }
+        while hi < text.len() && is_group_byte(text[hi]) {
+            hi += 1;
+        }
+        regions.push((lo, hi));
+    }
+    // Rescanning most of a text in pieces costs more than one whole pass.
+    let covered: usize = regions.iter().map(|(lo, hi)| hi - lo).sum();
+    if covered * 2 >= text.len() && !regions.is_empty() {
+        return vec![(0, text.len())];
+    }
+    regions
+}
+
+/// One coarse change a transform made: `input` bytes of its input became
+/// `output` bytes of its output. Changes close together are merged, so a
+/// range can also cover unchanged bytes; that only widens what is rescanned.
+#[derive(Debug, Clone, Copy)]
+struct Change {
+    input: (usize, usize),
+    output: (usize, usize),
+}
+
+/// Changes closer than this many input bytes are merged into one, which keeps
+/// the change list short on text with many small changes.
+const CHANGE_MERGE_GAP: usize = 256;
+
+/// A transform's output being built, with the changes made so far.
+struct Rewrite {
+    out: Zeroizing<Vec<u8>>,
+    changes: Vec<Change>,
+}
+
+impl Rewrite {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            out: Zeroizing::new(Vec::with_capacity(capacity)),
+            changes: Vec::new(),
+        }
+    }
+
+    fn keep(&mut self, byte: u8) {
+        self.out.push(byte);
+    }
+
+    /// Input bytes `from..to` become `bytes`.
+    fn replace(&mut self, from: usize, to: usize, bytes: &[u8]) {
+        let out_start = self.out.len();
+        self.out.extend_from_slice(bytes);
+        let out_end = self.out.len();
+        match self.changes.last_mut() {
+            Some(last) if from <= last.input.1 + CHANGE_MERGE_GAP => {
+                last.input.1 = to;
+                last.output.1 = out_end;
+            }
+            _ => self.changes.push(Change {
+                input: (from, to),
+                output: (out_start, out_end),
+            }),
+        }
+    }
+
+    fn finish(self) -> Option<Edited> {
+        (!self.changes.is_empty()).then_some(Edited {
+            text: self.out,
+            changes: self.changes,
+        })
+    }
+}
+
+/// One transform's output with its changes.
+struct Edited {
+    text: Zeroizing<Vec<u8>>,
+    changes: Vec<Change>,
+}
+
+/// One layer of a chain: its text and the ranges of it a change touched.
+struct Layer {
+    text: Zeroizing<Vec<u8>>,
+    changed: Vec<(usize, usize)>,
+}
+
+/// One change [`reveal_outcome`] undoes; `None` when it would change nothing.
+type RevealTransform = fn(&[u8]) -> Option<Edited>;
+
+/// One step of a chain; `None` when nothing changed.
+type RevealChain = fn(&[u8]) -> Option<Layer>;
 
 /// The single changes, each also undone repeatedly in a chain of its own.
 const REVEAL_TRANSFORMS: &[RevealTransform] = &[
@@ -1249,87 +1623,140 @@ const REVEAL_TRANSFORMS: &[RevealTransform] = &[
     without_markup_tags,
 ];
 
-/// The chains [`reveals_any`] follows: every single change on its own, then
-/// all of them applied in turn at every layer.
-const REVEAL_CHAINS: &[RevealTransform] = &[
-    without_control_bytes,
-    percent_decoded,
-    markdown_unescaped,
-    html_entities_decoded,
-    without_markup_tags,
+/// The chains [`reveal_outcome`] follows: every single change on its own,
+/// then all of them applied in turn at every layer.
+const REVEAL_CHAINS: &[RevealChain] = &[
+    |text| single_layer(without_control_bytes, text),
+    |text| single_layer(percent_decoded, text),
+    |text| single_layer(markdown_unescaped, text),
+    |text| single_layer(html_entities_decoded, text),
+    |text| single_layer(without_markup_tags, text),
     all_reveal_transforms,
 ];
 
-/// Every [`REVEAL_TRANSFORMS`] change applied once, in order.
-fn all_reveal_transforms(text: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
-    let mut changed: Option<Zeroizing<Vec<u8>>> = None;
+fn single_layer(transform: RevealTransform, text: &[u8]) -> Option<Layer> {
+    transform(text).map(|edited| Layer {
+        changed: edited.changes.iter().map(|change| change.output).collect(),
+        text: edited.text,
+    })
+}
+
+/// Every [`REVEAL_TRANSFORMS`] change applied once, in order. The touched
+/// ranges of earlier transforms are carried through the later ones.
+fn all_reveal_transforms(text: &[u8]) -> Option<Layer> {
+    let mut current: Option<Layer> = None;
     for transform in REVEAL_TRANSFORMS {
-        let current = changed.as_ref().map_or(text, |changed| changed.as_slice());
-        if let Some(next) = transform(current) {
-            changed = Some(next);
+        let input = current.as_ref().map_or(text, |layer| layer.text.as_slice());
+        let Some(edited) = transform(input) else {
+            continue;
+        };
+        let mut changed: Vec<(usize, usize)> = current
+            .take()
+            .map(|layer| layer.changed)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(start, end)| {
+                (
+                    map_position(&edited.changes, start, false),
+                    map_position(&edited.changes, end, true),
+                )
+            })
+            .collect();
+        changed.extend(edited.changes.iter().map(|change| change.output));
+        changed.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(changed.len());
+        for range in changed {
+            match merged.last_mut() {
+                Some(last) if range.0 <= last.1 => last.1 = last.1.max(range.1),
+                _ => merged.push(range),
+            }
         }
+        current = Some(Layer {
+            text: edited.text,
+            changed: merged,
+        });
     }
-    changed
+    current
+}
+
+/// Where input position `position` lands in a transform's output. A position
+/// inside a change lands on the start of that change's output, or its end
+/// when `end` is set.
+fn map_position(changes: &[Change], position: usize, end: bool) -> usize {
+    let before = changes.partition_point(|change| change.input.0 <= position);
+    let Some(change) = before.checked_sub(1).map(|index| changes[index]) else {
+        return position;
+    };
+    if position < change.input.1 {
+        if end {
+            change.output.1
+        } else {
+            change.output.0
+        }
+    } else {
+        position - change.input.1 + change.output.1
+    }
 }
 
 /// `text` without ASCII control bytes, which a URL parser drops (a tab or a
 /// line break inside a URL) or a reader skips.
-fn without_control_bytes(text: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
-    let is_control = |byte: &u8| *byte < 0x20 || *byte == 0x7f;
-    text.iter().any(is_control).then(|| {
-        Zeroizing::new(
-            text.iter()
-                .copied()
-                .filter(|byte| !is_control(byte))
-                .collect(),
-        )
-    })
+fn without_control_bytes(text: &[u8]) -> Option<Edited> {
+    let is_control = |byte: u8| byte < 0x20 || byte == 0x7f;
+    if !text.iter().any(|byte| is_control(*byte)) {
+        return None;
+    }
+    let mut rewrite = Rewrite::with_capacity(text.len());
+    for (index, byte) in text.iter().enumerate() {
+        if is_control(*byte) {
+            rewrite.replace(index, index + 1, &[]);
+        } else {
+            rewrite.keep(*byte);
+        }
+    }
+    rewrite.finish()
 }
 
 /// `text` with one layer of `%XX` escapes decoded; a malformed escape stays
 /// as it is.
-fn percent_decoded(text: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+fn percent_decoded(text: &[u8]) -> Option<Edited> {
     if !text.contains(&b'%') {
         return None;
     }
-    let mut out = Zeroizing::new(Vec::with_capacity(text.len()));
+    let mut rewrite = Rewrite::with_capacity(text.len());
     let mut index = 0;
-    let mut changed = false;
     while index < text.len() {
         if text[index] == b'%' {
             if let Some((value, len)) = decode_percent(text, index) {
-                out.push(value);
+                rewrite.replace(index, index + len, &[value]);
                 index += len;
-                changed = true;
                 continue;
             }
         }
-        out.push(text[index]);
+        rewrite.keep(text[index]);
         index += 1;
     }
-    changed.then_some(out)
+    rewrite.finish()
 }
 
 /// `text` with Markdown backslash escapes removed (`\*` read as `*`), the form
 /// an HTML-to-Markdown converter writes punctuation in and a reader sees
 /// through.
-fn markdown_unescaped(text: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
-    let escapes = |pair: &[u8]| pair[0] == b'\\' && pair[1].is_ascii_punctuation();
-    if !text.windows(2).any(escapes) {
+fn markdown_unescaped(text: &[u8]) -> Option<Edited> {
+    if !text.contains(&b'\\') {
         return None;
     }
-    let mut out = Zeroizing::new(Vec::with_capacity(text.len()));
+    let mut rewrite = Rewrite::with_capacity(text.len());
     let mut index = 0;
     while index < text.len() {
         if text[index] == b'\\' && text.get(index + 1).is_some_and(u8::is_ascii_punctuation) {
-            out.push(text[index + 1]);
+            rewrite.replace(index, index + 2, &[text[index + 1]]);
             index += 2;
             continue;
         }
-        out.push(text[index]);
+        rewrite.keep(text[index]);
         index += 1;
     }
-    Some(out)
+    rewrite.finish()
 }
 
 /// Named HTML character references for ASCII characters that
@@ -1371,29 +1798,27 @@ const HTML_NAMED_ENTITIES: &[(&[u8], u8)] = &[
 ];
 
 /// `text` with HTML character references decoded: `&#42;`, `&#x2a;`, the
-/// same without `;`, and the named ones in [`HTML_NAMED_ENTITIES`]. HTML kept as it is (a page served
-/// under a source-file path) spells characters this way, and any browser or
-/// reader decodes them.
-fn html_entities_decoded(text: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+/// same without `;`, and the named ones in [`HTML_NAMED_ENTITIES`]. HTML kept
+/// as it is spells characters this way, and any browser or reader decodes
+/// them.
+fn html_entities_decoded(text: &[u8]) -> Option<Edited> {
     if !text.contains(&b'&') {
         return None;
     }
-    let mut out = Zeroizing::new(Vec::with_capacity(text.len()));
+    let mut rewrite = Rewrite::with_capacity(text.len());
     let mut index = 0;
-    let mut changed = false;
     while index < text.len() {
         if text[index] == b'&' {
             if let Some((decoded, len)) = html_entity_at(text, index) {
-                out.extend_from_slice(&decoded);
+                rewrite.replace(index, index + len, &decoded);
                 index += len;
-                changed = true;
                 continue;
             }
         }
-        out.push(text[index]);
+        rewrite.keep(text[index]);
         index += 1;
     }
-    changed.then_some(out)
+    rewrite.finish()
 }
 
 /// The longest tag [`without_markup_tags`] removes; a `<` with no `>` within
@@ -1403,13 +1828,12 @@ const MAX_TAG_LEN: usize = 1024;
 /// `text` with HTML tags removed (`<span>`, `</b>`, `<!-- -->`), the way a
 /// browser or a Markdown renderer shows inline markup: a key split across
 /// tags is one word on screen.
-fn without_markup_tags(text: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+fn without_markup_tags(text: &[u8]) -> Option<Edited> {
     if !text.contains(&b'<') {
         return None;
     }
-    let mut out = Zeroizing::new(Vec::with_capacity(text.len()));
+    let mut rewrite = Rewrite::with_capacity(text.len());
     let mut index = 0;
-    let mut changed = false;
     while index < text.len() {
         let opens_tag = text[index] == b'<'
             && text
@@ -1418,15 +1842,15 @@ fn without_markup_tags(text: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
         if opens_tag {
             let limit = (index + MAX_TAG_LEN).min(text.len());
             if let Some(close) = text[index + 1..limit].iter().position(|byte| *byte == b'>') {
+                rewrite.replace(index, index + close + 2, &[]);
                 index += close + 2;
-                changed = true;
                 continue;
             }
         }
-        out.push(text[index]);
+        rewrite.keep(text[index]);
         index += 1;
     }
-    changed.then_some(out)
+    rewrite.finish()
 }
 
 /// The character reference starting at `text[index]` (which is `&`): its
@@ -1827,5 +2251,154 @@ mod tests {
             b"<p><span>abcdef</span> <span>*xyzw</span></p> &#42 a < b",
             key
         ));
+    }
+
+    #[test]
+    fn a_passed_deadline_makes_the_reveal_check_out_of_time() {
+        let key: &[u8] = b"0123456789abcdef";
+        let past = std::time::Instant::now();
+        assert_eq!(
+            reveal_outcome(b"plain text", &[key], Some(past)),
+            RevealOutcome::OutOfTime
+        );
+        assert_eq!(
+            reveal_outcome(b"plain text", &[key], None),
+            RevealOutcome::Clean
+        );
+    }
+
+    /// Thirty layers of percent-encoding converge before the depth limit,
+    /// but rescanning a 60 KB base64 group at every layer of two chains
+    /// passes the work budget first.
+    #[test]
+    fn rescanning_past_the_work_budget_is_exhausted() {
+        let key: &[u8] = b"0123456789abcdef";
+        let mut text = b"ABCDEFGHIJKLMNOP ".repeat(60 * 1024 / 17);
+        text.push(b'%');
+        text.extend_from_slice(&b"25".repeat(30));
+        text.extend_from_slice(b"41");
+        assert!(text.len() < 64 * 1024);
+        assert_eq!(
+            reveal_outcome(&text, &[key], None),
+            RevealOutcome::Exhausted
+        );
+        // The same nesting in a short text stays inside the budget.
+        let mut short = b"x %".to_vec();
+        short.extend_from_slice(&b"25".repeat(30));
+        short.extend_from_slice(b"41");
+        assert_eq!(reveal_outcome(&short, &[key], None), RevealOutcome::Clean);
+    }
+
+    /// The one-pass, all-keys detector agrees with the scrubber's own search
+    /// on every family.
+    #[test]
+    fn the_reveal_detector_agrees_with_the_scrubber_search() {
+        let keys: [&[u8]; 3] = [
+            b"0123456789abcdef",
+            b"fetch-secret-key/0123456789+abc",
+            b"key with space 0123",
+        ];
+        let mut samples: Vec<Vec<u8>> = vec![
+            b"nothing here at all".to_vec(),
+            b"almost 0123456789abcdeX".to_vec(),
+            b"x MDEyMzQ1Njc4OWFiY2RlZg== y".to_vec(),
+            b"MDEy MzQ1 Njc4 OWFi Y2Rl Zg".to_vec(),
+            b"QUJDMDEyMzQ1Njc4OWFiY2RlZg".to_vec(),
+            b"%30%31%32%33%34%35%36%37%38%39%61%62%63%64%65%66".to_vec(),
+            b"303132333435363738396162636465 66".to_vec(),
+            b"30313233343536373839616263646566".to_vec(),
+            b"30313233343536373839414243444546".to_vec(),
+            b"\\u0030123456789abcdef".to_vec(),
+            b"fetch-secret-key%2F0123456789%2Babc".to_vec(),
+            b"key+with+space+0123".to_vec(),
+            b"ZmV0Y2gtc2VjcmV0LWtleS8wMTIzNDU2Nzg5K2FiYw".to_vec(),
+        ];
+        samples.push(b"prefix ".iter().chain(keys[1]).copied().collect());
+        let needles = Needles::new(&keys);
+        for sample in &samples {
+            let scrubber = keys.iter().any(|key| {
+                let literals = KeyPatterns::derive(key)
+                    .map(|p| p.patterns)
+                    .unwrap_or_default();
+                !find_key_spans(sample, key, &literals).is_empty()
+            });
+            let detector = matches!(needles.held_in(sample, &Clock(None)), Ok(true));
+            assert_eq!(detector, scrubber, "{}", String::from_utf8_lossy(sample));
+        }
+    }
+
+    /// A GitHub-style JSON API response of about `size` bytes: escaped
+    /// quotes and backslashes, `%20`, `&amp;` and inline tags in every record.
+    fn realistic_json(size: usize) -> Vec<u8> {
+        let mut out = b"[\n".to_vec();
+        let mut number = 0;
+        while out.len() < size {
+            number += 1;
+            out.extend_from_slice(format!(
+                "  {{\n    \"url\": \"https://api.github.com/repos/octo/repo/issues/{number}\",\n    \"title\": \"Fix \\\"quoted\\\" path C:\\\\tmp\\\\a%20b for case {number}\",\n    \"body\": \"See <b>bold</b> &amp; more at https://example.com/x?y=1&amp;z=2, run `cargo test` and %41 here.\",\n    \"labels\": [\"bug\", \"help wanted\"],\n    \"state\": \"open\",\n    \"number\": {number}\n  }},\n"
+            ).as_bytes());
+        }
+        out.extend_from_slice(b"  {}\n]\n");
+        out
+    }
+
+    /// A key-unaware body used to measure the residual check: alphanumeric
+    /// sixteen-character lines and a thirty-layer percent tail. It needs no
+    /// knowledge of a key.
+    fn key_unaware_hostile_body(size: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(size + 80);
+        while out.len() < size {
+            out.extend_from_slice(b"ABCDEFGHIJKLMNOP\n");
+        }
+        out.push(b'%');
+        out.extend_from_slice(&b"25".repeat(30));
+        out.extend_from_slice(b"41");
+        out
+    }
+
+    /// Release-build timings for the residual check at the 8 MiB fetch cap,
+    /// within the 1.5 s a placeholder fetch gives it; run with
+    /// `--release --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn measure_residual_check_time_on_8_mib_inputs() {
+        let keys: [&[u8]; 3] = [
+            b"0123456789abcdef",
+            b"fetch-secret-key/0123456789+abc",
+            b"sk_live_abcdefghijklmnop",
+        ];
+        let share = std::time::Duration::from_millis(1500);
+        let cases: [(&str, Vec<u8>, &[&[u8]]); 4] = [
+            ("realistic JSON, 1 key", realistic_json(8 << 20), &keys[..1]),
+            ("realistic JSON, 3 keys", realistic_json(8 << 20), &keys[..]),
+            (
+                "key-unaware hostile, 1 key",
+                key_unaware_hostile_body(8 << 20),
+                &keys[..1],
+            ),
+            (
+                "key-unaware hostile, 3 keys",
+                key_unaware_hostile_body(8 << 20),
+                &keys[..],
+            ),
+        ];
+        for (name, input, keys) in cases {
+            let started = std::time::Instant::now();
+            let outcome = reveal_outcome(&input, keys, Some(started + share));
+            let elapsed = started.elapsed();
+            eprintln!(
+                "{name}: {} bytes -> {outcome:?} in {elapsed:?}",
+                input.len()
+            );
+            assert!(
+                elapsed < share + std::time::Duration::from_millis(250),
+                "{name}: {elapsed:?}"
+            );
+            if name.starts_with("realistic") {
+                assert_eq!(outcome, RevealOutcome::Clean, "{name}");
+            } else {
+                assert!(!outcome.is_clean(), "{name}");
+            }
+        }
     }
 }

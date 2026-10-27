@@ -60,6 +60,10 @@ pub(crate) const URL_REPLY_MARGIN: Duration = Duration::from_secs(1);
 /// reading the document back. A download that ends at its deadline still has
 /// this much time for that work.
 const URL_READ_BACK_RESERVE: Duration = Duration::from_secs(2);
+/// The part of the read-back reserve a placeholder fetch's final residual
+/// key check may use, counted from the end of the download deadline. The
+/// rest stays for writing and reading the document back.
+const RESIDUAL_CHECK_RESERVE: Duration = Duration::from_millis(1500);
 /// A transient failure is retried only when the backoff plus at least this
 /// much time for the next attempt still fit before the fetch deadline.
 const MIN_USEFUL_ATTEMPT: Duration = Duration::from_secs(1);
@@ -1081,9 +1085,28 @@ fn fetch_with_secrets(
     // The scrub replaced every spelling it recognised, but conversion and
     // plain readers undo more (a Markdown-escaped `\*`, an HTML entity kept in
     // a page served under a source path). A document that still spells a held
-    // key after those is refused, never written.
-    if held.reveals(&body) {
-        return Err(secret_fetch_refused("document_discloses_key", logical_url));
+    // key after those is refused, never written; so is one the check could
+    // not finish, within its work budget or before its share of the call's
+    // read-back reserve ran out.
+    let outcome = secret_rules::reveal_outcome(
+        &body,
+        &held.keys(),
+        Some(residual_check_deadline(&deadline)),
+    );
+    match outcome {
+        secret_rules::RevealOutcome::Clean => {}
+        secret_rules::RevealOutcome::Found => {
+            return Err(secret_fetch_refused("document_discloses_key", logical_url));
+        }
+        secret_rules::RevealOutcome::Exhausted => {
+            return Err(secret_fetch_refused(
+                "residual_check_exhausted",
+                logical_url,
+            ));
+        }
+        secret_rules::RevealOutcome::OutOfTime => {
+            return Err(secret_fetch_refused("residual_check_timeout", logical_url));
+        }
     }
     let content_file = document_dir.join(format!("document{extension}"));
     write_secret_document(&content_file, &body)?;
@@ -1164,6 +1187,38 @@ impl Read for FailingBody {
     fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
         Err(io::Error::other(self.0.clone()))
     }
+}
+
+/// When a placeholder fetch's final residual key check must stop: its share
+/// of the read-back reserve after the download deadline, or sooner in a test
+/// that injects a shorter limit.
+fn residual_check_deadline(deadline: &FetchDeadline) -> Instant {
+    #[cfg(test)]
+    if let Some(limit) = TEST_RESIDUAL_LIMIT.with(std::cell::Cell::get) {
+        return Instant::now() + limit;
+    }
+    deadline.at + RESIDUAL_CHECK_RESERVE
+}
+
+#[cfg(test)]
+thread_local! {
+    /// When set, a placeholder fetch's residual check stops this long after
+    /// it starts, so a test can reach the timeout without a slow document.
+    static TEST_RESIDUAL_LIMIT: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+/// Make this thread's placeholder fetches stop their residual check `limit`
+/// after it starts, until the returned guard drops.
+#[cfg(test)]
+pub(crate) fn limit_secret_residual_check_for_test(limit: Duration) -> impl Drop {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_RESIDUAL_LIMIT.with(|slot| slot.set(None));
+        }
+    }
+    TEST_RESIDUAL_LIMIT.with(|slot| slot.set(Some(limit)));
+    Restore
 }
 
 /// A content coding a placeholder fetch can undo before scrubbing.
