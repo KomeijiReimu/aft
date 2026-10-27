@@ -1090,27 +1090,26 @@ mod storage_retention_tests {
                 BTreeSet::from([[index as u8 + 1; 32]]),
             );
             let readers = crate::root_cache::read_marker_dir(&view_dir, generation);
+            // A same-host marker whose owner is long dead: stale, like the
+            // malformed file beside it. Copying the live record keeps the
+            // real hostname, so the verdict never depends on file mtime.
+            let marker = ReadMarker::create(&view_dir, generation).unwrap();
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&fs::read(marker.path()).unwrap()).unwrap();
+            record["pid"] = serde_json::Value::from(4_000_000_000u64);
+            fs::write(
+                readers.join("dead.json"),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+            fs::write(readers.join("malformed.json"), b"not a marker").unwrap();
             if *generation != "gen-e" {
-                let marker = ReadMarker::create(&view_dir, generation).unwrap();
-                // A same-host marker whose owner is long dead: stale, like the
-                // malformed file beside it. Copying the live record keeps the
-                // real hostname, so the verdict never depends on file mtime.
-                let mut record: serde_json::Value =
-                    serde_json::from_slice(&fs::read(marker.path()).unwrap()).unwrap();
-                record["pid"] = serde_json::Value::from(4_000_000_000u64);
-                fs::write(readers.join("dead.json"), serde_json::to_vec(&record).unwrap())
-                    .unwrap();
-                fs::write(readers.join("malformed.json"), b"not a marker").unwrap();
                 marker_files += 3;
                 live_markers.push(marker);
             } else {
-                fs::create_dir_all(&readers).unwrap();
-                fs::write(
-                    readers.join("dead.json"),
-                    br#"{"pid":4000000000,"hostname":"elsewhere","created_at_ms":0}"#,
-                )
-                .unwrap();
-                fs::write(readers.join("malformed.json"), b"not a marker").unwrap();
+                // No live reader here: dropping the marker unlinks it, so
+                // nothing protects this generation.
+                drop(marker);
                 marker_files += 2;
             }
         }
@@ -1158,21 +1157,22 @@ mod storage_retention_tests {
         // One view open plus one readers open, then one open per generation
         // and one per marker file. Re-opening the view and its readers once
         // per generation would report three opens per generation here.
+        let opens = work_counts::get().opens;
+        let hostnames = crate::root_cache::hostname_resolutions_for_test();
+        let starts = crate::root_cache::process_start_resolutions_for_test();
+        println!(
+            "query pin marking over {} generations and {marker_files} markers: {opens} opens, {hostnames} hostname resolutions, {starts} process-start resolutions",
+            generations.len(),
+        );
         assert!(
-            work_counts::get().opens <= 2 + generations.len() + marker_files,
-            "query pin marking re-opened shared parents: {}",
-            work_counts::get().opens,
+            opens <= 2 + generations.len() + marker_files,
+            "query pin marking re-opened shared parents: {opens}",
         );
         // The pass resolves the hostname once and each live pid's start time
         // once, no matter how many generations or markers name them.
+        assert_eq!(hostnames, 1, "hostname resolved once per generation");
         assert_eq!(
-            crate::root_cache::hostname_resolutions_for_test(),
-            1,
-            "hostname resolved once per generation"
-        );
-        assert_eq!(
-            crate::root_cache::process_start_resolutions_for_test(),
-            1,
+            starts, 1,
             "one process start time resolved once per marker"
         );
     }

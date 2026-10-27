@@ -6716,17 +6716,21 @@ mod tests {
         // One tick over 32 contexts sharing a root resolves it once (plus the
         // one standing-roots probe, which runs once per tick by construction).
         // Resolving once per context would report hundreds here.
+        let resolutions = crate::bash_background::storage_dir_calls_for_test();
+        let canonicalizations =
+            crate::project_content::register_canonicalizations_for_test();
+        println!(
+            "health tick over 32 contexts: {resolutions} storage resolutions, {canonicalizations} canonicalizations"
+        );
         assert!(
-            crate::bash_background::storage_dir_calls_for_test() <= 8,
-            "shared storage resolved once per context: {}",
-            crate::bash_background::storage_dir_calls_for_test(),
+            resolutions <= 8,
+            "shared storage resolved once per context: {resolutions}",
         );
         // The first registration canonicalizes the root; repeats reuse the
         // retained spelling without another realpath probe.
         assert!(
-            crate::project_content::register_canonicalizations_for_test() <= 4,
-            "storage root canonicalized once per context: {}",
-            crate::project_content::register_canonicalizations_for_test(),
+            canonicalizations <= 4,
+            "storage root canonicalized once per context: {canonicalizations}",
         );
         drop(dirs);
     }
