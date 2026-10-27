@@ -10836,6 +10836,8 @@ impl BgTaskRegistry {
     /// Find live shell tasks with a persisted daemon scope identity. Keep
     /// this off the subc frame loop: locks and process sampling may block.
     pub(crate) fn live_scope_stamps(&self) -> Vec<subc_protocol::scope::ScopeStamp> {
+        // Only unix extends the task scopes with secret proxy authorizations.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut scopes: Vec<_> = self
             .running_tasks()
             .into_iter()
