@@ -1,1 +1,1 @@
-Language server startup now shares one reservation per workspace, preventing duplicate servers and keeping diagnostics pending until startup finishes.
+- Language servers start once per workspace even when several requests arrive together, and file changes made while a server is starting are sent to it once it is ready.
