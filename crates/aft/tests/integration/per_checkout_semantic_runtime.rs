@@ -791,6 +791,26 @@ fn assert_reloading_after_eviction(answer: &Value) {
     );
 }
 
+/// Evicts the root's artifacts as the idle reaper does until its views-on
+/// semantic lane is released. Eviction does not wait for a lane whose locks
+/// are held (its worker can still be publishing the fill the test waited
+/// for): it leaves that lane loaded, and the reaper releases it on a later
+/// pass. This repeats the eviction the same way.
+fn evict_until_lane_released(ctx: &AppContext) {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        assert!(ctx.evict_idle_artifacts(), "the root must be idle");
+        if !ctx.checkout_semantic().active() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "idle eviction never released the lane: {}",
+            ctx.checkout_semantic().describe()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
 /// Idle eviction drops the trigram index too, and both lanes reload by
 /// design. Reloads the trigram index through a grep, which reloads only that
 /// index, and waits until it is ready, so the next search has a ready lexical
@@ -839,11 +859,12 @@ fn views_on_search_after_idle_eviction_reports_the_lane_reloading() {
     let storage = tempfile::tempdir().unwrap();
     let ctx = configure(&repo.main, storage.path(), &server, true);
     wait_views_filled(&ctx);
-    assert!(ctx.evict_idle_artifacts(), "the root must be idle");
+    evict_until_lane_released(&ctx);
     reload_trigram_after_eviction(&ctx);
     assert!(
         !ctx.checkout_semantic().active(),
-        "idle eviction must release the lane, and reloading the trigram index must not restart it"
+        "reloading the trigram index must not restart the semantic lane: {}",
+        ctx.checkout_semantic().describe()
     );
 
     let query = "read a configuration file from disk";
