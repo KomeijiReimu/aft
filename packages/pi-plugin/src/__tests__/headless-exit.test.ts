@@ -26,6 +26,9 @@ import { linkCachedExecutable } from "../../../aft-bridge/src/__tests__/test-uti
 const EXIT_BOUND_MS = 5_000;
 /** When to stop waiting and kill a child that is evidently not going to exit. */
 const HANG_KILL_MS = 15_000;
+// Each notification test spawns a harness process; on a loaded runner it can take
+// longer than bun's 5 s default to finish, so allow more than the 15 s rescue kill.
+const SUBPROCESS_TEST_MS = 30_000;
 
 interface HarnessRun {
   events: Array<{ name: string; detail: string; at: number }>;
@@ -585,111 +588,135 @@ describe.skipIf(process.platform === "win32")("approved session UI binding", () 
     return { code, stdout, stderr };
   }
 
-  test("factory without UI delivers the actual plugin version through session context", async () => {
-    const run = await notifications("notification-upgrade");
-    expect(run.code).toBe(0);
-    const toasts = run.stdout.split("\n").filter((line) => line.startsWith("EVENT ui-toast "));
-    expect(toasts).toHaveLength(1);
-    const toast = JSON.parse(toasts[0]?.slice("EVENT ui-toast ".length) ?? "null") as {
-      sessionId: string;
-      message: string;
-      type: string;
-    };
-    const version = (
-      JSON.parse(readFileSync(join(import.meta.dir, "../../package.json"), "utf8")) as {
-        version: string;
-      }
-    ).version;
-    expect(toast.sessionId).toBe("harness-session");
-    expect(toast.type).toBe("info");
-    expect(toast.message).toContain(`v${version}:`);
-    expect(run.stdout).toContain(`EVENT announcement-marker ${version}`);
-  });
+  test(
+    "factory without UI delivers the actual plugin version through session context",
+    async () => {
+      const run = await notifications("notification-upgrade");
+      expect(run.code).toBe(0);
+      const toasts = run.stdout.split("\n").filter((line) => line.startsWith("EVENT ui-toast "));
+      expect(toasts).toHaveLength(1);
+      const toast = JSON.parse(toasts[0]?.slice("EVENT ui-toast ".length) ?? "null") as {
+        sessionId: string;
+        message: string;
+        type: string;
+      };
+      const version = (
+        JSON.parse(readFileSync(join(import.meta.dir, "../../package.json"), "utf8")) as {
+          version: string;
+        }
+      ).version;
+      expect(toast.sessionId).toBe("harness-session");
+      expect(toast.type).toBe("info");
+      expect(toast.message).toContain(`v${version}:`);
+      expect(run.stdout).toContain(`EVENT announcement-marker ${version}`);
+    },
+    SUBPROCESS_TEST_MS,
+  );
 
-  test("real headless context with callable UI preserves pending upgrade", async () => {
-    const run = await notifications("notification-headless");
-    expect(run.code).toBe(0);
-    expect(run.stdout).not.toContain("EVENT ui-toast ");
-    expect(run.stdout).toContain("EVENT announcement-marker 0.1.0");
-  });
+  test(
+    "real headless context with callable UI preserves pending upgrade",
+    async () => {
+      const run = await notifications("notification-headless");
+      expect(run.code).toBe(0);
+      expect(run.stdout).not.toContain("EVENT ui-toast ");
+      expect(run.stdout).toContain("EVENT announcement-marker 0.1.0");
+    },
+    SUBPROCESS_TEST_MS,
+  );
 
-  test("pending announcements and install summaries retry once on a later UI context", async () => {
-    const run = await notifications("notification-retry");
-    expect(run.code).toBe(0);
-    expect(run.stdout).toContain("EVENT pending-marker 0.1.0");
-    const toasts = run.stdout
-      .split("\n")
-      .filter((line) => line.startsWith("EVENT ui-toast "))
-      .map((line) => JSON.parse(line.slice("EVENT ui-toast ".length)));
-    expect(toasts.map((toast) => [toast.sessionId, toast.type])).toEqual([
-      ["retry-session", "info"],
-      ["retry-session", "warning"],
-    ]);
-    expect(toasts[1].message).toContain("fixture install failed");
-    expect(toasts[1].message).not.toContain("routine-server");
-  });
+  test(
+    "pending announcements and install summaries retry once on a later UI context",
+    async () => {
+      const run = await notifications("notification-retry");
+      expect(run.code).toBe(0);
+      expect(run.stdout).toContain("EVENT pending-marker 0.1.0");
+      const toasts = run.stdout
+        .split("\n")
+        .filter((line) => line.startsWith("EVENT ui-toast "))
+        .map((line) => JSON.parse(line.slice("EVENT ui-toast ".length)));
+      expect(toasts.map((toast) => [toast.sessionId, toast.type])).toEqual([
+        ["retry-session", "info"],
+        ["retry-session", "warning"],
+      ]);
+      expect(toasts[1].message).toContain("fixture install failed");
+      expect(toasts[1].message).not.toContain("routine-server");
+    },
+    SUBPROCESS_TEST_MS,
+  );
 
-  test("install completion notifies the active session UI rather than the factory API", async () => {
-    const run = await notifications("notification-summary");
-    expect(run.code).toBe(0);
-    const toasts = run.stdout
-      .split("\n")
-      .filter((line) => line.startsWith("EVENT ui-toast "))
-      .map(
-        (line) =>
-          JSON.parse(line.slice("EVENT ui-toast ".length)) as {
-            sessionId: string;
-            message: string;
-            type: string;
-          },
+  test(
+    "install completion notifies the active session UI rather than the factory API",
+    async () => {
+      const run = await notifications("notification-summary");
+      expect(run.code).toBe(0);
+      const toasts = run.stdout
+        .split("\n")
+        .filter((line) => line.startsWith("EVENT ui-toast "))
+        .map(
+          (line) =>
+            JSON.parse(line.slice("EVENT ui-toast ".length)) as {
+              sessionId: string;
+              message: string;
+              type: string;
+            },
+        );
+      const warnings = toasts.filter((toast) => toast.type === "warning");
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]?.sessionId).toBe("harness-session");
+      expect(warnings[0]?.message).toContain("fixture install failed");
+      expect(warnings[0]?.message).not.toContain("routine-server");
+    },
+    SUBPROCESS_TEST_MS,
+  );
+
+  test(
+    "headless install-summary retries log once and deliver once when UI becomes available",
+    async () => {
+      const run = await notifications("notification-log-retry");
+      expect(run.code).toBe(0);
+      expect(run.stdout).toContain("EVENT headless-turns-done");
+      expect(run.stdout).toContain("EVENT ui-turns-done");
+      expect(run.stdout.split("EVENT headless-turns-done")[0]).not.toContain("EVENT ui-toast ");
+      const summaryLogs = run.stderr.match(
+        /\] WARN \[aft-pi\] \[lsp\] skipped or failed to install \d+ server\(s\):/g,
       );
-    const warnings = toasts.filter((toast) => toast.type === "warning");
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]?.sessionId).toBe("harness-session");
-    expect(warnings[0]?.message).toContain("fixture install failed");
-    expect(warnings[0]?.message).not.toContain("routine-server");
-  });
+      expect(summaryLogs).toHaveLength(1);
+      const warnings = run.stdout
+        .split("\n")
+        .filter((line) => line.startsWith("EVENT ui-toast "))
+        .map((line) => JSON.parse(line.slice("EVENT ui-toast ".length)))
+        .filter((toast) => toast.type === "warning");
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]?.sessionId).toBe("retry-session");
+      expect(warnings[0]?.message).toContain("fixture install failed");
+      expect(warnings[0]?.message).not.toContain("routine-server");
+    },
+    SUBPROCESS_TEST_MS,
+  );
 
-  test("headless install-summary retries log once and deliver once when UI becomes available", async () => {
-    const run = await notifications("notification-log-retry");
-    expect(run.code).toBe(0);
-    expect(run.stdout).toContain("EVENT headless-turns-done");
-    expect(run.stdout).toContain("EVENT ui-turns-done");
-    expect(run.stdout.split("EVENT headless-turns-done")[0]).not.toContain("EVENT ui-toast ");
-    const summaryLogs = run.stderr.match(
-      /\] WARN \[aft-pi\] \[lsp\] skipped or failed to install \d+ server\(s\):/g,
-    );
-    expect(summaryLogs).toHaveLength(1);
-    const warnings = run.stdout
-      .split("\n")
-      .filter((line) => line.startsWith("EVENT ui-toast "))
-      .map((line) => JSON.parse(line.slice("EVENT ui-toast ".length)))
-      .filter((toast) => toast.type === "warning");
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]?.sessionId).toBe("retry-session");
-    expect(warnings[0]?.message).toContain("fixture install failed");
-    expect(warnings[0]?.message).not.toContain("routine-server");
-  });
-
-  test("headless announcement retries log once and deliver once when UI becomes available", async () => {
-    const run = await notifications("notification-log-retry");
-    expect(run.code).toBe(0);
-    expect(run.stdout).toContain("EVENT headless-turns-done");
-    expect(run.stdout).toContain("EVENT ui-turns-done");
-    expect(run.stdout.split("EVENT headless-turns-done")[0]).not.toContain("EVENT ui-toast ");
-    const announcementLogs = run.stderr.match(/\] INFO \[aft-pi\] 🔧 AFT: ✨ v[^\r\n]+:/g);
-    expect(announcementLogs).toHaveLength(1);
-    const announcements = run.stdout
-      .split("\n")
-      .filter((line) => line.startsWith("EVENT ui-toast "))
-      .map((line) => JSON.parse(line.slice("EVENT ui-toast ".length)))
-      .filter((toast) => toast.type === "info" && toast.message.startsWith("🔧 AFT: ✨"));
-    expect(announcements).toHaveLength(1);
-    expect(announcements[0]?.sessionId).toBe("retry-session");
-    const version = JSON.parse(
-      readFileSync(join(import.meta.dir, "../../package.json"), "utf8"),
-    ).version;
-    expect(announcements[0]?.message).toContain(`v${version}:`);
-    expect(run.stdout).toContain(`EVENT announcement-marker ${version}`);
-  });
+  test(
+    "headless announcement retries log once and deliver once when UI becomes available",
+    async () => {
+      const run = await notifications("notification-log-retry");
+      expect(run.code).toBe(0);
+      expect(run.stdout).toContain("EVENT headless-turns-done");
+      expect(run.stdout).toContain("EVENT ui-turns-done");
+      expect(run.stdout.split("EVENT headless-turns-done")[0]).not.toContain("EVENT ui-toast ");
+      const announcementLogs = run.stderr.match(/\] INFO \[aft-pi\] 🔧 AFT: ✨ v[^\r\n]+:/g);
+      expect(announcementLogs).toHaveLength(1);
+      const announcements = run.stdout
+        .split("\n")
+        .filter((line) => line.startsWith("EVENT ui-toast "))
+        .map((line) => JSON.parse(line.slice("EVENT ui-toast ".length)))
+        .filter((toast) => toast.type === "info" && toast.message.startsWith("🔧 AFT: ✨"));
+      expect(announcements).toHaveLength(1);
+      expect(announcements[0]?.sessionId).toBe("retry-session");
+      const version = JSON.parse(
+        readFileSync(join(import.meta.dir, "../../package.json"), "utf8"),
+      ).version;
+      expect(announcements[0]?.message).toContain(`v${version}:`);
+      expect(run.stdout).toContain(`EVENT announcement-marker ${version}`);
+    },
+    SUBPROCESS_TEST_MS,
+  );
 });
