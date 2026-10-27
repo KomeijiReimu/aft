@@ -117,8 +117,19 @@ fn assert_terminal_survivor_reclaimed(clear_sample: bool) {
     fixture.wait_for_kill();
     // The worker settles group liveness, not this test's Child handle. Reap
     // the child to observe the signal rather than requiring try_wait to be
-    // ready immediately after the worker clears its in-flight flag.
-    let status = group.0.wait().unwrap();
+    // ready immediately after the worker clears its in-flight flag. The wait
+    // is bounded so a group that survived fails the test instead of hanging it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = group.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "terminal task's owned group survived reclaim"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
     assert!(
         matches!(status.signal(), Some(libc::SIGTERM) | Some(libc::SIGKILL)),
         "terminal task's owned group was not killed by a reclaim signal: {status}"
