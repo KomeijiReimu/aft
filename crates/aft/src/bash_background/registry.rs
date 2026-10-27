@@ -18242,6 +18242,14 @@ mod tests {
         db.lock().unwrap().execute_batch(
             "CREATE TRIGGER reject_discovery BEFORE INSERT ON bash_tasks BEGIN SELECT RAISE(FAIL, 'fixture recording refused'); END;"
         ).unwrap();
+        // The product's 25 ms time budget can expire on a slow runner after
+        // the task is read but before the session directory is exhausted, and
+        // a budget stop is reported ahead of the recording failure. A wide
+        // time budget keeps each pass checking the recording-failure report.
+        registry.set_project_replay_scan_budget_for_test(
+            PROJECT_REPLAY_SCAN_ENTRY_BUDGET,
+            Duration::from_secs(60),
+        );
         for _ in 0..2 {
             let batch = registry.replay_session_from_disk_for_project(
                 storage.path(),

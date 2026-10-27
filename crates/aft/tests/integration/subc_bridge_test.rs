@@ -5233,20 +5233,27 @@ async fn drive_bash_abort_inflight_daemon(input: FakeDaemonInput) {
     } = open_fake_daemon_session(input).await;
     bind_route1(&mut stream, &root1).await;
 
+    // The command writes the marker once it is running. The release file is
+    // never created, so only the abort (or the 5 s command timeout) ends it.
+    let marker = root1.join("abort-inflight-started");
+    let release = root1.join("abort-inflight-release");
     send_tool_call(
         &mut stream,
         1,
         130,
         "bash",
         json!({
-            "command": "sleep 30",
+            "command": hold_bash_until_release_command(&marker, &release, "abort-done"),
             "foreground_orchestrate": true,
             "wait": true,
             "timeout": 5_000,
         }),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // An abort only kills calls already registered as in flight, and a call
+    // registers when its command starts. Waiting a fixed time lost that race
+    // on a slow Windows runner; wait for the running command's marker instead.
+    wait_for_path_event(&marker, "aborted bash command start").await;
     send_tool_call(
         &mut stream,
         1,
