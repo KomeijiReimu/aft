@@ -10,9 +10,10 @@
 //! chunk count and `bytes` is the whole asset's length.
 //!
 //! Only the authenticated principal `reserved:occipital` may call them. Every
-//! refusal is an [`ErrorBody`] carrying one of the codes the posted transport
-//! contract lists, with the fixed message from [`operations::fixed_message`],
-//! so no request data ever appears in a refusal.
+//! refusal is an [`ErrorBody`] carrying one of the refusal codes listed in
+//! `tests/fixtures/rich_ui/transport-contract.json` (`chunks.refusalCodes`),
+//! with the fixed message from [`operations::fixed_message`], so no request
+//! data ever appears in a refusal.
 
 use std::ops::Deref;
 use std::sync::{Mutex, TryLockError};
@@ -48,9 +49,10 @@ pub(crate) fn admit_principal(principal_id: Option<&str>) -> Result<(), ErrorBod
     }
 }
 
-/// The manifest bytes the running build publishes, with their digest. There
-/// is none until the publication slice ships one; tests inject the golden
-/// manifest through [`set_test_manifest_for_test`].
+/// The manifest bytes the running build publishes, with their digest. The
+/// production builder does not publish a manifest yet, so this is `None`
+/// outside tests; tests inject the golden manifest through
+/// [`set_test_manifest_for_test`].
 fn running_manifest() -> Option<(String, Vec<u8>)> {
     #[cfg(test)]
     {
@@ -101,16 +103,18 @@ pub(crate) fn set_test_manifest_for_test(bytes: Option<Vec<u8>>) -> TestManifest
     TestManifestGuard { _serial: serial }
 }
 
-/// Template bytes the binary ships, by digest. No template ships until the
-/// publication slice pins CKIOS's files, so this finds nothing yet.
+/// Template bytes embedded in the binary, by digest. The binary embeds no
+/// template yet, so this lookup always returns `None` and every template is
+/// served from aft.db.
 fn shipped_template(_digest: &str) -> Option<&'static [u8]> {
     None
 }
 
 /// The request's digest and index. A digest that is missing or not a string
 /// names no asset (`digest_unknown`); an index that is missing or not a
-/// non-negative integer names no chunk (`chunk_index_out_of_range`). Both
-/// stay within the codes the posted contract lists for these queries.
+/// non-negative integer names no chunk (`chunk_index_out_of_range`, checked
+/// once the asset is found). A malformed request therefore gets one of the
+/// same refusal codes as a well-formed one, rather than a separate code.
 fn request(body: &Value, digest_field: &str) -> Result<(String, Option<u64>), ErrorBody> {
     let digest = body
         .get(digest_field)
