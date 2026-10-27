@@ -6096,7 +6096,7 @@ mod tests {
         std::fs::write(&resolved.paths.json, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(read_task_at(&resolved).unwrap().schema_pin.is_none());
         // The dispatch pin is recorded at spawn when the call carried one.
-        let pinned = super::with_schema_pin(Some("sha256:pin".into()), || {
+        let pinned = crate::bash_background::with_schema_pin(Some("sha256:pin".into()), || {
             let (_, task) = counted_task(directory.path());
             task
         });

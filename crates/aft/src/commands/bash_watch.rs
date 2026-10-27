@@ -976,10 +976,13 @@ mod tests {
                 .expect("record must be stored");
             drop(conn);
             let storage = crate::bash_background::task_storage_dir(&ctx);
-            let snapshot = ctx
-                .bash_background()
+            ctx.bash_background()
                 .recover_watch_task(&storage, SESSION, TASK, Some(dir.path()), Some("runner"))
                 .unwrap();
+            let snapshot = ctx
+                .bash_background()
+                .observed_status(TASK, SESSION, 0)
+                .expect("recovered terminal snapshot");
             (snapshot, stored)
         });
         assert!(snapshot.info.status.is_terminal());

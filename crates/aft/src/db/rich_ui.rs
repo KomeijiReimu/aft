@@ -817,6 +817,7 @@ mod tests {
                 .as_object()
                 .unwrap()
                 .keys()
+                .map(String::as_str)
                 .collect::<std::collections::BTreeSet<_>>(),
             [
                 "schema",
