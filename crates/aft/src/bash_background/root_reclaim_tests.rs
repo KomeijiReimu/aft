@@ -20,9 +20,17 @@ pub(crate) fn register_task(
         true,
         false,
     );
+    // Terminal group kills require a saved process identity so a reused PID
+    // cannot authorize signaling an unrelated group. Record the real spawn's
+    // ownership evidence before overriding its status for the fixture.
+    if let Some(pid) = pid {
+        metadata.mark_running(pid, i32::try_from(pid).expect("owned PGID fits i32"));
+        assert!(
+            metadata.child_start_time_ms.is_some(),
+            "owned fixture child must have a readable process identity"
+        );
+    }
     metadata.status = status;
-    metadata.child_pid = pid;
-    metadata.pgid = pid.map(|pid| pid as i32);
     metadata.live_descendants = pid.map(|pid| {
         vec![super::super::process::LiveDescendant {
             pid,

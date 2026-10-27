@@ -100,6 +100,8 @@ fn deleted_root_terminal_group_with_no_sample_is_checked_before_reclaim() {
 }
 
 fn assert_terminal_survivor_reclaimed(clear_sample: bool) {
+    use std::os::unix::process::ExitStatusExt;
+
     let mut fixture = ReclaimFixture::new();
     let mut group = OwnedGroup::spawn();
     fixture.task(
@@ -113,9 +115,13 @@ fn assert_terminal_survivor_reclaimed(clear_sample: bool) {
     }
     assert_eq!(fixture.sweep().evicted, 0);
     fixture.wait_for_kill();
+    // The worker settles group liveness, not this test's Child handle. Reap
+    // the child to observe the signal rather than requiring try_wait to be
+    // ready immediately after the worker clears its in-flight flag.
+    let status = group.0.wait().unwrap();
     assert!(
-        group.0.try_wait().unwrap().is_some(),
-        "terminal task's owned group survived reclaim"
+        matches!(status.signal(), Some(libc::SIGTERM) | Some(libc::SIGKILL)),
+        "terminal task's owned group was not killed by a reclaim signal: {status}"
     );
     let outcome = fixture.sweep();
     fixture.assert_reclaimed(outcome);
