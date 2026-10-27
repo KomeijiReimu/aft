@@ -11,7 +11,9 @@ test("view token uses a management request, not an agent tool", async () => {
     },
   } as unknown as AftProjectTransport;
   expect(await mintViewToken(transport, "/future/root", "abc")).toEqual({
-    token: "opaque", expires_ms: 100, advisory: true,
+    token: "opaque",
+    expires_ms: 100,
+    advisory: true,
   });
   expect(calls).toEqual([["view_token", { root: "/future/root", expected_tree: "abc" }]]);
 });

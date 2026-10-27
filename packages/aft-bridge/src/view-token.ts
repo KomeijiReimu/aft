@@ -17,7 +17,9 @@ export async function mintViewToken(
     expected_tree: expectedTree,
   });
   if (!response.success) {
-    throw new Error(typeof response.message === "string" ? response.message : "View token mint failed");
+    throw new Error(
+      typeof response.message === "string" ? response.message : "View token mint failed",
+    );
   }
   const data = response;
   if (typeof data !== "object" || data === null) {
