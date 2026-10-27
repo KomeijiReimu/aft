@@ -35,6 +35,14 @@ use subc_protocol::{Flags, Frame, FrameType, ModuleHelloAckBody, Priority, PROTO
 use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
 use subc_transport::{DAEMON_ID_LEN, KEY_LEN};
 
+/// The stand-in holder's copy of Plexus's published `gh.route` request
+/// contract (`crates/aft/src/gh_shim/plexus_contract_judge.rs`, vendored
+/// fixtures under `crates/aft/tests/fixtures/gh_shim/plexus-contract/`).
+/// Judging every incoming `gh.route` request against it is what keeps a test
+/// stand-in from ever again being more lenient than Plexus's real route.
+#[path = "../src/gh_shim/plexus_contract_judge.rs"]
+mod plexus_contract_judge;
+
 /// Seed of the dev manifest-signing key compiled into debug builds; see
 /// `crates/aft/tests/fixtures/gh_shim/README.md`.
 const DEV_MANIFEST_SEED: [u8; 32] = [
@@ -414,6 +422,26 @@ fn relay_bindings_reply() -> Vec<u8> {
 /// holder accepts any ticket.
 const TEST_GH_SHIM_TICKET: &str = "00112233445566778899aabbccddeeff";
 
+/// What the loopback stand-in holder answers a relayed `gh.route` request
+/// with: the canned reply when the request meets Plexus's published contract,
+/// else a refusal carrying the contract's exact code. A refused request never
+/// reaches the canned reply, so a shim that builds a refused shape fails its
+/// round trip here instead of against live Plexus. Silence (`None` canned) is
+/// preserved for the outcome-unknown rows: an accepted request with no canned
+/// reply still gets no answer.
+fn stand_in_route_reply(request: &Value, canned: Option<&[u8]>) -> Option<Vec<u8>> {
+    match plexus_contract_judge::judge(request) {
+        Ok(_) => canned.map(relay_reply),
+        Err(code) => Some(relay_reply(
+            &serde_json::to_vec(&json!({
+                "outcome": "refusal",
+                "refusal_code": code,
+            }))
+            .expect("refusal reply"),
+        )),
+    }
+}
+
 /// Loopback subc daemon that advertises `aft` serving the gh shim relay on its
 /// management surface, opens route channel 42, records every request frame
 /// body, and answers the relayed write according to its `HolderReply`.
@@ -636,9 +664,18 @@ async fn serve_connection(
                     Some("gh_shim.bindings_read") if frame.header.channel == ROUTE_CHANNEL => {
                         Some(response_frame(&frame, bindings_reply.clone()))
                     }
-                    _ if bot_write => reply
-                        .as_deref()
-                        .map(|bytes| response_frame(&frame, relay_reply(bytes))),
+                    _ if bot_write => {
+                        // The captured frame body above holds these same bytes;
+                        // read the request from the decoded frame because that
+                        // body was moved into the capture.
+                        let request = decoded
+                            .as_ref()
+                            .and_then(|value| value.get("params"))
+                            .and_then(|params| params.get("request"))
+                            .expect("relayed bot write carries params.request");
+                        stand_in_route_reply(request, reply.as_deref())
+                            .map(|bytes| response_frame(&frame, bytes))
+                    }
                     _ => None,
                 }
             }
@@ -1988,6 +2025,55 @@ fn check_v22_row(row: &V22Row, run: &V22Run, agent_id: &str) {
             );
         }
     }
+}
+
+/// The stand-in holder's reply decision, the seam the contract pins: an
+/// accepted `gh.route` request gets its canned reply (or silence when none
+/// is canned, preserving the outcome-unknown rows), while a request Plexus's
+/// contract refuses gets a refusal carrying the contract's exact code —
+/// never the canned reply.
+#[test]
+fn stand_in_holder_answers_routed_requests_from_the_plexus_contract() {
+    let canned = serde_json::to_vec(&json!({
+        "outcome": "result",
+        "gh_route_schema": 1,
+        "result": {"url": "https://github.com/cortexkit/aft/issues/42"},
+        "field_order": ["url"],
+    }))
+    .expect("canned reply");
+    let vectors = plexus_contract_judge::load_vectors();
+    let request = |name: &str| {
+        vectors
+            .iter()
+            .find(|vector| vector.name == name)
+            .unwrap_or_else(|| panic!("{name}: no such vendored vector"))
+            .request
+            .clone()
+    };
+    // An accepted request is answered with the canned reply bytes.
+    assert_eq!(
+        stand_in_route_reply(&request("accepted-comment-issue"), Some(&canned)),
+        Some(relay_reply(&canned)),
+    );
+    // Silence stays silent: an accepted request with no canned reply gets no
+    // answer, which is what the outcome-unknown rows pin.
+    assert_eq!(
+        stand_in_route_reply(&request("accepted-comment-issue"), None),
+        None,
+    );
+    // A refused request is answered with a refusal carrying the contract's
+    // exact code, even though a canned reply was staged.
+    let refused = request("refused-pr-edit-unknown-top-level-field");
+    assert_eq!(
+        stand_in_route_reply(&refused, Some(&canned)),
+        Some(relay_reply(
+            &serde_json::to_vec(&json!({
+                "outcome": "refusal",
+                "refusal_code": "request_field_forbidden{field: draft}",
+            }))
+            .expect("refusal reply")
+        )),
+    );
 }
 
 #[test]

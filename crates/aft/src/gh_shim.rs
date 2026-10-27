@@ -49,6 +49,10 @@ use v22_rows::{
 mod security_audit_tests;
 
 #[cfg(test)]
+#[path = "gh_shim/plexus_contract_judge.rs"]
+mod plexus_contract_judge;
+
+#[cfg(test)]
 #[path = "gh_shim/v19_compat_tests.rs"]
 mod v19_compat_tests;
 

@@ -692,6 +692,237 @@ fn api_request(raw: &[&str], stdin: &str) -> Result<GovernedRequest, Canonicaliz
     canonicalize_governed_api_from(&argv, &tuple, &canonical, 22, &mut Cursor::new(stdin))
 }
 
+/// Every governed request shape the shim can emit, judged the way Plexus's
+/// `gh.route` facade would judge it. One row per governed tuple the shim's
+/// classification admits at the v22 manifest — which governs every older
+/// family too — built through the same classify, canonicalize and
+/// `governed_wire_request` path the shim uses, so the envelope fields the
+/// shim stamps (`gh_route_schema` and friends) are part of what is judged.
+/// A row fails here if the shim ever builds a request Plexus refuses. That
+/// is what the shim's pre-signing round trip missed: its stand-in holder
+/// accepted the `gh_route_schema` envelope field that live Plexus refused
+/// (`request_field_forbidden{field: gh_route_schema}`), so the first live
+/// `gh pr edit` failed after a green round trip. This test fails that round
+/// trip instead.
+/// (`pr reaction` is not a row: the shim has no such tuple, only the
+/// `issue reaction` one; Plexus routes both.)
+#[test]
+fn plexus_contract_accepts_every_governed_wire_request_the_shim_builds() {
+    let _lock = crate::test_env::process_env_lock();
+    let _repo = EnvGuard::set("GH_REPO", Some("cortexkit/aft"));
+    let manifest = manifest();
+    assert_eq!(manifest.manifest_version, 22);
+    // (row name, argv, expected Plexus kind, stdin for --body-file `-`).
+    // Repository argv spellings vary the way the goldens do: an explicit
+    // `--repo`, a `/repos/...` path, or the `GH_REPO` fallback above.
+    // The GraphQL documents name the admitted shapes; the row argv borrow
+    // them as leaked strings the way `speech_rows` does. GraphQL rows go
+    // through `canonicalize_governed_from` like the other plain rows: the
+    // review-thread canonicalizer is dispatched by tuple, not by api rule.
+    let resolve_query: &str =
+        Box::leak(format!("query={RESOLVE_LITERAL}").into_boxed_str());
+    let unresolve_query: &str =
+        Box::leak(format!("query={UNRESOLVE_VARIABLE}").into_boxed_str());
+    let plain: Vec<(&str, Vec<&str>, &str)> = vec![
+        (
+            "issue comment",
+            vec!["issue", "comment", "42", "--body", "A governed issue comment.", "--repo", "cortexkit/aft"],
+            "comment",
+        ),
+        (
+            "issue comment edit-last",
+            vec!["issue", "comment", "42", "--edit-last", "--body", "Replacement text.", "--repo", "cortexkit/aft"],
+            "comment_edit_last",
+        ),
+        (
+            "pr comment",
+            vec!["pr", "comment", "7", "--body", "A governed pull-request comment.", "--repo", "cortexkit/aft"],
+            "comment",
+        ),
+        (
+            "pr comment edit-last",
+            vec!["pr", "comment", "7", "--edit-last", "--body", "Replacement text.", "--repo", "cortexkit/aft"],
+            "comment_edit_last",
+        ),
+        (
+            "pr review",
+            vec!["pr", "review", "7", "--comment", "--body", "A governed review comment.", "--repo", "cortexkit/aft"],
+            "pr_review",
+        ),
+        (
+            "issue reaction",
+            vec!["issue", "reaction", "42", "--reaction", "+1", "--repo", "cortexkit/aft"],
+            "reaction",
+        ),
+        (
+            "issue create",
+            vec!["issue", "create", "--title", "A governed issue", "--body", "Filed by the bot.", "--label", "bug", "--repo", "cortexkit/aft"],
+            "issue_create",
+        ),
+        (
+            "issue edit title-body",
+            vec!["issue", "edit", "42", "--title", "A retitled issue", "--body", "Edited by the bot.", "--repo", "cortexkit/aft"],
+            "issue_edit",
+        ),
+        (
+            "issue edit labels",
+            vec!["issue", "edit", "42", "--add-label", "triaged", "--remove-label", "needs-triage", "--repo", "cortexkit/aft"],
+            "issue_edit",
+        ),
+        (
+            "pr edit",
+            vec!["pr", "edit", "7", "--title", "New title", "--body", "Edited by the bot.", "--repo", "cortexkit/aft"],
+            "pr_edit",
+        ),
+        (
+            "issue close",
+            vec!["issue", "close", "42", "--reason", "not planned", "--comment", "Closing as not planned.", "--repo", "cortexkit/aft"],
+            "close",
+        ),
+        (
+            "pr close",
+            vec!["pr", "close", "7", "--comment", "Superseded by a newer pull request.", "--repo", "cortexkit/aft"],
+            "close",
+        ),
+        (
+            "issue reopen",
+            vec!["issue", "reopen", "42", "--comment", "Reopening for another pass.", "--repo", "cortexkit/aft"],
+            "reopen",
+        ),
+        ("pr reopen", vec!["pr", "reopen", "7", "--repo", "cortexkit/aft"], "reopen"),
+        (
+            "pr ready",
+            vec!["pr", "ready", "7", "--repo", "cortexkit/aft"],
+            "pr_ready",
+        ),
+        (
+            "pr draft",
+            vec!["pr", "ready", "7", "--undo", "--repo", "cortexkit/aft"],
+            "pr_draft",
+        ),
+        ("resolve thread", vec!["api", "graphql", "-f", resolve_query], "resolve_thread"),
+        (
+            "unresolve thread",
+            vec!["api", "graphql", "-f", unresolve_query, "-f", "id=PRRT_kwDOAbc123"],
+            "unresolve_thread",
+        ),
+    ];
+    // (row name, argv, expected Plexus kind, stdin). The review reply, pull
+    // PATCH and stack writes only exist as `api` rows.
+    let api: Vec<(&str, Vec<&str>, &str, &str)> = vec![
+        (
+            "review reply",
+            vec!["api", "-X", "POST", "repos/cortexkit/aft/pulls/7/comments/99/replies", "-f", "body=Fixed in the next push"],
+            "review_reply",
+            "",
+        ),
+        (
+            "comment edit patch",
+            vec!["api", "-X", "PATCH", "/repos/cortexkit/aft/issues/comments/123", "-f", "body=Edited comment text."],
+            "comment_edit",
+            "",
+        ),
+        (
+            "pull patch",
+            vec!["api", "-X", "PATCH", "repos/cortexkit/aft/pulls/7", "-f", "title=New title"],
+            "pr_edit",
+            "",
+        ),
+        (
+            "stack create",
+            vec!["api", "-X", "POST", "repos/cortexkit/aft/stacks", "-F", "pull_requests[]=7", "-F", "pull_requests[]=8"],
+            "stack_create",
+            "",
+        ),
+        (
+            "stack add",
+            vec!["api", "-X", "POST", "repos/cortexkit/aft/stacks/3/add", "-F", "pull_requests[]=9"],
+            "stack_add",
+            "",
+        ),
+        (
+            "stack unstack",
+            vec!["api", "-X", "POST", "repos/cortexkit/aft/stacks/3/unstack"],
+            "stack_unstack",
+            "",
+        ),
+    ];
+    let mut judged = Vec::new();
+    for (name, raw, expected_kind) in plain {
+        let argv = args(&raw);
+        let Classification::Governed { tuple, canonical } =
+            classify(&argv, &manifest, "linux")
+        else {
+            panic!("{name}: must be governed bot speech");
+        };
+        let request =
+            canonicalize_governed_from(&argv, &tuple, &canonical, 22, &mut Cursor::new(""))
+                .unwrap_or_else(|error| panic!("{name}: must canonicalize: {error:?}"));
+        let wire = wire_of(request);
+        match plexus_contract_judge::judge(&wire) {
+            Ok(kind) => {
+                assert_eq!(kind, expected_kind, "{name}: routed kind");
+                judged.push((name, kind.to_string()));
+            }
+            Err(code) => panic!("{name}: the shim's request is refused by the contract: {code}\n{wire}"),
+        }
+    }
+    for (name, raw, expected_kind, stdin) in api {
+        let request = api_request(&raw, stdin)
+            .unwrap_or_else(|error| panic!("{name}: must canonicalize: {error:?}"));
+        let wire = wire_of(request);
+        match plexus_contract_judge::judge(&wire) {
+            Ok(kind) => {
+                assert_eq!(kind, expected_kind, "{name}: routed kind");
+                judged.push((name, kind.to_string()));
+            }
+            Err(code) => panic!("{name}: the shim's request is refused by the contract: {code}\n{wire}"),
+        }
+    }
+    // `pr create` reads its body file from disk, so its argv carries a
+    // temporary file the way the v16 golden does.
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let body_file = directory.path().join("pr-body.md");
+        fs::write(&body_file, "Opened by the bot.\n").unwrap();
+        let raw = [
+            "pr", "create", "-R", "cortexkit/aft", "--base", "main", "--head", "feature",
+            "--title", "Add the thing", "--body-file", body_file.to_str().unwrap(), "--draft",
+        ];
+        let argv = args(&raw);
+        let Classification::Governed { tuple, canonical } =
+            classify(&argv, &manifest, "linux")
+        else {
+            panic!("pr create: must be governed bot speech");
+        };
+        assert_eq!(tuple, "pr create");
+        let request =
+            canonicalize_governed_from(&argv, &tuple, &canonical, 22, &mut Cursor::new(""))
+                .expect("pr create must canonicalize");
+        let wire = wire_of(request);
+        match plexus_contract_judge::judge(&wire) {
+            Ok(kind) => {
+                assert_eq!(kind, "pr_create");
+                judged.push(("pr create", kind.to_string()));
+            }
+            Err(code) => panic!("pr create: the shim's request is refused by the contract: {code}\n{wire}"),
+        }
+    }
+    // Every routed kind the shim can emit is judged here: the shim's
+    // `issue reaction` tuple covers Plexus's `reaction` kind (whose other
+    // action, `pr reaction`, has no shim tuple), and every other kind has
+    // its own row above.
+    let mut kinds: Vec<String> = judged.iter().map(|(_, kind)| kind.clone()).collect();
+    kinds.sort();
+    kinds.dedup();
+    let mut expected: Vec<String> = plexus_contract_judge::REQUEST_KINDS
+        .iter()
+        .map(|kind| kind.to_string())
+        .collect();
+    expected.sort();
+    assert_eq!(kinds, expected, "every emittable kind must be judged");
+}
+
 #[test]
 fn v22_pull_patch_is_routed_as_the_same_own_pr_edit() {
     let request = api_request(
