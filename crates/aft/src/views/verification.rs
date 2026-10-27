@@ -1188,15 +1188,29 @@ mod tests {
     fn final_policy_digest_covers_git_stat_settings_and_include_targets() {
         let root = tempfile::tempdir().unwrap();
         git(root.path(), &["init", "-q"]);
-        for (key, value) in [
-            ("core.autocrlf", "true"),
-            ("core.eol", "crlf"),
-            ("core.symlinks", "false"),
-            ("core.ignorecase", "true"),
-            ("core.checkStat", "minimal"),
-            ("core.trustctime", "false"),
-            ("core.fileMode", "false"),
+        // `git init` already writes some of these keys, with values that
+        // depend on the platform (Git for Windows records
+        // `core.ignorecase=true` and `core.fileMode=false`). Setting a key to
+        // the value it already has is no change at all, so each key is moved
+        // to whichever candidate differs from its current value.
+        for (key, values) in [
+            ("core.autocrlf", ["true", "false"]),
+            ("core.eol", ["crlf", "lf"]),
+            ("core.symlinks", ["false", "true"]),
+            ("core.ignorecase", ["true", "false"]),
+            ("core.checkStat", ["minimal", "default"]),
+            ("core.trustctime", ["false", "true"]),
+            ("core.fileMode", ["false", "true"]),
         ] {
+            let current = std::process::Command::new("git")
+                .current_dir(root.path())
+                .args(["config", "--get", key])
+                .output()
+                .unwrap();
+            let current = String::from_utf8_lossy(&current.stdout)
+                .trim()
+                .to_lowercase();
+            let value = values.into_iter().find(|value| *value != current).unwrap();
             let before = BindGuard::capture(root.path(), None).unwrap();
             git(root.path(), &["config", key, value]);
             assert!(before.validate(root.path()).is_err(), "{key}");
