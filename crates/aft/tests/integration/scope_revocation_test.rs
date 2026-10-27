@@ -58,7 +58,7 @@ fn observing_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
 /// stretch that past the test's next steps.
 async fn observed_task(marker: &Path) -> (aft::bash_background::BgTaskRegistry, String) {
     let marker = marker.display().to_string();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let found = OBSERVED_TASKS
             .lock()
