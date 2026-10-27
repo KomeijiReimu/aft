@@ -92,11 +92,12 @@ fn legacy_row_for_probe<'a>(
         .unwrap_or_else(|| panic!("live {preset} catalog advertises {tool}, but no pre-flip legacy baseline matches arguments {arguments}"))
 }
 
+#[cfg(unix)]
 fn catalog_pwsh_path(root: &Path) -> PathBuf {
-    root.join("catalog-only-pwsh")
-        .join(if cfg!(windows) { "pwsh.exe" } else { "pwsh" })
+    root.join("catalog-only-pwsh").join("pwsh")
 }
 
+#[cfg(unix)]
 fn catalog_pwsh_marker(root: &Path) -> PathBuf {
     let executable = catalog_pwsh_path(root);
     executable.with_file_name(format!(
@@ -107,69 +108,30 @@ fn catalog_pwsh_marker(root: &Path) -> PathBuf {
 
 /// An executable-presence fixture only: the schema-valid probe is refused
 /// before execution. The marker makes any accidental invocation observable.
+#[cfg(unix)]
 fn advertise_catalog_powershell(command: &mut Command, root: &Path) -> Result<(), HarnessError> {
+    use std::os::unix::fs::PermissionsExt;
     let executable = catalog_pwsh_path(root);
     let directory = executable.parent().unwrap();
     std::fs::create_dir_all(directory).map_err(harness_error)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(
-            &executable,
-            "#!/bin/sh\nprintf invoked > \"$0.invoked\"\nexit 99\n",
-        )
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\nprintf invoked > \"$0.invoked\"\nexit 99\n",
+    )
+    .map_err(harness_error)?;
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
         .map_err(harness_error)?;
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
-            .map_err(harness_error)?;
-        eprintln!(
-            "PowerShell catalog fixture branch: Unix script {}",
-            executable.display()
-        );
-    }
-    #[cfg(windows)]
-    {
-        // AFT resolves pwsh.exe on Windows, not command scripts. Build a real
-        // marker executable so host-installed PowerShell cannot mask this fixture.
-        let source = directory.join("pwsh.rs");
-        std::fs::write(
-            &source,
-            r#"
-fn main() {
-    let mut marker = std::env::current_exe().unwrap().into_os_string();
-    marker.push(".invoked");
-    std::fs::write(std::path::PathBuf::from(marker), b"invoked").unwrap();
-    std::process::exit(99);
-}
-"#,
-        )
-        .map_err(harness_error)?;
-        let output = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
-            .arg("--crate-name")
-            .arg("aft_catalog_pwsh")
-            .arg(&source)
-            .arg("-o")
-            .arg(&executable)
-            .output()
-            .map_err(harness_error)?;
-        if !output.status.success() {
-            return Err(HarnessError::new(format!(
-                "building the Windows pwsh.exe fixture failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-        eprintln!(
-            "PowerShell catalog fixture branch: Windows native executable {}",
-            executable.display()
-        );
-    }
+    eprintln!(
+        "PowerShell catalog fixture branch: Unix script {}",
+        executable.display()
+    );
     let paths = std::iter::once(directory.to_path_buf())
         .chain(std::env::split_paths(
             &std::env::var_os("PATH").unwrap_or_default(),
         ))
         .collect::<Vec<_>>();
     let path = std::env::join_paths(paths).map_err(harness_error)?;
-    let lookup = if cfg!(windows) { "pwsh.exe" } else { "pwsh" };
-    let resolved = which::which_in(lookup, Some(&path), root).map_err(harness_error)?;
+    let resolved = which::which_in("pwsh", Some(&path), root).map_err(harness_error)?;
     assert_eq!(
         resolved, executable,
         "PowerShell lookup must select the fixture, not a host executable"
@@ -178,6 +140,41 @@ fn main() {
     Ok(())
 }
 
+#[cfg(windows)]
+fn advertise_catalog_powershell(_command: &mut Command, root: &Path) -> Result<(), HarnessError> {
+    let executable = which::which("pwsh.exe").map_err(|error| {
+        HarnessError::new(format!(
+            "real pwsh.exe is required for this Windows catalog case: {error}"
+        ))
+    })?;
+    // Other conformance cases execute real shell commands on Windows, so a
+    // presence-only executable cannot stand in for the installed PowerShell.
+    assert!(
+        !root.join("catalog-only-pwsh").exists(),
+        "Windows uses real pwsh.exe; no script fixture or invocation marker may apply"
+    );
+    eprintln!(
+        "PowerShell catalog branch: Windows real pwsh.exe {}; no fixture invocation marker applies",
+        executable.display()
+    );
+    Ok(())
+}
+
+fn powershell_catalog_case_available() -> bool {
+    #[cfg(windows)]
+    if let Err(error) = which::which("pwsh.exe") {
+        assert_ne!(
+            std::env::var("AFT_REQUIRE_PWSH").as_deref(),
+            Ok("1"),
+            "AFT_REQUIRE_PWSH=1 requires real pwsh.exe for the Windows catalog case: {error}"
+        );
+        eprintln!("SKIP Windows PowerShell catalog case: real pwsh.exe is absent ({error}); set AFT_REQUIRE_PWSH=1 to require it");
+        return false;
+    }
+    true
+}
+
+#[cfg(unix)]
 #[test]
 fn catalog_powershell_fixture_is_discovered_and_marks_execution() {
     let root = tempfile::tempdir().unwrap();
@@ -189,6 +186,39 @@ fn catalog_powershell_fixture_is_discovered_and_marks_execution() {
     let status = Command::new(executable).status().unwrap();
     assert_eq!(status.code(), Some(99));
     assert_eq!(std::fs::read(marker).unwrap(), b"invoked");
+}
+
+#[cfg(windows)]
+#[test]
+fn catalog_powershell_uses_real_executable_without_marker() {
+    if !powershell_catalog_case_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    advertise_catalog_powershell(&mut Command::new(aft_binary::aft_binary()), root.path()).unwrap();
+    let executable = which::which("pwsh.exe").unwrap();
+    let output = Command::new(executable)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Write-Output AFT_REAL_PWSH",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "installed pwsh.exe must execute the real-shell check"
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "AFT_REAL_PWSH"
+    );
+    assert!(
+        !root.path().join("catalog-only-pwsh").exists(),
+        "no fixture invocation marker applies to the real Windows executable"
+    );
 }
 
 /// Only the marked project path is platform-dependent. Do not rewrite other
@@ -246,8 +276,8 @@ fn legacy_probe_key(tool: &str, arguments: &Value) -> String {
     format!("{tool}:{}", serde_json::to_string(arguments).unwrap())
 }
 
-/// The SDK reports the pointer; include bounded values there without changing
-/// its equality check or omitting any reply fields from the comparison.
+/// Report the differing JSON pointer and bounded expected and actual values;
+/// keep the complete-reply comparison unchanged.
 fn legacy_mismatch_diagnostic(expected: &Value, actual: &Value) -> Option<String> {
     fn difference(
         expected: Option<&Value>,
@@ -437,13 +467,19 @@ impl Subject {
         self.catalog_powershell = true;
         self
     }
-    fn assert_catalog_powershell_not_invoked(&self) {
+    fn assert_catalog_powershell_fixture_policy(&self) {
         if self.catalog_powershell {
             let project = self.project.lock().unwrap();
             let root = project.as_ref().unwrap().parent().unwrap();
+            #[cfg(unix)]
             assert!(
                 !catalog_pwsh_marker(root).exists(),
                 "catalog-only pwsh fixture was executed"
+            );
+            #[cfg(windows)]
+            assert!(
+                !root.join("catalog-only-pwsh").exists(),
+                "real Windows pwsh.exe has no test-owned invocation marker"
             );
         }
     }
@@ -3855,14 +3891,14 @@ async fn regenerate_pre_flip_powershell_legacy_replies() {
         } else {
             rows.push(captured);
         }
-        subject.assert_catalog_powershell_not_invoked();
-        eprintln!("captured pre-flip {preset}/powershell; catalog-only pwsh was not executed");
+        subject.assert_catalog_powershell_fixture_policy();
+        eprintln!("captured pre-flip {preset}/powershell; platform executable policy verified");
     }
     fixtures["optional_tool_captures"]["powershell"] = json!({
         "source_commit":fixtures["source_commit"].clone(),
         "binary_sha256":format!("{:x}", Sha256::digest(std::fs::read(aft_binary::aft_binary()).unwrap())),
         "catalog_references":["p1_runner_pwsh", "worker_preset_pwsh"],
-        "availability":"executable-presence pwsh fixture on PATH; invocation marker remained absent",
+        "availability":if cfg!(windows) { "real pwsh.exe on Windows; no invocation marker applies" } else { "executable-presence pwsh fixture on PATH; invocation marker remained absent" },
         "capture":"real pre-flip tool.call powershell; production wait:true/pty:true validation refusal"
     });
     std::fs::write(
@@ -4088,11 +4124,14 @@ async fn assert_legacy_probe_wire_bytes(subject: Subject) {
         tools.contains("powershell"),
         rows.len()
     );
-    subject.assert_catalog_powershell_not_invoked();
+    subject.assert_catalog_powershell_fixture_policy();
 }
 
 #[tokio::test]
 async fn pwsh_catalog_runs_legacy_wire_and_conformance_checks() {
+    if !powershell_catalog_case_available() {
+        return;
+    }
     for preset in ["head", "worker", "reader"] {
         assert_legacy_probe_wire_bytes(Subject::new(Some(preset)).with_catalog_powershell()).await;
         conformance_inventory(Subject::new(Some(preset)).with_catalog_powershell()).await;
@@ -4174,7 +4213,7 @@ async fn conformance_inventory(subject: Subject) {
         cortexkit_role_tool_provider_conformance::run_suite(&subject, &dir.path().join("run"))
             .await
             .unwrap();
-    subject.assert_catalog_powershell_not_invoked();
+    subject.assert_catalog_powershell_fixture_policy();
     let mut enabled = BTreeSet::new();
     let mut skipped = BTreeSet::new();
     let mut inapplicable = BTreeSet::new();
