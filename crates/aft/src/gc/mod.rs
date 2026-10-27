@@ -1073,6 +1073,19 @@ mod storage_retention_tests {
         marker_files: usize,
     }
 
+    // Descriptors open under a directory, following the fs_lock lease tests.
+    // Other tests work under their own temporary directories, so only this
+    // fixture's descriptors are counted.
+    #[cfg(target_os = "linux")]
+    fn open_descriptors_under(dir: &Path) -> usize {
+        fs::read_dir("/proc/self/fd")
+            .expect("descriptor census")
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read_link(entry.path()).ok())
+            .filter(|target| target.starts_with(dir))
+            .count()
+    }
+
     // Four generations with a live reader plus dead and malformed markers,
     // and one generation with only dead markers that protects nothing.
     fn query_pin_fixture() -> QueryPinFixture {
@@ -1147,7 +1160,17 @@ mod storage_retention_tests {
         crate::root_cache::reset_hostname_resolutions_for_test();
         crate::root_cache::reset_process_start_resolutions_for_test();
         let mut pass = ReadMarkerSweepContext::new();
+        // The live markers stay open across the pass; nothing the pass
+        // opens may survive it.
+        #[cfg(target_os = "linux")]
+        let descriptors_before = open_descriptors_under(&fixture.view_dir);
         mark_live_query_pins(&request, &mut keys, &mut report, &mut pass);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            open_descriptors_under(&fixture.view_dir),
+            descriptors_before,
+            "a marker pass must not retain descriptors"
+        );
         // Every live generation protects its keys; the readerless generation
         // keeps none. Dead and malformed markers are reclaimed everywhere.
         let expected: BTreeSet<[u8; 32]> = (0..4).map(|index| [index as u8 + 1; 32]).collect();
