@@ -52,10 +52,10 @@ mod location;
 #[cfg(test)]
 pub(crate) use location::acquire_cache_cleanup_lease;
 pub use location::{
-    acquire_daemon_storage_lease, cache_root, cache_unavailable, clean_old_caches,
-    prepare_cache_root, reclaim_configured_inactive_caches, CacheLease, CleanupCandidate,
-    CleanupReport, ProcessStorageLease, StoragePaths, CACHE_DIR_BUSY, CACHE_DIR_BUSY_MESSAGE,
-    CACHE_DIR_UNAVAILABLE,
+    acquire_daemon_storage_lease, cache_root, cache_unavailable, cache_unavailable_for_root,
+    clean_old_caches, prepare_cache_root, reclaim_configured_inactive_caches, CacheLease,
+    CleanupCandidate, CleanupReport, ProcessStorageLease, StoragePaths, CACHE_DIR_BUSY,
+    CACHE_DIR_BUSY_MESSAGE, CACHE_DIR_UNAVAILABLE,
 };
 pub(crate) use location::{
     cache_deletion_protections, cache_status_code, check_cache_access, durable_route,
@@ -906,9 +906,29 @@ fn sweep_marker_generation(
     budget: &mut crate::bash_background::persistence::RepairBudget,
     remove_stale: bool,
 ) -> io::Result<ReadMarkerSweep> {
+    sweep_marker_generation_cached(
+        generation,
+        budget,
+        remove_stale,
+        now_ms(),
+        &current_hostname(),
+        &mut HashMap::new(),
+    )
+}
+
+/// [`sweep_marker_generation`] with the caller-supplied clock, hostname and
+/// process-start cache. The storage sweep visits many generations per pass
+/// and keeps all three in its pass context instead of re-reading the hostname
+/// and each live pid's start time once per generation.
+fn sweep_marker_generation_cached(
+    generation: &crate::bash_background::persistence::PinnedDir,
+    budget: &mut crate::bash_background::persistence::RepairBudget,
+    remove_stale: bool,
+    now: u64,
+    host: &str,
+    started: &mut HashMap<u32, Option<u64>>,
+) -> io::Result<ReadMarkerSweep> {
     let mut sweep = ReadMarkerSweep::default();
-    let now = now_ms();
-    let host = current_hostname();
     let mut names = generation.repair_names(budget)?;
     names.sort();
     for name in names {
@@ -923,7 +943,7 @@ fn sweep_marker_generation(
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        match marker_file_is_protected(file, now, &host)? {
+        match marker_file_is_protected(file, now, host, started)? {
             MarkerProtection::Protected => sweep.protected = true,
             MarkerProtection::Stale | MarkerProtection::Malformed if remove_stale => {
                 match generation.repair_remove_file(&name) {
@@ -1038,6 +1058,105 @@ impl ReadMarkerProtectionCache {
     }
 }
 
+/// Marker inputs a storage sweep re-reads for every generation it visits:
+/// the process hostname and each live pid's start time. The hostname cannot
+/// change mid-pass and a cached start time only ever over-retains (pids are
+/// reused with ever newer start times), so one pass keeps one copy of each
+/// instead of re-reading them once per generation or once per marker.
+/// Liveness itself is still probed per marker and never cached.
+pub(crate) struct ReadMarkerSweepContext {
+    hostname: String,
+    started: HashMap<u32, Option<u64>>,
+}
+
+impl ReadMarkerSweepContext {
+    pub(crate) fn new() -> Self {
+        Self {
+            hostname: current_hostname(),
+            started: HashMap::new(),
+        }
+    }
+
+    /// [`sweep_read_markers`] for one generation of an already-pinned
+    /// `<view>/readers` directory. The caller opens the view and its readers
+    /// once per view and sweeps each generation from that handle, instead of
+    /// re-opening both once per generation. Vanished generations stay
+    /// unprotected and unreadable ones stay protected, as with the
+    /// pathname-based sweep.
+    pub(crate) fn sweep_read_markers_from_readers(
+        &mut self,
+        readers: &crate::bash_background::persistence::PinnedDir,
+        generation_label: &str,
+        remove_stale: bool,
+    ) -> ReadMarkerSweep {
+        let Self { hostname, started } = self;
+        let result = (|| {
+            let generation = match readers
+                .repair_child_same_mount(std::ffi::OsStr::new(generation_label))
+            {
+                Ok(generation) => generation,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(ReadMarkerSweep::default())
+                }
+                Err(error) => return Err(error),
+            };
+            sweep_marker_generation_cached(
+                &generation,
+                &mut crate::bash_background::persistence::RepairBudget::new(),
+                remove_stale,
+                now_ms(),
+                hostname,
+                started,
+            )
+        })();
+        match result {
+            Ok(sweep) => sweep,
+            Err(_) => ReadMarkerSweep {
+                protected: true,
+                removed_stale: 0,
+            },
+        }
+    }
+}
+
+// Test hook counting hostname resolutions on this thread. Reset before a
+// marker pass and read after it to prove the pass resolved the hostname
+// once instead of once per generation.
+#[cfg(test)]
+thread_local! {
+    static HOSTNAME_RESOLUTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn hostname_resolutions_for_test() -> u64 {
+    HOSTNAME_RESOLUTIONS.with(|count| count.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_hostname_resolutions_for_test() {
+    HOSTNAME_RESOLUTIONS.with(|count| count.set(0));
+}
+
+// Test hook counting process-start-time resolutions on this thread: cache
+// misses while attributing markers, not liveness probes (which are never
+// cached). Reset before a marker pass and read after it to prove repeated
+// markers from one process resolved its start time once.
+#[cfg(test)]
+thread_local! {
+    static PROCESS_START_RESOLUTIONS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn process_start_resolutions_for_test() -> u64 {
+    PROCESS_START_RESOLUTIONS.with(|count| count.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_process_start_resolutions_for_test() {
+    PROCESS_START_RESOLUTIONS.with(|count| count.set(0));
+}
+
 fn read_marker_protection(
     cache_dir: &Path,
     generation_label: &str,
@@ -1114,6 +1233,7 @@ fn marker_file_is_protected(
     file: File,
     now: u64,
     current_host: &str,
+    started: &mut HashMap<u32, Option<u64>>,
 ) -> io::Result<MarkerProtection> {
     use std::io::Read;
     let file_metadata = file.metadata()?;
@@ -1146,7 +1266,7 @@ fn marker_file_is_protected(
         );
     }
     Ok(
-        if fs_lock::process_alive(metadata.pid) && marker_matches_live_process_instance(&metadata) {
+        if fs_lock::process_alive(metadata.pid) && marker_start_matches(&metadata, started) {
             MarkerProtection::Protected
         } else {
             MarkerProtection::Stale
@@ -1154,12 +1274,29 @@ fn marker_file_is_protected(
     )
 }
 
-fn marker_matches_live_process_instance(metadata: &ReadMarkerMetadata) -> bool {
+fn marker_start_matches(
+    metadata: &ReadMarkerMetadata,
+    started: &mut HashMap<u32, Option<u64>>,
+) -> bool {
     // Same-host PID liveness is authoritative for the process instance. When the
     // OS can tell us the live PID started after this marker was created, the PID
     // has been reused and the marker belongs to a dead prior process; otherwise
     // a live PID protects the marker without consulting marker mtime.
-    process_start_time_ms(metadata.pid)
+    let started_at_ms = match started.get(&metadata.pid) {
+        Some(cached) => *cached,
+        None => {
+            #[cfg(test)]
+            PROCESS_START_RESOLUTIONS.with(|count| count.set(count.get() + 1));
+            let resolved = process_start_time_ms(metadata.pid);
+            started.insert(metadata.pid, resolved);
+            resolved
+        }
+    };
+    // A cached start time only ever over-retains: PIDs are reused with ever
+    // newer start times, so a cached (older) start protects a superset of the
+    // markers the current start would protect. A negative answer is never
+    // cached: liveness itself is re-probed per marker above.
+    started_at_ms
         .map(|started_at_ms| {
             started_at_ms
                 <= metadata
@@ -1484,6 +1621,8 @@ pub fn process_start_time_ms(pid: u32) -> Option<u64> {
 
 #[cfg(unix)]
 fn current_hostname() -> String {
+    #[cfg(test)]
+    HOSTNAME_RESOLUTIONS.with(|count| count.set(count.get() + 1));
     let mut buffer = [0u8; 256];
     let result = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
     if result == 0 {
@@ -1500,6 +1639,8 @@ fn current_hostname() -> String {
 
 #[cfg(windows)]
 fn current_hostname() -> String {
+    #[cfg(test)]
+    HOSTNAME_RESOLUTIONS.with(|count| count.set(count.get() + 1));
     crate::environment::non_empty_var("COMPUTERNAME").unwrap_or_else(|| "unknown-host".to_string())
 }
 

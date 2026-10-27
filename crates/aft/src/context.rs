@@ -5720,6 +5720,17 @@ impl AppContext {
     }
 
     pub(crate) fn try_health_summary(&self) -> RootHealthSummary {
+        self.try_health_summary_for_root(None)
+    }
+
+    /// [`Self::try_health_summary`] against an already-resolved cache root.
+    /// The health rollup resolves each distinct root once per tick and passes
+    /// it here so a many-context tick does not re-resolve the same root once
+    /// per context. `None` resolves as usual for callers without a tick memo.
+    pub(crate) fn try_health_summary_for_root(
+        &self,
+        cache_dir: Option<&Path>,
+    ) -> RootHealthSummary {
         // Read lifecycle state before taking artifact locks. Worker admission takes
         // the lifecycle lock first and then installs artifact receivers, so the
         // reverse order here would deadlock a health poll against worker startup.
@@ -5731,8 +5742,12 @@ impl AppContext {
             Ok(guard) => Arc::clone(&*guard),
             Err(_) => return RootHealthSummary::busy(),
         };
-        let cache_unavailable_reason = crate::root_cache::cache_unavailable(&config)
-            .map(|reason| crate::root_cache::cache_status_code(&reason));
+        let cache_unavailable_reason = match cache_dir {
+            Some(cache_dir) => crate::root_cache::cache_unavailable_for_root(&config, cache_dir)
+                .map(|reason| crate::root_cache::cache_status_code(&reason)),
+            None => crate::root_cache::cache_unavailable(&config)
+                .map(|reason| crate::root_cache::cache_status_code(&reason)),
+        };
         let cache_unavailable = cache_unavailable_reason.is_some();
         // Answers from other subsystems are taken before any of this
         // context's guards below. The guards are held until the summary is
@@ -9146,7 +9161,16 @@ impl AppContext {
     }
 
     pub fn cache_unavailable_reason(&self) -> Option<String> {
-        let reason = crate::root_cache::cache_unavailable(&self.config())?;
+        self.cache_unavailable_reason_for_root(&crate::root_cache::cache_root(&self.config()))
+    }
+
+    /// [`Self::cache_unavailable_reason`] against an already-resolved cache
+    /// root. The health rollup resolves each distinct root once per tick and
+    /// reuses it here so a many-context tick does not re-resolve the same
+    /// root once per context.
+    pub(crate) fn cache_unavailable_reason_for_root(&self, cache_dir: &Path) -> Option<String> {
+        let reason =
+            crate::root_cache::cache_unavailable_for_root(&self.config(), cache_dir)?;
         if reason.starts_with(crate::root_cache::CACHE_DIR_BUSY)
             && !crate::provisional_identity_retry::cache_retry_pending(self)
         {
@@ -9229,6 +9253,7 @@ impl AppContext {
         self.publish_build_suspensions_for_health(suspensions, now_ms);
     }
 
+    #[cfg(test)]
     pub(crate) fn build_breaker_path_for_health(
         &self,
         project_key: Option<&str>,
