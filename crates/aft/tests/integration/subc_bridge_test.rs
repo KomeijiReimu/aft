@@ -1634,6 +1634,37 @@ pub(super) fn run_subc_bridge_test_with_dispatch_and_executor_config<F, Fut, A>(
     );
 }
 
+/// Like the executor-config variant, but also installs the lifecycle probe so
+/// the driver can wait on `BashForegroundWait` instead of sleeping past the
+/// bash spawn job.
+fn run_subc_bridge_test_with_dispatch_lifecycle_and_executor_config<F, Fut, A>(
+    name: &'static str,
+    watchdog: Duration,
+    driver: F,
+    after: A,
+    dispatch: aft::subc::DispatchFn,
+    executor_config: ExecutorConfig,
+) where
+    F: FnOnce(FakeDaemonInput) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+    A: FnOnce(&Arc<BridgeState>, &Arc<Executor>, &SubcBridgeTestRoots),
+{
+    run_subc_bridge_test_inner(
+        name,
+        watchdog,
+        Vec::new,
+        driver,
+        after,
+        true,
+        None,
+        dispatch,
+        executor_config,
+        true,
+        None,
+        None,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_subc_bridge_test_inner<E, F, Fut, A>(
     name: &'static str,
@@ -2885,7 +2916,7 @@ fn single_reader_executor_config() -> ExecutorConfig {
 
 #[test]
 fn subc_bridge_module_draining_answers_bash_wait_whose_poll_is_stuck() {
-    run_subc_bridge_test_with_dispatch_and_executor_config(
+    run_subc_bridge_test_with_dispatch_lifecycle_and_executor_config(
         "subc_bridge_module_draining_answers_bash_wait_whose_poll_is_stuck",
         Duration::from_secs(90),
         drive_module_draining_answers_stuck_bash_wait_daemon,
@@ -2897,13 +2928,12 @@ fn subc_bridge_module_draining_answers_bash_wait_whose_poll_is_stuck() {
 
 #[test]
 fn subc_bridge_client_cancel_answers_held_bash_wait_and_keeps_command_running() {
-    run_subc_bridge_test_with_dispatch_and_executor_config(
+    run_subc_bridge_test_with_dispatch_and_lifecycle_probe(
         "subc_bridge_client_cancel_answers_held_bash_wait_and_keeps_command_running",
         Duration::from_secs(90),
         drive_client_cancel_answers_held_bash_wait_daemon,
         |_, _, _| {},
         bridge_dispatch,
-        bridge_executor_config(),
     );
 }
 
@@ -9855,6 +9885,50 @@ async fn wait_for_file(path: &std::path::Path, label: &str) {
     }
 }
 
+/// Waits until each listed bash call has left its spawn job and reached the
+/// foreground wait loop, publishing the detach target the drain uses to
+/// answer it. The census then reports `bash:wait` / `bash:block` instead of
+/// `bash:spawning`. This replaces the old fixed sleep past the spawn job: on
+/// a loaded runner the spawn job can still be queued when the sleep expires.
+/// Waits up to 30 s (a generous positive wait); every assertion that follows
+/// still checks the exact census the drain reports.
+async fn wait_for_bash_foreground_waits(
+    events: &mut mpsc::UnboundedReceiver<SubcLifecycleEvent>,
+    expected: &[(u16, u64, &str)],
+) {
+    let bound = Duration::from_secs(30);
+    let deadline = Instant::now() + bound;
+    let wanted: HashMap<(u16, u64), &str> = expected
+        .iter()
+        .map(|(channel, corr, phase)| ((*channel, *corr), *phase))
+        .collect();
+    let mut seen: HashSet<(u16, u64)> = HashSet::new();
+    while seen.len() < expected.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let event = tokio::time::timeout(remaining, events.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("bash foreground waits {expected:?} not reached within {bound:?}; seen {seen:?}")
+            })
+            .expect("lifecycle probe open");
+        if let SubcLifecycleEvent::BashForegroundWait {
+            route_channel,
+            route_epoch: _,
+            corr,
+            phase,
+        } = event
+        {
+            if let Some(wanted_phase) = wanted.get(&(route_channel, corr)) {
+                assert_eq!(
+                    &phase, wanted_phase,
+                    "foreground phase for channel={route_channel} corr={corr}"
+                );
+                seen.insert((route_channel, corr));
+            }
+        }
+    }
+}
+
 /// At the moment of `module.draining` the module holds one of every long-lived
 /// request kind: a `wait: true` bash call, a `block_to_completion` bash call, an
 /// untrusted bash call waiting on the host's permission answer, a bg_events
@@ -9971,8 +10045,17 @@ async fn drive_module_draining_releases_every_held_request_daemon(input: FakeDae
     .await;
     wait_for_file(&wait_started, "wait:true bash start marker").await;
     wait_for_file(&block_started, "block_to_completion bash start marker").await;
-    // Let both calls move from their spawn job into the foreground wait.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait until both calls have left their spawn job and reached the
+    // foreground wait loop (census `bash:wait` / `bash:block`, never
+    // `bash:spawning`) before starting the drain.
+    wait_for_bash_foreground_waits(
+        &mut lifecycle_events,
+        &[
+            (WAIT_CHANNEL, WAIT_CORR, "bash:wait"),
+            (BLOCK_CHANNEL, BLOCK_CORR, "bash:block"),
+        ],
+    )
+    .await;
 
     let drain_started = Instant::now();
     send_module_draining(&mut stream, Duration::from_secs(30)).await;
@@ -10638,8 +10721,10 @@ async fn drive_module_draining_answers_stuck_bash_wait_daemon(input: FakeDaemonI
         mut stream,
         root1,
         state,
+        lifecycle_events,
         ..
     } = open_fake_daemon_session(input).await;
+    let mut lifecycle_events = lifecycle_events.expect("lifecycle probe installed");
     const WAIT_CHANNEL: u16 = 1;
     // Channel 5 is reserved by the bridge dispatch for a failing configure.
     const READ_CHANNEL: u16 = 6;
@@ -10670,8 +10755,13 @@ async fn drive_module_draining_answers_stuck_bash_wait_daemon(input: FakeDaemonI
     )
     .await;
     wait_for_file(&started, "stuck bash wait start marker").await;
-    // Let the call move from its spawn job into the foreground wait.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait until the call has left its spawn job and reached the foreground
+    // wait loop (census `bash:wait`, never `bash:spawning`).
+    wait_for_bash_foreground_waits(
+        &mut lifecycle_events,
+        &[(WAIT_CHANNEL, WAIT_CORR, "bash:wait")],
+    )
+    .await;
 
     // Occupy the root's only reader slot: the wait's next poll queues behind it.
     send_tool_call(
@@ -10760,8 +10850,12 @@ async fn drive_module_draining_answers_stuck_bash_wait_daemon(input: FakeDaemonI
 /// completion is still delivered.
 async fn drive_client_cancel_answers_held_bash_wait_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
-        mut stream, root1, ..
+        mut stream,
+        root1,
+        lifecycle_events,
+        ..
     } = open_fake_daemon_session(input).await;
+    let mut lifecycle_events = lifecycle_events.expect("lifecycle probe installed");
     const WAIT_CHANNEL: u16 = 1;
     const WAIT_CORR: u64 = 1301;
     const TERMINAL_BOUND: Duration = Duration::from_secs(2);
@@ -10785,7 +10879,13 @@ async fn drive_client_cancel_answers_held_bash_wait_daemon(input: FakeDaemonInpu
     )
     .await;
     wait_for_file(&started, "cancelled bash wait start marker").await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait until the call has left its spawn job and reached the foreground
+    // wait loop (census `bash:wait`, never `bash:spawning`).
+    wait_for_bash_foreground_waits(
+        &mut lifecycle_events,
+        &[(WAIT_CHANNEL, WAIT_CORR, "bash:wait")],
+    )
+    .await;
 
     let cancelled_at = Instant::now();
     send_bg_events_cancel(&mut stream, WAIT_CHANNEL, WAIT_CORR).await;
@@ -11181,12 +11281,20 @@ fn minimal_bind_doc() -> Value {
     })
 }
 
+/// Write `doc` as the root's project config in one atomic replacement, so a
+/// reader in the daemon never sees a half-written document.
+///
+/// On Windows, replacing a file is refused with ERROR_ACCESS_DENIED (os error
+/// 5) while a handle on the destination is open without share-delete, and
+/// briefly after such a handle closes while Windows finishes removing its
+/// directory entry. The daemon reads this file on every bind and config
+/// reload, so the second case can happen here: retry it for a bounded time
+/// instead of failing the scenario. On Unix a rename over a file is never
+/// refused for this reason.
 fn write_bind_project_config(root: &std::path::Path, doc: &Value) {
     let path = root.join(".cortexkit").join("aft.jsonc");
     let parent = path.parent().expect("project config parent");
     std::fs::create_dir_all(parent).expect("create .cortexkit dir");
-    // An earlier bind may be reading this path while the next bind is sent.
-    // Publish a complete sibling file instead of truncating the live document.
     let mut temporary =
         tempfile::NamedTempFile::new_in(parent).expect("create project config temp");
     std::io::Write::write_all(
@@ -11194,7 +11302,28 @@ fn write_bind_project_config(root: &std::path::Path, doc: &Value) {
         &serde_json::to_vec(doc).expect("serialize bind doc"),
     )
     .expect("write project config temp");
-    temporary.persist(&path).expect("publish project config");
+    let mut attempt = 0u32;
+    loop {
+        match temporary.persist(&path) {
+            Ok(_) => return,
+            Err(error)
+                if cfg!(windows) && is_windows_sharing_retry(error.error.kind(), attempt) =>
+            {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                temporary = error.file;
+            }
+            Err(error) => panic!("publish project config: {:?}", error.error),
+        }
+    }
+}
+
+/// Whether a refused publish should be tried again: only the Windows
+/// replacement conflict, and only for the bounded number of attempts the
+/// caller allows.
+fn is_windows_sharing_retry(kind: std::io::ErrorKind, attempts_so_far: u32) -> bool {
+    const PUBLISH_ATTEMPTS: u32 = 40;
+    kind == std::io::ErrorKind::PermissionDenied && attempts_so_far < PUBLISH_ATTEMPTS
 }
 
 fn subc_mcp_principal() -> Principal {

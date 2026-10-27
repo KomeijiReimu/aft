@@ -741,6 +741,38 @@ pub(crate) fn with_call_requester<T>(requester: Option<String>, run: impl FnOnce
     run()
 }
 
+thread_local! {
+    /// The v1 `bash` schema pin of the tool call whose dispatch runs on this
+    /// thread, if any. Installed around the dispatch like the call key (see
+    /// [`with_call_key`]), because the spawn path that records the task only
+    /// sees the tool's own arguments. A pinless call leaves no pin, and so
+    /// no view record, even when view writing is enabled.
+    static CURRENT_SCHEMA_PIN: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `run` with `schema_pin` recorded as the pin of any task it creates,
+/// restoring the previous one afterwards, even if `run` panics.
+pub(crate) fn with_schema_pin<T>(schema_pin: Option<String>, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Option<String>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                CURRENT_SCHEMA_PIN.with(|slot| *slot.borrow_mut() = previous);
+            }
+        }
+    }
+    let previous = CURRENT_SCHEMA_PIN.with(|slot| slot.replace(schema_pin));
+    let _restore = Restore(Some(previous));
+    run()
+}
+
+/// The schema pin to record on a task being created now, if its call
+/// carried one.
+pub(crate) fn current_schema_pin() -> Option<String> {
+    CURRENT_SCHEMA_PIN.with(|slot| slot.borrow().clone())
+}
+
 /// The requester and key to record on a task being created now: the
 /// consumer's key when the call carried one, otherwise the task id.
 pub(crate) fn call_key_for_new_task(task_id: &str) -> TaskCallKey {
@@ -1649,6 +1681,10 @@ pub(crate) fn note_storage_root(storage_root: &std::path::Path) {
 }
 
 pub fn storage_dir(configured: Option<&std::path::Path>) -> PathBuf {
+    // Test hook for the health-rollup path cache: one tick over many contexts
+    // sharing a storage root must resolve it once, not once per context.
+    #[cfg(test)]
+    STORAGE_DIR_CALLS.with(|calls| calls.set(calls.get() + 1));
     let lookup = |name: &str| std::env::var_os(name);
     let fallback_home = std::env::home_dir();
     let current_dir = std::env::current_dir().ok();
@@ -1682,6 +1718,28 @@ pub fn cache_artifact_root(cache_root: Option<&std::path::Path>) -> PathBuf {
         }
         None => storage_dir(None),
     }
+}
+
+// Test hook counting storage_dir resolutions on this thread. Reset
+// before a health tick and read after it to prove the tick resolved shared
+// roots once instead of once per context.
+#[cfg(test)]
+thread_local! {
+    static STORAGE_DIR_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test hook counting [`storage_dir`] resolutions on this thread. Reset
+/// before a health tick and read after it to prove the tick resolved shared
+/// roots once instead of once per context.
+#[cfg(test)]
+pub(crate) fn storage_dir_calls_for_test() -> u64 {
+    STORAGE_DIR_CALLS.with(|calls| calls.get())
+}
+
+/// Test hook resetting [`storage_dir_calls_for_test`].
+#[cfg(test)]
+pub(crate) fn reset_storage_dir_calls_for_test() {
+    STORAGE_DIR_CALLS.with(|calls| calls.set(0));
 }
 
 /// Resolve the current test environment's default, excluding AFT-specific

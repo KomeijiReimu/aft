@@ -19,6 +19,18 @@ pub(crate) fn register_storage_root(path: &Path) {
     } else {
         return;
     };
+    if storage_roots()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(&absolute)
+    {
+        // The absolute spelling is retained together with its canonical one,
+        // so a repeat registration adds nothing and can skip the realpath
+        // probe that produced them.
+        return;
+    }
+    #[cfg(test)]
+    REGISTER_CANONICALIZATIONS.with(|count| count.set(count.get() + 1));
     let canonical =
         crate::production_storage::canonicalized_with(&absolute, &|p| p.canonicalize().ok());
     let mut roots = storage_roots().write().unwrap_or_else(|p| p.into_inner());
@@ -260,6 +272,24 @@ fn capped_read(path: &Path, cap: u64) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     file.take(cap).read_to_end(&mut bytes).ok()?;
     Some(bytes)
+}
+// Test hook counting realpath probes for storage-root registration. The
+// health rollup resolves process-wide storage paths once per tick, so one
+// tick over many contexts sharing a root must barely move this count.
+#[cfg(test)]
+thread_local! {
+    static REGISTER_CANONICALIZATIONS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn register_canonicalizations_for_test() -> u64 {
+    REGISTER_CANONICALIZATIONS.with(|count| count.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_register_canonicalizations_for_test() {
+    REGISTER_CANONICALIZATIONS.with(|count| count.set(0));
 }
 
 /// SQLite uses `-shm` files as shared-memory indexes and protects them with

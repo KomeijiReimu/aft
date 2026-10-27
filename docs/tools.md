@@ -430,9 +430,11 @@ is copied back: the files the run changed (`These files changed on the server an
 copied back:`), a changed Git state (HEAD before -> after, the symbolic ref or `detached`,
 whether the index tree changed, and the stash count change), new untracked files (marked when
 the runner listed only some of them), and the number of writes under ignored paths with sample
-paths. A kind of change the runner reported as empty is not mentioned. A kind it did not report
-(an older runner) gets one line, such as `git state: not reported by the runner`, and is never
-shown as "nothing changed".
+paths. A kind of change the runner reported as empty is not mentioned. When the runner sends no
+changed-file list at all, the reply says `changed files: not reported by the runner` rather than
+implying nothing changed. The Git state, untracked-file and ignored-write reports stay silent when
+absent: the build server never fills them (its Git folder is read-only, and every changed file is
+already in the changed-file list).
 
 **Rewriter** — when `experimental.bash.rewrite: true`, common shell command shapes route to AFT
 tools instead of spawning bash:

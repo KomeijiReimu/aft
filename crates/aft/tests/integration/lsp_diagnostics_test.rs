@@ -909,8 +909,10 @@ fn move_file_reports_deleted_source_and_created_destination_for_config_file() {
     let json = serde_json::to_value(&response).expect("response serializes");
     assert_eq!(json["success"], true, "move failed: {json}");
 
+    // Both notifications arrive asynchronously from the move; a loaded runner
+    // can deliver the second one well after 2 s, so wait generously for it.
     let mut events = drain_watched_file_events_from_ctx(&ctx);
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while events.len() < 2 && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(25));
         events.extend(drain_watched_file_events_from_ctx(&ctx));
@@ -3953,7 +3955,10 @@ fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
     if std::path::Path::new("armed").exists() {
         let out = std::env::var("OUT_DIR").unwrap();
-        std::fs::write("check-started", &out).unwrap();
+        // Rename into place so the test never reads the file between its
+        // creation and the write (it once read an empty path that way).
+        std::fs::write("check-started.tmp", &out).unwrap();
+        std::fs::rename("check-started.tmp", "check-started").unwrap();
         std::thread::sleep(std::time::Duration::from_secs(8));
     }
 }

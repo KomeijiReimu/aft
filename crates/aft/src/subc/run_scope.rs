@@ -31,8 +31,8 @@ impl RunBudget {
 
     /// Fit a codemode program's shell call to its run. A PTY needs someone to
     /// drive it interactively, so it is refused. A background command is
-    /// allowed: it joins the head agent's session, so the agent can read it
-    /// with `bash_status`, but it sends no completion wake, because the
+    /// allowed: it joins its owner route's session (the head agent's, or a
+    /// worker run's own worker's), so that owner can read it with `bash_status`, but it sends no completion wake, because the
     /// program is the one waiting for it; the run's end kills it. A
     /// foreground command blocks until it completes, and its wait is cut at
     /// the run's deadline.

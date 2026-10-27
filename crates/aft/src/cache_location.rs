@@ -380,6 +380,12 @@ pub fn cache_root(config: &crate::config::Config) -> PathBuf {
     root
 }
 pub fn cache_unavailable(config: &crate::config::Config) -> Option<String> {
+    cache_unavailable_for_root(config, &cache_root(config))
+}
+/// [`cache_unavailable`] against an already-resolved cache root. The health
+/// rollup resolves each distinct root once per tick and reuses it here so a
+/// many-context tick does not re-resolve the same root once per context.
+pub fn cache_unavailable_for_root(config: &crate::config::Config, root: &Path) -> Option<String> {
     if let Some(reason) = &config.cache_config_unknown {
         return Some(format!("cache_dir_config_unknown: {reason}"));
     }
@@ -391,7 +397,7 @@ pub fn cache_unavailable(config: &crate::config::Config) -> Option<String> {
         return Some("configured cache root has not been prepared".into());
     }
     config.cache_unavailable.clone().or_else(|| {
-        let (reason, epoch, _) = status(&cache_root(config));
+        let (reason, epoch, _) = status(root);
         reason.or_else(|| {
             (epoch != config.cache_epoch).then(|| "cache root transition pending configure".into())
         })

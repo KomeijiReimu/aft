@@ -590,6 +590,10 @@ pub(super) struct DispatchPathMetrics {
     pub(super) deferred_bash_waits_in_flight: AtomicUsize,
     /// Bash calls whose route request is still waiting for a terminal frame.
     pub(super) held_bash_calls: super::drain::HeldBashCalls,
+    /// Test-only probe that learns when a bash call reaches its foreground
+    /// wait. Production never installs one; integration tests wait on its
+    /// `BashForegroundWait` event instead of sleeping past the spawn job.
+    pub(super) lifecycle_probe: StdMutex<Option<super::SubcTestLifecycleProbe>>,
     pub(super) reliable_push_budget_deferrals: AtomicU64,
     pub(super) maintenance_budget_deferrals: AtomicU64,
     pub(super) response_tasks_live: AtomicUsize,
@@ -639,6 +643,7 @@ impl DispatchPathMetrics {
             bash_poll_touch_queued: AtomicUsize::new(0),
             deferred_bash_waits_in_flight: AtomicUsize::new(0),
             held_bash_calls: super::drain::HeldBashCalls::default(),
+            lifecycle_probe: StdMutex::new(None),
             reliable_push_budget_deferrals: AtomicU64::new(0),
             maintenance_budget_deferrals: AtomicU64::new(0),
             response_tasks_live: AtomicUsize::new(0),
@@ -1211,14 +1216,18 @@ impl DispatchPathMetrics {
                     continue;
                 }
                 logged.insert(key, now);
-                crate::slog_warn!(
-                    "subc bg wake: pending watch remains unacked root={} session={} task={} watch={} age_ms={}",
-                    root.as_path().display(),
-                    session,
-                    task_id,
-                    watch_id,
-                    age_ms
-                );
+                // One scan covers every session's watches, so log each inside
+                // its own session's scope to tag it with that session.
+                crate::log_ctx::with_session(Some(session.clone()), || {
+                    crate::slog_warn!(
+                        "subc bg wake: pending watch remains unacked root={} session={} task={} watch={} age_ms={}",
+                        root.as_path().display(),
+                        session,
+                        task_id,
+                        watch_id,
+                        age_ms
+                    );
+                });
             }
         }
         logged.retain(|_, last| {
@@ -1679,16 +1688,19 @@ pub(super) fn warn_slow_pending_binds(
                 in_flight_writer: None,
                 reader_admissions_while_promoted_writer_waited: 0,
             });
-        crate::slog_warn!(
-            "{}",
-            pending_bind_breadcrumb(
-                *route,
-                &pending.bind_root_id,
-                age,
-                &pending.configure_request_id,
-                &snapshot,
-            )
+        let breadcrumb = pending_bind_breadcrumb(
+            *route,
+            &pending.bind_root_id,
+            age,
+            &pending.configure_request_id,
+            &snapshot,
         );
+        // The frame loop serves every session, so tag the line with the
+        // session that requested this bind rather than whatever scope (if
+        // any) the thread happens to be in.
+        crate::log_ctx::with_session(pending.session.clone(), || {
+            crate::slog_warn!("{breadcrumb}");
+        });
     }
 }
 
@@ -2370,13 +2382,17 @@ impl HealthRollupCache {
         ctx: &AppContext,
         project_root: &std::path::Path,
         project_key: Option<&str>,
+        cache_dir: &std::path::Path,
     ) {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
-        let Some(path) = ctx.build_breaker_path_for_health(project_key) else {
+        // The caller resolved the cache root once for the whole tick; the
+        // breaker database lives under it for every context sharing the root.
+        let Some(path) = crate::context::build_breaker_path_for_health(cache_dir, project_key)
+        else {
             ctx.publish_build_suspensions_for_health(Vec::new(), now_ms);
             return;
         };
@@ -3167,20 +3183,71 @@ impl RollupStepTimer {
     }
 }
 
+/// Storage roots resolved once per rollup tick. Every context in one tick
+/// that names the same configured storage and cache roots resolves to the
+/// same directories, so resolving once per distinct configuration keeps a
+/// many-root tick off realpath/getcwd instead of re-resolving once per
+/// context. The resolved values are identical to calling
+/// [`crate::bash_background::storage_dir`] and [`crate::root_cache::cache_root`]
+/// directly: the memo is keyed by the exact configured spellings and dropped
+/// with the tick, so a reconfiguration on the next tick resolves afresh.
+#[derive(Default)]
+struct TickStoragePaths {
+    storage: HashMap<Option<std::path::PathBuf>, std::path::PathBuf>,
+    cache: HashMap<(Option<std::path::PathBuf>, Option<std::path::PathBuf>), std::path::PathBuf>,
+}
+
+impl TickStoragePaths {
+    fn storage_dir(&mut self, configured: Option<&std::path::Path>) -> std::path::PathBuf {
+        let key = configured.map(std::path::Path::to_path_buf);
+        if let Some(hit) = self.storage.get(&key) {
+            return hit.clone();
+        }
+        let resolved = crate::bash_background::storage_dir(configured);
+        self.storage.insert(key, resolved.clone());
+        resolved
+    }
+
+    fn cache_dir(&mut self, config: &crate::config::Config) -> std::path::PathBuf {
+        let key = (config.storage_dir.clone(), config.cache_dir.clone());
+        if let Some(hit) = self.cache.get(&key) {
+            return hit.clone();
+        }
+        let resolved = crate::root_cache::cache_root(config);
+        self.cache.insert(key, resolved.clone());
+        resolved
+    }
+
+    fn storage_paths(&mut self, config: &crate::config::Config) -> crate::root_cache::StoragePaths {
+        crate::root_cache::StoragePaths::new(
+            self.storage_dir(config.storage_dir.as_deref()),
+            self.cache_dir(config),
+        )
+    }
+
+    fn cache_unavailable_reason(
+        &mut self,
+        ctx: &AppContext,
+        config: &crate::config::Config,
+    ) -> Option<String> {
+        let cache_dir = self.cache_dir(config);
+        ctx.cache_unavailable_reason_for_root(&cache_dir)
+    }
+}
+
 /// The unavailable code of each context whose cache location is unavailable,
 /// keyed by its cache root. The reason is read once per context: a recovery
-/// can clear it at any moment, so a second read may find nothing.
+/// can clear it at any moment, so a second read may find nothing. The
+/// description computes the cache root too, so a tick that already resolved
+/// it passes both together instead of resolving the same root twice.
 fn cache_unavailable_codes<'a>(
     contexts: impl Iterator<Item = &'a AppContext>,
-    reason: impl Fn(&AppContext) -> Option<String>,
+    mut describe: impl FnMut(&AppContext) -> Option<(std::path::PathBuf, String)>,
 ) -> std::collections::BTreeMap<std::path::PathBuf, &'static str> {
     contexts
         .filter_map(|ctx| {
-            let reason = reason(ctx)?;
-            Some((
-                ctx.cache_dir(),
-                crate::root_cache::unavailable_code(&reason),
-            ))
+            let (cache_dir, reason) = describe(ctx)?;
+            Some((cache_dir, crate::root_cache::unavailable_code(&reason)))
         })
         .collect()
 }
@@ -3232,8 +3299,13 @@ fn build_health_diagnostic_rollup_from_actors(
     let mut embedding_backend_since_ms = None;
     let mut task_storage_roots = std::collections::HashSet::new();
     let mut bash_task_refusals = Vec::new();
+    // Process-wide storage paths cannot change mid-tick: every context that
+    // names the same configured roots shares the resolution below instead of
+    // repeating its realpath and current-directory probes once per context.
+    let mut tick_paths = TickStoragePaths::default();
     for (root_id, ctx) in actor_entries {
-        let storage = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+        let config = ctx.config();
+        let storage = tick_paths.storage_dir(config.storage_dir.as_deref());
         if task_storage_roots.insert(storage.clone()) {
             // Refused tasks are named health diagnostics, not a reason to
             // disable shell execution for every route sharing this daemon.
@@ -3254,9 +3326,12 @@ fn build_health_diagnostic_rollup_from_actors(
                     }),
             );
         }
-        if ctx.cache_unavailable_reason().is_none() {
+        if tick_paths
+            .cache_unavailable_reason(ctx.as_ref(), &config)
+            .is_none()
+        {
             crate::storage_retention::schedule(
-                ctx.storage_paths(),
+                tick_paths.storage_paths(&config),
                 ctx.subc_lifecycle_admission(),
                 ctx.configure_generation_flag(),
                 ctx.configure_generation(),
@@ -3300,7 +3375,8 @@ fn build_health_diagnostic_rollup_from_actors(
         // Durable breaker state is loaded during the off-path rollup, then the
         // cached health reply reads only the context snapshot. Standing keys can
         // be scoped or path-based, so they must not depend on the session-key memo.
-        cache.refresh_build_suspensions(ctx.as_ref(), root_id.as_path(), artifact_key);
+        let cache_dir = tick_paths.cache_dir(&config);
+        cache.refresh_build_suspensions(ctx.as_ref(), root_id.as_path(), artifact_key, &cache_dir);
         let repair_entries_60s = artifact_key.and_then(|key| {
             repair_roots_annotated = repair_roots_annotated.saturating_add(1);
             crate::callgraph_store::repair_entry_rate(key)
@@ -3347,7 +3423,7 @@ fn build_health_diagnostic_rollup_from_actors(
             );
         }
         rollup_mark!(timer, "root disk probes / breaker / callgraph");
-        let health_summary = ctx.try_health_summary();
+        let health_summary = ctx.try_health_summary_for_root(Some(&cache_dir));
         rollup_mark!(timer, "index readiness / view status");
         let busy = health_summary.is_busy();
         let fully_ready = health_summary.is_fully_ready();
@@ -3529,13 +3605,20 @@ fn build_health_diagnostic_rollup_from_actors(
         )
     });
     rollup_mark!(timer, "process memory snapshots");
-    let cache_roots = lifecycle_contexts
-        .iter()
-        .map(|ctx| ctx.cache_dir())
-        .collect::<std::collections::BTreeSet<_>>();
+    // The tick's resolved roots are reused here: the same directories the
+    // per-context loop above resolved are not resolved again per context.
+    let mut cache_roots = std::collections::BTreeSet::new();
+    for ctx in &lifecycle_contexts {
+        cache_roots.insert(tick_paths.cache_dir(&ctx.config()));
+    }
     let cache_unavailable = cache_unavailable_codes(
         lifecycle_contexts.iter().map(Arc::as_ref),
-        AppContext::cache_unavailable_reason,
+        |ctx: &AppContext| {
+            let config = ctx.config();
+            let cache_dir = tick_paths.cache_dir(&config);
+            let reason = ctx.cache_unavailable_reason_for_root(&cache_dir)?;
+            Some((cache_dir, reason))
+        },
     );
     let measured_census = census_snapshot.map(|census_snapshot| {
         #[cfg(test)]
@@ -3586,7 +3669,7 @@ fn build_health_diagnostic_rollup_from_actors(
     let storage_retention = lifecycle_contexts
         .iter()
         .filter_map(|ctx| {
-            let storage = ctx.cache_dir();
+            let storage = tick_paths.cache_dir(&ctx.config());
             crate::storage_retention::snapshot(&storage)
                 .map(|report| (storage.display().to_string(), report))
         })
@@ -4124,11 +4207,17 @@ mod tests {
                 ..Default::default()
             },
         );
-        // Each read returns the reason once, then the recovered state.
+        // Each read returns the reason once, then the recovered state. The
+        // description also resolves the cache root, mirroring the tick's
+        // once-per-context read of both together.
         let reads = std::sync::atomic::AtomicUsize::new(0);
-        let recovering = |_: &AppContext| {
-            (reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0)
-                .then(|| "cache_dir_unavailable: volume missing".to_string())
+        let recovering = |ctx: &AppContext| {
+            (reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0).then(|| {
+                (
+                    ctx.cache_dir(),
+                    "cache_dir_unavailable: volume missing".to_string(),
+                )
+            })
         };
         let refresh = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             super::cache_unavailable_codes(std::iter::once(&ctx), &recovering)
@@ -6579,6 +6668,62 @@ mod tests {
         assert_eq!(refresh_at(0), (1, 1, Some(0)));
         assert_eq!(refresh_at(29_999), (0, 0, Some(0)));
         assert_eq!(refresh_at(30_000), (1, 1, Some(30_000)));
+    }
+
+    #[test]
+    fn rollup_resolves_shared_storage_paths_once_per_tick() {
+        // One shared App, so every context names the same storage root the way
+        // the daemon's contexts do; only the project roots differ.
+        let app = crate::context::App::default_shared();
+        let executor = Executor::new();
+        let cache = HealthRollupCache::new();
+        let shared_app = crate::context::App::default_shared();
+        let mut entries = Vec::new();
+        let mut dirs = Vec::new();
+        for index in 0..32 {
+            let (dir, root) = test_root(&format!("health-shared-storage-{index:02}"));
+            let ctx = Arc::new(AppContext::from_app(
+                Arc::clone(&app),
+                crate::config::Config::default(),
+            ));
+            entries.push((root, ctx));
+            dirs.push(dir);
+        }
+        // The fixture really shares one storage root. Comparing configured
+        // spellings resolves nothing, so the tick below measures the first
+        // registration of this root.
+        let storage = entries[0].1.config().storage_dir.clone();
+        assert!(storage.is_some());
+        for (_, ctx) in &entries {
+            assert_eq!(ctx.config().storage_dir, storage);
+        }
+        crate::bash_background::reset_storage_dir_calls_for_test();
+        crate::project_content::reset_register_canonicalizations_for_test();
+        let rollup =
+            build_health_diagnostic_rollup_from_actors(&cache, &executor, &shared_app, entries);
+        assert_eq!(
+            rollup.metrics["root_count"], 32,
+            "the tick must have visited every actor"
+        );
+        // One tick over 32 contexts sharing a root resolves it once (plus the
+        // one standing-roots probe, which runs once per tick by construction).
+        // Resolving once per context would report hundreds here.
+        let resolutions = crate::bash_background::storage_dir_calls_for_test();
+        let canonicalizations = crate::project_content::register_canonicalizations_for_test();
+        println!(
+            "health tick over 32 contexts: {resolutions} storage resolutions, {canonicalizations} canonicalizations"
+        );
+        assert!(
+            resolutions <= 8,
+            "shared storage resolved once per context: {resolutions}",
+        );
+        // The first registration canonicalizes the root; repeats reuse the
+        // retained spelling without another realpath probe.
+        assert!(
+            canonicalizations <= 4,
+            "storage root canonicalized once per context: {canonicalizations}",
+        );
+        drop(dirs);
     }
 
     #[test]

@@ -854,6 +854,7 @@ mod fixup_tests {
                     ver: PROTOCOL_VERSION,
                     flags: control_flags(),
                     cancellation: JobCancellation::new(),
+                    session: None,
                 },
             );
             ControlCompletion::AckWritten(RouteBindCompletion {
@@ -979,6 +980,7 @@ mod fixup_tests {
                     ver: PROTOCOL_VERSION,
                     flags: control_flags(),
                     cancellation: JobCancellation::new(),
+                    session: None,
                 },
             )]);
             expire_overdue_route_binds(
@@ -1206,6 +1208,7 @@ mod ordering_tests {
                 ver: PROTOCOL_VERSION,
                 flags: control_flags(),
                 cancellation: JobCancellation::new(),
+                session: None,
             },
         )]);
         let mut routes = HashMap::new();

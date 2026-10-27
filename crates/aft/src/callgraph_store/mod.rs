@@ -45,7 +45,7 @@ use tree_sitter::Node;
 #[cfg(not(test))]
 use tree_sitter::Parser;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 /// Highest callgraph generation schema this build reads (and writes).
 pub const STORE_FORMAT_VERSION: u32 = SCHEMA_VERSION as u32;
 const BACKEND_TREESITTER: &str = "treesitter";
@@ -851,7 +851,7 @@ mod write_amplification_tests {
             "control: a store with the current fingerprint is served"
         );
 
-        let previous = schema_fingerprint_for("v10-rust-macro-templates");
+        let previous = schema_fingerprint_for("v19-position-independent-node-identities");
         assert_ne!(previous, schema_fingerprint());
         Connection::open(&path)
             .unwrap()
@@ -4832,6 +4832,8 @@ impl StoreNode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreCallSite {
+    pub kind: String,
+    pub caller_is_test: Option<bool>,
     pub caller: StoreNode,
     pub target_file: String,
     pub target_symbol: String,
@@ -4874,6 +4876,7 @@ pub struct StoreUnresolvedCall {
 /// One raw ref row located by name; see `CallGraphRead::ref_sites_named`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreRefSite {
+    pub is_test: Option<bool>,
     pub file: String,
     /// Scoped name of the symbol containing the ref, when it has a node.
     pub caller_symbol: Option<String>,
@@ -4985,6 +4988,7 @@ struct FileExtract {
 
 #[derive(Debug, Clone)]
 struct NodeRecord {
+    is_test: Option<bool>,
     id: String,
     file_path: String,
     name: String,
@@ -8931,9 +8935,10 @@ impl CallGraphStore {
         self.refresh_read_marker()?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         self.ensure_ready(&conn)?;
-        let mut stmt = conn.prepare_cached("SELECT r.caller_file, n.scoped_name, r.line FROM refs r JOIN files f ON f.path=r.caller_file LEFT JOIN nodes n ON n.id=r.caller_node WHERE r.kind='call' AND r.short_name=?1 AND f.lang=?2 AND r.status='unresolved' AND r.full_ref LIKE '%.%' AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.ref_id=r.ref_id AND e.kind='call') ORDER BY r.caller_file, r.line, r.ref_id")?;
+        let mut stmt = conn.prepare_cached("SELECT r.caller_file, n.scoped_name, r.line, n.is_test FROM refs r JOIN files f ON f.path=r.caller_file LEFT JOIN nodes n ON n.id=r.caller_node WHERE r.kind IN ('call','construction') AND (?1='' OR (r.short_name=?1 AND r.full_ref LIKE '%.%')) AND f.lang=?2 AND r.status='unresolved' AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.ref_id=r.ref_id AND e.kind='call') GROUP BY r.caller_file, r.byte_start, r.byte_end ORDER BY r.caller_file, r.byte_start")?;
         let rows = stmt.query_map(params![name, lang_label(language)], |row| {
             Ok(StoreRefSite {
+                is_test: row.get(3)?,
                 file: row.get(0)?,
                 caller_symbol: row.get(1)?,
                 line: row.get::<_, i64>(2)?.max(0) as u32,
@@ -9032,7 +9037,10 @@ impl CallGraphStore {
                 continue;
             };
             let callers =
-                direct_callers_for_tuple(&conn, &current.node.file, &current.node.symbol)?;
+                direct_callers_for_tuple(&conn, &current.node.file, &current.node.symbol)?
+                    .into_iter()
+                    .filter(|site| site.kind == "call")
+                    .collect::<Vec<_>>();
             if callers.is_empty() {
                 if path.len() > 1 {
                     truncated_paths += 1;
@@ -10284,11 +10292,11 @@ fn direct_caller_counts_for_tuples(
                  JOIN edges e
                    ON e.target_file = requested.target_file
                   AND e.target_symbol = requested.target_symbol
-                  AND e.kind = 'call'
+                  AND e.kind IN ('call', 'callback_ref')
                  JOIN refs r ON r.ref_id = e.ref_id
                  JOIN nodes src ON src.id = e.source_node
                  JOIN files src_file ON src_file.path = src.file_path
-                 GROUP BY e.target_file, e.target_symbol, src.file_path, e.line
+                  GROUP BY e.target_file, e.target_symbol, src.file_path, e.line, e.kind
              )
              SELECT target_file, target_symbol, COUNT(*)
              FROM deduped
@@ -10327,7 +10335,7 @@ fn direct_caller_count_for_tuple(
          JOIN refs r ON r.ref_id = e.ref_id
          JOIN nodes src ON src.id = e.source_node
          JOIN files src_file ON src_file.path = src.file_path
-         WHERE e.kind = 'call' AND e.target_file = ?1 AND e.target_symbol = ?2",
+         WHERE e.kind IN ('call', 'callback_ref') AND e.target_file = ?1 AND e.target_symbol = ?2",
         params![target_file, target_symbol],
         |row| row.get(0),
     )?;
@@ -10347,14 +10355,14 @@ fn direct_callers_for_tuple(
                 src_file.lang,
                 tgt.id, tgt.file_path, tgt.scoped_name, tgt.name, tgt.kind, tgt.start_line,
                 tgt.end_line, tgt.signature, tgt.exported, tgt.is_callgraph_entry_point,
-                tgt_file.lang
+                tgt_file.lang, e.kind, src.is_test
          FROM edges e
          JOIN refs r ON r.ref_id = e.ref_id
          JOIN nodes src ON src.id = e.source_node
          JOIN files src_file ON src_file.path = src.file_path
          LEFT JOIN (nodes tgt JOIN files tgt_file ON tgt_file.path = tgt.file_path)
              ON tgt.id = e.target_node
-         WHERE e.kind = 'call' AND e.target_file = ?1 AND e.target_symbol = ?2
+         WHERE e.kind IN ('call', 'callback_ref') AND e.target_file = ?1 AND e.target_symbol = ?2
          ORDER BY e.source_node, r.byte_start, r.line, r.ref_id",
     )?;
     let rows = stmt.query_map(
@@ -10369,6 +10377,8 @@ fn direct_call_site_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreC
     let caller = store_node_from_row_at(row, 7)?;
     let target = optional_store_node_from_row_at(row, 18)?;
     Ok(StoreCallSite {
+        kind: row.get(29)?,
+        caller_is_test: row.get(30)?,
         caller,
         target_file: row.get(0)?,
         target_symbol: row.get(1)?,
@@ -10407,12 +10417,12 @@ fn direct_callers_for_tuples(
                     src_file.lang,
                     tgt.id, tgt.file_path, tgt.scoped_name, tgt.name, tgt.kind, tgt.start_line,
                     tgt.end_line, tgt.signature, tgt.exported, tgt.is_callgraph_entry_point,
-                    tgt_file.lang
+                    tgt_file.lang, e.kind, src.is_test
              FROM requested requested
              JOIN edges e
                ON e.target_file = requested.target_file
               AND e.target_symbol = requested.target_symbol
-              AND e.kind = 'call'
+              AND e.kind IN ('call', 'callback_ref')
              JOIN refs r ON r.ref_id = e.ref_id
              JOIN nodes src ON src.id = e.source_node
              JOIN files src_file ON src_file.path = src.file_path
@@ -10495,6 +10505,8 @@ fn outgoing_calls_for_symbol_tuples(
             Ok((
                 source_node_id,
                 StoreCallSite {
+                    kind: "call".to_string(),
+                    caller_is_test: None,
                     caller,
                     target_file: row.get(1)?,
                     target_symbol: row.get(2)?,
@@ -10631,6 +10643,8 @@ fn outgoing_calls_for_node_limited(
         |row| {
             let target = optional_store_node_from_row_at(row, 7)?;
             Ok(StoreCallSite {
+                kind: "call".to_string(),
+                caller_is_test: None,
                 caller: node.clone(),
                 target_file: row.get(0)?,
                 target_symbol: row.get(1)?,
@@ -10678,6 +10692,8 @@ fn resolved_self_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<V
         |row| {
             let target = optional_store_node_from_row_at(row, 7)?;
             Ok(StoreCallSite {
+                kind: "call".to_string(),
+                caller_is_test: None,
                 caller: node.clone(),
                 target_file: row.get(0)?,
                 target_symbol: row.get(1)?,
@@ -10703,7 +10719,7 @@ fn ref_sites_named(
     // LIMIT bounds returned rows, not rows examined: the short-name index does
     // not provide caller-file/line ordering, so SQLite may sort all matches.
     let mut stmt = conn.prepare_cached(
-        "SELECT r.caller_file, n.scoped_name, r.line, r.local_name
+        "SELECT r.caller_file, n.scoped_name, r.line, r.local_name, n.is_test
          FROM refs r
          LEFT JOIN nodes n ON n.id = r.caller_node
          WHERE r.short_name = ?1 AND r.kind = ?2
@@ -10718,6 +10734,7 @@ fn ref_sites_named(
                 caller_symbol: row.get(1)?,
                 line: row.get::<_, i64>(2)?.max(0) as u32,
                 local_name: row.get(3)?,
+                is_test: row.get(4)?,
             })
         },
     )?;
@@ -10967,7 +10984,11 @@ pub fn live_callgraph_edge_snapshot(
 
     let mut edges = BTreeSet::new();
     for (caller_file, data) in &file_data {
-        for (caller_symbol, call_sites) in &data.calls_by_symbol {
+        for (caller_symbol, call_sites) in data
+            .calls_by_symbol
+            .iter()
+            .chain(&data.value_refs_by_symbol)
+        {
             for call_site in call_sites {
                 let resolution = graph.resolve_cross_file_edge(
                     &call_site.full_callee,
@@ -10975,7 +10996,7 @@ pub fn live_callgraph_edge_snapshot(
                     caller_file,
                     &data.import_block,
                 );
-                let (target_file, target_symbol) = match resolution {
+                let (target_file, mut target_symbol) = match resolution {
                     EdgeResolution::Resolved { file, symbol } => (file, symbol),
                     EdgeResolution::Unresolved { callee_name } => {
                         if !callgraph::is_bare_callee(&call_site.full_callee, &callee_name) {
@@ -10991,6 +11012,43 @@ pub fn live_callgraph_edge_snapshot(
                         (caller_file.clone(), target_symbol)
                     }
                 };
+                let target_data = graph.build_file(&target_file)?;
+                let mut kind = if data.value_refs_by_symbol.contains_key(caller_symbol)
+                    && data.value_refs_by_symbol[caller_symbol].contains(call_site)
+                {
+                    "value_ref"
+                } else {
+                    "call"
+                };
+                match call_site.kind {
+                    callgraph::CallSiteKind::CallbackReference => kind = "callback_ref",
+                    callgraph::CallSiteKind::Construction => {
+                        if target_data
+                            .symbol_metadata_for(&target_symbol)
+                            .is_some_and(|meta| meta.kind == SymbolKind::Class)
+                        {
+                            let constructor = format!("{target_symbol}::constructor");
+                            if target_data.symbol_metadata.contains_key(&constructor) {
+                                target_symbol = constructor;
+                            } else {
+                                kind = "value_ref";
+                            }
+                        }
+                    }
+                    callgraph::CallSiteKind::Call => {}
+                }
+                if kind != "call"
+                    && data.lang != LangId::Go
+                    && !target_data
+                        .symbol_metadata_for(&target_symbol)
+                        .is_some_and(|meta| {
+                            matches!(meta.kind, SymbolKind::Function | SymbolKind::Method)
+                                || (call_site.kind == callgraph::CallSiteKind::Construction
+                                    && meta.kind == SymbolKind::Class)
+                        })
+                {
+                    continue;
+                }
                 if target_file == *caller_file && target_symbol == *caller_symbol {
                     continue;
                 }
@@ -10999,7 +11057,7 @@ pub fn live_callgraph_edge_snapshot(
                     source_symbol: caller_symbol.clone(),
                     target_file: relative_path(project_root, &target_file),
                     target_symbol,
-                    kind: "call".to_string(),
+                    kind: kind.to_string(),
                     line: call_site.line,
                 });
             }
@@ -12123,6 +12181,7 @@ pub(crate) fn initialize_schema(conn: &Connection) -> Result<()> {
             is_type_like               INTEGER NOT NULL,
             is_callgraph_entry_point   INTEGER NOT NULL,
             provenance                 TEXT NOT NULL,
+            is_test                    INTEGER,
             UNIQUE(file_path, start_line, start_col, end_line, end_col, range_ordinal)
         );
 
@@ -12232,6 +12291,15 @@ pub(crate) fn initialize_schema(conn: &Connection) -> Result<()> {
         .any(|name| name == "callee_last_segment");
     if !has_last_segment {
         conn.execute_batch("ALTER TABLE refs ADD COLUMN callee_last_segment TEXT;")?;
+    }
+    let has_test_status = conn
+        .prepare("PRAGMA table_info(nodes)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "is_test");
+    if !has_test_status {
+        conn.execute_batch("ALTER TABLE nodes ADD COLUMN is_test INTEGER;")?;
     }
     source_stat::ensure_identity_column(conn)?;
     conn.execute_batch(&create_secondary_indexes_sql())?;
@@ -12475,7 +12543,7 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 ///   completion does not duplicate documented methods.
 /// - v13: known interface contracts and their implementation fan-out retain
 ///   exact/dispatch provenance; a concrete trait call has only its actual target.
-const BUILD_OUTPUT_VERSION: &str = "v19-position-independent-node-identities";
+const BUILD_OUTPUT_VERSION: &str = "v20-callback-constructor-inline-test-items";
 
 fn staging_file_name(project_key: &str) -> String {
     format!("{project_key}.{BUILD_OUTPUT_VERSION}.staging.sqlite.tmp.resume")
@@ -14499,6 +14567,7 @@ fn build_node_records(
             .map(|default| default == scoped_name || default == name)
             .unwrap_or(false);
         records.push(NodeRecord {
+            is_test: meta.is_test,
             id,
             file_path: rel_path.to_string(),
             name: name.clone(),
@@ -14655,7 +14724,12 @@ fn build_callable_refs(
                 caller_node: caller_node.clone(),
                 caller_symbol: Some(caller_symbol.clone()),
                 caller_file: rel_path.to_string(),
-                kind: kind.to_string(),
+                kind: match call_site.kind {
+                    callgraph::CallSiteKind::Construction => "construction",
+                    callgraph::CallSiteKind::CallbackReference => "callback_ref",
+                    callgraph::CallSiteKind::Call => kind,
+                }
+                .to_string(),
                 short_name: Some(call_site.callee_name.clone()),
                 full_ref: Some(call_site.full_callee.clone()),
                 module_path: None,
@@ -15717,7 +15791,7 @@ fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> 
     }
     if !matches!(
         raw.kind.as_str(),
-        "call" | "value_ref" | MACRO_BODY_CALL_REF_KIND
+        "call" | "construction" | "callback_ref" | "value_ref" | MACRO_BODY_CALL_REF_KIND
     ) {
         return Ok(ResolvedRef {
             dependencies: raw.dependencies.clone(),
@@ -15754,7 +15828,7 @@ fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> 
         _ => resolve_local_target(index, &caller_file, full_ref, short_name, caller_data),
     };
 
-    let Some((status, target_file, target_symbol)) = resolved else {
+    let Some((status, target_file, mut target_symbol)) = resolved else {
         return Ok(ResolvedRef {
             raw,
             status: "unresolved".to_string(),
@@ -15767,8 +15841,31 @@ fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> 
     };
 
     dependencies.insert(target_file.clone());
+    let mut construction_without_constructor = false;
+    if raw.kind == "construction" {
+        let Some(node) = index.node_for_symbol(&target_file, &target_symbol) else {
+            return Ok(ResolvedRef {
+                raw,
+                status: "unresolved".to_string(),
+                target_node: None,
+                target_file: None,
+                target_symbol: None,
+                dependencies,
+                edge: None,
+            });
+        };
+        let constructor = format!("{target_symbol}::constructor");
+        if index.node_is_callable(&target_file, &node) {
+            // JavaScript functions can also be constructed; they remain callable targets.
+        } else if index.node_for_symbol(&target_file, &constructor).is_some() {
+            target_symbol = constructor;
+        } else {
+            // Keep the class reference for liveness without inventing an executable method call.
+            construction_without_constructor = true;
+        }
+    }
     let target_node = index.node_for_symbol(&target_file, &target_symbol);
-    if raw.kind == "value_ref"
+    if matches!(raw.kind.as_str(), "value_ref" | "callback_ref")
         && index.lang_for(&caller_file) != Some(LangId::Go)
         && !target_node
             .as_deref()
@@ -15797,7 +15894,16 @@ fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> 
                 target_node: target_node.clone(),
                 target_file: target_file.clone(),
                 target_symbol: target_symbol.clone(),
-                kind: raw.kind.clone(),
+                kind: if raw.kind == "construction" {
+                    if construction_without_constructor {
+                        "value_ref"
+                    } else {
+                        "call"
+                    }
+                } else {
+                    raw.kind.as_str()
+                }
+                .to_string(),
                 line: raw.line,
             })
         }
@@ -17826,8 +17932,8 @@ impl<'stmt> ColdBuildInsertStatements<'stmt> {
                 "INSERT INTO nodes(
                     id, file_path, name, scoped_name, kind, start_line, start_col,
                     end_line, end_col, range_ordinal, signature, exported,
-                    is_default_export, is_type_like, is_callgraph_entry_point, provenance
-                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                    is_default_export, is_type_like, is_callgraph_entry_point, provenance, is_test
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                 ON CONFLICT(id) DO UPDATE SET
                     file_path=excluded.file_path,
                     name=excluded.name,
@@ -17843,7 +17949,8 @@ impl<'stmt> ColdBuildInsertStatements<'stmt> {
                     is_default_export=excluded.is_default_export,
                     is_type_like=excluded.is_type_like,
                     is_callgraph_entry_point=excluded.is_callgraph_entry_point,
-                    provenance=excluded.provenance
+                    provenance=excluded.provenance,
+                    is_test=excluded.is_test
                 WHERE file_path IS NOT excluded.file_path
                    OR name IS NOT excluded.name
                    OR scoped_name IS NOT excluded.scoped_name
@@ -17858,6 +17965,7 @@ impl<'stmt> ColdBuildInsertStatements<'stmt> {
                    OR is_default_export IS NOT excluded.is_default_export
                    OR is_type_like IS NOT excluded.is_type_like
                    OR is_callgraph_entry_point IS NOT excluded.is_callgraph_entry_point
+                   OR is_test IS NOT excluded.is_test
                    OR provenance IS NOT excluded.provenance",
             )?,
             file_dependency: tx.prepare(
@@ -18003,6 +18111,7 @@ fn insert_file_graph_rows_prepared(
             bool_int(node.is_type_like),
             bool_int(node.is_callgraph_entry_point),
             PROVENANCE_TREESITTER,
+            node.is_test.map(bool_int),
         ])?;
     }
 
@@ -18385,8 +18494,8 @@ fn insert_file_extract(
             "INSERT OR REPLACE INTO nodes(
                 id, file_path, name, scoped_name, kind, start_line, start_col,
                 end_line, end_col, range_ordinal, signature, exported,
-                is_default_export, is_type_like, is_callgraph_entry_point, provenance
-            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                is_default_export, is_type_like, is_callgraph_entry_point, provenance, is_test
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 node.id,
                 node.file_path,
@@ -18404,6 +18513,7 @@ fn insert_file_extract(
                 bool_int(node.is_type_like),
                 bool_int(node.is_callgraph_entry_point),
                 PROVENANCE_TREESITTER,
+                node.is_test.map(bool_int),
             ],
         )?;
     }
@@ -18456,7 +18566,7 @@ fn insert_file_dependencies(
 }
 
 fn ref_provenance(raw: &RawRef) -> &'static str {
-    if raw.kind == "value_ref" {
+    if matches!(raw.kind.as_str(), "value_ref" | "callback_ref") {
         PROVENANCE_VALUE_REF
     } else {
         PROVENANCE_TREESITTER
@@ -20975,7 +21085,7 @@ fn stored_extract_matches(
     let mut stored_nodes_stmt = tx.prepare_cached(
         "SELECT id, file_path, name, scoped_name, kind, start_line, start_col,
                 end_line, end_col, range_ordinal, signature, exported,
-                is_default_export, is_type_like, is_callgraph_entry_point, provenance
+                is_default_export, is_type_like, is_callgraph_entry_point, provenance, is_test
          FROM nodes WHERE file_path = ?1",
     )?;
     let stored_nodes = stored_nodes_stmt
@@ -20997,6 +21107,7 @@ fn stored_extract_matches(
                 row.get::<_, i64>(13)?,
                 row.get::<_, i64>(14)?,
                 row.get::<_, String>(15)?,
+                row.get::<_, Option<i64>>(16)?,
             ])
             .to_string())
         })?
@@ -21022,6 +21133,7 @@ fn stored_extract_matches(
                 bool_int(node.is_type_like),
                 bool_int(node.is_callgraph_entry_point),
                 PROVENANCE_TREESITTER,
+                node.is_test.map(bool_int),
             ])
             .to_string()
         })
@@ -21314,7 +21426,10 @@ fn ref_ids_depending_on(
                 // Only calls and value references resolve to a target. The
                 // other refs of an importer (imports, re-exports, module
                 // declarations) resolve the same whatever the file defines.
-                if !matches!(row.kind.as_str(), "call" | "value_ref") {
+                if !matches!(
+                    row.kind.as_str(),
+                    "call" | "construction" | "callback_ref" | "value_ref"
+                ) {
                     continue;
                 }
                 let name = short_name.as_deref().map(callee_last_segment);
@@ -21772,14 +21887,14 @@ fn reexport_consumer_refs(
     )?;
     let mut calls_of = conn.prepare_cached(
         "SELECT ref_id, short_name FROM refs
-         WHERE caller_file = ?1 AND kind IN ('call', 'value_ref')",
+         WHERE caller_file = ?1 AND kind IN ('call', 'construction', 'callback_ref', 'value_ref')",
     )?;
     // Fully qualified Rust calls (`crate::git::clone()`) reach a barrel without
     // any import row; when the barrel cannot place the name they are stored
     // as resolved to the barrel itself.
     let mut resolved_to = conn.prepare_cached(
         "SELECT ref_id, caller_file, short_name FROM refs
-         WHERE target_file = ?1 AND kind IN ('call', 'value_ref')",
+         WHERE target_file = ?1 AND kind IN ('call', 'construction', 'callback_ref', 'value_ref')",
     )?;
     for (barrel, names) in &barrels {
         let resolved = resolved_to
@@ -22769,7 +22884,7 @@ fn ref_dependency_row_depends_on(
         // A call or value reference in a file that imports `rel_path` can bind
         // to it even when its stored state points elsewhere or nowhere (a value
         // reference only resolves once its target is callable).
-        "call" | "value_ref" => true,
+        "call" | "construction" | "callback_ref" | "value_ref" => true,
         "import" | "reexport" => row.module_path.as_deref().is_some_and(|module_path| {
             module_ref_can_name(project_root, &row.caller_file, module_path, rel_path, memo)
         }),
@@ -23682,7 +23797,7 @@ mod refresh_worker_tests {
                 "INSERT INTO nodes SELECT 'positional-target', file_path, name, scoped_name, kind,
                  start_line + 100, start_col, end_line + 100, end_col, range_ordinal,
                  signature, exported, is_default_export, is_type_like, is_callgraph_entry_point,
-                 provenance FROM nodes WHERE name = 'old_leaf';",
+                  provenance, is_test FROM nodes WHERE name = 'old_leaf';",
             )
             .unwrap();
         }
@@ -28760,6 +28875,7 @@ export function leaf() {}
         let rel_path = "src/main.ts".to_string();
         let target_path = "src/helper.ts".to_string();
         let node = NodeRecord {
+            is_test: Some(false),
             id: "node-main".to_string(),
             file_path: rel_path.clone(),
             name: "main".to_string(),
@@ -30166,7 +30282,7 @@ edition = "2021"
             .lock()
             .unwrap()
             .query_row(
-                "SELECT status FROM refs WHERE kind='value_ref' AND full_ref='GoGetHandler'",
+                "SELECT status FROM refs WHERE kind='callback_ref' AND full_ref='GoGetHandler'",
                 [],
                 |row| row.get(0),
             )

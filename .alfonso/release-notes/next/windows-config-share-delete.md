@@ -1,0 +1,1 @@
+- On Windows, an editor or tool can save AFT's user or project config file while AFT is reading it; the save is no longer refused with "access denied".

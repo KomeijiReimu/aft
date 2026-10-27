@@ -137,7 +137,12 @@ pub(super) fn canonicalize_pr_edit_from<R: Read>(
         gh_repo: gh_repo_env(),
     })?;
     let mut target = Map::new();
-    target.insert("number".into(), Value::String(positional.remove(0)));
+    // The route holder routes on the bare thread number, so a URL positional
+    // contributes its digits, not the URL (the repository half resolved
+    // above). Anything else passes through unchanged.
+    let number = positional.remove(0);
+    let number = thread_url_number(&number).unwrap_or(number);
+    target.insert("number".into(), Value::String(number));
     Ok(GovernedRequest {
         action: "pr edit".to_string(),
         target,

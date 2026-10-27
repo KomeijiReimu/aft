@@ -60,15 +60,24 @@ fn stamp() -> ScopeStamp {
     ScopeStamp::new(Principal::Direct, "session-scope", 4, ScopeKind::Head)
 }
 
+fn canonical_root(path: &Path) -> PathBuf {
+    ProjectRootId::from_path(path).unwrap().into_path_buf()
+}
+
 // Exercise admission and completion, not a second implementation of root selection.
-fn bind(root: &Path, scope: Option<ScopeStamp>) -> (Vec<String>, Vec<u8>) {
-    bind_observed(root, scope, |_| {})
+fn bind(
+    root: &Path,
+    scope: Option<ScopeStamp>,
+    expected_project_root: &Path,
+) -> (Vec<String>, Vec<u8>) {
+    bind_observed(root, scope, expected_project_root, |_, _, _| {})
 }
 
 fn bind_observed(
     root: &Path,
     scope: Option<ScopeStamp>,
-    after_ack: impl FnOnce(&mut Option<oneshot::Receiver<()>>),
+    expected_project_root: &Path,
+    after_ack: impl FnOnce(&mut Option<oneshot::Receiver<()>>, &RouteIdentity, &AppContext),
 ) -> (Vec<String>, Vec<u8>) {
     // The bind resolves its storage root through the process environment,
     // where AFT_STORAGE_DIR overrides the configured root. A test that sets
@@ -163,7 +172,11 @@ fn bind_observed(
                     }
                     Response::success(request.id, request.params)
                 },
-                Some(&test_support::bind_config_without_indexes(&root)),
+                // The bind identity folder may not exist (stamp-only binds), so the
+                // user config file goes in the project folder the route resolves to.
+                Some(&test_support::bind_config_without_indexes(
+                    expected_project_root,
+                )),
                 usize::MAX,
                 None,
                 storage.path(),
@@ -174,14 +187,14 @@ fn bind_observed(
                 .await
                 .unwrap()
                 .unwrap();
-            let expected_root = ProjectRootId::from_path(root).unwrap();
+            let expected_root = ProjectRootId::from_path(expected_project_root).unwrap();
             let ControlCompletion::ConfigureReady(completion) = completion else {
                 panic!("configure completion expected");
             };
             assert!(completion.configure_response.success);
             assert_eq!(completion.bind_root_id, expected_root);
             assert_eq!(completion.identity.root, expected_root);
-            assert_eq!(completion.identity.project_root, root);
+            assert_eq!(completion.identity.project_root, expected_project_root);
             assert_eq!(completion.identity.scope, scope);
             assert_eq!(completion.identity.trust, BindTrust::FirstParty);
             match &completion.identity.spawn_principal {
@@ -190,14 +203,14 @@ fn bind_observed(
                     session_id,
                     ..
                 } => {
-                    assert_eq!(project_root, root);
+                    assert_eq!(project_root, expected_project_root);
                     assert_eq!(session_id, "folder-session");
                 }
                 other => panic!("unexpected spawn principal: {other:?}"),
             }
             assert_eq!(
                 completion.configure_response.data["project_root"],
-                root.to_string_lossy().as_ref()
+                expected_project_root.to_string_lossy().as_ref()
             );
             assert_eq!(executor.actor_count(), 1);
             assert_eq!(executor.actor_entries()[0].0, expected_root);
@@ -253,7 +266,9 @@ fn bind_observed(
                 (ack.header.channel, ack.header.epoch, ack.header.corr),
                 (0, 0, 91)
             );
-            after_ack(&mut observed);
+            let identity = &routes[&route_key(7, 1)];
+            let ctx = executor.actor_context(&identity.root).unwrap();
+            after_ack(&mut observed, identity, &ctx);
             if let Some(observed) = observed {
                 tokio::time::timeout(Duration::from_secs(8), observed)
                     .await
@@ -263,6 +278,22 @@ fn bind_observed(
             ack.body.clone()
         })
     });
+    let key_changes: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("subc route project key changed:"))
+        .collect();
+    if root.display().to_string() != expected_project_root.display().to_string() {
+        assert_eq!(key_changes.len(), 1, "{key_changes:?}");
+        assert!(key_changes[0].starts_with("INFO "), "{key_changes:?}");
+        for value in [root, expected_project_root] {
+            assert!(
+                key_changes[0].contains(&value.display().to_string()),
+                "{key_changes:?}"
+            );
+        }
+    } else {
+        assert!(key_changes.is_empty(), "{key_changes:?}");
+    }
     let lines = lines
         .into_iter()
         .filter(|line| line.contains("subc scope workdir"))
@@ -278,14 +309,16 @@ fn scope_workdir_held_lookup_does_not_delay_bind_ack() {
     // environment is not bind latency. `bind_observed` takes it again.
     let _env = crate::test_env::process_env_lock();
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().canonicalize().unwrap();
+    let root = canonical_root(dir.path());
     let workdir = root.join("held-workdir");
+    std::fs::create_dir(&workdir).unwrap();
     let held = crate::bounded_io::stall_running_helper(&workdir);
     let started = Instant::now();
     let (lines, reply) = bind_observed(
         &root,
         Some(stamp().with_workdir(Some(workdir.to_string_lossy().into_owned()))),
-        |observed| {
+        &workdir,
+        |observed, _, _| {
             assert!(
                 started.elapsed() < Duration::from_secs(1),
                 "diagnostic delayed bind ACK by {:?}",
@@ -317,13 +350,15 @@ fn scope_workdir_held_lookup_does_not_delay_bind_ack() {
 fn scope_workdir_expired_lookup_logs_skipped_without_guessing() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().canonicalize().unwrap();
+    let root = canonical_root(dir.path());
     let workdir = root.join("timed-out-workdir");
+    std::fs::create_dir(&workdir).unwrap();
     let held = crate::bounded_io::stall_running_helper(&workdir);
     let (lines, reply) = bind_observed(
         &root,
         Some(stamp().with_workdir(Some(workdir.to_string_lossy().into_owned()))),
-        |_| {
+        &workdir,
+        |_, _, _| {
             held.reached
                 .recv_timeout(Duration::from_secs(1))
                 .expect("workdir lookup reached the held helper");
@@ -344,18 +379,19 @@ fn scope_workdir_expired_lookup_logs_skipped_without_guessing() {
 fn scope_workdir_repeated_binds_keep_one_stuck_diagnostic_in_flight() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().canonicalize().unwrap();
+    let root = canonical_root(dir.path());
     let workdir = root.join("stuck-workdir");
+    std::fs::create_dir(&workdir).unwrap();
     let scope = stamp().with_workdir(Some(workdir.to_string_lossy().into_owned()));
     let held = crate::bounded_io::stall_running_helper(&workdir);
-    let (lines, _) = bind_observed(&root, Some(scope.clone()), |_| {
+    let (lines, _) = bind_observed(&root, Some(scope.clone()), &workdir, |_, _, _| {
         held.reached.recv_timeout(Duration::from_secs(1)).unwrap();
     });
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].contains("comparison skipped:"), "{lines:?}");
     for _ in 0..5 {
         assert_eq!(SCOPE_WORKDIR_DIAGNOSTICS.in_flight.lock().unwrap().len(), 1);
-        let (lines, reply) = bind(&root, Some(scope.clone()));
+        let (lines, reply) = bind(&root, Some(scope.clone()), &workdir);
         assert_eq!(reply, br#"{"op":"route.bind"}"#);
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
@@ -366,7 +402,7 @@ fn scope_workdir_repeated_binds_keep_one_stuck_diagnostic_in_flight() {
     assert_eq!(SCOPE_WORKDIR_DIAGNOSTICS.in_flight.lock().unwrap().len(), 1);
     drop(held);
     wait_for_diagnostics_idle();
-    let (lines, _) = bind(&root, Some(scope));
+    let (lines, _) = bind(&root, Some(scope), &workdir);
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].contains("workdir differs:"), "{lines:?}");
 }
@@ -398,7 +434,7 @@ fn scope_workdir_full_diagnostic_capacity_preserves_shared_file_reads() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().canonicalize().unwrap();
+    let root = canonical_root(dir.path());
     let healthy_file = root.join("healthy.txt");
     std::fs::write(&healthy_file, b"healthy shared read").unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -504,7 +540,7 @@ fn scope_workdir_full_diagnostic_capacity_preserves_shared_file_reads() {
 fn scope_workdir_matching_is_silent_and_preserves_project_root() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().canonicalize().unwrap();
+    let root = canonical_root(dir.path());
     let (lines, _) = bind(
         &root,
         Some(
@@ -512,6 +548,7 @@ fn scope_workdir_matching_is_silent_and_preserves_project_root() {
                 .with_workdir(Some(root.join(".").to_string_lossy().into_owned()))
                 .with_project_id(Some("project-match".into())),
         ),
+        &root,
     );
     assert!(lines.is_empty(), "{lines:?}");
     #[cfg(unix)]
@@ -521,19 +558,21 @@ fn scope_workdir_matching_is_silent_and_preserves_project_root() {
         let (lines, _) = bind(
             &alias,
             Some(stamp().with_workdir(Some(root.to_string_lossy().into_owned()))),
+            &root,
         );
         assert!(lines.is_empty(), "{lines:?}");
     }
 }
 
 #[test]
-fn scope_workdir_mismatch_logs_once_and_preserves_project_root() {
+fn scope_workdir_mismatch_logs_once_and_binds_stamped_project() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().canonicalize().unwrap();
-    let folder = root.join("missing-session-folder");
+    let root = canonical_root(dir.path());
+    let folder = root.join("session-folder");
+    std::fs::create_dir(&folder).unwrap();
     let expected_root = ProjectRootId::from_path(&root).unwrap();
-    let expected_folder = expected_root.as_path().join("missing-session-folder");
+    let expected_folder = expected_root.as_path().join("session-folder");
     let (lines, _) = bind(
         &root,
         Some(
@@ -541,6 +580,7 @@ fn scope_workdir_mismatch_logs_once_and_preserves_project_root() {
                 .with_workdir(Some(folder.to_string_lossy().into_owned()))
                 .with_project_id(Some("project-mismatch".into())),
         ),
+        &folder,
     );
     assert_eq!(lines.len(), 1, "{lines:?}");
     let line = &lines[0];
@@ -562,36 +602,144 @@ fn scope_workdir_mismatch_logs_once_and_preserves_project_root() {
 fn scope_workdir_old_stamp_is_silent_and_preserves_project_root() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().canonicalize().unwrap();
+    let root = canonical_root(dir.path());
     let old_stamp: ScopeStamp = serde_json::from_str(
         r#"{"owner":{"kind":"direct"},"ref":"session-scope","scope_epoch":4,"kind":"head","owner_authorized":false}"#,
     ).unwrap();
     assert!(old_stamp.workdir.is_none());
     assert!(old_stamp.project_id.is_none());
     assert_eq!(serde_json::to_vec(&old_stamp).unwrap(), br#"{"owner":{"kind":"direct"},"ref":"session-scope","scope_epoch":4,"kind":"head","owner_authorized":false}"#);
-    let (lines, old_reply) = bind(&root, Some(old_stamp));
-    let (unscoped_lines, unscoped_reply) = bind(&root, None);
+    let (lines, old_reply) = bind(&root, Some(old_stamp), &root);
+    let (unscoped_lines, unscoped_reply) = bind(&root, None, &root);
     assert!(lines.is_empty(), "{lines:?}");
     assert!(unscoped_lines.is_empty(), "{unscoped_lines:?}");
     assert_eq!(old_reply, unscoped_reply);
+    let literal_root = root.join(".");
+    let (lines, _) = bind(&literal_root, None, &literal_root);
+    assert!(lines.is_empty(), "{lines:?}");
+}
+
+#[test]
+fn scope_workdir_stamp_binds_without_a_valid_bind_identity_folder() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let root = canonical_root(dir.path());
+    let missing_bind_root = root.join("absent-bind-folder");
+    let (lines, _) = bind(
+        &missing_bind_root,
+        Some(stamp().with_workdir(Some(root.to_string_lossy().into_owned()))),
+        &root,
+    );
+    assert!(lines.is_empty(), "{lines:?}");
+}
+
+#[test]
+fn scope_workdir_stamp_selects_project_config_instead_of_bind_config() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let root = canonical_root(dir.path());
+    let project = root.join("stamped-project");
+    let bind_folder = root.join("bind-folder");
+    for (folder, tool) in [(&project, "aft_search"), (&bind_folder, "aft_zoom")] {
+        let config_dir = folder.join(".cortexkit");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("aft.jsonc"),
+            json!({"harnesses": {"opencode": {"disabled_tools": [tool]}}}).to_string(),
+        )
+        .unwrap();
+    }
+    bind_observed(
+        &bind_folder,
+        Some(stamp().with_workdir(Some(project.to_string_lossy().into_owned()))),
+        &project,
+        |_, identity, _| {
+            assert!(identity
+                .disabled_tools
+                .iter()
+                .any(|tool| tool == "aft_search"));
+            assert!(!identity
+                .disabled_tools
+                .iter()
+                .any(|tool| tool == "aft_zoom"));
+        },
+    );
+}
+
+#[test]
+fn scope_workdir_stamp_recovers_legacy_catalog_state_for_same_path() {
+    use crate::db::remote_exec::{self, PolicyKey};
+    use crate::exec_remote::FrozenParams;
+
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let root = canonical_root(dir.path());
+    let project = root.join("legacy-project");
+    let bind_folder = root.join("pool-folder");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::create_dir(&bind_folder).unwrap();
+    let db_path = root.join("aft.db");
+    // Seed the literal path key written before scope workdirs selected projects.
+    // The daemon's project id deliberately differs and must not become the key.
+    let legacy_key = PolicyKey {
+        project_root: project.display().to_string(),
+        harness: "opencode".into(),
+        session: "folder-session".into(),
+        principal: "direct".into(),
+        owner: serde_json::to_string(&Principal::Direct).unwrap(),
+        scope_ref: "session-scope".into(),
+        epoch: 4,
+        preset: "worker".into(),
+    };
+    let policy = FrozenParams {
+        siblings: vec!["saved-sibling".into()],
+        host: Some("saved-host".into()),
+        ..Default::default()
+    };
+    let conn = crate::db::open(&db_path).unwrap();
+    remote_exec::freeze(&conn, &legacy_key, &policy, 1, || {}).unwrap();
+    drop(conn);
+
+    let scope = ScopeStamp::new(Principal::Direct, "session-scope", 4, ScopeKind::Worker)
+        .with_workdir(Some(project.to_string_lossy().into_owned()))
+        .with_project_id(Some("daemon-project-id-not-a-path".into()));
+    bind_observed(&bind_folder, Some(scope), &project, |_, identity, ctx| {
+        ctx.set_db(Arc::new(StdMutex::new(crate::db::open(&db_path).unwrap())));
+        let key = remote_policy::key(identity, Some("worker")).unwrap();
+        let db = ctx.db().unwrap();
+        let conn = db.lock().unwrap();
+        let recovered = remote_exec::lookup(&conn, &key, 2)
+            .unwrap()
+            .expect("stamped route must find the legacy root-keyed catalog row");
+        assert_eq!(recovered.host.as_deref(), Some("saved-host"));
+        assert_eq!(recovered.siblings, ["saved-sibling"]);
+    });
 }
 
 #[test]
 fn scope_workdir_bind_reply_is_byte_for_byte_unchanged() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().canonicalize().unwrap();
-    for scope in [
-        None,
-        Some(stamp()),
-        Some(stamp().with_workdir(Some(root.to_string_lossy().into_owned()))),
-        Some(
-            stamp()
-                .with_workdir(Some(root.join("other").to_string_lossy().into_owned()))
-                .with_project_id(Some("project-other".into())),
+    let root = canonical_root(dir.path());
+    let other = root.join("other");
+    std::fs::create_dir(&other).unwrap();
+    for (scope, expected) in [
+        (None, &root),
+        (Some(stamp()), &root),
+        (
+            Some(stamp().with_workdir(Some(root.to_string_lossy().into_owned()))),
+            &root,
+        ),
+        (
+            Some(
+                stamp()
+                    .with_workdir(Some(other.to_string_lossy().into_owned()))
+                    .with_project_id(Some("project-other".into())),
+            ),
+            &other,
         ),
     ] {
-        let (_, reply) = bind(&root, scope);
+        let (_, reply) = bind(&root, scope, expected);
         assert_eq!(reply, br#"{"op":"route.bind"}"#);
     }
 }

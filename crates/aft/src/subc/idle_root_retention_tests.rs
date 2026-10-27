@@ -450,7 +450,7 @@ mod thread_inventory {
         struct ThreadState {
             _x: [u64; 29],
             fp: u64,
-            _lr: u64,
+            lr: u64,
             _sp: u64,
             pc: u64,
             _cpsr: u32,
@@ -598,11 +598,22 @@ mod thread_inventory {
             (result == 0 && read == 16).then_some(frame)
         }
 
+        /// The registers of a suspended thread that locate its stack.
+        struct Registers {
+            pc: u64,
+            fp: u64,
+            /// The link register on arm64, which holds the running
+            /// function's return address until that function saves it in its
+            /// frame record. x86_64 keeps the return address on the stack
+            /// instead, so it has none.
+            lr: Option<u64>,
+        }
+
         /// A thread's saved registers and return addresses.
         struct Stack {
-            /// Program counter and frame pointer; `None` when the thread could
-            /// not be suspended or its registers could not be read.
-            registers: Option<(u64, u64)>,
+            /// `None` when the thread could not be suspended or its registers
+            /// could not be read.
+            registers: Option<Registers>,
             /// Return addresses, innermost first.
             returns: Vec<u64>,
         }
@@ -656,10 +667,39 @@ mod thread_inventory {
             unsafe {
                 thread_resume(port);
             }
+            #[cfg(target_arch = "aarch64")]
+            let lr = Some(state.lr & ADDRESS_MASK);
+            #[cfg(target_arch = "x86_64")]
+            let lr = None;
             Stack {
-                registers: got_state.then_some((state.pc & ADDRESS_MASK, state.fp & ADDRESS_MASK)),
+                registers: got_state.then_some(Registers {
+                    pc: state.pc & ADDRESS_MASK,
+                    fp: state.fp & ADDRESS_MASK,
+                    lr,
+                }),
                 returns: frames[..depth].to_vec(),
             }
+        }
+
+        /// What `dladdr` knows about `address`; `None` outside every image.
+        fn lookup(address: u64) -> Option<libc::Dl_info> {
+            // SAFETY: Dl_info is plain C data that dladdr fills.
+            let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+            // SAFETY: dladdr only reads loader tables for the address.
+            (unsafe { libc::dladdr(address as *const libc::c_void, &mut info) } != 0)
+                .then_some(info)
+        }
+
+        /// The demangled name of the symbol recorded in `info`, if `dladdr`
+        /// found one.
+        fn symbol_name(info: &libc::Dl_info) -> Option<String> {
+            if info.dli_sname.is_null() {
+                return None;
+            }
+            // SAFETY: dladdr returned a NUL-terminated symbol name.
+            let name = unsafe { CStr::from_ptr(info.dli_sname) }.to_string_lossy();
+            // `{:#}` leaves out the hash suffix; other names pass through.
+            Some(format!("{:#}", rustc_demangle::demangle(&name)))
         }
 
         /// The symbol containing `address`, demangled, or the image and
@@ -667,17 +707,11 @@ mod thread_inventory {
         /// points after its call, so it is looked up one byte back.
         fn symbol(address: u64, return_address: bool) -> String {
             let address = address.saturating_sub(u64::from(return_address));
-            // SAFETY: Dl_info is plain C data that dladdr fills.
-            let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
-            // SAFETY: dladdr only reads loader tables for the address.
-            if unsafe { libc::dladdr(address as *const libc::c_void, &mut info) } == 0 {
+            let Some(info) = lookup(address) else {
                 return format!("{address:#x}");
-            }
-            if !info.dli_sname.is_null() {
-                // SAFETY: dladdr returned a NUL-terminated symbol name.
-                let name = unsafe { CStr::from_ptr(info.dli_sname) }.to_string_lossy();
-                // `{:#}` leaves out the hash suffix; other names pass through.
-                return format!("{:#}", rustc_demangle::demangle(&name));
+            };
+            if let Some(name) = symbol_name(&info) {
+                return name;
             }
             let image = if info.dli_fname.is_null() {
                 "?".to_string()
@@ -693,10 +727,47 @@ mod thread_inventory {
             name == "start_wqthread" || name == "_pthread_wqthread"
         }
 
+        fn is_entry_frame(name: &str) -> bool {
+            ENTRY_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+        }
+
+        /// The functions the registers name that the saved frames cannot:
+        /// the running function (from the program counter), then on arm64
+        /// the function the link register returns into.
+        ///
+        /// The frame pointer chain yields return addresses: once the running
+        /// function has saved its frame record, the chain names its caller
+        /// and everything outside it, but never the running function itself. A thread caught executing its spawn
+        /// closure's own code has no saved frame naming the closure; neither
+        /// has one caught entering or leaving a callee (before the callee
+        /// saves its frame record, or after it restores it), because the
+        /// frame pointer still points at the closure's record, which names
+        /// only the closure's caller. In the second case the closure is where
+        /// the link register returns to.
+        ///
+        /// The program counter always lies in code. The link register can be
+        /// reused as scratch once its function has saved it, so it is used
+        /// only when it falls in a named symbol, and only after the program
+        /// counter.
+        fn running_functions(registers: &Registers) -> Vec<String> {
+            let mut names = vec![symbol(registers.pc, false)];
+            if let Some(lr) = registers.lr.filter(|&lr| lr != 0) {
+                if let Some(name) = lookup(lr - 1).as_ref().and_then(symbol_name) {
+                    names.push(name);
+                }
+            }
+            names
+        }
+
         /// How a thread started, from its stack: the two outermost frames and
-        /// the first frame past the entry and spawn machinery, which for a
+        /// the first function past the entry and spawn machinery, which for a
         /// Rust thread is the closure it was spawned with. Also whether it is
         /// a kernel workqueue thread.
+        ///
+        /// That function is searched for in the saved frames from the
+        /// outermost in, then in the functions the registers name (see
+        /// [`running_functions`]). When none qualifies, only the two
+        /// outermost frames are shown.
         ///
         /// The kernel creates workqueue threads ahead of demand and parks
         /// them before they ever run: such a thread has all-zero registers
@@ -704,17 +775,17 @@ mod thread_inventory {
         /// rayon and tokio use) sets a new thread's registers and storage
         /// before it is scheduled, so no AFT thread looks like that.
         fn describe_start(tls_base: u64, stack: Stack) -> (Option<String>, bool) {
-            let Some((pc, fp)) = stack.registers else {
+            let Some(registers) = stack.registers else {
                 return (Some("<stack not readable>".to_string()), false);
             };
             if stack.returns.is_empty() {
-                if pc == 0 && fp == 0 && tls_base == 0 {
+                if registers.pc == 0 && registers.fp == 0 && tls_base == 0 {
                     return (
                         Some("<kernel workqueue thread that has not run yet>".to_string()),
                         true,
                     );
                 }
-                let name = symbol(pc, false);
+                let name = symbol(registers.pc, false);
                 let os_workqueue = is_workqueue_entry(&name);
                 return (Some(format!("{name} (no saved frames)")), os_workqueue);
             }
@@ -729,15 +800,91 @@ mod thread_inventory {
                 .take(2)
                 .any(|name| is_workqueue_entry(name));
             let mut chain: Vec<&str> = outer_first.iter().take(2).map(String::as_str).collect();
+            let running = running_functions(&registers);
             if let Some(routine) = outer_first
                 .iter()
-                .find(|name| !ENTRY_PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
+                .chain(&running)
+                .find(|name| !is_entry_frame(name))
             {
                 if !chain.contains(&routine.as_str()) {
                     chain.push(routine);
                 }
             }
             (Some(chain.join(" > ")), os_workqueue)
+        }
+
+        /// A thread caught where no saved frame names its spawn closure (see
+        /// [`running_functions`]) must still be reported with the closure,
+        /// not with the entry and runtime frames alone. The stack here is
+        /// built by hand so that case is certain: every saved frame is a
+        /// standard-library function, as the frames outside a Rust spawn
+        /// closure are.
+        #[test]
+        fn start_routine_comes_from_the_registers_when_no_saved_frame_names_it() {
+            #[inline(never)]
+            fn spawned_work_marker() {
+                std::hint::black_box(());
+            }
+            let marker = spawned_work_marker as fn() as usize as u64;
+            let runtime_function = std::thread::yield_now as fn() as usize as u64;
+            let outer_runtime_function = std::thread::park as fn() as usize as u64;
+            // Return addresses, innermost first: each points one byte into
+            // its function, as `symbol` expects after looking one byte back.
+            let runtime_returns = vec![runtime_function + 1, outer_runtime_function + 1];
+
+            // Running the closure's own code: only the program counter
+            // names it.
+            let (start, os_workqueue) = describe_start(
+                1,
+                Stack {
+                    registers: Some(Registers {
+                        pc: marker,
+                        fp: 1,
+                        lr: None,
+                    }),
+                    returns: runtime_returns.clone(),
+                },
+            );
+            let start = start.unwrap_or_default();
+            assert!(start.contains("spawned_work_marker"), "{start}");
+            assert!(start.starts_with("std::"), "{start}");
+            assert!(!os_workqueue, "{start}");
+
+            // This synthetic register state models an arm64 thread entering
+            // a runtime callee before the callee saved its frame record: the
+            // program counter is in the callee, and only the link register,
+            // not yet saved, returns into the closure.
+            let (start, _) = describe_start(
+                1,
+                Stack {
+                    registers: Some(Registers {
+                        pc: runtime_function,
+                        fp: 1,
+                        lr: Some(marker + 4),
+                    }),
+                    returns: runtime_returns.clone(),
+                },
+            );
+            let start = start.unwrap_or_default();
+            assert!(start.contains("spawned_work_marker"), "{start}");
+
+            // A saved frame that names the closure wins over the running
+            // function, which is whatever the closure called into last.
+            let callee = libc::getpid as unsafe extern "C" fn() -> libc::pid_t as usize as u64;
+            let (start, _) = describe_start(
+                1,
+                Stack {
+                    registers: Some(Registers {
+                        pc: callee,
+                        fp: 1,
+                        lr: None,
+                    }),
+                    returns: vec![marker + 4, outer_runtime_function + 1],
+                },
+            );
+            let start = start.unwrap_or_default();
+            assert!(start.contains("spawned_work_marker"), "{start}");
+            assert!(!start.contains("getpid"), "{start}");
         }
     }
 }

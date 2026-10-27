@@ -130,6 +130,32 @@ pub(crate) const fn default_bash_worker_wait_max_ms() -> u64 {
 
 use crate::harness::Harness;
 
+/// Open a configuration file for reading.
+///
+/// On Windows a plain open asks for read access only, and the file then
+/// refuses to be replaced while this handle lives: an editor that saves by
+/// writing a temporary file and renaming it over this path, or an `aft write`
+/// replacing it, gets ERROR_ACCESS_DENIED (os error 5). A handle that shares
+/// delete lets the replacement land; it reaches the old file's bytes, which is
+/// what a reader already under way should see. Config files are read and
+/// released quickly, so this window is small either way.
+///
+/// Prefer this over `std::fs::read_to_string` for any file a user or tool may
+/// rewrite while AFT runs: the user and project config files.
+pub(crate) fn open_config_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    }
+    options.open(path)
+}
+
 /// Idle reclamation window for unbound-root artifacts.
 ///
 /// `root_ttl_minutes` controls when an unbound root's indexes are evicted.

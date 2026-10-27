@@ -255,6 +255,7 @@ pub fn complete_members(
             .entry(position)
             .or_insert_with(|| scoped_name.clone());
         parse.symbols.push(BlobSymbol {
+            is_test: None,
             ordinal,
             name,
             scoped_name: scoped_name.clone(),

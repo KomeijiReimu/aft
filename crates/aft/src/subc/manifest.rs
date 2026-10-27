@@ -453,6 +453,12 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
     // `call-modes/v1` requests the bind mode and run deadline. AFT checks
     // each tool's modes and confirms a run scope has ended before killing
     // its processes.
+    //
+    // `worker-runs/v1` admits worker runs: codemode runs that carry
+    // `on_behalf_of_agent` and no `agent_id`. Declaring it promises that AFT
+    // runs such a call with only its worker's own access (see `codemode`) and
+    // treats `on_behalf_of_agent` as attribution: it never acts as, asks for,
+    // or hands out the tasks or handles of the attributed agent.
     // Nothing goes in `requires`.
     //
     // The builder leaves `self_signals` and `provenance` unset; `provenance`
@@ -477,6 +483,7 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
             provides: vec![
                 cortexkit_role_tool_provider::PROVIDES.to_string(),
                 cortexkit_role_tool_provider::CALL_MODES_CAPABILITY.to_string(),
+                subc_protocol::scope::WORKER_RUNS_CAPABILITY.to_string(),
                 subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),
                 crate::page_collect::CAPABILITY.to_string(),
             ],
@@ -844,6 +851,7 @@ mod tests {
             vec![
                 "tool-provider/v1".to_string(),
                 "call-modes/v1".to_string(),
+                "worker-runs/v1".to_string(),
                 "scope-workdir/v1".to_string(),
                 "page-collect/v1".to_string(),
             ]
@@ -855,6 +863,7 @@ mod tests {
             Some(&serde_json::json!([
                 "tool-provider/v1",
                 "call-modes/v1",
+                "worker-runs/v1",
                 "scope-workdir/v1",
                 "page-collect/v1"
             ]))
@@ -1148,7 +1157,7 @@ mod tests {
         assert_eq!(
             top.insert(
                 "capabilities".to_string(),
-                json!({"provides": ["tool-provider/v1", "call-modes/v1", "scope-workdir/v1", "page-collect/v1"], "requires": [], "must_never_reach": []}),
+                json!({"provides": ["tool-provider/v1", "call-modes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1"], "requires": [], "must_never_reach": []}),
             ),
             None
         );

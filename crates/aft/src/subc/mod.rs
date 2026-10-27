@@ -312,6 +312,16 @@ pub enum SubcLifecycleEvent {
         counts: Vec<(String, usize)>,
         line: String,
     },
+    /// A foreground bash call reached its wait loop and published the detach
+    /// target the drain uses to answer it, so its census kind is no longer
+    /// `bash:spawning`. `phase` is the census label (`bash:wait`,
+    /// `bash:block` or `bash:foreground`).
+    BashForegroundWait {
+        route_channel: u16,
+        route_epoch: u32,
+        corr: u64,
+        phase: String,
+    },
 }
 
 /// Test-only observer and rendezvous for the frame-loop lifecycle.
@@ -443,6 +453,15 @@ impl SubcTestLifecycleProbe {
             held: census.held(phase),
             counts: census.counts(),
             line: line.to_string(),
+        });
+    }
+
+    fn bash_foreground_wait(&self, route: RouteChannel, corr: u64, phase: &str) {
+        let _ = self.events_tx.send(SubcLifecycleEvent::BashForegroundWait {
+            route_channel: route.channel,
+            route_epoch: route.epoch,
+            corr,
+            phase: phase.to_string(),
         });
     }
 
@@ -1479,6 +1498,10 @@ struct PendingBind {
     /// removed, running configures return at their next checkpoint) instead of
     /// only marking bookkeeping.
     cancellation: crate::executor::JobCancellation,
+    /// Session that requested this bind. Periodic warnings about the bind run
+    /// on the frame loop, which serves every session, so they log inside this
+    /// session's scope to carry the right session tag.
+    session: Option<String>,
 }
 
 struct RouteBindCompletion {
@@ -1507,6 +1530,9 @@ impl RouteIdentity {
 #[derive(Debug)]
 struct RouteIdentityData {
     root: ProjectRootId,
+    /// Resolved scope workdir, or the legacy bind root when no workdir is stamped.
+    /// The daemon's project id is retained alongside it in `scope.project_id`;
+    /// persisted state continues to use the root path, not that id.
     project_root: PathBuf,
     harness: String,
     session: String,
@@ -1523,8 +1549,10 @@ struct RouteIdentityData {
     /// `owner` publishes work under a stable `ref`; `scope_epoch` distinguishes
     /// a new generation of that work from obsolete routes. Optional
     /// `attributes.agent_id` and `attributes.run_id` identify the agent and its
-    /// codemode run. The GitHub CLI relay uses this identity for delegated bot
-    /// writes; lifetime controls confirm the run ended before terminating processes.
+    /// codemode run; a worker run carries `attributes.on_behalf_of_agent`
+    /// instead of `agent_id`, as attribution only. The GitHub CLI relay uses
+    /// this identity for delegated bot writes; lifetime controls confirm the
+    /// run ended before terminating processes.
     /// Absent on routes opened without a scope or by a daemon predating scopes.
     scope: Option<subc_protocol::scope::ScopeStamp>,
     call_mode: subc_protocol::call_mode::CallMode,
@@ -1533,9 +1561,10 @@ struct RouteIdentityData {
     /// Set by the route's first tool call, so the health counter of scoped
     /// routes that make tool calls counts each route once.
     made_tool_call: AtomicBool,
-    /// Present only on the identity a codemode tool call runs under: the head
-    /// agent the call acts for (see `codemode`). Routes in the route table
-    /// never carry it.
+    /// Present only on the identity a codemode tool call runs under: the owner
+    /// route the call takes its access from, the head agent's for an agent run
+    /// or the worker's own for a worker run (see `codemode`). Routes in the
+    /// route table never carry it.
     run_owner: Option<Arc<codemode::RunOwner>>,
 }
 
@@ -3474,6 +3503,9 @@ async fn handle_bash_elicitation_reply(
                 pending.spawn_principal,
                 pending.edit_slot_survives,
                 pending.call_key,
+                // A permission-prompt resume carries no pin through the
+                // pending ask; only the direct production caller passes one.
+                None,
                 Some(pending.grants),
                 pending.repeat,
                 pending.worker_session,
@@ -5003,6 +5035,12 @@ where
     };
 
     let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
+    if let Some(probe) = lifecycle_probe.clone() {
+        *dispatch_path_metrics
+            .lifecycle_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(probe);
+    }
     shared_app.set_subc_connection_file(connection_file_path.to_path_buf());
     #[cfg(test)]
     let dispatch_path_metrics = watchdog_test
@@ -5733,8 +5771,9 @@ where
                                 continue;
                             }
                         }
-                        // A codemode program's tool call runs with its head agent's
-                        // access: every step below sees the head-derived identity.
+                        // A codemode program's tool call runs with its owner route's
+                        // access (the head agent's, or a worker run's own worker's):
+                        // every step below sees the owner-derived identity.
                         let codemode_routes;
                         let (routes_for_call, codemode_call) = match codemode::admit(&routes, route, decoded.body().ok(), |identity| {
                             let Some(ctx) = executor.actor_context(&identity.root) else {
@@ -7695,6 +7734,47 @@ fn normalized_scope_workdir(workdir: &Path) -> Option<PathBuf> {
     }
 }
 
+fn resolve_route_project_root(
+    identity: &subc_protocol::BindIdentity,
+    scope: Option<&subc_protocol::scope::ScopeStamp>,
+) -> PathBuf {
+    match scope.and_then(|stamp| stamp.workdir.as_deref()) {
+        Some(workdir) => {
+            let workdir = Path::new(workdir);
+            // Invalid stamped paths still go through bind validation; they must
+            // never select a different project through the compatibility fallback.
+            normalized_scope_workdir(workdir).unwrap_or_else(|| workdir.to_path_buf())
+        }
+        None => legacy_unstamped_bind_project_root(identity),
+    }
+}
+
+// Older daemons and session hosts do not always stamp a workdir. Remove this
+// compatibility fallback when BindIdentity no longer carries project_root.
+fn legacy_unstamped_bind_project_root(identity: &subc_protocol::BindIdentity) -> PathBuf {
+    identity.project_root.clone()
+}
+
+fn log_route_project_key_change(
+    identity: &subc_protocol::BindIdentity,
+    project_root: &Path,
+    route: RouteChannel,
+) {
+    // Catalog and consent keys use literal display strings. Compare those strings
+    // so aliases that canonicalize to one folder still produce a key-change log.
+    let bind_key = identity.project_root.display().to_string();
+    let resolved_key = project_root.display().to_string();
+    if bind_key != resolved_key {
+        crate::slog_info!(
+            "subc route project key changed: bind_project_root={} resolved_project_root={} session={} route={}",
+            bind_key,
+            resolved_key,
+            identity.session,
+            route,
+        );
+    }
+}
+
 const MAX_SCOPE_WORKDIR_DIAGNOSTICS: usize = 2;
 
 #[derive(Default)]
@@ -8096,6 +8176,7 @@ async fn handle_control_request(
                 .await;
             }
 
+            let bind_project_root = resolve_route_project_root(&identity, scope.as_ref());
             let mut bind_root_id = None;
             if let Some(installed_epoch) = installed_route_epochs.get(&route_channel).copied() {
                 if installed_epoch >= epoch {
@@ -8109,7 +8190,7 @@ async fn handle_control_request(
                     .await;
                 }
 
-                let replacement_root = match ProjectRootId::from_path(&identity.project_root) {
+                let replacement_root = match ProjectRootId::from_path(&bind_project_root) {
                     Ok(root_id) => root_id,
                     Err(error) => {
                         return send_route_bind_error(
@@ -8166,7 +8247,7 @@ async fn handle_control_request(
                 Some(root_id) => root_id,
                 None => match {
                     metrics.mark_frame_loop_wait("disk/canonicalize_root", None);
-                    ProjectRootId::from_path(&identity.project_root)
+                    ProjectRootId::from_path(&bind_project_root)
                 } {
                     Ok(root_id) => root_id,
                     Err(error) => {
@@ -8181,11 +8262,11 @@ async fn handle_control_request(
                     }
                 },
             };
+            log_route_project_key_change(&identity, &bind_project_root, route_id);
 
-            // Reconcile RootConfig: build a configure request from the bind
-            // identity + forwarded config tiers and run it through the executor.
+            // Reconcile RootConfig using the resolved project and the local
+            // config tiers, then run it through the executor.
             let request_id = format!("subc-bind-{route_channel}");
-            let bind_project_root = identity.project_root.clone();
             let bind_harness = identity.harness.clone();
             let bind_session = identity.session.clone();
             let bind_principal_id = principal_id(&principal);
@@ -8298,6 +8379,7 @@ async fn handle_control_request(
                 scopes.bind(&route_identity);
             }
             let configure_session = route_identity.session.clone();
+            let bind_session = configure_session.clone();
             let root_was_live = live_roots.contains_key(&bind_root_id);
             metrics.mark_frame_loop_wait(
                 "executor.scheduler/register_actor",
@@ -8387,6 +8469,7 @@ async fn handle_control_request(
                     ver: frame.header.ver,
                     flags: frame.header.flags,
                     cancellation: configure_cancellation,
+                    session: Some(bind_session),
                 },
             );
 
@@ -10370,6 +10453,9 @@ async fn handle_tool_call(
         log::debug!("subc tool call {}: schema_pin={pin}", call.name);
     }
     let call_key = call.call_key;
+    // The pin travels with the deferred bash path so the spawned task can
+    // record it; every other tool drops it after this log line.
+    let schema_pin = call.schema_pin.clone();
     let ledger_key = call_key
         .as_deref()
         .filter(|_| identity.role == tool_provider::RouteRole::ToolProviderV1)
@@ -10757,6 +10843,7 @@ async fn handle_tool_call(
             identity.spawn_principal.clone(),
             call.edit_slot_survives,
             call_key,
+            schema_pin,
             None,
             repeat,
             role.is_worker(),
@@ -19119,6 +19206,7 @@ mod tests {
                 ver: PROTOCOL_VERSION,
                 flags: control_flags(),
                 cancellation: crate::executor::JobCancellation::new(),
+                session: None,
             },
         )]);
         let mut installed_route_epochs = HashMap::from([(route.channel, route.epoch)]);
@@ -19252,6 +19340,7 @@ mod tests {
                 ver: PROTOCOL_VERSION,
                 flags: control_flags(),
                 cancellation: crate::executor::JobCancellation::new(),
+                session: None,
             },
         )]);
         let mut installed_route_epochs = HashMap::from([(route.channel, route.epoch)]);
@@ -19307,6 +19396,7 @@ mod tests {
             ver: PROTOCOL_VERSION,
             flags: control_flags(),
             cancellation: crate::executor::JobCancellation::new(),
+            session: None,
         };
         let young = route_key(9, 1);
         let held = route_key(10, 1);
@@ -19347,6 +19437,71 @@ mod tests {
         );
         assert!(pending_binds[&held].deadline_reported);
         assert!(!pending_binds[&young].deadline_reported);
+    }
+
+    /// The frame loop serves every session. After it has served session A,
+    /// the slow-bind warning for a bind that session B requested must carry
+    /// B's tag, and one for a bind with no session must carry no tag; neither
+    /// may carry A's.
+    #[test]
+    fn slow_pending_bind_warning_carries_the_bind_session_not_the_last_served() {
+        let (_dir, root) = test_root("route-bind-slow-warn-session");
+        let pending_bind = |corr: u64, session: Option<&str>| PendingBind {
+            ack_publication: None,
+            bind_root_id: root.clone(),
+            inserted_new_actor: false,
+            cancelled: false,
+            configure_request_id: format!("subc-bind-{corr}"),
+            started_at: Instant::now()
+                .checked_sub(DISPATCH_PATH_BIND_WARN_AFTER + Duration::from_secs(1))
+                .expect("monotonic clock is older than the bind age"),
+            warned_half_deadline: false,
+            deadline_reported: false,
+            corr,
+            ver: PROTOCOL_VERSION,
+            flags: control_flags(),
+            cancellation: crate::executor::JobCancellation::new(),
+            session: session.map(str::to_string),
+        };
+        let owned = route_key(352, 1);
+        let unowned = route_key(353, 1);
+        let mut pending_binds = HashMap::from([
+            (owned, pending_bind(352, Some("ses_B"))),
+            (unowned, pending_bind(353, None)),
+        ]);
+        let executor = Executor::new();
+
+        let ((), lines) = crate::logging::capture_log_lines(|| {
+            log_ctx::with_session(Some("ses_A".to_string()), || {
+                crate::slog_info!("serving session A");
+            });
+            warn_slow_pending_binds(&mut pending_binds, &executor);
+        });
+
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("INFO [ses_A] serving session A")
+        );
+        let owned_line = lines
+            .iter()
+            .find(|line| line.contains("route 352@1"))
+            .unwrap_or_else(|| panic!("no warning for route 352: {lines:?}"));
+        let unowned_line = lines
+            .iter()
+            .find(|line| line.contains("route 353@1"))
+            .unwrap_or_else(|| panic!("no warning for route 353: {lines:?}"));
+        assert!(
+            owned_line.starts_with("WARN [ses_B] subc attach: "),
+            "{owned_line}"
+        );
+        assert!(
+            unowned_line.starts_with("WARN subc attach: "),
+            "{unowned_line}"
+        );
+        assert!(
+            !lines[1..].iter().any(|line| line.contains("ses_A")),
+            "{lines:?}"
+        );
     }
 
     /// A bind whose deadline passes while it waits behind a reader on its root
@@ -19410,6 +19565,7 @@ mod tests {
                 ver: PROTOCOL_VERSION,
                 flags: control_flags(),
                 cancellation: bind_token,
+                session: None,
             },
         )]);
         let mut installed_route_epochs = HashMap::from([(route.channel, route.epoch)]);
@@ -19604,6 +19760,7 @@ mod tests {
                 ver: PROTOCOL_VERSION,
                 flags: control_flags(),
                 cancellation,
+                session: None,
             },
         )]);
         let mut installed = HashMap::from([(route.channel, route.epoch)]);
@@ -19848,6 +20005,7 @@ mod tests {
                 ver: PROTOCOL_VERSION,
                 flags: control_flags(),
                 cancellation,
+                session: None,
             },
         )]);
         let mut installed = HashMap::from([(route.channel, route.epoch)]);

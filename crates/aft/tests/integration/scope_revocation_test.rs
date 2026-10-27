@@ -2161,3 +2161,412 @@ fn codemode_withdraw_kills_a_running_shell_call_on_the_head_root() {
         configured_dispatch,
     );
 }
+
+/// A worker's own task scope, under the agent-a head scope.
+fn worker_stamp() -> subc_protocol::scope::ScopeStamp {
+    serde_json::from_value(json!({
+        "owner": {"kind":"reserved", "module_id":PREFRONTAL},
+        "ref":"worker-scope", "scope_epoch":1, "kind":"worker",
+        "parent": {"owner": {"kind":"reserved", "module_id":PREFRONTAL}, "ref":"head-scope", "scope_epoch":1},
+        "parent_state":"linked",
+        "owner_authorized":true
+    }))
+    .unwrap()
+}
+
+/// A worker run (`worker-runs/v1`): a codemode run attributed to agent-a
+/// through `on_behalf_of_agent`, with no `agent_id`, under the worker's scope.
+fn worker_run_stamp() -> subc_protocol::scope::ScopeStamp {
+    serde_json::from_value(json!({
+        "owner": {"kind":"reserved", "module_id":PREFRONTAL},
+        "ref":"worker-run-scope", "scope_epoch":1, "kind":"ephemeral",
+        "attributes":{"on_behalf_of_agent":"agent-a", "run_id":"run-w"},
+        "parent": {"owner": {"kind":"reserved", "module_id":PREFRONTAL}, "ref":"worker-scope", "scope_epoch":1},
+        "parent_state":"linked",
+        "owner_authorized":true,
+        "expires_at_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + 30000
+    }))
+    .unwrap()
+}
+
+/// Bind the worker's own classic route on `channel`, in `worker-session`.
+async fn bind_worker(stream: &mut tokio::net::TcpStream, root: &Path, channel: u16) {
+    bind_mode_as(
+        stream,
+        root,
+        channel,
+        Some(subc_protocol::call_mode::CallMode::Classic),
+        Some(worker_stamp()),
+        "worker-session",
+    )
+    .await;
+}
+
+/// Answer the worker run's pre-shell `scope.describe` with "live".
+async fn answer_worker_run_live(stream: &mut tokio::net::TcpStream) {
+    let request = read_frame_timeout(stream, "worker run describe").await;
+    assert_eq!(
+        request.header.ty,
+        FrameType::Request,
+        "{}",
+        String::from_utf8_lossy(&request.body)
+    );
+    let body: subc_protocol::session::ModuleControlRequestFromModule =
+        serde_json::from_slice(&request.body).unwrap();
+    assert!(
+        matches!(&body, subc_protocol::session::ModuleControlRequestFromModule::ScopeDescribe {scope_ref, ..}
+        if scope_ref == "worker-run-scope"),
+        "{body:?}"
+    );
+    let reply = subc_protocol::session::ModuleControlResponseToModule::ScopeDescribe {
+        status: subc_protocol::scope::ScopeStatus::Live,
+        scope_epoch: Some(1),
+        daemon_incarnation: "daemon-a".into(),
+        owner_synced: true,
+        owner_configured: true,
+        scope: Some(worker_run_stamp()),
+    };
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Response,
+            control_flags(),
+            0,
+            0,
+            request.header.corr,
+            serde_json::to_vec(&reply).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await;
+}
+
+/// The error code a call's reply carries: a provider error frame's code, or
+/// a tool response's native code.
+fn any_code(frame: &Frame) -> String {
+    if frame.header.ty == FrameType::Error {
+        return reply_json(frame)["code"].as_str().unwrap_or("").to_owned();
+    }
+    reply_code(frame)
+}
+
+/// Send `name` with `preset` on `channel`.
+async fn preset_call(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    preset: &str,
+    name: &str,
+    args: Value,
+) {
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            channel,
+            1,
+            corr,
+            serde_json::to_vec(&json!({"name":name, "preset":preset, "arguments":args})).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await;
+}
+
+#[test]
+fn worker_codemode_run_uses_the_workers_root_and_frozen_params_never_the_heads() {
+    run_subc_bridge_test_with_dispatch(
+        "worker-run-authority",
+        Duration::from_secs(30),
+        |input| async move {
+            // Every route is held to its own root, so the head's root is
+            // access only the head (and its agent runs) hold.
+            std::fs::write(
+                &input.user_config_path,
+                serde_json::to_vec(&json!({"restrict_to_project_root": true})).unwrap(),
+            )
+            .unwrap();
+            let mut daemon = open_scope_daemon_session(input).await;
+            write_project_config(&daemon.root1, json!({}));
+            write_project_config(&daemon.root2, json!({}));
+            std::fs::write(daemon.root1.join("head.txt"), "head-root-file").unwrap();
+            std::fs::write(daemon.root2.join("worker.txt"), "worker-root-file").unwrap();
+            bind_head(&mut daemon.stream, &daemon.root1, 1, "head-session").await;
+            bind_worker(&mut daemon.stream, &daemon.root2, 2).await;
+            // An agent run of the same head, bound at the worker's root.
+            bind_run(&mut daemon.stream, &daemon.root2, 3, stamp()).await;
+            // The worker run binds at the head's root: its bind is
+            // configuration, never authority.
+            bind_run(&mut daemon.stream, &daemon.root1, 4, worker_run_stamp()).await;
+            let head_file = json!({"path": daemon.root1.join("head.txt")});
+            let worker_file = json!({"path": daemon.root2.join("worker.txt")});
+
+            // The agent run behaves as before: the head's root is its root.
+            named_call(&mut daemon.stream, 3, 100, "read", head_file.clone()).await;
+            let reply = read_frame_timeout(&mut daemon.stream, "agent run head read").await;
+            assert!(
+                reply_text(&reply).contains("head-root-file"),
+                "{}",
+                String::from_utf8_lossy(&reply.body)
+            );
+            // The worker run reaches the worker's root...
+            named_call(&mut daemon.stream, 4, 101, "read", worker_file.clone()).await;
+            let reply = read_frame_timeout(&mut daemon.stream, "worker run worker read").await;
+            assert!(
+                reply_text(&reply).contains("worker-root-file"),
+                "{}",
+                String::from_utf8_lossy(&reply.body)
+            );
+            // ...and never the head's, although its own bind names it.
+            named_call(&mut daemon.stream, 4, 102, "read", head_file.clone()).await;
+            let reply = read_frame_timeout(&mut daemon.stream, "worker run head read").await;
+            assert!(
+                !reply_text(&reply).contains("head-root-file"),
+                "{}",
+                reply_text(&reply)
+            );
+            assert_eq!(
+                any_code(&reply),
+                "path_outside_root",
+                "{}",
+                reply_text(&reply)
+            );
+
+            // The worker freezes `confine: root` at its own catalog fetch.
+            send_frame(
+                &mut daemon.stream,
+                Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    2,
+                    1,
+                    103,
+                    serde_json::to_vec(&json!({
+                        "op":"tool.catalog", "preset":"worker", "params":{"confine":"root"}
+                    }))
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+            .await;
+            let catalog = read_frame_timeout(&mut daemon.stream, "worker catalog").await;
+            assert_eq!(
+                catalog.header.ty,
+                FrameType::Response,
+                "{}",
+                String::from_utf8_lossy(&catalog.body)
+            );
+            // A worker-run call naming the head preset is still held to the
+            // worker's frozen params: a confined session offers no shell.
+            preset_call(
+                &mut daemon.stream,
+                4,
+                104,
+                "head",
+                "bash",
+                json!({"command":"echo escaped", "timeout": 5000}),
+            )
+            .await;
+            // A run's shell call first confirms the run is still live.
+            answer_worker_run_live(&mut daemon.stream).await;
+            let reply = read_frame_timeout(&mut daemon.stream, "confined worker run bash").await;
+            assert!(
+                !String::from_utf8_lossy(&reply.body).contains("escaped\n"),
+                "{}",
+                String::from_utf8_lossy(&reply.body)
+            );
+            assert_eq!(
+                any_code(&reply),
+                "tool_not_offered_confined",
+                "{}",
+                String::from_utf8_lossy(&reply.body)
+            );
+            // Reads stay offered in a confined session, on the worker's root.
+            preset_call(&mut daemon.stream, 4, 105, "head", "read", worker_file).await;
+            let reply = read_frame_timeout(&mut daemon.stream, "confined worker run read").await;
+            assert!(
+                reply_text(&reply).contains("worker-root-file"),
+                "{}",
+                String::from_utf8_lossy(&reply.body)
+            );
+            send_connection_goodbye(&mut daemon.stream).await;
+        },
+        |_, _, _| {},
+        configured_dispatch,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_codemode_run_cannot_see_or_kill_the_heads_bash_tasks() {
+    run_subc_bridge_test_with_dispatch(
+        "worker-run-head-tasks",
+        Duration::from_secs(30),
+        |input| async move {
+            *OBSERVED_TASK
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .unwrap() = None;
+            let mut daemon = open_scope_daemon_session(input).await;
+            bind_head(&mut daemon.stream, &daemon.root1, 1, "head-session").await;
+            bind_worker(&mut daemon.stream, &daemon.root2, 2).await;
+            bind_run(&mut daemon.stream, &daemon.root1, 4, worker_run_stamp()).await;
+            // The head starts a background task in its own session.
+            call(
+                &mut daemon.stream,
+                1,
+                100,
+                json!({"command":"sleep 30", "background":true}),
+            )
+            .await;
+            let launch = read_frame_timeout(&mut daemon.stream, "head background launch").await;
+            assert_eq!(
+                launch.header.ty,
+                FrameType::Response,
+                "{}",
+                String::from_utf8_lossy(&launch.body)
+            );
+            let (registry, task) = OBSERVED_TASK
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap();
+            assert!(registry
+                .status(&task, "head-session", None, None, 0)
+                .is_some());
+            // The worker run looks the task up in the worker's session, where
+            // it does not exist.
+            named_call(
+                &mut daemon.stream,
+                4,
+                101,
+                "bash_status",
+                json!({"taskId": &task}),
+            )
+            .await;
+            let status = read_frame_timeout(&mut daemon.stream, "worker run bash_status").await;
+            assert!(
+                !reply_text(&status).contains("sleep 30"),
+                "{}",
+                String::from_utf8_lossy(&status.body)
+            );
+            assert!(
+                reply_text(&status).contains("not found") || !any_code(&status).is_empty(),
+                "{}",
+                String::from_utf8_lossy(&status.body)
+            );
+            named_call(
+                &mut daemon.stream,
+                4,
+                102,
+                "bash_kill",
+                json!({"taskId": &task}),
+            )
+            .await;
+            let kill = read_frame_timeout(&mut daemon.stream, "worker run bash_kill").await;
+            assert!(
+                reply_text(&kill).contains("not found") || !any_code(&kill).is_empty(),
+                "{}",
+                String::from_utf8_lossy(&kill.body)
+            );
+            let snapshot = registry
+                .status(&task, "head-session", None, None, 0)
+                .unwrap();
+            assert_eq!(
+                snapshot.info.status,
+                BgTaskStatus::Running,
+                "a worker run must not kill the head's task"
+            );
+            // The head itself still controls its task.
+            named_call(
+                &mut daemon.stream,
+                1,
+                103,
+                "bash_kill",
+                json!({"taskId": &task}),
+            )
+            .await;
+            let killed = read_frame_timeout(&mut daemon.stream, "head bash_kill").await;
+            assert_eq!(
+                killed.header.ty,
+                FrameType::Response,
+                "{}",
+                String::from_utf8_lossy(&killed.body)
+            );
+            send_connection_goodbye(&mut daemon.stream).await;
+        },
+        |_, _, _| {},
+        observing_dispatch,
+    );
+}
+
+#[test]
+fn worker_codemode_run_without_its_workers_identity_is_refused_by_name() {
+    run_subc_bridge_test_with_dispatch(
+        "worker-run-identity",
+        Duration::from_secs(30),
+        |input| async move {
+            let mut daemon = open_scope_daemon_session(input).await;
+            std::fs::write(daemon.root1.join("head.txt"), "head-root-file").unwrap();
+            let read = json!({"path": daemon.root1.join("head.txt")});
+            bind_head(&mut daemon.stream, &daemon.root1, 1, "head-session").await;
+            // The worker's scope has no live route bound to AFT yet.
+            bind_run(&mut daemon.stream, &daemon.root1, 2, worker_run_stamp()).await;
+            let mut no_parent = worker_run_stamp();
+            no_parent.scope_ref = "worker-run-no-parent".into();
+            no_parent.parent = None;
+            no_parent.parent_state = None;
+            bind_run(&mut daemon.stream, &daemon.root1, 3, no_parent).await;
+            let mut pending = worker_run_stamp();
+            pending.scope_ref = "worker-run-pending".into();
+            pending.parent_state = Some(subc_protocol::scope::ParentState::Pending);
+            bind_run(&mut daemon.stream, &daemon.root1, 4, pending).await;
+            // A worker run whose parent is the head's own scope.
+            let mut under_head = worker_run_stamp();
+            under_head.scope_ref = "worker-run-under-head".into();
+            under_head.parent = stamp().parent;
+            // (Channel 5's bind is the shared dispatch's configure-failure case.)
+            bind_run(&mut daemon.stream, &daemon.root1, 7, under_head).await;
+            for (channel, corr, reason) in [
+                (2, 100, "worker_route_not_bound"),
+                (3, 101, "parent_missing"),
+                (4, 102, "parent_pending"),
+                (7, 103, "parent_not_worker"),
+            ] {
+                named_call(&mut daemon.stream, channel, corr, "read", read.clone()).await;
+                let error = expect_refusal(&mut daemon.stream, reason).await;
+                assert_eq!(error.code, "run_owner_not_bound", "{reason}");
+                let detail = error.detail.as_ref().unwrap();
+                assert_eq!(detail["reason"], reason, "{detail}");
+                assert_eq!(detail["on_behalf_of_agent"], "agent-a", "{detail}");
+                assert_eq!(detail["run_id"], "run-w", "{detail}");
+                assert!(!error.message.contains("head-root-file"));
+            }
+            // Once the worker's own route is bound, the same run is served,
+            // on the worker's root.
+            write_project_config(&daemon.root2, json!({}));
+            std::fs::write(daemon.root2.join("worker.txt"), "worker-root-file").unwrap();
+            bind_worker(&mut daemon.stream, &daemon.root2, 6).await;
+            named_call(
+                &mut daemon.stream,
+                2,
+                104,
+                "read",
+                json!({"path": daemon.root2.join("worker.txt")}),
+            )
+            .await;
+            let reply = read_frame_timeout(&mut daemon.stream, "served worker run").await;
+            assert!(
+                reply_text(&reply).contains("worker-root-file"),
+                "{}",
+                String::from_utf8_lossy(&reply.body)
+            );
+            send_connection_goodbye(&mut daemon.stream).await;
+        },
+        |_, _, _| {},
+        bridge_dispatch,
+    );
+}

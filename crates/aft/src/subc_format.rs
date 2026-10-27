@@ -3262,6 +3262,9 @@ pub fn format_callgraph(op: &str, response_data: &Value, include_unresolved: boo
         if let Some(reason) = string_field(record, "incomplete_reason") {
             sections.insert(0, reason.to_string());
         }
+        if let Some(note) = string_field(record, "test_filter_note") {
+            sections.insert(0, note.to_string());
+        }
     }
     let body = sections.join("\n");
     // A checkout that reads another checkout's callgraph gets a one-line
@@ -3369,9 +3372,9 @@ fn format_callgraph_error(command: &str, data: &Value) -> String {
                 .map(|symbol| format!("multiple symbols named \"{symbol}\""))
                 .unwrap_or_else(|| strip_terminal_punctuation(message));
             let action = if code == Some("ambiguous_target") {
-                "Pass toFile to disambiguate"
+                "Pass toPath to disambiguate"
             } else {
-                "Try one of these files for toFile"
+                "Try one of these files for toPath"
             };
             let mut lines = vec![format!(
                 "{command}: {} — {target}. {action}:",
@@ -3628,6 +3631,15 @@ fn unresolved_summary_text(nodes: &[&serde_json::Map<String, Value>]) -> String 
     format!("+ {} unresolved external {noun}: {names}", nodes.len())
 }
 
+fn callback_reference_count_suffix(record: &serde_json::Map<String, Value>) -> String {
+    let count = number_field(record, "callback_dependencies").unwrap_or(0);
+    if count > 0 {
+        format!(" ({count} by callback reference)")
+    } else {
+        String::new()
+    }
+}
+
 fn format_callers_sections(record: &serde_json::Map<String, Value>) -> Vec<String> {
     let envelope = record
         .get("callers_list_envelope")
@@ -3654,9 +3666,10 @@ fn format_callers_sections(record: &serde_json::Map<String, Value>) -> Vec<Strin
         let total = number_field(record, "total_callers").unwrap_or(0);
         format!("{}", total.saturating_sub(hidden_test_callers))
     };
+    let callback_note = callback_reference_count_suffix(record);
     let mut sections = vec![join_non_empty(&[
         Some(format!(
-            "{total_str} caller{}",
+            "{total_str} caller{}{callback_note}",
             if total_str == "1" { "" } else { "s" }
         )),
         Some(format!(
@@ -3706,7 +3719,8 @@ fn render_callers_group_lines(group: &serde_json::Map<String, Value>) -> Vec<Str
             "exact"
         };
         let via = string_field(caller, "via").unwrap_or("");
-        let key = format!("{symbol}\0{via}\0{provenance}");
+        let relation = string_field(caller, "relation").unwrap_or("");
+        let key = format!("{symbol}\0{via}\0{relation}\0{provenance}");
         let bucket = by_symbol_provenance.entry(key).or_default();
         if let Some(line) = number_field(caller, "line") {
             bucket.push(line);
@@ -3716,6 +3730,7 @@ fn render_callers_group_lines(group: &serde_json::Map<String, Value>) -> Vec<Str
         let mut parts = key.split('\0');
         let symbol = parts.next().unwrap_or("(unknown)");
         let via = parts.next().unwrap_or("");
+        let relation = parts.next().unwrap_or("");
         let is_name_match = key.ends_with("\0name_match");
         line_nums.sort_unstable();
         let line_part = if line_nums.is_empty() {
@@ -3733,7 +3748,14 @@ fn render_callers_group_lines(group: &serde_json::Map<String, Value>) -> Vec<Str
         } else {
             format!(" via {via}")
         };
-        lines.push(format!("  ↳ {symbol}:{line_part}{marker}{via_part}"));
+        let reference = if relation == "callback_reference" {
+            crate::commands::callgraph_store_adapter::CALLBACK_REFERENCE_LABEL
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "  ↳ {symbol}:{line_part}{marker}{via_part}{reference}"
+        ));
     }
     lines
 }
@@ -3889,9 +3911,15 @@ fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String
         format!("{}", total_affected.saturating_sub(hidden_test_callers))
     };
     let affected_files = number_field(record, "affected_files").unwrap_or(0);
+    let callback_note = callback_reference_count_suffix(record);
     let mut sections = vec![join_non_empty(&[
         Some(format!(
-            "{total_str} affected call site{}",
+            "{total_str} affected {}{}{callback_note}",
+            if callback_note.is_empty() {
+                "call site"
+            } else {
+                "site"
+            },
             if total_str == "1" { "" } else { "s" }
         )),
         Some(format!(
@@ -3930,7 +3958,14 @@ fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String
             .unwrap_or_default();
         let mut lines = vec![
             format!("{file}:{line}"),
-            format!("  ↳ {symbol}{entry}{name_match}"),
+            format!(
+                "  ↳ {symbol}{entry}{name_match}{}",
+                if string_field(caller, "relation") == Some("callback_reference") {
+                    crate::commands::callgraph_store_adapter::CALLBACK_REFERENCE_LABEL
+                } else {
+                    ""
+                }
+            ),
         ];
         if let Some(expression) = expression {
             lines.push(format!("  {expression}"));

@@ -527,18 +527,44 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                 // itself rebuilds an out-of-date one). Between a publication
                 // and the worker's rebuild there is none; `serving_index`
                 // then builds it, because without a snapshot the semantic
-                // lane would silently drop out of this search. Views-off
-                // roots never have a checkout view.
-                let checkout_index = matches!(status, SemanticIndexStatus::Ready { .. })
-                    .then(|| self.ctx.checkout_semantic_runtime())
-                    .flatten()
-                    .and_then(|runtime| runtime.serving_index());
-                if let Some(index) = checkout_index {
-                    SemanticReadiness {
+                // lane would silently drop out of this search. If it cannot
+                // be built, the lane is failed for this search with that
+                // reason, never served from the legacy index, which a
+                // views-on root does not build. A started lane whose view is
+                // still loading, or failed to load, is sampled in that state
+                // even when the shared status was rewritten to ready.
+                // Views-off roots never have a checkout lane.
+                use crate::views::semantic_runtime::CheckoutSemanticState;
+                let lane = matches!(status, SemanticIndexStatus::Ready { .. })
+                    .then(|| self.ctx.checkout_semantic().state())
+                    .flatten();
+                if let Some(lane) = lane {
+                    let unserved = |status| SemanticReadiness {
                         status,
-                        snapshot: Some(SemanticSnapshot::from_borrowed(index)),
+                        snapshot: None,
                         evicted: false,
                         lock_contended: false,
+                    };
+                    match lane {
+                        CheckoutSemanticState::Ready(runtime) => match runtime.serving_index() {
+                            Ok(index) => SemanticReadiness {
+                                status,
+                                snapshot: Some(SemanticSnapshot::from_borrowed(index)),
+                                evicted: false,
+                                lock_contended: false,
+                            },
+                            Err(reason) => unserved(SemanticIndexStatus::Failed(reason)),
+                        },
+                        CheckoutSemanticState::Loading => unserved(SemanticIndexStatus::Building {
+                            stage: crate::views::semantic_runtime::CHECKOUT_VIEW_LOADING_STAGE
+                                .to_string(),
+                            files: None,
+                            entries_done: None,
+                            entries_total: None,
+                        }),
+                        CheckoutSemanticState::Unavailable(reason) => {
+                            unserved(SemanticIndexStatus::Failed(reason))
+                        }
                     }
                 } else if matches!(status, SemanticIndexStatus::Ready { .. }) {
                     match try_read_with_budget(
@@ -1872,6 +1898,9 @@ fn handle_split_search<'a>(
 struct SearchLaneStatus {
     trigram: IndexObservation,
     semantic: IndexObservation,
+    /// Whether observing started a reload of an evicted semantic index or
+    /// released views-on lane.
+    semantic_reload_started: bool,
 }
 
 impl SearchLaneStatus {
@@ -1888,6 +1917,7 @@ impl SearchLaneStatus {
                 observation => observation,
             }
         };
+        let mut semantic_reload_started = false;
         let semantic = match observed_index_status(ctx, IndexPlane::Semantic) {
             // Enabled but not resident: a query is the signal that recovers an
             // idle-evicted semantic index, as the semantic branch did before.
@@ -1900,11 +1930,16 @@ impl SearchLaneStatus {
                         == Some(feature_cause::SEMANTIC_BUILD_FAILED))
                     && super::configure::trigger_semantic_index_reload_if_evicted(ctx) =>
             {
+                semantic_reload_started = true;
                 IndexObservation::building()
             }
             observation => observation,
         };
-        Self { trigram, semantic }
+        Self {
+            trigram,
+            semantic,
+            semantic_reload_started,
+        }
     }
 
     fn not_observed(observation: &IndexObservation) -> bool {
@@ -1932,6 +1967,7 @@ impl SearchLaneStatus {
         Self {
             trigram: observed_index_status(ctx, IndexPlane::Trigram),
             semantic: observed_index_status(ctx, IndexPlane::Semantic),
+            semantic_reload_started: false,
         }
     }
 
@@ -2085,6 +2121,7 @@ impl SearchLaneStatus {
             relabelled = Self {
                 trigram: IndexObservation::building(),
                 semantic: self.semantic.clone(),
+                semantic_reload_started: self.semantic_reload_started,
             };
             &relabelled
         } else {
@@ -2308,7 +2345,23 @@ fn handle_semantic_search_inner(
             );
         }
     };
-    let semantic_status = semantic_status_label(&semantic_status_snapshot);
+    // The readiness sample can see the semantic lane in a state the shared
+    // status does not show: a views-on checkout lane still loading, failed to
+    // load, or unable to build its index for the installed snapshot, while
+    // the shared status reads ready. The plan then has no semantic lane, so
+    // the reply reports the sampled state, not the shared `ready`. When the
+    // lane itself is loaded, its footer also says it was unavailable for this
+    // query.
+    let sampled = matches!(semantic_status_snapshot, SemanticIndexStatus::Ready { .. })
+        .then(|| engine_plan.readiness.semantic_status())
+        .flatten()
+        .filter(|status| !matches!(status, SemanticIndexStatus::Ready { .. }))
+        .cloned();
+    let checkout_failure = match &sampled {
+        Some(SemanticIndexStatus::Failed(reason)) => Some(reason.clone()),
+        _ => None,
+    };
+    let semantic_status_snapshot = sampled.unwrap_or(semantic_status_snapshot);
     let mut warnings = Vec::new();
 
     SearchLaneStatus::recover_evicted_trigram(ctx);
@@ -2337,10 +2390,30 @@ fn handle_semantic_search_inner(
             return refusal;
         }
     }
-    let mode = choose_mode(&params.query, &shape, lexical_ready, &mut warnings);
-    if lexical_ready && mode != SearchMode::Regex && !engine_plan.contains(SearchLaneKind::Semantic)
+    // Observing the lanes restarts a views-on lane that idle eviction
+    // released. The restart rewrites the shared status, which this request
+    // read before; report the restarted lane's status, not the `ready` the
+    // released lane left behind.
+    let semantic_status_snapshot = if lanes.semantic_reload_started
+        && ctx.checkout_semantic().active()
+        && matches!(semantic_status_snapshot, SemanticIndexStatus::Ready { .. })
     {
-        return handle_engine_only_search(
+        try_read_with_budget(
+            ctx.semantic_index_status(),
+            INTERACTIVE_ARTIFACT_READ_BUDGET,
+        )
+        .map(|status| status.clone())
+        .unwrap_or(semantic_status_snapshot)
+    } else {
+        semantic_status_snapshot
+    };
+    let semantic_status = semantic_status_label(&semantic_status_snapshot);
+    let mode = choose_mode(&params.query, &shape, lexical_ready, &mut warnings);
+    let response = if lexical_ready
+        && mode != SearchMode::Regex
+        && !engine_plan.contains(SearchLaneKind::Semantic)
+    {
+        handle_engine_only_search(
             req,
             ctx,
             &params,
@@ -2352,44 +2425,48 @@ fn handle_semantic_search_inner(
             page_request,
             extensions,
             engine_plan,
-        );
-    }
-
-    match mode {
-        SearchMode::Regex | SearchMode::Literal => handle_grep_search(
-            req,
-            ctx,
-            &params.query,
-            params.offset,
-            top_k,
-            &shape,
-            mode,
-            semantic_status,
-            warnings,
-            &project_root,
-            params.include_tests,
-            page_request,
-            extensions,
-            engine_plan,
-            false,
-            None,
-        ),
-        SearchMode::Semantic | SearchMode::Hybrid => handle_semantic_or_hybrid_search(
-            req,
-            ctx,
-            params,
-            top_k,
-            shape,
-            mode,
-            lexical_ready,
-            semantic_status_snapshot,
-            semantic_status,
-            warnings,
-            &project_root,
-            page_request,
-            extensions,
-            engine_plan,
-        ),
+        )
+    } else {
+        match mode {
+            SearchMode::Regex | SearchMode::Literal => handle_grep_search(
+                req,
+                ctx,
+                &params.query,
+                params.offset,
+                top_k,
+                &shape,
+                mode,
+                semantic_status,
+                warnings,
+                &project_root,
+                params.include_tests,
+                page_request,
+                extensions,
+                engine_plan,
+                false,
+                None,
+            ),
+            SearchMode::Semantic | SearchMode::Hybrid => handle_semantic_or_hybrid_search(
+                req,
+                ctx,
+                params,
+                top_k,
+                shape,
+                mode,
+                lexical_ready,
+                semantic_status_snapshot,
+                semantic_status,
+                warnings,
+                &project_root,
+                page_request,
+                extensions,
+                engine_plan,
+            ),
+        }
+    };
+    match checkout_failure {
+        Some(reason) => with_semantic_query_failure(response, reason),
+        None => response,
     }
 }
 
@@ -10082,6 +10159,144 @@ mod tests {
         );
     }
 
+    /// A views-on root is served only by its checkout view. When the view's
+    /// index for the installed snapshot cannot be built, the search must not
+    /// answer lexical hits under `semantic: ready`: it reports the semantic
+    /// lane as unavailable and names why.
+    #[test]
+    fn views_on_search_names_a_checkout_index_that_cannot_be_built() {
+        let project = tempfile::tempdir().expect("project");
+        let storage = tempfile::tempdir().expect("storage");
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        std::fs::write(
+            root.join("lib.rs"),
+            "pub fn watchdog_needle() -> u8 {\n    1\n}\n",
+        )
+        .unwrap();
+        let ctx = test_context(&root);
+        install_ready_search_index(&ctx, &root);
+        let slot = ctx.checkout_semantic();
+        let (epoch, _wake) = slot.begin();
+        let runtime = Arc::new(
+            crate::views::semantic_runtime::CheckoutSemantic::new(
+                &crate::root_cache::StoragePaths::same(storage.path()),
+                "family",
+                "scope",
+                &root,
+                crate::views::semantic::SemanticProducer::current(
+                    "readiness-model",
+                    crate::semantic_index::EmbedTextCaps::default(),
+                ),
+                Arc::downgrade(slot),
+            )
+            .unwrap(),
+        );
+        runtime.load().unwrap();
+        // Fill and fold without the worker's rebuild, so the installed
+        // snapshot has no index and the next sample has to build one.
+        runtime
+            .refresh(
+                crate::views::semantic::FillBudget::default(),
+                &mut |texts: Vec<String>| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
+            )
+            .unwrap();
+        assert!(slot.install(epoch, Arc::clone(&runtime)));
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
+        // The error the plane reports when the installed generation is not
+        // resident.
+        let reason = "semantic plane: semantic generation not resident";
+        let _failure =
+            crate::views::semantic_runtime::fail_serving_index_build_for_test(&root, reason);
+
+        let response = response_value(handle_semantic_search(
+            &semantic_request("where is the watchdog needle defined", 5),
+            &ctx,
+        ));
+        assert_eq!(response["success"], true, "{response:#}");
+        assert_eq!(
+            response["semantic_status"], "unavailable",
+            "a checkout view that cannot serve must not read as ready: {response:#}"
+        );
+        assert_eq!(response["complete"], false, "{response:#}");
+        assert_eq!(response["lexical_only_fallback"], true, "{response:#}");
+        let text = response["text"].as_str().expect("text");
+        assert!(
+            text.contains(&format!("Semantic search unavailable: {reason}")),
+            "the reply must name the reason: {text}"
+        );
+        assert!(
+            !text.contains("semantic: ready"),
+            "the reply must not claim a ready semantic lane: {text}"
+        );
+        assert!(
+            text.contains(&format!("semantic: unavailable for this query ({reason})")),
+            "the lane footer must name the reason: {text}"
+        );
+    }
+
+    /// A started views-on lane with no loaded view yet answers for the state
+    /// its slot is in, even when something rewrote the shared status to ready
+    /// (watcher-gap invalidation does): a loading lane reads as building with
+    /// the building disclosure, a failed lane as unavailable with its reason.
+    /// Neither may answer lexical hits under `semantic: ready`.
+    #[test]
+    fn views_on_search_reports_a_loading_or_failed_lane_under_a_ready_status() {
+        let project = tempfile::tempdir().expect("project");
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        std::fs::write(
+            root.join("lib.rs"),
+            "pub fn watchdog_needle() -> u8 {\n    1\n}\n",
+        )
+        .unwrap();
+        let ctx = test_context(&root);
+        install_ready_search_index(&ctx, &root);
+        let slot = ctx.checkout_semantic();
+        let query = "where is the watchdog needle defined";
+        let footer = |text: &str| {
+            text.lines()
+                .find(|line| line.starts_with("semantic:"))
+                .unwrap_or_default()
+                .to_owned()
+        };
+
+        let (_loading, _wake) = slot.begin();
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
+        let response = response_value(handle_semantic_search(&semantic_request(query, 5), &ctx));
+        assert_eq!(response["success"], true, "{response:#}");
+        assert_eq!(response["semantic_status"], "building", "{response:#}");
+        assert_eq!(response["complete"], false, "{response:#}");
+        assert_eq!(response["lexical_only_fallback"], true, "{response:#}");
+        let text = response["text"].as_str().expect("text");
+        assert!(
+            text.starts_with("Semantic index is building"),
+            "a loading lane must open with the building disclosure: {text}"
+        );
+        assert_eq!(footer(text), "semantic: building", "{text}");
+
+        let (failed, _wake) = slot.begin();
+        let reason = "view load: semantic plane: semantic generation not resident";
+        assert!(slot.fail(failed, reason.to_string()));
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
+        let response = response_value(handle_semantic_search(&semantic_request(query, 5), &ctx));
+        assert_eq!(response["success"], true, "{response:#}");
+        assert_eq!(response["semantic_status"], "unavailable", "{response:#}");
+        assert_eq!(response["complete"], false, "{response:#}");
+        assert_eq!(response["lexical_only_fallback"], true, "{response:#}");
+        let text = response["text"].as_str().expect("text");
+        assert!(
+            text.starts_with(&format!("Semantic search unavailable: {reason}")),
+            "a failed lane must open with its reason: {text}"
+        );
+        assert_eq!(
+            footer(text),
+            format!(
+                "semantic: unavailable: {}",
+                crate::feature_status::cause::SEMANTIC_BUILD_FAILED
+            ),
+            "{text}"
+        );
+    }
+
     /// Mark the semantic lane ready with an empty resident index, so a test
     /// can exercise the walk routes aft_search takes while the trigram lane
     /// is not ready.
@@ -11737,6 +11952,7 @@ mod tests {
         let lanes = SearchLaneStatus {
             trigram: IndexObservation::building(),
             semantic: IndexObservation::unavailable("semantic_backend_unavailable"),
+            semantic_reload_started: false,
         };
         let response = lanes.refusal("lane-text", &ctx).unwrap();
         let rendered = crate::subc_format::format_response("search", &response, false);
@@ -11760,6 +11976,7 @@ mod tests {
         let lanes = SearchLaneStatus {
             trigram: IndexObservation::off(),
             semantic: IndexObservation::building(),
+            semantic_reload_started: false,
         };
         let response = lanes.refusal("progress-text", &ctx).unwrap();
         let rendered = crate::subc_format::format_response("search", &response, false);

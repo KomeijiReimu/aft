@@ -785,12 +785,15 @@ fn detach_held_bash_sync(target: drain::BashDetachTarget, cancelled: bool) {
         // process alive until the daemon's scope.describe response confirms the run ended; the
         // command's normal hard timeout still applies while confirmation waits.
     } else if let Err(error) = target.registry.promote(&target.task_id, &target.session_id) {
-        crate::slog_warn!(
-            "subc attach: bash background handoff failed task_id={:?} session={:?} error={:?}",
-            target.task_id,
-            target.session_id,
-            error
-        );
+        // Runs on a shared blocking-pool thread; tag with the task's session.
+        crate::log_ctx::with_session(Some(target.session_id.clone()), || {
+            crate::slog_warn!(
+                "subc attach: bash background handoff failed task_id={:?} session={:?} error={:?}",
+                target.task_id,
+                target.session_id,
+                error
+            );
+        });
     } else if cancelled {
         // The caller saw only the cancellation; name the still-running task
         // on the session's next bash call.
@@ -993,6 +996,12 @@ fn finalized_bash_result(
     allow_bg_completions: bool,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
 ) -> ToolCallResult {
+    // A terminal task's stored view record rides `structuredContent` on
+    // tool-result/v1 routes only; the bash text renderer reads `output`, so
+    // the extra member leaves the model-visible content bytes unchanged.
+    // Running replies and legacy routes are skipped inside the attach.
+    ctx.bash_background()
+        .attach_terminal_view(&mut response.data, session_id);
     // The bash formatter never renders `bg_completions`, so formatting before finalization
     // yields the same text and lets the finalizer append the status bar to it.
     let mut text =
@@ -1590,6 +1599,10 @@ pub(super) fn submit_deferred_bash(
     spawn_principal: crate::sandbox_spawn::AuthenticatedPrincipal,
     edit_slot_survives: Option<bool>,
     call_key: Option<String>,
+    // The v1 `bash` schema pin the call carried, if any. It is installed
+    // around the dispatch (see `with_schema_pin`) so the spawned task
+    // records it; a pinless call leaves no view record.
+    schema_pin: Option<String>,
     permissions_granted: Option<Vec<String>>,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
     worker_session: bool,
@@ -2035,9 +2048,9 @@ pub(super) fn submit_deferred_bash(
                                                                       })
                                                                   };
                                                                   #[cfg(not(test))]
-                                                                  let response = run_dispatch();
+                                                                  let response = crate::bash_background::with_schema_pin(schema_pin, run_dispatch);
                                                                   #[cfg(test)]
-                                                                  let response = with_bash_timing_for_test(spawn_timing_for_test.clone(), run_dispatch);
+                                                                  let response = with_bash_timing_for_test(spawn_timing_for_test.clone(), || crate::bash_background::with_schema_pin(schema_pin, run_dispatch));
                                                                   let response = refuse_run_permission_ask(response, run_scoped);
                                                                   // Registration and revocation can race across actors.
                                                                   // Recheck after dispatch so neither ordering loses the task.
@@ -2288,17 +2301,21 @@ pub(super) fn submit_deferred_bash(
             task_metrics
                 .held_bash_calls
                 .set_detach_target(route, corr, target.clone());
-            task_metrics.held_bash_calls.set_phase(
-                route,
-                corr,
-                if capture_wait_mode {
-                    drain::BashHoldPhase::Wait
-                } else if blocking_intent {
-                    drain::BashHoldPhase::Block
-                } else {
-                    drain::BashHoldPhase::Foreground
-                },
-            );
+            let capture_phase = if capture_wait_mode {
+                drain::BashHoldPhase::Wait
+            } else if blocking_intent {
+                drain::BashHoldPhase::Block
+            } else {
+                drain::BashHoldPhase::Foreground
+            };
+            task_metrics
+                .held_bash_calls
+                .set_phase(route, corr, capture_phase);
+            if let Ok(guard) = task_metrics.lifecycle_probe.lock() {
+                if let Some(probe) = guard.as_ref() {
+                    probe.bash_foreground_wait(route, corr, capture_phase.label());
+                }
+            }
             #[cfg(test)]
             if let Some(timing) = &timing_for_test {
                 timing.capture_registered.notify_one();
@@ -2383,7 +2400,10 @@ pub(super) fn submit_deferred_bash(
                             let reply = await_runon_launch_reply(spawn_ctx.bash_background().clone(), &session_id, &response, capture_deadline, &cancel, &claim, server_completion, Some(capture_reply_deadline), background_runon).await.unwrap_or(response);
                             foreground_runon_reply(reply, foreground_runon_deadline, background_runon, &cancel, foreground_runon_timeout, startup_window, worker_session, format_context.bash_watch_available.unwrap_or(worker_session))
                         };
-                        crate::slog_warn!("bash startup reply deadline channel={} corr={corr} elapsed_ms={} admitted={} code={} steps={}", route.channel, received_at.elapsed().as_millis(), admitted.load(Ordering::Relaxed), response.data.get("code").and_then(Value::as_str).unwrap_or("promoted"), startup_steps.format_steps());
+                        // This task runs on the shared subc runtime outside any session scope.
+                        crate::log_ctx::with_session(Some(session_id.to_string()), || {
+                            crate::slog_warn!("bash startup reply deadline channel={} corr={corr} elapsed_ms={} admitted={} code={} steps={}", route.channel, received_at.elapsed().as_millis(), admitted.load(Ordering::Relaxed), response.data.get("code").and_then(Value::as_str).unwrap_or("promoted"), startup_steps.format_steps());
+                        });
                         let result = (!cancel.connection.is_cancelled() && !cancel.route.is_cancelled() && claim.try_claim_for_wait_task()).then(|| bash_result_from_response(response, &format_context));
                         send_bash_deferred_completion(&completion_tx, &task_metrics, route, corr, flags, ver, root_for_task.clone(), request_id.clone(), result, false).await;
                         answered_startup = true;
@@ -2892,6 +2912,19 @@ async fn run_deferred_bash_wait(
             format_context: format_context.clone(),
         },
     );
+    // The phase was set when the spawn reported its foreground control (from
+    // `blocking_intent`, not the capped `block_to_completion` flag this wait
+    // receives); the detach target above is what moves the census off
+    // `bash:spawning`. Publish the stored phase together with the detach so a
+    // test waiting on this event sees exactly what a drain census taken next
+    // would report for this call.
+    if let Some(foreground_phase) = metrics.held_bash_calls.phase(route, corr) {
+        if let Ok(guard) = metrics.lifecycle_probe.lock() {
+            if let Some(probe) = guard.as_ref() {
+                probe.bash_foreground_wait(route, corr, foreground_phase.label());
+            }
+        }
+    }
     loop {
         tokio::select! {
             _ = claim.module_loop_claimed() => {
@@ -3592,9 +3625,12 @@ async fn send_ready_bash_result(
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or(&result.text);
-        crate::slog_warn!(
-            "subc attach: late bash result discarded after handoff task_id={task_id:?} session={session_id:?} error={error:?}"
-        );
+        // Runs on the shared subc runtime; tag with the task's session.
+        crate::log_ctx::with_session(Some(session_id.to_string()), || {
+            crate::slog_warn!(
+                "subc attach: late bash result discarded after handoff task_id={task_id:?} session={session_id:?} error={error:?}"
+            );
+        });
     } else if claim.claimed_by_module_loop() {
         send_bash_deferred_completion(
             completion_tx,
@@ -3902,6 +3938,183 @@ pub(super) async fn assert_deferred_wait_entrypoint_for_test(
 
 #[cfg(test)]
 mod grant_path_tests {
+    #[test]
+    fn finalized_terminal_bash_result_carries_the_stored_record_on_tool_result_routes() {
+        let manifest = crate::db::rich_ui::test_view_manifest_for_test();
+        let pin = manifest.pins[0].clone();
+        let _writing = crate::db::rich_ui::enable_test_view_writing_for_test(manifest.clone());
+        let (dir, _root) = super::super::test_support::test_root("finalized-view");
+        let ctx = super::super::test_support::test_ctx();
+        let db = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        ));
+        ctx.set_db(std::sync::Arc::clone(&db));
+        ctx.bash_background()
+            .set_db_pool(std::sync::Arc::clone(&db));
+        ctx.bash_background()
+            .set_harness(crate::harness::Harness::Opencode);
+        let session = "finalized-session";
+        let task = "bash-0000000000000041";
+        let mut metadata = crate::db::rich_ui::terminal_task_metadata_for_test(Some(&pin));
+        metadata.session_id = session.into();
+        metadata.task_id = task.into();
+        metadata.harness = Some("opencode".into());
+        let row = crate::db::rich_ui::task_row_for_test(
+            &metadata,
+            "opencode",
+            "completed",
+            Some(7),
+            true,
+        );
+        let stored = {
+            let conn = db.lock().unwrap();
+            crate::db::rich_ui::upsert_task_row_with_view(&conn, &row, &metadata).unwrap();
+            crate::db::rich_ui::view_record_json(&conn, "opencode", session, task)
+                .unwrap()
+                .expect("record must be stored")
+        };
+        let body = || {
+            serde_json::json!({
+                "task_id": task,
+                "status": "completed",
+                "exit_code": 0,
+                "output": "done",
+                "output_preview": "done",
+                "output_truncated": false,
+            })
+        };
+        // A legacy-envelope route never receives the record.
+        let legacy = finalized_bash_result(
+            Response::success("r1", body()),
+            &ctx,
+            session,
+            &crate::subc_format::FormatContext::default(),
+            false,
+            None,
+        );
+        assert!(legacy.response.data.get("view").is_none());
+        // A tool-result/v1 route receives the stored record, with the same
+        // model-visible text as the legacy reply.
+        let _v1 = super::result_body::enter(true);
+        let done = finalized_bash_result(
+            Response::success("r1", body()),
+            &ctx,
+            session,
+            &crate::subc_format::FormatContext::default(),
+            false,
+            None,
+        );
+        assert_eq!(done.response.data["view"], stored);
+        assert_eq!(done.text, legacy.text);
+    }
+
+    /// The deferred bash dispatch installs the call's schema pin around the
+    /// spawn: a finished task persists that pin on its record, and the
+    /// terminal upsert stores a view record carrying it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_bash_dispatch_records_the_call_schema_pin() {
+        let manifest = crate::db::rich_ui::test_view_manifest_for_test();
+        let pin = manifest.pins[0].clone();
+        let _writing = crate::db::rich_ui::enable_test_view_writing_for_test(manifest);
+        let (dir, root) = super::super::test_support::test_root("dispatch-schema-pin");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| {
+            config.project_root = Some(dir.path().into());
+            config.storage_dir = Some(dir.path().join("storage"));
+        });
+        let db = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        ));
+        ctx.set_db(std::sync::Arc::clone(&db));
+        ctx.bash_background()
+            .set_db_pool(std::sync::Arc::clone(&db));
+        ctx.bash_background()
+            .set_harness(crate::harness::Harness::Opencode);
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx.clone());
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (tx, mut rx) = mpsc::channel(8);
+        let (touch, _touch_rx) = mpsc::channel(8);
+        let session = "pin-dispatch-session";
+        submit_deferred_bash(
+            &executor,
+            &tx,
+            &touch,
+            &metrics,
+            crate::bash_background::completed_spawn_for_test,
+            root.clone(),
+            dir.path().to_path_buf(),
+            session.into(),
+            "pin-dispatch".into(),
+            RouteChannel {
+                channel: 1,
+                epoch: 1,
+            },
+            1,
+            Flags::new(false, Priority::Interactive, false),
+            PROTOCOL_VERSION,
+            json!({"command": "exit 0", "background": true}),
+            crate::subc_format::FormatContext::default(),
+            BashWaitCancel {
+                run_scope: None,
+                scope: None,
+                late_results: false,
+                ledger_carrier: None,
+                connection: PersistentCancelSignal::new(),
+                route: PersistentCancelSignal::new(),
+                drain: drain::ModuleDrainWindow::default(),
+            },
+            BindTrust::FirstParty,
+            crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+            None,
+            None,
+            Some(pin.clone()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            super::remote_policy::RemoteSource::None,
+            Instant::now(),
+        );
+        let done = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let response = done.response_for_test();
+        assert!(response.success, "{response:?}");
+        let task_id = response.data["task_id"].as_str().unwrap().to_string();
+        let started = Instant::now();
+        let stored = loop {
+            let conn = db.lock().unwrap();
+            let row =
+                crate::db::bash_tasks::get_bash_task(&conn, "opencode", session, &task_id).unwrap();
+            let settled = row.as_ref().is_some_and(|row| row.status == "completed");
+            let record =
+                crate::db::rich_ui::view_record_json(&conn, "opencode", session, &task_id).unwrap();
+            drop(conn);
+            if settled
+                && record
+                    .as_ref()
+                    .and_then(|record| record.get("schema_pin"))
+                    .and_then(|value| value.as_str())
+                    == Some(pin.as_str())
+            {
+                break (row.unwrap(), record.unwrap());
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "pinned task did not settle with a view record"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let persisted: serde_json::Value = serde_json::from_str(&stored.0.metadata).unwrap();
+        assert_eq!(persisted["schema_pin"], pin);
+        assert_eq!(stored.1["schema_pin"], pin);
+        assert_eq!(stored.1["task_id"], task_id);
+    }
     #[cfg(unix)]
     static CHANGED_FILES_BUDGET_FOR_TEST: std::sync::Mutex<
         Option<crate::bash_changed_files::SharedCallDeadline>,
@@ -4024,6 +4237,7 @@ mod grant_path_tests {
                 },
                 BindTrust::FirstParty,
                 crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+                None,
                 None,
                 None,
                 None,
@@ -4477,6 +4691,7 @@ mod grant_path_tests {
             Some("program-shell".into()),
             None,
             None,
+            None,
             false,
             false,
             false,
@@ -4540,6 +4755,7 @@ mod grant_path_tests {
                     },
                     BindTrust::FirstParty,
                     crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+                    None,
                     None,
                     None,
                     None,
@@ -4617,6 +4833,7 @@ mod grant_path_tests {
             },
             BindTrust::FirstParty,
             crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+            None,
             None,
             None,
             None,
@@ -4706,6 +4923,7 @@ mod grant_path_tests {
                 },
                 BindTrust::FirstParty,
                 crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+                None,
                 None,
                 None,
                 None,
@@ -4910,6 +5128,7 @@ mod grant_path_tests {
             cancel,
             BindTrust::FirstParty,
             crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+            None,
             None,
             None,
             None,
@@ -8919,6 +9138,7 @@ mod grant_path_tests {
                 None,
                 None,
                 None,
+                None,
                 false,
                 false,
                 false,
@@ -9092,6 +9312,7 @@ mod grant_path_tests {
             None,
             None,
             None,
+            None,
             false,
             false,
             false,
@@ -9196,6 +9417,7 @@ mod run_tests {
             },
             BindTrust::FirstParty,
             AuthenticatedPrincipal::FirstParty,
+            None,
             None,
             None,
             None,

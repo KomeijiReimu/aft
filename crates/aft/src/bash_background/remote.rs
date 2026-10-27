@@ -5111,7 +5111,12 @@ fn render_terminal_report(terminal: &TerminalRecord) -> Option<String> {
             blocks.push(block);
         }
         Some(_) => {}
-        None => unreported.push("git state"),
+        // The build-server runner never fills the Git, untracked-file, or
+        // ignored-write fields: its checkout is read-only and every file
+        // change arrives in `workspace_changes`. An absent field therefore
+        // carries no information, so it stays silent instead of printing a
+        // "not reported" line.
+        None => {}
     }
 
     match &terminal.untracked_files {
@@ -5128,7 +5133,9 @@ fn render_terminal_report(terminal: &TerminalRecord) -> Option<String> {
             blocks.push(block);
         }
         Some(_) => {}
-        None => unreported.push("untracked files"),
+        // Same as above: an absent untracked-file report carries no
+        // information from this runner, so it stays silent.
+        None => {}
     }
 
     match &terminal.ignored_writes {
@@ -5150,7 +5157,9 @@ fn render_terminal_report(terminal: &TerminalRecord) -> Option<String> {
             blocks.push(block);
         }
         Some(_) => {}
-        None => unreported.push("ignored writes"),
+        // Same as above: an absent ignored-write report carries no
+        // information from this runner, so it stays silent.
+        None => {}
     }
 
     for field in unreported {
