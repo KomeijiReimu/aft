@@ -5964,20 +5964,45 @@ fn command_argv_for_plan(
     }
 }
 
-/// A request's resolved shell policy for project-controlled formatters and
-/// checkers. The owner keeps the private task directory alive across all of
-/// the request's tools, then removes it even on refusal or an early return.
-pub struct ToolLaunchPolicy {
+/// A request's shell policy for project-controlled formatters and checkers.
+///
+/// A policy is either resolved when it is made ([`Self::resolve`]), or it is a
+/// tool call's deferred policy ([`Self::for_session`], handed to the call's
+/// commands by [`Self::for_request`]) that is resolved the first time one of
+/// the call's tools is actually launched. Resolving a worker's policy creates
+/// a private task directory and builds a full sandbox profile (access grants
+/// from aft.db, Git policy, temporary directories), so most edits, which
+/// launch no formatter or checker, must not pay for it.
+pub struct ToolLaunchPolicy<'ctx> {
+    /// The context a deferred policy is resolved against; `None` when the
+    /// policy was resolved up front.
+    ctx: Option<&'ctx AppContext>,
+    request: std::rc::Rc<RequestToolLaunch>,
+}
+
+/// One request's launch policy, shared by every command the request runs so
+/// they launch tools under one policy and one private task directory.
+pub(crate) struct RequestToolLaunch {
+    /// The principal and worker-jail flag to resolve for. `None` when
+    /// `resolved` was filled when the policy was made.
+    deferred: Option<(AuthenticatedPrincipal, bool)>,
+    resolved: std::cell::OnceCell<ResolvedToolLaunch>,
+}
+
+/// A resolved launch policy. The owner keeps the private task directory alive
+/// across all of the request's tools, then removes it even on refusal or an
+/// early return.
+pub(crate) struct ResolvedToolLaunch {
     plan: SpawnPlan,
     environment: HashMap<String, String>,
     task: Option<crate::bash_background::persistence::ResolvedTask>,
 }
 
 thread_local! {
-    static CURRENT_TOOL_POLICY: RefCell<Option<std::rc::Rc<ToolLaunchPolicy>>> = const { RefCell::new(None) };
+    static CURRENT_TOOL_POLICY: RefCell<Option<std::rc::Rc<RequestToolLaunch>>> = const { RefCell::new(None) };
 }
 
-impl Drop for ToolLaunchPolicy {
+impl Drop for ResolvedToolLaunch {
     fn drop(&mut self) {
         self.plan.cleanup_unspawned();
         if let Some(task) = &self.task {
@@ -5986,40 +6011,8 @@ impl Drop for ToolLaunchPolicy {
     }
 }
 
-impl ToolLaunchPolicy {
-    /// Direct tools carry only their formatter policy across dispatch. General
-    /// sandbox scopes must not cover dispatch: it can start shared LSP servers.
-    pub(crate) fn with_current<R>(policy: Option<std::rc::Rc<Self>>, run: impl FnOnce() -> R) -> R {
-        struct Restore(Option<std::rc::Rc<ToolLaunchPolicy>>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                CURRENT_TOOL_POLICY.with(|slot| {
-                    slot.replace(self.0.take());
-                });
-            }
-        }
-        let previous = CURRENT_TOOL_POLICY.with(|slot| slot.replace(policy));
-        let _restore = Restore(previous);
-        run()
-    }
-
-    pub(crate) fn for_request(ctx: &AppContext) -> std::rc::Rc<Self> {
-        CURRENT_TOOL_POLICY
-            .with(|slot| slot.borrow().clone())
-            .unwrap_or_else(|| std::rc::Rc::new(Self::resolve(ctx)))
-    }
-
-    pub(crate) fn for_session(
-        ctx: &AppContext,
-        principal: AuthenticatedPrincipal,
-        worker: bool,
-    ) -> std::rc::Rc<Self> {
-        std::rc::Rc::new(with_authenticated_principal(principal, || {
-            with_worker_jail(worker, || Self::resolve(ctx))
-        }))
-    }
-
-    pub(crate) fn resolve(ctx: &AppContext) -> Self {
+impl ResolvedToolLaunch {
+    fn resolve(ctx: &AppContext) -> Self {
         let principal = current_authenticated_principal();
         let mode = effective_sandbox_mode(ctx, &principal);
         let mut environment = HashMap::new();
@@ -6062,6 +6055,121 @@ impl ToolLaunchPolicy {
         );
         policy
     }
+}
+
+impl RequestToolLaunch {
+    fn resolved(resolved: ResolvedToolLaunch) -> Self {
+        Self {
+            deferred: None,
+            resolved: std::cell::OnceCell::from(resolved),
+        }
+    }
+}
+
+impl<'ctx> ToolLaunchPolicy<'ctx> {
+    /// Direct tools carry only their formatter-and-checker launch policy across
+    /// dispatch. General sandbox scopes must not cover dispatch: it can start
+    /// shared LSP servers.
+    pub(crate) fn with_current<R>(
+        policy: Option<std::rc::Rc<RequestToolLaunch>>,
+        run: impl FnOnce() -> R,
+    ) -> R {
+        struct Restore(Option<std::rc::Rc<RequestToolLaunch>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CURRENT_TOOL_POLICY.with(|slot| {
+                    slot.replace(self.0.take());
+                });
+            }
+        }
+        let previous = CURRENT_TOOL_POLICY.with(|slot| slot.replace(policy));
+        let _restore = Restore(previous);
+        run()
+    }
+
+    /// The policy for a command's tools: the tool call's policy installed by
+    /// [`Self::with_current`], or else one resolved now from the current
+    /// principal and worker-jail scope.
+    pub(crate) fn for_request(ctx: &'ctx AppContext) -> Self {
+        match CURRENT_TOOL_POLICY.with(|slot| slot.borrow().clone()) {
+            Some(request) => Self {
+                ctx: Some(ctx),
+                request,
+            },
+            None => ToolLaunchPolicy::resolve(ctx),
+        }
+    }
+
+    /// A tool call's policy for `principal`, resolved only when one of the
+    /// call's tools is launched. Resolution then runs with `principal` and
+    /// the worker-jail flag installed, exactly as if it had run here, and
+    /// with nothing else changed: dispatch itself keeps its own scopes.
+    pub(crate) fn for_session(
+        principal: AuthenticatedPrincipal,
+        worker: bool,
+    ) -> std::rc::Rc<RequestToolLaunch> {
+        std::rc::Rc::new(RequestToolLaunch {
+            deferred: Some((principal, worker)),
+            resolved: std::cell::OnceCell::new(),
+        })
+    }
+
+    /// Resolve the policy now for the current principal and worker-jail scope.
+    pub(crate) fn resolve(ctx: &AppContext) -> ToolLaunchPolicy<'static> {
+        ToolLaunchPolicy {
+            ctx: None,
+            request: std::rc::Rc::new(RequestToolLaunch::resolved(ResolvedToolLaunch::resolve(
+                ctx,
+            ))),
+        }
+    }
+
+    /// This policy as one [`Self::with_current`] can install.
+    #[cfg(all(test, unix))]
+    pub(crate) fn shared(&self) -> std::rc::Rc<RequestToolLaunch> {
+        std::rc::Rc::clone(&self.request)
+    }
+
+    /// The resolved policy, resolving a deferred one on first use.
+    fn launch(&self) -> &ResolvedToolLaunch {
+        self.request.resolved.get_or_init(|| {
+            match (self.ctx, self.request.deferred.clone()) {
+                (Some(ctx), Some((principal, worker))) => {
+                    with_authenticated_principal(principal, || {
+                        with_worker_jail(worker, || ResolvedToolLaunch::resolve(ctx))
+                    })
+                }
+                // Unreachable by construction: a deferred policy is only
+                // handed out by `for_request`, which supplies the context.
+                // Refuse rather than launch a tool under no policy.
+                _ => ResolvedToolLaunch {
+                    plan: SpawnPlan::Refused {
+                        code: "sandbox_unavailable",
+                        message: "the tool launch policy has no context to resolve against"
+                            .to_string(),
+                        mismatch_class: None,
+                    },
+                    environment: HashMap::new(),
+                    task: None,
+                },
+            }
+        })
+    }
+
+    #[cfg(all(test, unix))]
+    fn resolved_for_test(&self) -> &ResolvedToolLaunch {
+        self.launch()
+    }
+
+    #[cfg(test)]
+    fn resolved_mut_for_test(&mut self) -> &mut ResolvedToolLaunch {
+        self.launch();
+        std::rc::Rc::get_mut(&mut self.request)
+            .expect("a test policy is not shared")
+            .resolved
+            .get_mut()
+            .expect("the policy was just resolved")
+    }
 
     pub(crate) fn command(&self, program: &OsStr, args: &[OsString]) -> Result<Command, String> {
         self.command_with_base_environment(program, args, false)
@@ -6083,17 +6191,18 @@ impl ToolLaunchPolicy {
         args: &[OsString],
         clean: bool,
     ) -> Result<Command, String> {
+        let launch = self.launch();
         // Host grants bind one approved shell command, never an edit's tools.
-        if matches!(self.plan.policy(), SpawnPlan::Host { .. }) {
+        if matches!(launch.plan.policy(), SpawnPlan::Host { .. }) {
             return Err(
                 "sandbox_unavailable: host escalation cannot run a formatter or checker".into(),
             );
         }
-        if let SpawnPlan::Refused { code, message, .. } = self.plan.policy() {
+        if let SpawnPlan::Refused { code, message, .. } = launch.plan.policy() {
             return Err(format!("{code}: {message}"));
         }
         let (program, args, _profile_handle) =
-            command_argv_for_plan(&self.plan, program, args, Path::new(""), None)?;
+            command_argv_for_plan(&launch.plan, program, args, Path::new(""), None)?;
         #[cfg(windows)]
         let mut command = if crate::windows_command::is_batch_file(Path::new(&program)) {
             crate::windows_command::batch_command(Path::new(&program), &args)
@@ -6115,20 +6224,23 @@ impl ToolLaunchPolicy {
                 command.env("PATH", path);
             }
         }
-        apply_sandbox_environment(&self.plan, &mut command, &self.environment);
+        apply_sandbox_environment(&launch.plan, &mut command, &launch.environment);
         #[cfg(unix)]
-        if !matches!(self.plan.policy(), SpawnPlan::Unsandboxed) {
-            disclaim_command_for_plan(&self.plan, &mut command, &self.environment)?;
+        if !matches!(launch.plan.policy(), SpawnPlan::Unsandboxed) {
+            disclaim_command_for_plan(&launch.plan, &mut command, &launch.environment)?;
         }
         Ok(command)
     }
 
     #[cfg(test)]
-    pub(crate) fn unconfined_for_test() -> Self {
-        Self {
-            plan: SpawnPlan::Unsandboxed,
-            environment: HashMap::new(),
-            task: None,
+    pub(crate) fn unconfined_for_test() -> ToolLaunchPolicy<'static> {
+        ToolLaunchPolicy {
+            ctx: None,
+            request: std::rc::Rc::new(RequestToolLaunch::resolved(ResolvedToolLaunch {
+                plan: SpawnPlan::Unsandboxed,
+                environment: HashMap::new(),
+                task: None,
+            })),
         }
     }
 }
@@ -9092,6 +9204,7 @@ mod policy_tests {
                             with_worker_jail(jailed, || {
                                 let policy = ToolLaunchPolicy::resolve(&ctx);
                                 let io = policy
+                                    .resolved_for_test()
                                     .task
                                     .as_ref()
                                     .map(|task| task.paths.io_dir.as_path())
@@ -9105,7 +9218,7 @@ mod policy_tests {
                                     io,
                                     None,
                                 );
-                                match (&policy.plan, &shell) {
+                                match (&policy.resolved_for_test().plan, &shell) {
                                     (SpawnPlan::Unsandboxed, SpawnPlan::Unsandboxed) => {
                                         assert_eq!(mode, SandboxMode::Off);
                                         assert!(!jailed);
@@ -9220,7 +9333,7 @@ mod policy_tests {
         std::fs::write(&launcher, "#!/bin/sh\nshift 4\nexec \"$@\"\n").unwrap();
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut policy = ToolLaunchPolicy::resolve(&ctx);
-        let temp = match &mut policy.plan {
+        let temp = match &mut policy.resolved_mut_for_test().plan {
             SpawnPlan::Launcher {
                 profile,
                 launcher_path,
@@ -9230,7 +9343,14 @@ mod policy_tests {
             }
             other => panic!("strict tools need a launcher: {other:?}"),
         };
-        let io = policy.task.as_ref().unwrap().paths.io_dir.clone();
+        let io = policy
+            .resolved_for_test()
+            .task
+            .as_ref()
+            .unwrap()
+            .paths
+            .io_dir
+            .clone();
         for capture in [false, true] {
             let result = if capture {
                 crate::format::run_external_tool_capture(
@@ -9270,7 +9390,7 @@ mod policy_tests {
     #[test]
     fn tool_policy_refuses_host_escalation() {
         let mut policy = ToolLaunchPolicy::unconfined_for_test();
-        policy.plan = SpawnPlan::Host {
+        policy.resolved_mut_for_test().plan = SpawnPlan::Host {
             shell_path: PathBuf::from("sh"),
             environment: BTreeMap::new(),
         };
@@ -9355,10 +9475,10 @@ mod policy_tests {
         let policy = crate::access_policy::with_scope(Some(scope.clone()), || {
             ToolLaunchPolicy::resolve(&ctx)
         });
-        let SpawnPlan::Launcher { profile, .. } = &policy.plan else {
+        let SpawnPlan::Launcher { profile, .. } = &policy.resolved_for_test().plan else {
             panic!(
                 "a scoped strict tool must get its shell profile: {:?}",
-                policy.plan
+                policy.resolved_for_test().plan
             );
         };
         assert_scoped_profile_grants(profile, &write, &read);

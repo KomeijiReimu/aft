@@ -274,10 +274,11 @@ mod tests {
                 ..config()
             },
         );
-        let policy = std::rc::Rc::new(crate::sandbox_spawn::with_spawn_plan_for_test(
+        let policy = crate::sandbox_spawn::with_spawn_plan_for_test(
             SpawnPlan::launcher_for_test(profile.clone(), launcher),
             || ToolLaunchPolicy::resolve(&ctx),
-        ));
+        )
+        .shared();
         let path = project.join("script.sh");
         std::fs::write(&path, "echo old\n").unwrap();
         assert_eq!(validate_syntax_str(GRAMMAR_GAP, &path), Some(false));
@@ -327,10 +328,11 @@ mod tests {
                 ..config()
             },
         );
-        let policy = std::rc::Rc::new(crate::sandbox_spawn::with_spawn_plan_for_test(
+        let policy = crate::sandbox_spawn::with_spawn_plan_for_test(
             SpawnPlan::refused_for_test("sandbox_unavailable"),
             || ToolLaunchPolicy::resolve(&ctx),
-        ));
+        )
+        .shared();
         let path = root.path().join("new.sh");
         assert_eq!(validate_syntax_str(GRAMMAR_GAP, &path), Some(false));
         let request = serde_json::from_value(serde_json::json!({"id":"syntax-refused", "command":"write", "file":path, "content":GRAMMAR_GAP})).unwrap();

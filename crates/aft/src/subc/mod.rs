@@ -9661,7 +9661,6 @@ impl PlainToolRun {
                         && manifest::tool_call_is_mutating(&bare_name, &arguments))
                     .then(|| {
                         crate::sandbox_spawn::ToolLaunchPolicy::for_session(
-                            ctx,
                             identity_for_run.spawn_principal.clone(),
                             access_grants::alfonso_worker(&identity_for_run),
                         )
@@ -10758,7 +10757,7 @@ async fn handle_tool_call(
     // enable Cargo indirectly by selecting a head catalog on its route.
     if access_grants::alfonso_worker(&identity) {
         if let Some(ctx) = executor.actor_context(&identity.root) {
-            ctx.lsp().disable_rust_cargo_for_worker();
+            ctx.disable_rust_cargo_for_worker();
         }
     }
     let lane = command_lane(&bare_name);

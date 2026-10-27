@@ -1399,7 +1399,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
 
 fn dispatch_on_route(req: RawRequest, ctx: &AppContext) -> Response {
     if req.worker_session() {
-        ctx.lsp().disable_rust_cargo_for_worker();
+        ctx.disable_rust_cargo_for_worker();
     }
     if ctx.claim_database_runtime_retry(&req.command) {
         ctx.retry_database_runtime();
@@ -1765,7 +1765,7 @@ fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
 
 fn dispatch_outcome_on_route(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
     if req.worker_session() {
-        ctx.lsp().disable_rust_cargo_for_worker();
+        ctx.disable_rust_cargo_for_worker();
     }
     // The request is admitted here: pin the published config so every handler
     // below, and every worker thread a deferred handler starts, uses this
