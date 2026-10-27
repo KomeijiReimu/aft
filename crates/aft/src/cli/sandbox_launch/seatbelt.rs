@@ -273,6 +273,7 @@ fn secret_bash_task_ports_are_denied_only_for_secret_profiles() {
         assert!(!ordinary.contains("mach-priv-task-port"));
         profile.secret_proxy = true;
         let secret = render_profile(&profile).unwrap();
+        assert!(secret.contains("(deny mach-priv-task-port)\n"));
         assert_eq!(secret.replace("(deny mach-priv-task-port)\n", ""), ordinary);
     }
 }

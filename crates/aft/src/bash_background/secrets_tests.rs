@@ -5,6 +5,10 @@ use secret_rules::location::{LabelRule, Location};
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(unix)]
+#[path = "secrets_audit_tests.rs"]
+mod audit_followups;
+
 struct Vault {
     resolves: AtomicUsize,
     materials: AtomicUsize,
@@ -321,9 +325,21 @@ fn native_pipeline() {
     use std::io::{Read, Write};
     use std::time::{Duration, Instant};
     let _ = rustls::crypto::ring::default_provider().install_default();
+    use rustls::pki_types::pem::PemObject;
+    let native = native_roots().unwrap();
+    let first_native = rustls::pki_types::CertificateDer::pem_slice_iter(&native)
+        .next()
+        .expect("native roots must contain certificates")
+        .unwrap();
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let _launcher = native_launcher(root.path());
+    let expected_native = root.path().join("expected-native.b64");
+    std::fs::write(
+        &expected_native,
+        base64::engine::general_purpose::STANDARD.encode(first_native.as_ref()),
+    )
+    .unwrap();
     let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
     params.distinguished_name = rcgen::DistinguishedName::new();
     params
@@ -462,6 +478,7 @@ else:
 paths = [os.environ[k] for k in ['SSL_CERT_FILE', 'CURL_CA_BUNDLE', 'NODE_EXTRA_CA_CERTS', 'REQUESTS_CA_BUNDLE', 'GIT_SSL_CAINFO']]
 assert len(set(paths)) == 1
 assert open(paths[0], 'rb').read().count(b'BEGIN CERTIFICATE') > 1
+assert open(sys.argv[2], 'rb').read() in open(paths[0], 'rb').read().replace(b'\n', b'').replace(b'\r', b'')
 "#).unwrap();
     for (index, (mode, pty)) in cases.into_iter().enumerate() {
         #[cfg(target_os = "linux")]
@@ -477,9 +494,10 @@ assert open(paths[0], 'rb').read().count(b'BEGIN CERTIFICATE') > 1
         let gate = root.path().join(format!("go-{index}"));
         let command = format!("while [ ! -f '{}' ]; do sleep 0.05; done; test -n \"$HTTPS_PROXY\" && test \"$HTTPS_PROXY\" = \"$https_proxy\" && test \"$HTTP_PROXY\" = \"$http_proxy\" && test -z \"${{NO_PROXY+x}}\" && test -z \"${{no_proxy+x}}\" && test -z \"${{ALL_PROXY+x}}\" && test -z \"${{all_proxy+x}}\" || exit 70; printf 'proxy-env-ok\\n' >&2; curl --connect-timeout 5 --max-time 10 --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; curl --connect-timeout 5 --max-time 10 --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; sleep 30", gate.display(), vault.port, vault.port);
         let command = format!(
-            "python3 '{}' {} || exit 71; printf 'memory-and-bundle-ok\\n' >&2; {command}",
+            "python3 '{}' {} '{}' || exit 71; printf 'memory-and-bundle-ok\\n' >&2; {command}",
             memory_probe.display(),
-            std::process::id()
+            std::process::id(),
+            expected_native.display()
         );
         let mut req = request(&command);
         req.params["params"]["pty"] = json!(pty);
@@ -604,6 +622,11 @@ assert open(paths[0], 'rb').read().count(b'BEGIN CERTIFICATE') > 1
                 super::super::process::is_process_alive(pid as u32),
                 "detach should leave the child alive but revoke its proxy"
             );
+            assert!(
+                std::net::TcpStream::connect(address).is_err(),
+                "detach left listener alive while child was alive"
+            );
+            assert!(super::super::process::is_process_alive(pid as u32));
             super::super::process::terminate_pgid(pid, None);
         }
         assert!(
@@ -621,7 +644,28 @@ assert open(paths[0], 'rb').read().count(b'BEGIN CERTIFICATE') > 1
         *vault.material_kinds.lock().unwrap(),
         ["worker", "worker", "head", "head"].repeat(expected_requests / 4)
     );
-    for record in vault.audits.lock().unwrap().iter() {
+    let audits = vault.audits.lock().unwrap();
+    assert_eq!(audits.len(), expected_requests);
+    for (index, record) in audits.iter().enumerate() {
+        let scope = record.scope.as_ref().unwrap();
+        assert_eq!(scope.owner, "reserved:prefrontal-core");
+        assert_eq!(scope.reference, "secret-bash");
+        assert_eq!(
+            scope.kind,
+            if (index / 2) % 2 == 0 {
+                "worker"
+            } else {
+                "head"
+            }
+        );
+        assert_eq!(record.host.as_deref(), Some("localhost"));
+        assert_eq!(record.port, Some(vault.port));
+        assert_eq!(record.matched_prefix.as_ref().unwrap().path_prefix, "/api");
+        assert_eq!(record.location_kind.as_deref(), Some("bearer"));
+        assert_eq!(record.decision, secret_rules::audit::Decision::Substituted);
+        assert_eq!(record.reason, secret_rules::audit::AuditReason::Matched);
+        assert_eq!(record.label, "test");
+        assert!(record.origin.starts_with("bash-"));
         let serialized = record.to_json_line_with_key(KEY).unwrap();
         for encoded in &encodings {
             assert!(!serialized.contains(encoded));

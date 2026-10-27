@@ -1473,6 +1473,35 @@ describe("bash tool adapter", () => {
     ).rejects.toThrow("bash.memory_limit_mib");
   });
 
+  test("secret placeholders refuse host fallback before confirmation", async () => {
+    for (const command of ["printf '{{ck-secret:test}}'", "printf '{{ck-secret:unfinished'"]) {
+      const tools = new Map<string, MockToolDef>();
+      let confirmations = 0;
+      const bridge = {
+        send: async () => {
+          throw new BridgeTransportUnavailableError("offline");
+        },
+      } as unknown as BinaryBridge;
+      registerBashTool(
+        makeMockApi(tools),
+        makeMockContext(bridge, { bash: { host_fallback: true } } as PluginContext["config"]),
+      );
+      await expect(
+        tools.get("bash")!.execute("call", { command }, undefined, undefined, {
+          cwd: projectRoot,
+          hasUI: true,
+          ui: {
+            confirm: async () => {
+              confirmations++;
+              return false;
+            },
+          },
+        }),
+      ).rejects.toThrow("Secret placeholder commands cannot run through the host fallback.");
+      expect(confirmations).toBe(0);
+    }
+  });
+
   test("a bash call that timed out at the bridge names the task AFT started (issue #577)", async () => {
     const tools = new Map<string, MockToolDef>();
     const confirmations: unknown[] = [];
