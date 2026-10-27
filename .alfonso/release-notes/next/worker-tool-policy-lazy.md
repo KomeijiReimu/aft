@@ -1,0 +1,1 @@
+- Faster worker tool calls: edits no longer build a formatter sandbox profile and private task directory unless a formatter or checker actually runs, repeat calls no longer wait on the language-server lock, and slow tool-call logs report call-policy setup (`setup=`) apart from argument translation.
