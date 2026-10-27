@@ -7807,6 +7807,16 @@ impl BgTaskRegistry {
         // contended running scan still yields after one chunk.
         let mut bytes_read = 0;
         let mut matches = Vec::new();
+        // The capture file a withheld watch preview names, so the agent can
+        // read the matched output itself.
+        let output_file =
+            self.task(task_id)
+                .and_then(|task| match cursor_key.rsplit(':').next()? {
+                    "stdout" => Some(task.paths.stdout.clone()),
+                    "stderr" => Some(task.paths.stderr.clone()),
+                    "pty" => Some(task.paths.pty.clone()),
+                    _ => None,
+                });
         loop {
             if !drain && bytes_read >= CHUNK as usize {
                 break;
@@ -7872,6 +7882,7 @@ impl BgTaskRegistry {
                                     ..range.end as usize - source.start,
                                 source.start == 0,
                                 source.end == len as usize,
+                                output_file.as_deref(),
                             )
                         })
                     })

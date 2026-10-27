@@ -6,6 +6,11 @@ use std::borrow::Cow;
 // an unsafe preview from bash_status or the capture files after a restart.
 pub(super) const RESTART_PREVIEW_WITHHELD: &str =
     "Output preview withheld: this task's secret values aren't available after the daemon restarted; read the output with bash_status.";
+/// The watch-match form of [`RESTART_PREVIEW_WITHHELD`]. A watch usually
+/// fires while its task still runs, and `bash_status` shows no output for a
+/// running task, so the notice names the output file to read instead.
+pub(super) const RESTART_WATCH_PREVIEW_WITHHELD: &str =
+    "Output preview withheld: this task's secret values aren't available after the daemon restarted.";
 pub(super) const TRUNCATED_PREVIEW_WITHHELD: &str =
     "Output preview withheld because intact output is unavailable for credential masking; use bash_status.";
 
@@ -18,6 +23,9 @@ pub(super) const WATCH_PREVIEW_LINE_CAP_BYTES: usize =
 #[derive(Clone, Copy, Debug)]
 pub(super) struct UnavailablePreview {
     pub line_limit: bool,
+    /// The task's secret values are gone after a daemon restart. A watch
+    /// notice then shows [`restart_watch_notice`] instead of `reason`.
+    pub restart: bool,
     pub reason: &'static str,
 }
 
@@ -25,15 +33,36 @@ impl UnavailablePreview {
     pub(super) fn context(reason: &'static str) -> Self {
         Self {
             line_limit: false,
+            restart: false,
             reason,
         }
     }
     pub(super) fn line_limit() -> Self {
         Self {
             line_limit: true,
+            restart: false,
             reason: TRUNCATED_PREVIEW_WITHHELD,
         }
     }
+    pub(super) fn restart() -> Self {
+        Self {
+            line_limit: false,
+            restart: true,
+            reason: RESTART_PREVIEW_WITHHELD,
+        }
+    }
+}
+
+/// What a watch notice shows in place of output withheld after a restart:
+/// [`RESTART_WATCH_PREVIEW_WITHHELD`] and, when known, the capture file the
+/// match was found in, so the agent can read it directly.
+pub(super) fn restart_watch_notice(output_file: Option<&std::path::Path>) -> String {
+    let mut notice = RESTART_WATCH_PREVIEW_WITHHELD.to_string();
+    if let Some(path) = output_file {
+        notice.push_str("\nOutput file: ");
+        notice.push_str(&aft_redactor(&path.to_string_lossy()));
+    }
+    notice
 }
 /// Bytes read beyond the largest maskable region on each side, so a JSON field
 /// or private-key block that crosses a line break into the region can be seen
@@ -109,12 +138,15 @@ impl BgTaskRegistry {
             range,
             source.start == 0,
             source.end == bytes.len(),
+            None,
         )
     }
 
     /// Render a watch match from `bytes`, a window of the capture read with
     /// [`watch_preview_source_range`]. `starts_capture` and `ends_capture` say
     /// whether the window reaches the capture's first or last byte.
+    /// `output_file` is the capture file the match was found in, named when
+    /// the preview has to be withheld after a restart.
     pub(super) fn render_watch_preview_window(
         &self,
         task_id: &str,
@@ -122,6 +154,7 @@ impl BgTaskRegistry {
         range: std::ops::Range<usize>,
         starts_capture: bool,
         ends_capture: bool,
+        output_file: Option<&std::path::Path>,
     ) -> (String, String) {
         self.render_watch_preview_window_checked(
             task_id,
@@ -131,10 +164,12 @@ impl BgTaskRegistry {
             ends_capture,
         )
         .unwrap_or_else(|unavailable| {
-            (
-                crate::log_redact::SECRET_PLACEHOLDER.to_string(),
-                unavailable.reason.to_string(),
-            )
+            let context = if unavailable.restart {
+                restart_watch_notice(output_file)
+            } else {
+                unavailable.reason.to_string()
+            };
+            (crate::log_redact::SECRET_PLACEHOLDER.to_string(), context)
         })
     }
 
@@ -165,7 +200,7 @@ impl BgTaskRegistry {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         });
         let Some(secrets) = guard.as_deref().and_then(Option::as_ref) else {
-            return Err(UnavailablePreview::context(RESTART_PREVIEW_WITHHELD));
+            return Err(UnavailablePreview::restart());
         };
         if secrets.longest_value_len() > WATCH_SECRET_HALO_BYTES {
             return Err(UnavailablePreview::context(TRUNCATED_PREVIEW_WITHHELD));

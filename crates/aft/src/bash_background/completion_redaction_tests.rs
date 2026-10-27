@@ -1093,15 +1093,17 @@ fn bash_background_restart_watch_withholds_output_of_a_task_launched_with_secret
     // The secret values are gone after the restart, so output-derived text
     // stays withheld.
     assert_eq!(matched.match_text, SECRET_PLACEHOLDER);
-    assert!(
-        matched
-            .context
-            .starts_with(completion_preview::RESTART_PREVIEW_WITHHELD),
-        "{:?}",
-        matched.context
+    // bash_status shows no output for a running task, so the notice names
+    // the file the match was found in instead of pointing at bash_status.
+    assert_eq!(
+        matched.context,
+        format!(
+            "{}\nOutput file: {}",
+            completion_preview::RESTART_WATCH_PREVIEW_WITHHELD,
+            paths.stdout.display()
+        )
     );
     assert!(!matched.context.contains("03b92ca085"));
-    let _ = paths;
     // bash_status on the finished task still reads the output.
     assert!(status
         .output_preview
@@ -1115,5 +1117,5 @@ fn bash_background_restart_watch_withholds_output_of_a_task_launched_with_secret
     assert_eq!(matched.match_text, "failed");
     assert!(matched
         .context
-        .starts_with(completion_preview::RESTART_PREVIEW_WITHHELD));
+        .starts_with(completion_preview::RESTART_WATCH_PREVIEW_WITHHELD));
 }
