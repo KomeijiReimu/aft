@@ -151,6 +151,29 @@ pub fn finalize_tool_response(
     attach_command: &str,
     allow_bg_completions: bool,
 ) {
+    finalize_tool_response_with_visibility(
+        response,
+        text,
+        ctx,
+        session_id,
+        attach_command,
+        allow_bg_completions,
+        true,
+    );
+}
+
+/// Native plugin calls share tool dispatch with agent calls, but their replies are not
+/// shown to the agent. They must leave cancelled-call notices pending for a visible reply.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finalize_tool_response_with_visibility(
+    response: &mut Response,
+    text: &mut String,
+    ctx: &AppContext,
+    session_id: &str,
+    attach_command: &str,
+    allow_bg_completions: bool,
+    agent_visible: bool,
+) {
     let (publish, counts) = finalize_prefix(
         response,
         ctx,
@@ -158,7 +181,9 @@ pub fn finalize_tool_response(
         attach_command,
         allow_bg_completions,
     );
-    append_cancelled_call_notices(text, ctx, session_id, attach_command);
+    if agent_visible {
+        append_cancelled_call_notices(text, ctx, session_id);
+    }
     if let Some(line) = status_bar_line(ctx, publish, attach_command, session_id, counts) {
         append_trailing_line(text, &line);
     }
@@ -209,21 +234,10 @@ fn acknowledge_terminal_bash_reply(
     }
 }
 
-/// A bash-family reply names tasks the session has not heard about: commands
+/// An agent-visible reply names tasks the session has not heard about: commands
 /// still running after their waiting call was cancelled, and commands stopped
 /// by an owner cancellation. The registry supplies the appropriate status for each.
-fn append_cancelled_call_notices(
-    text: &mut String,
-    ctx: &AppContext,
-    session_id: &str,
-    command: &str,
-) {
-    if !matches!(
-        command,
-        "bash" | "powershell" | "bash_status" | "bash_watch" | "bash_kill" | "bash_write"
-    ) {
-        return;
-    }
+fn append_cancelled_call_notices(text: &mut String, ctx: &AppContext, session_id: &str) {
     for line in ctx
         .bash_background()
         .take_cancelled_call_notices(session_id)

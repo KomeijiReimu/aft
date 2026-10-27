@@ -9739,13 +9739,15 @@ impl PlainToolRun {
             log_ctx::with_session(Some(identity_for_run.session.clone()), || {
                 // Both the tool's run and the reply's finishing use the trace.
                 let phase_trace = std::cell::RefCell::new(Some(phase_trace));
+                // Classify before translation changes an agent's taskId to native task_id.
+                let agent_visible = !manifest::is_native_plumbing_call(&bare_name, &arguments);
                 let finalizer = |response: &mut Response, text: &mut String| {
                     // A UI copy must leave completions and cancellation notices
                     // available to the session that actually owns the command.
                     if observation_only {
                         return;
                     }
-                    crate::response_finalize::finalize_tool_response(
+                    crate::response_finalize::finalize_tool_response_with_visibility(
                         response,
                         text,
                         ctx,
@@ -9753,6 +9755,7 @@ impl PlainToolRun {
                         &bare_name,
                         bind_trust.allows_bash_observation()
                             && !crate::context::confinement::active(),
+                        agent_visible,
                     );
                 };
                 let work = |arguments: Value| {
