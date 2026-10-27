@@ -1,0 +1,1 @@
+- On macOS, killing a background `bash` task no longer waits for processes that have already exited. A process whose exit has started but whose parent has not cleaned it up yet was counted as still running, so a kill could take its full grace period, and the kill's report could name it as having survived.

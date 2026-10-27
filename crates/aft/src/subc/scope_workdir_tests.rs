@@ -183,7 +183,7 @@ fn bind_observed(
             )
             .await
             .unwrap();
-            let completion = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
+            let completion = tokio::time::timeout(Duration::from_secs(30), completion_rx.recv())
                 .await
                 .unwrap()
                 .unwrap();

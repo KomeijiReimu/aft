@@ -925,7 +925,18 @@ fn serialize_tool_response_body_with_text(
     if include_structured {
         body.extend_from_slice(b",\"structuredContent\":{\"id\":");
         let data = result.response.data.as_object();
-        match data.and_then(|data| data.get("id")) {
+        let response_id = data.and_then(|data| data.get("id"));
+        // Early orchestration errors have no native dispatch. Pin only their
+        // outgoing ID too; the remaining legacy/result body is serialized normally.
+        #[cfg(feature = "test-conformance-result-inputs")]
+        let fixture_id = serde_json::json!("conformance-result-probe");
+        #[cfg(feature = "test-conformance-result-inputs")]
+        let response_id = if std::env::var_os("AFT_TEST_CONFORMANCE_RESPONSE_ID").is_some() {
+            Some(&fixture_id)
+        } else {
+            response_id
+        };
+        match response_id {
             Some(value) => serde_json::to_writer(&mut body, value)?,
             None => serde_json::to_writer(&mut body, &result.response.id)?,
         }

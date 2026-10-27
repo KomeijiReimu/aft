@@ -10501,6 +10501,26 @@ async fn handle_tool_call(
     );
 
     let request_id = format!("subc-{}-{}", frame.header.channel, frame.header.corr);
+    // Pin the response ID only for the fixture's exact probe inputs. Other
+    // calls and frame correlation keep their ordinary identities; all native
+    // handlers, formatters and wire rendering still run unchanged.
+    #[cfg(feature = "test-conformance-result-inputs")]
+    let request_id = if std::env::var("AFT_TEST_CONFORMANCE_RESPONSE_ID")
+        .ok()
+        .and_then(|input| serde_json::from_str::<Value>(&input).ok())
+        .and_then(|probes| {
+            probes.as_array().map(|items| {
+                items.iter().any(|probe| {
+                    probe[0].as_str() == Some(bare_name.as_ref()) && probe[1] == arguments
+                })
+            })
+        })
+        .unwrap_or(false)
+    {
+        "conformance-result-probe".to_owned()
+    } else {
+        request_id
+    };
     let bind_trust = identity.trust;
     let diagnostics_on_edit = live_roots
         .get(&identity.root)
