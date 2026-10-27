@@ -403,14 +403,17 @@ impl IdentityConnection {
         crate::views::donor::refuse_sealed_write(path.as_ref())?;
         let _guard = filesystem_guard();
         crate::private_storage::prepare_sqlite(path.as_ref(), rusqlite::OpenFlags::default())?;
+        // Long view-store paths (and their `-journal`/`-wal` sidecars) pass
+        // Windows' MAX_PATH; `sqlite_open_path` spells those in `\\?\` form.
+        let sqlite_path = super::lifecycle::sqlite_open_path(path.as_ref());
         #[cfg(test)]
         let connection = crate::views::materialization::open_probe_connection(
-            path.as_ref(),
+            &sqlite_path,
             rusqlite::OpenFlags::default(),
         )?;
         #[cfg(not(test))]
         let connection = crate::views::write_accounting::open_connection(
-            path.as_ref(),
+            &sqlite_path,
             rusqlite::OpenFlags::default(),
         )?;
         Ok(Self::new(connection, seam))
@@ -427,11 +430,19 @@ impl IdentityConnection {
         }
         let _guard = filesystem_guard();
         crate::private_storage::prepare_sqlite(path.as_ref(), flags)?;
+        // A `file:` URI is SQLite syntax, not a filesystem path, so it is
+        // passed through; every plain path gets the long-path spelling.
+        let sqlite_path = if flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_URI)
+            && path.as_ref().to_string_lossy().starts_with("file:")
+        {
+            std::borrow::Cow::Borrowed(path.as_ref())
+        } else {
+            super::lifecycle::sqlite_open_path(path.as_ref())
+        };
         #[cfg(test)]
-        let connection =
-            crate::views::materialization::open_probe_connection(path.as_ref(), flags)?;
+        let connection = crate::views::materialization::open_probe_connection(&sqlite_path, flags)?;
         #[cfg(not(test))]
-        let connection = crate::views::write_accounting::open_connection(path.as_ref(), flags)?;
+        let connection = crate::views::write_accounting::open_connection(&sqlite_path, flags)?;
         Ok(Self::new(connection, seam))
     }
 

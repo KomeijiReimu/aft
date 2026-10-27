@@ -662,7 +662,8 @@ pub(crate) fn write_evidence(
         super::base_refs::fresh_nonce()
     ));
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let mut db = rusqlite::Connection::open(&staging)?;
+        // Generation names make this path pass Windows' MAX_PATH.
+        let mut db = rusqlite::Connection::open(crate::db::lifecycle::sqlite_open_path(&staging))?;
         db.pragma_update(None, "application_id", EVIDENCE_APP)?;
         db.pragma_update(None, "user_version", 1)?;
         db.pragma_update(None, "journal_mode", "DELETE")?;
@@ -705,7 +706,7 @@ pub(crate) fn read_evidence(
     guard: &BindGuard,
 ) -> Option<BTreeMap<RelPath, Evidence>> {
     let db = rusqlite::Connection::open_with_flags(
-        evidence_path(dir, generation),
+        crate::db::lifecycle::sqlite_open_path(&evidence_path(dir, generation)),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .ok()?;
@@ -836,7 +837,7 @@ pub(crate) fn write_tree_proof(
         super::base_refs::fresh_nonce()
     ));
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let mut db = rusqlite::Connection::open(&staging)?;
+        let mut db = rusqlite::Connection::open(crate::db::lifecycle::sqlite_open_path(&staging))?;
         db.pragma_update(None, "application_id", TREE_PROOF_APP)?;
         db.pragma_update(None, "user_version", 1)?;
         db.pragma_update(None, "journal_mode", "DELETE")?;
@@ -882,7 +883,7 @@ pub(crate) fn write_tree_proof(
 /// internally inconsistent file: the caller then takes the full check.
 pub(crate) fn read_tree_proof(dir: &Path) -> Option<TreeProof> {
     let db = rusqlite::Connection::open_with_flags(
-        dir.join(TREE_PROOF_FILE),
+        crate::db::lifecycle::sqlite_open_path(&dir.join(TREE_PROOF_FILE)),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .ok()?;
