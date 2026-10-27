@@ -133,6 +133,10 @@ pub fn project_manifest(
                 let key = match manifest.plane_readiness(path, FamilyPlane::Callgraph) {
                     Some(PlaneState::Ready { key }) => Some(key.clone()),
                     None => None,
+                    // A member no graph is extracted for needs no key. A base
+                    // built without a registered graph producer still lists
+                    // its call-graph state as pending.
+                    Some(_) if !applies_to(path) => None,
                     Some(_) => {
                         return Err(error(format!("callgraph member is not ready: {path:?}")))
                     }

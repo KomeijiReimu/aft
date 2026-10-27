@@ -212,7 +212,9 @@ pub fn plane_readiness(
     let mut pending = 0;
     let mut failed = 0;
     for (path, entry) in generation.entries() {
-        if live.live_state(path).is_some() {
+        // A member the plane has no work for counts neither way, whatever
+        // state an older base recorded for it.
+        if live.live_state(path).is_some() || !applies_to(path) {
             continue;
         }
         let Some(content) = entry.content() else {

@@ -4651,6 +4651,13 @@ impl CompositePlane for CallgraphBridge {
             {
                 continue;
             }
+            // A base built without a registered graph producer leaves every
+            // member pending, including members no graph is extracted for
+            // (documents, unsupported languages). Those need no blob and stay
+            // as they are; the graph projection ignores their state.
+            if !super::callgraph::applies_to(path) {
+                continue;
+            }
             // The base was read independently of the reconciliation; only
             // evidence for the very bytes the base names may complete it.
             let observation = observed.get(path).filter(|live| {
