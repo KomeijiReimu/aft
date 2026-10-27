@@ -10,34 +10,79 @@ async fn open_scope_daemon_session(input: FakeDaemonInput) -> FakeDaemonSession 
         .0
 }
 
-static OBSERVED_TASK: OnceLock<Mutex<Option<(aft::bash_background::BgTaskRegistry, String)>>> =
-    OnceLock::new();
+/// A bash task that a spawn dispatch reported, with the command that started it.
+#[derive(Clone)]
+struct ObservedTask {
+    command: String,
+    registry: aft::bash_background::BgTaskRegistry,
+    task: String,
+}
+
+/// Every bash task `observing_dispatch` has seen in this test process.
+///
+/// The tests in one process share this list, and an earlier test's entry is
+/// still here when a later test runs, so a reader looks up the entry for the
+/// command it sent. Each test's command names a file inside its own temporary
+/// root, which keeps the entries apart.
+static OBSERVED_TASKS: Mutex<Vec<ObservedTask>> = Mutex::new(Vec::new());
 
 fn observing_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
-    let bash = req.command == "bash";
+    let command = (req.command == "bash").then(|| {
+        req.params
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    });
     let response = bridge_dispatch(req, ctx);
-    if bash {
+    if let Some(command) = command {
         if let Some(task) = response.data.get("task_id").and_then(Value::as_str) {
-            *OBSERVED_TASK
-                .get_or_init(|| Mutex::new(None))
+            OBSERVED_TASKS
                 .lock()
-                .unwrap() = Some((ctx.bash_background().clone(), task.into()));
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(ObservedTask {
+                    command,
+                    registry: ctx.bash_background().clone(),
+                    task: task.into(),
+                });
         }
     }
     response
 }
 
-fn assert_run_not_killing() {
-    let (registry, task) = OBSERVED_TASK
-        .get()
-        .unwrap()
-        .lock()
-        .unwrap()
-        .clone()
-        .unwrap();
+/// The registry and id of the task whose bash command contains `marker`.
+///
+/// Waits for it, because the child can publish its pid file before the spawn
+/// dispatch returns and reports the task: the dispatch still has its
+/// foreground wait window and hand-off to finish, and a loaded machine can
+/// stretch that past the test's next steps.
+async fn observed_task(marker: &Path) -> (aft::bash_background::BgTaskRegistry, String) {
+    let marker = marker.display().to_string();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let found = OBSERVED_TASKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|observed| observed.command.contains(&marker))
+            .cloned();
+        if let Some(observed) = found {
+            return (observed.registry, observed.task);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "bash dispatch never reported a task for a command naming {marker}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn assert_run_not_killing(marker: &Path) {
+    let (registry, task) = observed_task(marker).await;
     let snapshot = registry
         .status(&task, "run-session", None, None, 0)
-        .unwrap();
+        .expect("the run's task is readable in its session");
     assert_eq!(
         snapshot.info.status,
         BgTaskStatus::Running,
@@ -45,23 +90,23 @@ fn assert_run_not_killing() {
     );
 }
 
-async fn assert_scope_kill_settled() {
-    assert_scope_kill_settled_as("run-session", "scope_revoked", "killed (scope revoked)").await;
+async fn assert_scope_kill_settled(marker: &Path) {
+    assert_scope_kill_settled_as(
+        marker,
+        "run-session",
+        "scope_revoked",
+        "killed (scope revoked)",
+    )
+    .await;
 }
 
 /// A codemode program's task killed at its run's end says so.
-async fn assert_run_kill_settled(session: &str) {
-    assert_scope_kill_settled_as(session, "run_ended", "killed (run ended)").await;
+async fn assert_run_kill_settled(marker: &Path, session: &str) {
+    assert_scope_kill_settled_as(marker, session, "run_ended", "killed (run ended)").await;
 }
 
-async fn assert_scope_kill_settled_as(session: &str, reason: &str, rendered: &str) {
-    let (registry, task) = OBSERVED_TASK
-        .get()
-        .unwrap()
-        .lock()
-        .unwrap()
-        .clone()
-        .unwrap();
+async fn assert_scope_kill_settled_as(marker: &Path, session: &str, reason: &str, rendered: &str) {
+    let (registry, task) = observed_task(marker).await;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let snapshot = registry.status(&task, session, None, None, 0).unwrap();
@@ -551,27 +596,6 @@ async fn wait_test_marker(path: &Path) {
 }
 
 #[cfg(unix)]
-async fn await_registered_run_task() {
-    let until = Instant::now() + Duration::from_secs(5);
-    loop {
-        let registered = OBSERVED_TASK
-            .get_or_init(|| Mutex::new(None))
-            .lock()
-            .unwrap()
-            .is_some();
-        if registered {
-            assert_run_not_killing();
-            return;
-        }
-        assert!(
-            Instant::now() < until,
-            "bash dispatch never acknowledged task registration"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-#[cfg(unix)]
 async fn no_extra_frames_until_pong(stream: &mut tokio::net::TcpStream, corr: u64, phase: &str) {
     send_frame(
         stream,
@@ -638,7 +662,12 @@ enum CloseCase {
 }
 
 #[cfg(unix)]
-async fn assert_hold_or_retry(stream: &mut tokio::net::TcpStream, pid: u32, reason: &str) {
+async fn assert_hold_or_retry(
+    stream: &mut tokio::net::TcpStream,
+    pid: u32,
+    marker: &Path,
+    reason: &str,
+) {
     #[cfg(feature = "test-timing-hooks")]
     let retry = describe(stream).await;
     #[cfg(not(feature = "test-timing-hooks"))]
@@ -649,7 +678,7 @@ async fn assert_hold_or_retry(stream: &mut tokio::net::TcpStream, pid: u32, reas
         "production retries must wait for the regular poll"
     );
     assert!(alive(pid), "{reason} must hold work");
-    assert_run_not_killing();
+    assert_run_not_killing(marker).await;
     #[cfg(feature = "test-timing-hooks")]
     answer(
         stream,
@@ -724,12 +753,6 @@ fn close_case(name: &'static str, case: CloseCase) {
             } else {
                 None
             };
-            if matches!(case, CloseCase::Duplicate) {
-                *OBSERVED_TASK
-                    .get_or_init(|| Mutex::new(None))
-                    .lock()
-                    .unwrap() = None;
-            }
             let pid_path = daemon.root1.join("grandchild.pid");
             let command = format!(
                 "(trap '' TERM; sleep 30) & echo $! > '{}'; wait",
@@ -782,7 +805,7 @@ fn close_case(name: &'static str, case: CloseCase) {
                 // The command can start before its task joins scope monitoring.
                 // Wait for spawn dispatch to finish so closing the sibling route
                 // finds the task and asks whether its scope is still live.
-                await_registered_run_task().await;
+                assert_run_not_killing(&pid_path).await;
             }
             // Close the unused sibling first: it must already share the run's
             // lifetime state even though it has never made a tool call.
@@ -838,7 +861,8 @@ fn close_case(name: &'static str, case: CloseCase) {
                             None,
                         )
                         .await;
-                        assert_hold_or_retry(&mut daemon.stream, pid, "not-synced").await;
+                        assert_hold_or_retry(&mut daemon.stream, pid, &pid_path, "not-synced")
+                            .await;
                     }
                     #[cfg(feature = "test-timing-hooks")]
                     CloseCase::SlowResync => {
@@ -864,7 +888,7 @@ fn close_case(name: &'static str, case: CloseCase) {
                             let body: Value = serde_json::from_slice(&request.body).unwrap();
                             assert_eq!(body["op"], "scope.describe");
                             assert!(alive(pid), "inconclusive reply {attempt} must hold work");
-                            assert_run_not_killing();
+                            assert_run_not_killing(&pid_path).await;
                         }
                         answer(
                             &mut daemon.stream,
@@ -893,7 +917,8 @@ fn close_case(name: &'static str, case: CloseCase) {
                             .unwrap(),
                         )
                         .await;
-                        assert_hold_or_retry(&mut daemon.stream, pid, "describe error").await;
+                        assert_hold_or_retry(&mut daemon.stream, pid, &pid_path, "describe error")
+                            .await;
                     }
                     CloseCase::Timeout => {
                         #[cfg(not(feature = "test-timing-hooks"))]
@@ -904,7 +929,13 @@ fn close_case(name: &'static str, case: CloseCase) {
                         )
                         .await
                         .is_none());
-                        assert_hold_or_retry(&mut daemon.stream, pid, "describe timeout").await;
+                        assert_hold_or_retry(
+                            &mut daemon.stream,
+                            pid,
+                            &pid_path,
+                            "describe timeout",
+                        )
+                        .await;
                     }
                     CloseCase::NewEpoch => {
                         answer(
@@ -946,7 +977,7 @@ fn close_case(name: &'static str, case: CloseCase) {
                                 .await;
                         }
                         assert!(alive(pid), "a live epoch move must not kill");
-                        assert_run_not_killing();
+                        assert_run_not_killing(&pid_path).await;
                     }
                     CloseCase::NotLive => {
                         answer(
@@ -978,9 +1009,9 @@ fn close_case(name: &'static str, case: CloseCase) {
                 if should_kill {
                     wait_dead(pid).await;
                     if run {
-                        assert_run_kill_settled("run-session").await;
+                        assert_run_kill_settled(&pid_path, "run-session").await;
                     } else {
-                        assert_scope_kill_settled().await;
+                        assert_scope_kill_settled(&pid_path).await;
                     }
                 }
                 if matches!(case, CloseCase::Duplicate) {
@@ -1535,10 +1566,6 @@ fn codemode_background_task_killed_when_run_scope_ends_and_only_then() {
         Duration::from_secs(30),
         |input| async move {
             use subc_protocol::scope::ScopeStatus;
-            *OBSERVED_TASK
-                .get_or_init(|| Mutex::new(None))
-                .lock()
-                .unwrap() = None;
             let mut daemon = open_scope_daemon_session(input).await;
             bind_head(&mut daemon.stream, &daemon.root1, 1, "head-session").await;
             // Two routes of one run: closing one is a transient close.
@@ -1574,13 +1601,7 @@ fn codemode_background_task_killed_when_run_scope_ends_and_only_then() {
             );
             let pid = child_pid(&pid_path).await;
             let _cleanup = ChildCleanup(pid);
-            let (registry, task) = OBSERVED_TASK
-                .get()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .clone()
-                .unwrap();
+            let (registry, task) = observed_task(&pid_path).await;
             // The task belongs to the head's session, so the agent reads it.
             assert!(registry
                 .status(&task, "head-session", None, None, 0)
@@ -1639,7 +1660,7 @@ fn codemode_background_task_killed_when_run_scope_ends_and_only_then() {
             )
             .await;
             wait_dead(pid).await;
-            assert_run_kill_settled("head-session").await;
+            assert_run_kill_settled(&pid_path, "head-session").await;
             send_connection_goodbye(&mut daemon.stream).await;
         },
         |_, _, _| {},

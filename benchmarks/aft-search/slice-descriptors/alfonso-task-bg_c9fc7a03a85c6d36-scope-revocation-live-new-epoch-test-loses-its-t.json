@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "scope-revocation-observed-task"
+  ],
+  "note": "Test-only: crates/aft/tests/integration/scope_revocation_test.rs looks up the bash task it observed by the command it sent and waits for the spawn dispatch to report it, instead of reading a process-wide slot that could be empty or hold an earlier test's task. No aft_search ranking, fusion, lane admission or truncation change."
+}
