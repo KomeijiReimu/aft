@@ -374,5 +374,85 @@ class MergeQueueEvaluationTests(unittest.TestCase):
 
 
 
+class SkewedQueueHistoryTests(unittest.TestCase):
+    """Merge-queue commits carry committer dates out of order. Ranges must follow
+    ancestry, not dates: one queue group reported main's own merge commit as a
+    PR commit because `git rev-list base..head` stopped its walk on dates."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="aft-skewed-queue-")
+        self.addCleanup(self.temp.cleanup)
+        self.repo = Path(self.temp.name)
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.name", "Queue fixture")
+        self.git("config", "user.email", "queue-fixture@example.invalid")
+        self.git("config", "commit.gpgsign", "false")
+        self.commit("01:00:00", "root")
+        m1 = self.commit("02:00:00", "m1")
+        self.merged_main = self.commit("03:00:00", "merged main commit")
+        self.pr_base = self.commit("03:10:00", "pr base")
+        self.git("checkout", "-qb", "pr")
+        self.pr_head = self.commit("10:00:00", "pr commit")
+        self.git("checkout", "-qb", "side", m1)
+        self.commit("02:30:00", "side")
+        self.git("checkout", "-q", "main")
+        # Later main commits dated before everything the PR sits on, more of them
+        # than the five extra commits git walks before ending a date-ordered
+        # range walk.
+        for minute in range(1, 9):
+            self.commit(f"00:1{minute}:00", f"queue {minute}")
+        self.git("merge", "-q", "--no-ff", "-m", "group base", "side",
+                 env=self.dated("00:19:30"))
+        self.group_base = self.git("rev-parse", "HEAD")
+
+    def dated(self, clock: str) -> dict:
+        stamp = f"2026-01-01T{clock}Z"
+        return {**os.environ, "GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp}
+
+    def git(self, *args: str, env: dict | None = None) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=self.repo, env=env, text=True, check=True, capture_output=True
+        ).stdout.strip()
+
+    def commit(self, clock: str, message: str) -> str:
+        self.git("commit", "-q", "--allow-empty", "-m", message, env=self.dated(clock))
+        return self.git("rev-parse", "HEAD")
+
+    def in_repo(self):
+        previous = Path.cwd()
+        os.chdir(self.repo)
+        self.addCleanup(os.chdir, previous)
+
+    def test_pr_commits_exclude_main_commits_the_group_base_contains(self) -> None:
+        # The naive range lists the PR base and an older main commit too.
+        naive = self.git("rev-list", f"{self.group_base}..{self.pr_head}").splitlines()
+        self.assertIn(self.merged_main, naive)
+        sys.path.insert(0, str(ROOT / "scripts/lib"))
+        import landing_policy
+
+        self.in_repo()
+        self.assertEqual(landing_policy.commits_between(self.group_base, self.pr_head), [self.pr_head])
+
+    def test_first_parent_chain_stops_exactly_at_base(self) -> None:
+        queue = import_queue_search()
+        self.in_repo()
+        chain = queue.first_parent_between(self.pr_base, self.group_base)
+        self.assertEqual(len(chain), 9)
+        self.assertEqual(chain[-1], self.group_base)
+        self.assertNotIn(self.pr_base, chain)
+        with self.assertRaises(queue.InputFault):
+            queue.first_parent_between(self.pr_head, self.group_base)
+
+
+def import_queue_search():
+    spec = importlib.util.spec_from_file_location(
+        "merge_queue_search", ROOT / "scripts/merge-queue-search.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -26,13 +26,25 @@ def git(*args: str, input: str | None = None) -> str:
     return subprocess.check_output(["git", *args], input=input, text=True).strip()
 
 
+def commits_between(base: str, head: str) -> list[str]:
+    """Commits reachable from head but not from base, newest first.
+
+    Compares full ancestry sets instead of asking `git rev-list base..head`.
+    Merge-queue commits carry committer dates out of order, and git's
+    date-based range walk then lists commits that base already contains (a
+    queue group once reported main's own merge commit as a PR commit).
+    """
+    known = set(git("rev-list", base).splitlines())
+    return [sha for sha in git("rev-list", head).splitlines() if sha not in known]
+
+
 def check_commits(base: str, head: str, branch: str) -> int:
     for sha in (base, head):
         if re.fullmatch(r"[0-9a-f]{40}", sha) is None:
             raise ValueError("identity policy requires full base/head SHAs")
         git("cat-file", "-e", f"{sha}^{{commit}}")
     count = 0
-    for sha in git("rev-list", f"{base}..{head}").splitlines():
+    for sha in commits_between(base, head):
         name, author, committer, message = git(
             "show", "-s", "--format=%an%x00%ae%x00%ce%x00%B", sha
         ).split("\0", 3)
@@ -80,7 +92,7 @@ def check_event(event: str, payload: dict) -> int:
             base = git("merge-base", "origin/main", head)
             return check_commits(base, head, payload["ref"].removeprefix("refs/heads/"))
         base = payload["before"]
-        commits = git("rev-list", "--first-parent", f"{base}..{head}").splitlines()
+        commits = queue.first_parent_between(base, head)
         if commits and all(len(git("show", "-s", "--format=%P", sha).split()) == 2 for sha in commits):
             members = queue.queue_members(base, head, None, payload["repository"]["full_name"])
             return sum(check_commits(base, member["head"], member["branch"]) for member in members)
