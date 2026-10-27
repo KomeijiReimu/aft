@@ -148,8 +148,10 @@ impl State {
     }
 
     fn mark_stopped(&self) {
-        let _gate = self.material_gate.lock();
+        // Latch cancellation before waiting for a synchronous vault callback.
+        // Its return must not authorize dispatch just because stop is waiting.
         self.stopped.store(true, Ordering::Release);
+        let _gate = self.material_gate.lock();
     }
 
     fn scrubber(&self) -> Result<Scrubber, ()> {
