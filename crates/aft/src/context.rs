@@ -278,6 +278,22 @@ pub(crate) const VIEW_PUBLICATION_WAITING_FOR_SEMANTIC_INDEX: &str =
 /// generation, and opens the view to load its manifest.
 pub(crate) const VIEW_PUBLICATION_PIN_PHASE: &str = "pin";
 
+/// The call-graph build breaker database for one project under a resolved
+/// cache root, when it exists. Health callers pass a root they resolved once
+/// for the whole rollup tick rather than re-resolving it per context.
+pub(crate) fn build_breaker_path_for_health(
+    cache_dir: &Path,
+    project_key: Option<&str>,
+) -> Option<PathBuf> {
+    project_key.and_then(|key| {
+        let path = cache_dir
+            .join("callgraph")
+            .join(key)
+            .join("build-breaker.sqlite");
+        path.is_file().then_some(path)
+    })
+}
+
 fn now_epoch_ms() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -9240,8 +9256,7 @@ impl AppContext {
         project_key: Option<&str>,
         now_ms: u64,
     ) {
-        let suspensions = self
-            .build_breaker_path_for_health(project_key)
+        let suspensions = build_breaker_path_for_health(&self.cache_dir(), project_key)
             .and_then(|path| crate::build_breaker::BuildDeathBreaker::open(path).ok())
             .and_then(|breaker| {
                 breaker
@@ -9250,21 +9265,6 @@ impl AppContext {
             })
             .unwrap_or_default();
         self.publish_build_suspensions_for_health(suspensions, now_ms);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn build_breaker_path_for_health(
-        &self,
-        project_key: Option<&str>,
-    ) -> Option<PathBuf> {
-        project_key.and_then(|key| {
-            let path = self
-                .cache_dir()
-                .join("callgraph")
-                .join(key)
-                .join("build-breaker.sqlite");
-            path.is_file().then_some(path)
-        })
     }
 
     pub(crate) fn publish_build_suspensions_for_health(

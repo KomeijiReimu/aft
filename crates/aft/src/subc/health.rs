@@ -2379,14 +2379,7 @@ impl HealthRollupCache {
             .min(u128::from(u64::MAX)) as u64;
         // The caller resolved the cache root once for the whole tick; the
         // breaker database lives under it for every context sharing the root.
-        let Some(path) = project_key
-            .map(|key| {
-                cache_dir
-                    .join("callgraph")
-                    .join(key)
-                    .join("build-breaker.sqlite")
-            })
-            .filter(|path| path.is_file())
+        let Some(path) = crate::context::build_breaker_path_for_health(cache_dir, project_key)
         else {
             ctx.publish_build_suspensions_for_health(Vec::new(), now_ms);
             return;
