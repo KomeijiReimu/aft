@@ -27401,12 +27401,18 @@ mod tests {
 
     #[test]
     fn each_line_terminal_summary_frame_fixture() {
-        // Host integration tests consume the native emitter's frame, not a
-        // reconstruction that could hide a disagreement in durable identity.
-        println!(
-            "AFT_EACH_LINE_TERMINAL_FRAME={}",
-            serde_json::to_string(&each_line_terminal_frame()).unwrap()
-        );
+        // Host integration tests consume the checked-in native emitter frame
+        // (packages/opencode-plugin/src/__tests__/fixtures/each-line-terminal-frame.json),
+        // not a reconstruction that could hide a disagreement in durable identity.
+        // Spawning cargo from a host test hangs offline builders, so the frame
+        // lives in the file and this test pins it: if the emitter changes,
+        // update the fixture to the new live frame printed below.
+        let live = serde_json::to_value(&each_line_terminal_frame()).unwrap();
+        let pinned: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../packages/opencode-plugin/src/__tests__/fixtures/each-line-terminal-frame.json"
+        ))
+        .unwrap();
+        assert_eq!(live, pinned);
     }
 
     #[test]

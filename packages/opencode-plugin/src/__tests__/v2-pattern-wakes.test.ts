@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { BashPatternMatchFrame } from "@cortexkit/aft-bridge";
 import { Effect, Exit, PubSub, Scope, Stream } from "effect";
@@ -654,64 +655,42 @@ function latch() {
 }
 
 function nativeTerminalFrame(): BashPatternMatchFrame {
-  const fixture = Bun.spawnSync({
-    cmd: [
-      "cargo",
-      "test",
-      "-p",
-      "agent-file-tools",
-      "--lib",
-      "--",
-      "bash_background::registry::tests::each_line_terminal_summary_frame_fixture",
-      "--exact",
-      "--nocapture",
-    ],
-    cwd: join(import.meta.dir, "../../../.."),
-    env: { ...process.env, RUSTC_WRAPPER: "", CARGO_BUILD_RUSTC_WRAPPER: "" },
-    stdout: "pipe",
-    stderr: "pipe",
-    timeout: 20 * 60 * 1000,
-  });
-  if (fixture.exitCode !== 0)
-    throw new Error(`native terminal fixture failed: ${fixture.stderr.toString()}`);
-  const frame = fixture.stdout.toString().match(/AFT_EACH_LINE_TERMINAL_FRAME=(\{[^\n]+\})/)?.[1];
-  if (!frame)
-    throw new Error(`native terminal fixture emitted no frame: ${fixture.stdout.toString()}`);
-  return JSON.parse(frame) as BashPatternMatchFrame;
+  // Checked-in native emitter output (see each-line-terminal-frame.json).
+  // Spawning cargo from a host test hangs offline builders; the Rust suite
+  // asserts the live frame equals this pinned file.
+  return JSON.parse(
+    readFileSync(join(import.meta.dir, "fixtures/each-line-terminal-frame.json"), "utf8"),
+  ) as BashPatternMatchFrame;
 }
 
-test(
-  "V2 each_line terminal cap summary survives the durable version fence",
-  async () => {
-    const native = nativeTerminalFrame();
-    const r = await rig();
-    try {
-      await r.register(false, "each_line");
-      const pending = eachLineSnapshot("terminal-pending", eachLineFrame(0, "READY first"));
-      pending.match_offset = 123;
-      pending.batch!.dropped_lines = 7;
-      pending.batch!.first_dropped_offset = 123;
-      pending.batch!.first_dropped_stream = "stderr";
-      r.setPending(pending);
-      await r.push(native);
-      expect(r.synthetic).toHaveLength(1);
-      expect(r.synthetic[0]?.text).toContain(
-        '7 matching lines dropped. Read them with bash_status({ taskId: "bash-running", stderrOffset: 123 }).',
-      );
-      expect(r.synthetic[0]?.text).toContain("stdout byte 0: READY first");
-      expect(
-        r.sends.filter((send) => send.command === "bash_ack_completions").at(-1)?.params,
-      ).toEqual({
-        session_id: "session-v2",
-        matches: [{ task_id: "bash-running", watch_id: "watch-ready", match_offset: 123 }],
-      });
-      expect(r.pending()).toBeUndefined();
-    } finally {
-      await r.close();
-    }
-  },
-  20 * 60 * 1000,
-);
+test("V2 each_line terminal cap summary survives the durable version fence", async () => {
+  const native = nativeTerminalFrame();
+  const r = await rig();
+  try {
+    await r.register(false, "each_line");
+    const pending = eachLineSnapshot("terminal-pending", eachLineFrame(0, "READY first"));
+    pending.match_offset = 123;
+    pending.batch!.dropped_lines = 7;
+    pending.batch!.first_dropped_offset = 123;
+    pending.batch!.first_dropped_stream = "stderr";
+    r.setPending(pending);
+    await r.push(native);
+    expect(r.synthetic).toHaveLength(1);
+    expect(r.synthetic[0]?.text).toContain(
+      '7 matching lines dropped. Read them with bash_status({ taskId: "bash-running", stderrOffset: 123 }).',
+    );
+    expect(r.synthetic[0]?.text).toContain("stdout byte 0: READY first");
+    expect(
+      r.sends.filter((send) => send.command === "bash_ack_completions").at(-1)?.params,
+    ).toEqual({
+      session_id: "session-v2",
+      matches: [{ task_id: "bash-running", watch_id: "watch-ready", match_offset: 123 }],
+    });
+    expect(r.pending()).toBeUndefined();
+  } finally {
+    await r.close();
+  }
+});
 
 test("V2 each_line superseded push delivers every durable line once", async () => {
   const r = await rig();
