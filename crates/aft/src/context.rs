@@ -12120,6 +12120,20 @@ impl AppContext {
         true
     }
 
+    /// Test hook: hold back query-triggered trigram reloads for the current
+    /// configure generation, as the retry cooldown in
+    /// `search_index_query_reload_allowed` does. A test can then observe a
+    /// root whose saved trigram cache is valid but not resident, without its
+    /// own search request starting a reload whose completion races the reply.
+    #[doc(hidden)]
+    pub fn defer_query_search_index_reloads_for_test(&self) {
+        const HOLD: Duration = Duration::from_secs(60 * 60);
+        let generation = self.configure_generation();
+        let mut state = self.search_index_disconnect_reschedule.lock();
+        let replacements = if state.0 == generation { state.1 } else { 0 };
+        *state = (generation, replacements, Some(Instant::now() + HOLD));
+    }
+
     pub(crate) fn note_search_index_load_succeeded(&self) {
         let generation = self.configure_generation();
         let mut state = self.search_index_disconnect_reschedule.lock();
