@@ -3079,6 +3079,167 @@ fn delay_symbol_prewarm_for_debug() {
     thread::sleep(Duration::from_millis(delay_ms));
 }
 
+/// What one views-routed symbol prewarm did with the files it was given.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SymbolViewPrewarm {
+    /// Already in the symbol cache for the file's current modification time.
+    cached: u64,
+    /// Served from rows the family's v3 symbol plane already held.
+    reused: u64,
+    /// Parsed here and stored into the v3 symbol plane.
+    stored: u64,
+    /// Left for an ordinary on-demand parse: unreadable, changed since the
+    /// lexical view verified it, or not parseable.
+    skipped: u64,
+}
+
+/// Pre-warms the symbol cache of a views-routed root from the files its
+/// lexical v3 view verified, on a background thread. Symbols come from the
+/// family's v3 symbol plane, keyed by content, so a file another checkout of
+/// the family already parsed is not parsed again; only misses are parsed and
+/// then stored for every checkout. The legacy symbol cache file is neither
+/// read nor written.
+fn spawn_symbol_view_prewarm(ctx: &AppContext, snapshot: &crate::search_index::SearchIndexSnapshot) {
+    let files = snapshot.file_entries().to_vec();
+    let symbol_cache = ctx.symbol_cache();
+    let generation = symbol_cache
+        .read()
+        .map(|cache| cache.generation())
+        .unwrap_or_default();
+    let storage = ctx.storage_paths().artifacts;
+    let root = ctx.canonical_cache_root();
+    let family = ctx.memoized_artifact_cache_key(&root);
+    let routes = ctx.symbol_view_route_counter();
+    let session_id = log_ctx::current_session();
+    let spawned = thread::Builder::new()
+        .name("aft-symbol-view-prewarm".to_owned())
+        .spawn(move || {
+            log_ctx::with_session(session_id, || {
+                #[cfg(debug_assertions)]
+                delay_symbol_prewarm_for_debug();
+                let report = prewarm_symbol_cache_from_view(
+                    &storage,
+                    &family,
+                    &symbol_cache,
+                    generation,
+                    &files,
+                );
+                routes.fetch_add(report.reused + report.stored, Ordering::Relaxed);
+                slog_info!(
+                    "pre-warmed symbol cache from the v3 symbol plane: {} reused, {} stored, {} cached, {} skipped root={}",
+                    report.reused,
+                    report.stored,
+                    report.cached,
+                    report.skipped,
+                    root.display()
+                );
+            });
+        });
+    if let Err(error) = spawned {
+        slog_warn!("symbol view prewarm thread failed to start: {}", error);
+    }
+}
+
+fn prewarm_symbol_cache_from_view(
+    storage: &Path,
+    family: &str,
+    symbol_cache: &SharedSymbolCache,
+    generation: u64,
+    files: &[crate::search_index::FileEntry],
+) -> SymbolViewPrewarm {
+    use crate::views::symbol_store;
+    let mut report = SymbolViewPrewarm::default();
+    let producer = symbol_store::SymbolProducer::current();
+    let mut rows = Vec::new();
+    // False once a newer configure reset the cache; that configure runs its
+    // own prewarm.
+    let insert = |file: &crate::search_index::FileEntry, symbols: Vec<crate::symbols::Symbol>| {
+        let Ok(mut cache) = symbol_cache.write() else {
+            return false;
+        };
+        if cache.generation() != generation {
+            return false;
+        }
+        cache.insert_for_generation(
+            generation,
+            file.path.clone(),
+            file.modified,
+            file.size,
+            file.content_hash,
+            symbols,
+        );
+        true
+    };
+    for file in files {
+        if symbol_cache
+            .read()
+            .is_ok_and(|cache| cache.contains_path_with_mtime(&file.path, file.modified))
+        {
+            report.cached += 1;
+            continue;
+        }
+        let Some(lang) = crate::parser::detect_language(&file.path) else {
+            continue;
+        };
+        let content = crate::blob_store::v2::ContentHash::from_bytes(*file.content_hash.as_bytes());
+        match symbol_store::lookup(storage, family, content, &file.path) {
+            Ok(Some(symbols)) => {
+                if !insert(file, symbols.as_ref().clone()) {
+                    break;
+                }
+                report.reused += 1;
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                slog_debug!(
+                    "v3 symbol lookup failed path={}: {}",
+                    file.path.display(),
+                    error
+                );
+            }
+        }
+        // Only the bytes the lexical view verified may be stored under its
+        // content hash; a file that moved on is left for an on-demand parse.
+        let source = match crate::parser::read_source(&file.path) {
+            Ok(source) if blake3::hash(source.as_bytes()) == file.content_hash => source,
+            _ => {
+                report.skipped += 1;
+                continue;
+            }
+        };
+        let symbols = crate::parser::parse_source_with_cached_parser(&file.path, &source, lang)
+            .and_then(|tree| crate::parser::extract_symbols_from_tree(&source, &tree, lang));
+        let Ok(symbols) = symbols else {
+            report.skipped += 1;
+            continue;
+        };
+        let language = symbol_store::language_id(lang);
+        let key = symbol_store::SymbolKey {
+            content,
+            language: language.clone(),
+            producer,
+        }
+        .family_key();
+        rows.push((
+            key,
+            symbol_store::encode_payload(&producer, &language, &symbols),
+        ));
+        if !insert(file, symbols) {
+            break;
+        }
+        report.stored += 1;
+    }
+    if !rows.is_empty() {
+        if let Err(error) = symbol_store::put(storage, family, &rows) {
+            slog_warn!("storing prewarmed symbols in the v3 symbol plane failed: {}", error);
+            report.skipped += report.stored;
+            report.stored = 0;
+        }
+    }
+    report
+}
+
 fn walk_semantic_project_files_bounded(
     root: &Path,
     max_files: usize,
@@ -8604,7 +8765,12 @@ fn run_configure_maintenance_unit_inner(
                 && ctx.config().views.enabled
                 && !job.root_too_broad
             {
-                if ctx.config().indexes.semantic || ctx.config().indexes.callgraph {
+                if ctx.views_route_root() {
+                    // Every read of this root goes through its v3 checkout
+                    // views; the v1 view is neither opened, imported into
+                    // nor published.
+                    ctx.drop_v1_view_runtime();
+                } else if ctx.config().indexes.semantic || ctx.config().indexes.callgraph {
                     finish_configure_view_load(
                         ctx,
                         prepare_configure_view(&ConfigureViewInput::capture(ctx, job), job),
@@ -8612,8 +8778,15 @@ fn run_configure_maintenance_unit_inner(
                 } else {
                     ctx.clear_view_runtime();
                 }
-                if let Some(Err(error)) = ctx.lexical_view_snapshot("bind") {
-                    slog_warn!("lexical checkout view unavailable: {}", error);
+                match ctx.lexical_view_snapshot("bind") {
+                    Some(Err(error)) => {
+                        slog_warn!("lexical checkout view unavailable: {}", error);
+                    }
+                    // The symbol prewarm follows the files the view verified.
+                    Some(Ok(snapshot)) if ctx.views_route_root() => {
+                        spawn_symbol_view_prewarm(ctx, &snapshot);
+                    }
+                    _ => {}
                 }
             } else {
                 ctx.clear_view_runtime();
@@ -15756,6 +15929,191 @@ mod tests {
             "{:?}",
             legacy_answers[0].1.data
         );
+    }
+
+    /// What a root's storage holds outside the v3 namespace: content-addressed
+    /// v1 views and v1/v2 blob stores, plus the legacy symbol cache file.
+    fn legacy_views_on_writes(storage: &Path) -> Vec<String> {
+        let mut found = Vec::new();
+        for (dir, keep) in [("blobs", Some("v3")), ("views", None), ("symbols", None)] {
+            if let Ok(entries) = std::fs::read_dir(storage.join(dir)) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if keep != Some(name.as_str()) {
+                        found.push(format!("{dir}/{name}"));
+                    }
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn views_routed_root_publishes_no_v1_view_and_puts_no_legacy_blobs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        for (name, text) in [
+            ("a.ts", "export function target() { return 1; }\n"),
+            (
+                "b.ts",
+                "import { target } from './a';\nexport function caller() { return target(); }\n",
+            ),
+        ] {
+            std::fs::write(root.join(name), text).unwrap();
+        }
+        git_commit_all(&root, "graph");
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        assert!(ctx.views_route_root());
+        // The view load stage runs here; a routed root opens no v1 view.
+        super::drain_deferred_configure_maintenance(&ctx);
+        let callers = |ctx: &AppContext| {
+            crate::commands::callers::handle_callers(
+                &RawRequest {
+                    id: "routed-callers".into(),
+                    command: "callers".into(),
+                    lsp_hints: None,
+                    session_id: None,
+                    params: json!({"file": root.join("a.ts"), "symbol": "target", "depth": 1}),
+                },
+                ctx,
+            )
+        };
+        let answer = callers(&ctx);
+        assert!(answer.success, "{:?}", answer.data);
+        assert!(ctx.callgraph_view_route_count() > 0);
+
+        // An edit, a watcher overflow and every publication trigger (a queued
+        // path publication and a full one) leave the v1 view and the legacy
+        // blob stores untouched.
+        std::fs::write(
+            root.join("b.ts"),
+            "import { target } from './a';\nexport function caller() { return target() + target(); }\n",
+        )
+        .unwrap();
+        ctx.record_checkout_watcher_change(&root.join("b.ts"));
+        ctx.record_checkout_watcher_overflow();
+        let _ = crate::executor::view_publication::schedule(
+            &ctx,
+            BTreeSet::from([b"b.ts".to_vec()]),
+            true,
+        );
+        let _ = crate::executor::view_publication::schedule(&ctx, BTreeSet::new(), true);
+        let answer = callers(&ctx);
+        assert!(answer.success, "{:?}", answer.data);
+        assert_eq!(legacy_views_on_writes(&storage), Vec::<String>::new());
+        assert_eq!(ctx.view_publication_attempts_for_test(), 0);
+        assert!(ctx.view_runtime_snapshot().is_none());
+        let direct = ctx.publish_view_paths(BTreeSet::new(), true);
+        assert!(
+            direct.as_ref().is_err_and(|error| error
+                .to_string()
+                .contains(crate::context::VIEW_PUBLICATION_STOPPED_ON_ROUTED_ROOT)),
+            "{direct:?}"
+        );
+        assert_eq!(legacy_views_on_writes(&storage), Vec::<String>::new());
+        assert!(
+            crate::blob_store::v3::family_dir(&storage, &ctx.memoized_artifact_cache_key(&root))
+                .unwrap()
+                .is_dir()
+        );
+
+        // Views off is not a routed root.
+        let off = test_context();
+        assert!(
+            handle_configure_for_test(
+                &configure_callgraph_views(&root, &temp.path().join("off-storage"), false),
+                &off
+            )
+            .success
+        );
+        assert!(!off.views_route_root());
+    }
+
+    #[test]
+    fn views_routed_symbol_prewarm_stores_then_reuses_v3_symbol_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("lib.rs"),
+            "pub fn alpha() -> u32 { 1 }\npub struct Beta;\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("notes.md"), "# notes\n").unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        super::drain_deferred_configure_maintenance(&ctx);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while ctx.symbol_view_route_count() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the routed symbol prewarm never ran"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let family = ctx.memoized_artifact_cache_key(&root);
+        let lib = root.join("lib.rs");
+        let bytes = std::fs::read(&lib).unwrap();
+        let stored = crate::views::symbol_store::lookup(
+            &storage,
+            &family,
+            crate::blob_store::v2::ContentHash::of(&bytes),
+            &lib,
+        )
+        .unwrap()
+        .expect("the prewarm stored lib.rs's symbols in the v3 symbol plane");
+        let names: Vec<_> = stored.iter().map(|symbol| symbol.name.clone()).collect();
+        assert!(names.contains(&"alpha".to_owned()), "{names:?}");
+        let modified = std::fs::metadata(&lib).unwrap().modified().unwrap();
+        assert!(ctx
+            .symbol_cache()
+            .read()
+            .unwrap()
+            .contains_path_with_mtime(&lib, modified));
+        assert_eq!(legacy_views_on_writes(&storage), Vec::<String>::new());
+
+        // A fresh cache over the same files reuses the stored rows: nothing
+        // is parsed or stored again.
+        let snapshot = ctx.lexical_view_snapshot("bind").unwrap().unwrap();
+        let fresh: crate::parser::SharedSymbolCache =
+            Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new()));
+        let report = super::prewarm_symbol_cache_from_view(
+            &storage,
+            &family,
+            &fresh,
+            0,
+            snapshot.file_entries(),
+        );
+        let parsed_files = snapshot
+            .file_entries()
+            .iter()
+            .filter(|file| crate::parser::detect_language(&file.path).is_some())
+            .count() as u64;
+        assert!(parsed_files >= 1);
+        assert_eq!(
+            report,
+            super::SymbolViewPrewarm {
+                reused: parsed_files,
+                ..Default::default()
+            }
+        );
+        assert!(fresh
+            .read()
+            .unwrap()
+            .contains_path_with_mtime(&lib, modified));
     }
 
     fn configure_search_with_max_file_size(

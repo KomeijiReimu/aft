@@ -273,6 +273,10 @@ const VIEW_DISK_LIMITS_OFF: u64 = u64::MAX;
 /// checkout's semantic index has finished loading.
 pub(crate) const VIEW_PUBLICATION_WAITING_FOR_SEMANTIC_INDEX: &str =
     "semantic view publication is waiting for the semantic index";
+/// Refusal of a content-addressed v1 view publication on a root whose views
+/// route every read through its v3 checkout views.
+pub(crate) const VIEW_PUBLICATION_STOPPED_ON_ROUTED_ROOT: &str =
+    "v1 view publication is stopped: this root's views read its v3 checkout views";
 /// The publication phase that takes the query pin for a newly assembled
 /// generation. Before it, publication walks source paths, assembles the
 /// generation, and opens the view to load its manifest.
@@ -4563,6 +4567,9 @@ pub struct AppContext {
     lexical_routes: [AtomicU64; 3],
     callgraph_view: parking_lot::Mutex<Option<Arc<crate::views::callgraph::CallgraphView>>>,
     callgraph_view_routes: AtomicU64,
+    /// Files whose symbols a views-routed root's prewarm reused from, or
+    /// stored into, the family's v3 symbol plane.
+    symbol_view_routes: Arc<AtomicU64>,
     /// The views-on semantic lane of this root (see `views::semantic_runtime`).
     checkout_semantic: Arc<crate::views::semantic_runtime::CheckoutSemanticSlot>,
     /// Wall-clock milliseconds at which the completion drain should next
@@ -5416,6 +5423,7 @@ impl AppContext {
             lexical_routes: Default::default(),
             callgraph_view: parking_lot::Mutex::new(None),
             callgraph_view_routes: AtomicU64::new(0),
+            symbol_view_routes: Arc::default(),
             checkout_semantic: Arc::default(),
             view_disk_limits_next_ms,
             checkout_query_runtime: RwLock::new(None),
@@ -9660,6 +9668,18 @@ impl AppContext {
         drop(retired);
     }
 
+    /// Drops this root's content-addressed v1 view runtime and nothing else:
+    /// the checkout drivers and the semantic lane keep running.
+    pub(crate) fn drop_v1_view_runtime(&self) {
+        self.release_view_publication_cache();
+        let retired = self
+            .view_runtime
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        drop(retired);
+    }
+
     fn release_view_publication_cache(&self) {
         let view_dir = self
             .view_runtime
@@ -9899,6 +9919,9 @@ impl AppContext {
         }
         let content_generation = self.configure_content_generation();
         phase("manifest").map_err(|error| error.to_string())?;
+        if self.views_route_root() {
+            return Err(VIEW_PUBLICATION_STOPPED_ON_ROUTED_ROOT.to_owned());
+        }
         if self.retire_deleted_view_root() {
             return Err("view publication root was deleted".to_owned());
         }
@@ -12122,9 +12145,18 @@ impl AppContext {
     /// the checkout's v3 view rather than the legacy store or a v1 view. An
     /// explicitly installed checkout query runtime keeps precedence.
     pub(crate) fn callgraph_views_enabled(&self) -> bool {
+        self.views_route_root() && self.config().indexes.callgraph
+    }
+
+    /// True when views serve this root through its own v3 checkout views
+    /// (lexical, call graph and semantic) rather than the content-addressed
+    /// v1 view or the legacy stores. Such a root runs none of the legacy
+    /// views-on writers: no v1 view publication or import, no v1 blob puts
+    /// and no legacy semantic import. An explicitly installed checkout query
+    /// runtime keeps the older route.
+    pub(crate) fn views_route_root(&self) -> bool {
         let config = self.config();
         config.views.enabled
-            && config.indexes.callgraph
             && config.project_root.is_some()
             && self.heavy_root_work_allowed()
             && self.cache_unavailable_reason().is_none()
@@ -12215,6 +12247,16 @@ impl AppContext {
     /// Executed v3 call-graph acquisitions (one per pinned request).
     pub fn callgraph_view_route_count(&self) -> u64 {
         self.callgraph_view_routes.load(Ordering::Relaxed)
+    }
+
+    /// Files a views-routed symbol prewarm served from or stored into the
+    /// v3 symbol plane.
+    pub fn symbol_view_route_count(&self) -> u64 {
+        self.symbol_view_routes.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn symbol_view_route_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.symbol_view_routes)
     }
 
     pub(crate) fn search_exact_memo(

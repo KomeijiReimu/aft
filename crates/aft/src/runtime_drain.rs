@@ -2728,10 +2728,13 @@ fn watcher_path_is_generated_for_callgraph(ctx: &AppContext, path: &Path) -> boo
 }
 
 fn published_view_owns_callgraph_writes(ctx: &AppContext) -> bool {
-    ctx.config().views.enabled
-        && ctx
-            .view_runtime_snapshot()
-            .is_some_and(|view| view.generation.is_some() && view.manifest.is_some())
+    // A views-routed root reads its call graph from its v3 view only, so no
+    // legacy store refresh runs for it.
+    ctx.views_route_root()
+        || ctx.config().views.enabled
+            && ctx
+                .view_runtime_snapshot()
+                .is_some_and(|view| view.generation.is_some() && view.manifest.is_some())
 }
 
 fn enqueue_legacy_callgraph_refresh_for_watcher(
@@ -4073,6 +4076,11 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 if ctx.config().views.enabled {
                     // Changed ignore rules change which files the checkout has.
                     ctx.note_checkout_changed_for_callgraph();
+                    if ctx.views_route_root() {
+                        // The v3 checkout views reconcile their membership
+                        // in full at their next read.
+                        ctx.record_checkout_watcher_overflow();
+                    }
                     ctx.reset_view_publication_retry();
                     state.view_publication_paths.clear();
                     state.view_publication_full = true;

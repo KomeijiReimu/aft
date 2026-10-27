@@ -238,11 +238,6 @@ pub(crate) fn open_published_callgraph(
     ReadonlyCallGraphStore::open_manifest_view(project_root, family, view_dir, generation, pin)
 }
 
-/// Why a linked worktree's own generation cannot answer call-graph queries:
-/// it was published without a derived database, which is built on first use.
-pub(crate) const CALLGRAPH_NOT_BUILT: &str =
-    "this checkout's call graph has not been built yet; the first query that needs it starts the build";
-
 /// True when `generation` has a call-graph database to read: its own derived
 /// file, or the checkout-wide `derived.sqlite` that older publications used,
 /// when that holds a ready graph. A linked worktree publishes generations

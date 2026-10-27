@@ -883,6 +883,12 @@ impl SearchIndexSnapshot {
             .and_then(|id| self.files.get(*id as usize))
             .map(|file| file.modified)
     }
+
+    /// The files this snapshot answers for, with the size, modification time
+    /// and content hash it verified for each.
+    pub(crate) fn file_entries(&self) -> &[FileEntry] {
+        &self.files
+    }
     /// Number of unique trigrams in the combined base index and delta postings.
     pub fn trigram_count(&self) -> usize {
         let base_count = self.base.as_ref().map_or(0, |base| base.lookup.len());
@@ -1902,6 +1908,24 @@ impl SearchIndex {
         Self {
             project_root: root.to_path_buf(),
             ready: true,
+            ..Self::new()
+        }
+    }
+
+    /// A read-only index over a snapshot projected from a published view.
+    /// It is never written or persisted; its holder replaces it with the
+    /// next publication instead of applying file changes to it.
+    pub(crate) fn from_view_snapshot(snapshot: SearchIndexSnapshot) -> Self {
+        Self {
+            base: snapshot.base,
+            delta: snapshot.delta,
+            files: snapshot.files,
+            path_to_id: snapshot.path_to_id,
+            ready: snapshot.ready,
+            project_root: snapshot.project_root,
+            max_file_size: snapshot.max_file_size,
+            file_trigram_count: snapshot.file_trigram_count,
+            unindexed_files: snapshot.unindexed_files,
             ..Self::new()
         }
     }

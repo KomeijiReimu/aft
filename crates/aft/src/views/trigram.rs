@@ -347,6 +347,81 @@ impl LexicalView {
     }
 }
 
+/// The query snapshot of a lexical view generation another session
+/// published, for a foreign reader such as a parent folder. It answers as of
+/// that publication: entries come from the generation alone, and a file whose
+/// trigram payload the generation does not name as ready is refused rather
+/// than read from the disk.
+pub(crate) fn project_published(
+    root: &Path,
+    storage: &Path,
+    family: &str,
+    policy: TrigramPolicy,
+    generation: &super::snapshot::ComposedGeneration,
+) -> Result<crate::search_index::SearchIndexSnapshot, String> {
+    use super::segment_store::PayloadSource;
+    let mut source = None;
+    let mut rows = Vec::new();
+    for (path, entry) in generation.entries() {
+        let super::manifest_v2::EntryV2::Regular { content, size, .. } = entry else {
+            continue;
+        };
+        let (content, size) = (*content, *size);
+        let absolute = root.join(rel_path_to_os(path).map_err(|error| error.to_string())?);
+        let key = crate::blob_store::v2::TrigramKey { content, policy }.family_key();
+        if generation.plane_readiness(path, FamilyPlane::Trigram)
+            != Some(&super::readiness::PlaneState::ready(&key))
+        {
+            return Err(format!("lexical payload not ready: {}", absolute.display()));
+        }
+        if source.is_none() {
+            source = Some(
+                crate::blob_store::v3::PlaneReader::open_existing(
+                    storage,
+                    family,
+                    FamilyPlane::Trigram,
+                )
+                .map_err(|error| error.to_string())?,
+            );
+        }
+        let bytes = source
+            .as_ref()
+            .unwrap()
+            .payload(&key)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("lexical payload missing: {}", absolute.display()))?;
+        let payload = TrigramPayload::decode(&bytes).map_err(|error| error.to_string())?;
+        // The file's own modification time when it still exists; a foreign
+        // reader does not verify the bytes, so a moved-on file still answers
+        // with the published content's postings.
+        let modified = fs::metadata(&absolute)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        rows.push((
+            crate::search_index::FileEntry {
+                path: absolute,
+                size,
+                modified,
+                content_hash: blake3::Hash::from_bytes(*content.as_bytes()),
+            },
+            (payload.flag == TrigramFlag::Indexed).then(|| {
+                payload
+                    .records
+                    .into_iter()
+                    .map(|record| (record.trigram, record.next_mask, record.loc_mask))
+                    .collect()
+            }),
+        ));
+    }
+    Ok(
+        crate::search_index::SearchIndexSnapshot::from_verified_rows(
+            root,
+            policy.max_file_size,
+            rows,
+        ),
+    )
+}
+
 #[cfg(test)]
 pub(crate) struct BaseBuilderTestSource {
     root: PathBuf,
