@@ -1,6 +1,7 @@
 //! Durable rich-UI assets and catalog attestations in the process's shared aft.db.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
 use std::sync::Mutex;
 
 use rusqlite::{params, Connection, OptionalExtension};

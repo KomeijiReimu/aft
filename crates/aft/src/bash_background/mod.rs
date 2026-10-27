@@ -741,12 +741,12 @@ pub(crate) fn with_call_requester<T>(requester: Option<String>, run: impl FnOnce
     run()
 }
 
-/// The v1 `bash` schema pin of the tool call whose dispatch runs on this
-/// thread, if any. Installed around the dispatch like the call key (see
-/// [`with_call_key`]), because the spawn path that records the task only
-/// sees the tool's own arguments. A pinless call leaves no pin, and so no
-/// view record, even when view writing is enabled.
 thread_local! {
+    /// The v1 `bash` schema pin of the tool call whose dispatch runs on this
+    /// thread, if any. Installed around the dispatch like the call key (see
+    /// [`with_call_key`]), because the spawn path that records the task only
+    /// sees the tool's own arguments. A pinless call leaves no pin, and so
+    /// no view record, even when view writing is enabled.
     static CURRENT_SCHEMA_PIN: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 }

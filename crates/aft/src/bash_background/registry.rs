@@ -3681,14 +3681,16 @@ impl BgTaskRegistry {
         let Some(view) = view else {
             return;
         };
-        let Some(map) = data.as_object_mut() else {
-            return;
-        };
-        map.insert("view".to_string(), view);
-        if serde_json::to_vec(&*data).is_ok_and(|body| {
+        {
+            let Some(map) = data.as_object_mut() else {
+                return;
+            };
+            map.insert("view".to_string(), view);
+        }
+        if serde_json::to_vec(data).is_ok_and(|body| {
             body.len() >= crate::subc::result_body::MAX_RESULT_BYTES
         }) {
-            map.remove("view");
+            data.as_object_mut().and_then(|map| map.remove("view"));
         }
     }
 
