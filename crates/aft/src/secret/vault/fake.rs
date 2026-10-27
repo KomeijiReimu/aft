@@ -109,11 +109,6 @@ impl FakeVault {
             .insert(label.to_string(), values);
     }
 
-    /// The labels `resolve` was asked about, in order.
-    pub fn resolves(&self) -> Vec<String> {
-        self.lock().resolves.clone()
-    }
-
     /// The labels `material` was asked about, in order.
     pub fn materials(&self) -> Vec<String> {
         self.lock().materials.clone()
