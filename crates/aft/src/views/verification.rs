@@ -681,7 +681,9 @@ pub(crate) fn write_evidence(
         }
         tx.commit()?;
         drop(db);
-        fs::File::open(&staging)?.sync_all()?;
+        // Windows refuses FlushFileBuffers on a read-only handle, so sync
+        // through the views helper, which opens the file for writing there.
+        super::sync_file(&staging)?;
         if destination.exists() {
             fs::remove_file(&staging)?;
         } else {
@@ -862,7 +864,9 @@ pub(crate) fn write_tree_proof(
         }
         tx.commit()?;
         drop(db);
-        fs::File::open(&staging)?.sync_all()?;
+        // Windows refuses FlushFileBuffers on a read-only handle, so sync
+        // through the views helper, which opens the file for writing there.
+        super::sync_file(&staging)?;
         fs::rename(&staging, &destination)?;
         super::sync_directory(dir)?;
         Ok(())

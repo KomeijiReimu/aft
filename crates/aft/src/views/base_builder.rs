@@ -425,7 +425,9 @@ impl BuildClaim {
             .view_dir()
             .join(format!(".derived-{generation}.ref.tmp"));
         std::fs::write(&temporary, owner.as_bytes())?;
-        std::fs::File::open(&temporary)?.sync_all()?;
+        // Windows refuses FlushFileBuffers on a read-only handle, so sync
+        // through the views helper, which opens the file for writing there.
+        super::sync_file(&temporary)?;
         std::fs::rename(&temporary, &reference)?;
         super::sync_directory(store.view_dir())?;
         Ok(())
