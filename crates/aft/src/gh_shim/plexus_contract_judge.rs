@@ -568,8 +568,8 @@ fn discriminant(request: &Value) -> (Option<String>, Option<String>, bool) {
 }
 
 /// Every vendored request vector through the stand-in judge, demanding the
-/// exact pinned outcome: all 144 accepted requests accepted, every refused
-/// request refused with its exact code (the field name is part of the code).
+/// exact pinned outcome for all 144: every accepted request accepted, every
+/// refused request refused with its exact code (the field name is part of the code).
 /// This pins the stand-in to Plexus's exact decisions: when the shim's
 /// pre-signing round trip ran against a stand-in that accepted the
 /// `gh_route_schema` envelope field live Plexus refused
