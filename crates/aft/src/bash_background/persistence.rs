@@ -785,6 +785,7 @@ impl PinnedDir {
             device: root.directory_identity()?.0,
             mount: root.repair_mount_identity()?,
             protected,
+            regular_files_only: false,
         }
         .check(self)
     }
@@ -934,6 +935,43 @@ impl PinnedDir {
         warnings: &mut Vec<String>,
         budget: &mut RepairBudget,
     ) -> io::Result<()> {
+        self.repair_remove_child_with_policy(
+            name, expected, protected, false, removed, warnings, budget,
+        )
+    }
+
+    /// Remove a tree too large to validate in one walk before deleting it.
+    /// The removal applies the validation rules as it goes: it stays on one
+    /// filesystem, skips protected directories, and stops with
+    /// [`NonRegularEntryRetained`] at the first symlink or special file
+    /// instead of unlinking it. A stop (that one, or the budget running out)
+    /// keeps everything not yet removed, and `removed` counts what was, so a
+    /// later call continues where this one stopped rather than starting over.
+    pub(crate) fn repair_remove_regular_child_with_budget(
+        &self,
+        name: &OsStr,
+        expected: (u64, u64),
+        protected: &[(u64, u64)],
+        removed: &mut usize,
+        warnings: &mut Vec<String>,
+        budget: &mut RepairBudget,
+    ) -> io::Result<()> {
+        self.repair_remove_child_with_policy(
+            name, expected, protected, true, removed, warnings, budget,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn repair_remove_child_with_policy(
+        &self,
+        name: &OsStr,
+        expected: (u64, u64),
+        protected: &[(u64, u64)],
+        regular_files_only: bool,
+        removed: &mut usize,
+        warnings: &mut Vec<String>,
+        budget: &mut RepairBudget,
+    ) -> io::Result<()> {
         budget.enter(0)?;
         let child = self.repair_child(name)?;
         if child.directory_identity()? != expected {
@@ -943,6 +981,7 @@ impl PinnedDir {
             device: self.directory_identity()?.0,
             mount: self.repair_mount_identity()?,
             protected,
+            regular_files_only,
         };
         policy.check(&child)?;
         repair_remove_contents(&child, &policy, removed, budget, 0, warnings)?;
@@ -1063,6 +1102,7 @@ impl PinnedDir {
             device: self.directory_identity()?.0,
             mount: self.repair_mount_identity()?,
             protected,
+            regular_files_only: false,
         };
         self.repair_child(name)?
             .repair_measure(&policy, &mut RepairBudget::new(), 0)
@@ -1453,6 +1493,196 @@ impl PinnedDir {
     fn remove_self(&self) -> io::Result<()> {
         self.ensure_current_identity()?;
         windows_delete_pinned_handle(&self.file, true)
+    }
+
+    /// Fail with [`NonRegularEntryRetained`] unless `name` is a regular file,
+    /// checked without following a symlink.
+    #[cfg(unix)]
+    fn repair_require_regular_file(&self, name: &OsStr) -> io::Result<()> {
+        let c_name = os_cstring(name)?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                self.file.as_raw_fd(),
+                c_name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { stat.assume_init() }.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(io::Error::other(NonRegularEntryRetained(
+                self.path.join(name),
+            )));
+        }
+        Ok(())
+    }
+
+    /// Type and write access of the entry `name`, read without following a
+    /// symlink.
+    pub(crate) fn repair_entry_status(&self, name: &OsStr) -> io::Result<RepairEntryStatus> {
+        #[cfg(unix)]
+        {
+            let c_name = os_cstring(name)?;
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe {
+                libc::fstatat(
+                    self.file.as_raw_fd(),
+                    c_name.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let stat = unsafe { stat.assume_init() };
+            Ok(RepairEntryStatus::unix(stat.st_mode as u32, stat.st_uid))
+        }
+        #[cfg(windows)]
+        {
+            self.ensure_current_identity()?;
+            Ok(RepairEntryStatus::windows(&fs::symlink_metadata(
+                self.path.join(name),
+            )?))
+        }
+    }
+
+    /// [`Self::repair_entry_status`] for this opened directory itself.
+    pub(crate) fn repair_status(&self) -> io::Result<RepairEntryStatus> {
+        let metadata = self.file.metadata()?;
+        #[cfg(unix)]
+        {
+            Ok(RepairEntryStatus::unix(metadata.mode(), metadata.uid()))
+        }
+        #[cfg(windows)]
+        {
+            Ok(RepairEntryStatus::windows(&metadata))
+        }
+    }
+
+    /// Give the owner read, write and search permission on this opened
+    /// directory so its entries can be listed and unlinked. Only a directory
+    /// owned by the current user is changed; for any other the later unlink
+    /// reports the permission error.
+    #[cfg(unix)]
+    fn restore_owner_access(&self) -> io::Result<()> {
+        let metadata = self.file.metadata()?;
+        let mode = metadata.mode() & 0o7777;
+        if mode & 0o700 == 0o700 || metadata.uid() != unsafe { libc::geteuid() } {
+            return Ok(());
+        }
+        // fchmod changes the inode this handle pinned, never a path.
+        if unsafe { libc::fchmod(self.file.as_raw_fd(), (mode | 0o700) as libc::mode_t) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Restore owner access to the child directory `name`, which could not be
+    /// opened because its owner lacks read or search permission. Returns the
+    /// identity of the directory that was changed. Returns `denied` unchanged
+    /// when the child belongs to another user or this platform has no way to
+    /// change it without following a symlink, and a `NotADirectory` error when
+    /// the entry is not a directory, so the caller unlinks it as a leaf.
+    #[cfg(unix)]
+    fn restore_child_directory_access(
+        &self,
+        name: &OsStr,
+        denied: io::Error,
+    ) -> io::Result<(u64, u64)> {
+        let c_name = os_cstring(name)?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                self.file.as_raw_fd(),
+                c_name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "entry is not a directory",
+            ));
+        }
+        if stat.st_uid != unsafe { libc::geteuid() } {
+            return Err(denied);
+        }
+        // A mount point's root can be locked like any directory; never change
+        // permissions on another filesystem (see `open_dir_for_removal`).
+        if removal_device(&self.path.join(name), stat.st_dev as u64)
+            != removal_device(&self.path, self.directory_identity()?.0)
+        {
+            return Err(io::Error::other(ForeignFilesystemRetained(
+                self.path.join(name),
+            )));
+        }
+        let identity = (stat.st_dev as u64, stat.st_ino as u64);
+        let mode = (stat.st_mode as u32 & 0o7777) | 0o700;
+        #[cfg(target_os = "macos")]
+        {
+            // With AT_SYMLINK_NOFOLLOW Darwin changes a symlink itself, so an
+            // entry swapped for a link after the stat above still cannot
+            // redirect the change outside the tree.
+            if unsafe {
+                libc::fchmodat(
+                    self.file.as_raw_fd(),
+                    c_name.as_ptr(),
+                    mode as libc::mode_t,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(identity)
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // Linux's fchmodat cannot refuse symlinks, and fchmod does not
+            // accept the O_PATH handle that opening a directory without read
+            // permission requires. Pin the directory with O_PATH and
+            // O_NOFOLLOW, check it is the one stat'ed above, then change it
+            // through /proc/self/fd, which names exactly that pinned inode.
+            let fd = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    c_name.as_ptr(),
+                    libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let pinned = unsafe { File::from_raw_fd(fd) };
+            let metadata = pinned.metadata()?;
+            if (metadata.dev(), metadata.ino()) != identity {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "directory changed while its permissions were restored for removal",
+                ));
+            }
+            let proc_path = CString::new(format!("/proc/self/fd/{fd}"))?;
+            if unsafe { libc::chmod(proc_path.as_ptr(), mode as libc::mode_t) } != 0 {
+                // Without /proc there is no symlink-safe way to change it.
+                return Err(denied);
+            }
+            drop(pinned);
+            Ok(identity)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+        {
+            let _ = (identity, mode);
+            Err(denied)
+        }
     }
 }
 
@@ -3520,8 +3750,15 @@ impl RepairBudget {
                 "repair cancelled",
             ));
         }
-        if depth > 64 || std::time::Instant::now() >= self.deadline {
-            return Err(io::Error::other("repair traversal limit exceeded"));
+        if depth > 64 {
+            // Not a budget stop: a deeper tree is just as deep next pass, so
+            // reporting it as progress to continue would retry it forever.
+            return Err(io::Error::other(
+                "repair traversal limit exceeded: more than 64 nested directories",
+            ));
+        }
+        if std::time::Instant::now() >= self.deadline {
+            return Err(io::Error::other(RepairLimitExceeded));
         }
         Ok(())
     }
@@ -3530,8 +3767,80 @@ impl RepairBudget {
         self.remaining = self
             .remaining
             .checked_sub(1)
-            .ok_or_else(|| io::Error::other("repair traversal limit exceeded"))?;
+            .ok_or_else(|| io::Error::other(RepairLimitExceeded))?;
         Ok(())
+    }
+}
+
+/// A bounded repair walk ran out of entries, depth or time. The walk stopped
+/// cleanly; anything it already removed stays removed.
+#[derive(Debug)]
+pub(crate) struct RepairLimitExceeded;
+
+impl std::fmt::Display for RepairLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("repair traversal limit exceeded")
+    }
+}
+
+impl std::error::Error for RepairLimitExceeded {}
+
+/// Whether a repair walk stopped because its budget ran out or its caller
+/// cancelled it, rather than because of what it found on disk.
+pub(crate) fn is_repair_budget_stop(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Interrupted
+        || error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<RepairLimitExceeded>())
+}
+
+/// A tree removed without validating it first met an entry that is neither a
+/// directory nor a regular file (a symlink, socket or device node). It is
+/// kept, untouched, together with everything not yet removed.
+#[derive(Debug)]
+// Only Unix walks construct it; Windows stops at the same entries through
+// its validated delete handles.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) struct NonRegularEntryRetained(pub(crate) PathBuf);
+
+impl std::fmt::Display for NonRegularEntryRetained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "non-regular entry retained: {}", self.0.display())
+    }
+}
+
+impl std::error::Error for NonRegularEntryRetained {}
+
+/// What a no-follow stat says about one entry.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RepairEntryStatus {
+    pub(crate) is_dir: bool,
+    pub(crate) is_file: bool,
+    /// Owned by the current user, and neither its group nor other users may
+    /// write it. Windows storage directories are per-user, so there this only
+    /// requires the entry not to be a reparse point.
+    pub(crate) private: bool,
+}
+
+impl RepairEntryStatus {
+    #[cfg(unix)]
+    fn unix(mode: u32, uid: u32) -> Self {
+        let kind = mode & libc::S_IFMT as u32;
+        Self {
+            is_dir: kind == libc::S_IFDIR as u32,
+            is_file: kind == libc::S_IFREG as u32,
+            private: uid == unsafe { libc::geteuid() } && mode & 0o022 == 0,
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows(metadata: &fs::Metadata) -> Self {
+        let reparse = metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        Self {
+            is_dir: !reparse && metadata.is_dir(),
+            is_file: !reparse && metadata.is_file(),
+            private: !reparse,
+        }
     }
 }
 
@@ -3555,6 +3864,9 @@ struct RepairPolicy<'a> {
     device: u64,
     mount: (u64, Vec<u8>),
     protected: &'a [(u64, u64)],
+    /// Stop at a symlink or special file instead of unlinking it. Used when a
+    /// tree is removed without a complete validation walk first.
+    regular_files_only: bool,
 }
 pub(crate) const REPAIR_WITNESS_LEAF: &str = ".aft-retirement.json";
 
@@ -3792,6 +4104,19 @@ fn repair_traversal_refuses_expired_deadline() {
     assert!(error.to_string().contains("traversal limit"), "{error}");
 }
 
+/// Running out of time or entries is progress a later pass continues; a tree
+/// nested too deeply is equally deep next pass, so it must not look the same.
+#[test]
+fn repair_depth_limit_is_not_a_budget_stop() {
+    let budget = RepairBudget::new();
+    let deep = budget.enter(65).expect_err("depth 65 must be refused");
+    assert!(!is_repair_budget_stop(&deep), "{deep}");
+    assert!(deep.to_string().contains("nested directories"), "{deep}");
+    let mut expired = RepairBudget::new();
+    expired.deadline = std::time::Instant::now();
+    assert!(is_repair_budget_stop(&expired.enter(0).unwrap_err()));
+}
+
 impl RepairPolicy<'_> {
     fn check(&self, dir: &PinnedDir) -> io::Result<()> {
         let actual = dir.directory_identity()?;
@@ -3849,9 +4174,18 @@ fn repair_remove_contents(
             }
             Err(error) if repair_leaf_error(&error) => {
                 #[cfg(unix)]
-                dir.remove_file(&name)?;
+                {
+                    if policy.regular_files_only {
+                        dir.repair_require_regular_file(&name)?;
+                    }
+                    dir.remove_file(&name)?;
+                }
                 #[cfg(windows)]
                 {
+                    // The delete handle is validated as a regular, non-reparse
+                    // file, so a Windows walk always stops at links and
+                    // special files, whatever the policy asks.
+                    let _ = policy.regular_files_only;
                     let file =
                         windows_relative_repair_file(&dir.file, &name, RepairOpen::DeleteFile)?;
                     let outcome = windows_delete_pinned_handle_outcome(&file, false)?;
@@ -3869,29 +4203,160 @@ fn repair_remove_contents(
     Ok(())
 }
 
+/// Remove everything below `dir` without following symlinks or junctions.
+///
+/// Commands can leave directories that their owner cannot write inside the
+/// trees AFT deletes: Go's module cache is read-only by design, and test
+/// suites `chmod -w` fixture folders and may exit before restoring them.
+/// Unlinking an entry needs write and search permission on the directory that
+/// holds it, so on Unix the walk gives the owner back full access to each
+/// directory before emptying it. That change is made only through handles
+/// opened without following links (see [`open_dir_for_removal`]): a symlink
+/// inside the tree is removed as a link and never lets the walk change
+/// permissions on, or delete, anything outside the tree. On Windows the
+/// read-only attribute of each deleted file is cleared through its pinned
+/// handle instead (see `windows_delete_pinned_handle_outcome`).
 fn remove_tree_contents(dir: &PinnedDir) -> io::Result<()> {
+    #[cfg(unix)]
+    dir.restore_owner_access()
+        .map_err(|error| removal_error(error, dir.path()))?;
     for name in dir.list_names()? {
-        match dir.open_dir_at(&name) {
+        match open_dir_for_removal(dir, &name) {
             Ok(child) => {
                 remove_tree_contents(&child)?;
                 #[cfg(unix)]
                 {
-                    let name = os_cstring(&name)?;
+                    let c_name = os_cstring(&name)?;
                     let result = unsafe {
-                        libc::unlinkat(dir.file.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR)
+                        libc::unlinkat(dir.file.as_raw_fd(), c_name.as_ptr(), libc::AT_REMOVEDIR)
                     };
                     if result != 0 {
-                        return Err(io::Error::last_os_error());
+                        return Err(removal_error(
+                            io::Error::last_os_error(),
+                            &dir.path().join(&name),
+                        ));
                     }
                 }
                 #[cfg(windows)]
                 child.remove_self()?;
             }
-            Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
-                dir.remove_file(&name)?;
+            // A symlink (ELOOP on macOS, ENOTDIR on Linux) or any other
+            // non-directory is unlinked itself; its target is never opened.
+            Err(error) if repair_leaf_error(&error) => {
+                dir.remove_file(&name)
+                    .map_err(|error| removal_error(error, &dir.path().join(&name)))?;
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(removal_error(error, &dir.path().join(&name))),
         }
+    }
+    Ok(())
+}
+
+/// Name the entry a permission failure is about, so a bundle that still
+/// cannot be removed reports which file or directory blocked it. Other
+/// errors keep their original text, which callers and tests match on.
+fn removal_error(error: io::Error, path: &Path) -> io::Error {
+    if error.kind() != io::ErrorKind::PermissionDenied {
+        return error;
+    }
+    io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+}
+
+/// Open a child directory for removal. On Unix a directory whose owner lacks
+/// read or search permission cannot be opened, so its owner access is
+/// restored first, without following a symlink, and the reopened directory
+/// must be the one whose permissions were changed.
+///
+/// The child must be on the same filesystem as `dir`. A command can leave a
+/// mount (sshfs, rclone, macFUSE, a disk image attached under its TMPDIR)
+/// inside the trees AFT deletes; descending into it would empty that volume.
+/// Such a child fails with [`ForeignFilesystemRetained`], which is not a leaf
+/// error, so the walk stops and keeps the whole tree for the owner to unmount.
+fn open_dir_for_removal(dir: &PinnedDir, name: &OsStr) -> io::Result<PinnedDir> {
+    let child = match dir.open_dir_at(name) {
+        #[cfg(unix)]
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            let restored = dir.restore_child_directory_access(name, error)?;
+            let child = dir.open_dir_at(name)?;
+            if child.directory_identity()? != restored {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "directory changed while its permissions were restored for removal",
+                ));
+            }
+            child
+        }
+        result => result?,
+    };
+    if removal_device(child.path(), child.directory_identity()?.0)
+        != removal_device(dir.path(), dir.directory_identity()?.0)
+        || child.repair_mount_identity()? != dir.repair_mount_identity()?
+    {
+        return Err(io::Error::other(ForeignFilesystemRetained(
+            child.path().to_path_buf(),
+        )));
+    }
+    Ok(child)
+}
+
+/// The device a removal walk compares to stay on one filesystem. Tests cannot
+/// mount a filesystem, so they inject a different device per path through
+/// `REPAIR_IDENTITIES`, the same seam the repair policy uses.
+fn removal_device(path: &Path, actual: u64) -> u64 {
+    #[cfg(test)]
+    if let Some(identity) = REPAIR_IDENTITIES.with(|ids| ids.borrow().get(path).copied()) {
+        return identity.0;
+    }
+    #[cfg(not(test))]
+    let _ = path;
+    actual
+}
+
+/// A removal walk met a directory on another filesystem (a mount point) and
+/// kept it, with everything below it and the tree that contains it.
+#[derive(Debug)]
+pub(crate) struct ForeignFilesystemRetained(pub(crate) PathBuf);
+
+impl std::fmt::Display for ForeignFilesystemRetained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: directory is on another filesystem (a mount point); kept, unmount it so \
+             the rest can be removed",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for ForeignFilesystemRetained {}
+
+/// Remove the directory `name` inside `parent` and everything below it,
+/// restoring owner access to read-only directories on the way (see
+/// [`remove_tree_contents`]). The directory must belong to the current user:
+/// AFT only force-removes trees it created for its own tasks.
+#[cfg(unix)]
+pub(crate) fn remove_directory_tree_at(parent: &PinnedDir, name: &OsStr) -> io::Result<()> {
+    let child = open_dir_for_removal(parent, name)?;
+    if child.file.metadata()?.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{}: directory to remove belongs to another user",
+                child.path().display()
+            ),
+        ));
+    }
+    remove_tree_contents(&child)?;
+    if !child.same_identity(&parent.open_dir_at(name)?)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "directory identity changed before removal",
+        ));
+    }
+    let c_name = os_cstring(name)?;
+    if unsafe { libc::unlinkat(parent.file.as_raw_fd(), c_name.as_ptr(), libc::AT_REMOVEDIR) } != 0
+    {
+        return Err(removal_error(io::Error::last_os_error(), child.path()));
     }
     Ok(())
 }
@@ -4997,6 +5462,14 @@ const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 #[cfg(windows)]
 const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x0000_0007;
 #[cfg(windows)]
+const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+#[cfg(windows)]
+const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
+#[cfg(windows)]
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+#[cfg(windows)]
+const FILE_BASIC_INFO_CLASS: i32 = 0;
+#[cfg(windows)]
 const FILE_DISPOSITION_INFO: i32 = 4;
 #[cfg(windows)]
 const FILE_DISPOSITION_INFO_EX: i32 = 21;
@@ -5468,13 +5941,19 @@ fn windows_delete_pinned_handle_outcome(
     // Reopen the pinned object, not a path that could be swapped. A distinct
     // DELETE file object is necessary: POSIX disposition unlinks the name when
     // that handle closes, even if the original pins remain open.
+    // Windows refuses to delete a file that carries the read-only attribute
+    // (commands and tools such as `attrib +r` or Go's module cache set it).
+    // Clear it through the same pinned handle that is about to be deleted, so
+    // only this file changes and no path is resolved again.
+    let readonly = !directory
+        && windows_file_information(file)?.file_attributes & FILE_ATTRIBUTE_READONLY != 0;
     let deletion = if directory {
         windows_reopen_directory_for_delete(file)?
     } else {
         let handle = unsafe {
             ReOpenFile(
                 file.as_raw_handle(),
-                GENERIC_READ | DELETE_ACCESS,
+                GENERIC_READ | DELETE_ACCESS | if readonly { FILE_WRITE_ATTRIBUTES } else { 0 },
                 FILE_SHARE_READ_WRITE_DELETE,
                 FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
             )
@@ -5488,6 +5967,9 @@ fn windows_delete_pinned_handle_outcome(
         validate_directory_handle(&deletion)?;
     } else {
         validate_regular_handle(&deletion)?;
+    }
+    if readonly {
+        windows_clear_readonly(&deletion)?;
     }
     let result = windows_delete_with_fallback(|disposition| {
         let success = match disposition {
@@ -5523,6 +6005,48 @@ fn windows_delete_pinned_handle_outcome(
     });
     drop(deletion);
     result
+}
+
+/// Layout of the Win32 `FILE_BASIC_INFO` structure. Zero timestamps mean
+/// "leave unchanged" when it is written with `SetFileInformationByHandle`.
+#[cfg(windows)]
+#[repr(C)]
+struct WindowsFileBasicInfo {
+    creation_time: i64,
+    last_access_time: i64,
+    last_write_time: i64,
+    change_time: i64,
+    file_attributes: u32,
+}
+
+#[cfg(windows)]
+fn windows_clear_readonly(file: &File) -> io::Result<()> {
+    let attributes = windows_file_information(file)?.file_attributes & !FILE_ATTRIBUTE_READONLY;
+    let mut info = WindowsFileBasicInfo {
+        creation_time: 0,
+        last_access_time: 0,
+        last_write_time: 0,
+        change_time: 0,
+        // Zero attributes would also mean "leave unchanged"; NORMAL is the
+        // documented value for a file with no other attributes.
+        file_attributes: if attributes == 0 {
+            FILE_ATTRIBUTE_NORMAL
+        } else {
+            attributes
+        },
+    };
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FILE_BASIC_INFO_CLASS,
+            (&mut info as *mut WindowsFileBasicInfo).cast(),
+            std::mem::size_of::<WindowsFileBasicInfo>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -7042,6 +7566,160 @@ mod tests {
             &task.dirs.io.path().join(".sandbox-tmp-already-removed"),
         )
         .unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bundle_deletion_restores_owner_access_and_leaves_symlink_targets_alone() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let mode = |path: &Path| fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777;
+        let set = |path: &Path, mode: u32| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let storage = tempfile::tempdir().unwrap();
+        let (task, mut metadata) = counted_task(storage.path());
+        // A directory outside the bundle that links inside it point at. Its
+        // contents and its (read-only) mode must survive the deletion.
+        let outside = storage.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), "outside").unwrap();
+        fs::create_dir(outside.join("locked")).unwrap();
+        set(&outside.join("locked"), 0o500);
+        set(&outside, 0o555);
+
+        // Inside the IO tree: a Go-module-cache-like read-only tree, a
+        // directory with no owner access at all, and links to the outside.
+        let io = task.dirs.io.path().to_path_buf();
+        let module = io.join("gomodcache/example.com/mod@v1");
+        fs::create_dir_all(&module).unwrap();
+        fs::write(module.join("go.mod"), "module example.com/mod").unwrap();
+        symlink(&outside, module.join("outside-link")).unwrap();
+        symlink(outside.join("locked"), io.join("locked-link")).unwrap();
+        let sealed = io.join("sealed");
+        fs::create_dir_all(sealed.join("inner")).unwrap();
+        fs::write(sealed.join("inner/file"), "sealed").unwrap();
+        set(&module, 0o555);
+        set(module.parent().unwrap(), 0o555);
+        set(&io.join("gomodcache"), 0o555);
+        set(&sealed.join("inner"), 0o311);
+        set(&sealed, 0o000);
+
+        // The command's TMPDIR, removed with the bundle, is read-only too.
+        let temp = crate::sandbox_spawn::create_task_temp_dir(&io).unwrap();
+        fs::create_dir_all(temp.join("build/cache")).unwrap();
+        fs::write(temp.join("build/cache/object"), "object").unwrap();
+        symlink(&outside, temp.join("build/outside-link")).unwrap();
+        set(&temp.join("build/cache"), 0o500);
+        set(&temp.join("build"), 0o555);
+        set(&temp, 0o500);
+        metadata.sandbox_temp_dir = Some(temp.clone());
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        write_task_at(&task, &metadata).unwrap();
+
+        delete_task_bundle(&task.paths).unwrap();
+
+        assert!(!task.paths.dir.exists(), "the bundle was not removed");
+        assert!(!temp.exists(), "the task scratch was not removed");
+        assert!(!temp.with_extension("owner").exists());
+        assert_eq!(fs::read_to_string(outside.join("keep")).unwrap(), "outside");
+        assert_eq!(mode(&outside), 0o555, "a symlink target's mode changed");
+        assert_eq!(mode(&outside.join("locked")), 0o500);
+        set(&outside, 0o755);
+        set(&outside.join("locked"), 0o755);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn removal_walk_keeps_a_directory_on_another_filesystem() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("scratch");
+        fs::create_dir_all(root.join("build")).unwrap();
+        fs::write(root.join("build/object"), "object").unwrap();
+        // Stands in for a volume a command mounted under its TMPDIR, with a
+        // read-only folder the walk would otherwise unlock and empty.
+        let mounted = root.join("mounted");
+        fs::create_dir_all(mounted.join("locked")).unwrap();
+        fs::write(mounted.join("locked/precious"), "precious").unwrap();
+        fs::write(mounted.join("precious"), "precious").unwrap();
+        fs::set_permissions(mounted.join("locked"), fs::Permissions::from_mode(0o555)).unwrap();
+        // A locked mount root that the walk could only open by changing it,
+        // in its own tree so the walk cannot stop at the other mount first.
+        let sealed_root = temp.path().join("other-scratch");
+        let sealed = sealed_root.join("sealed-mount");
+        fs::create_dir_all(&sealed).unwrap();
+        fs::write(sealed.join("precious"), "precious").unwrap();
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000)).unwrap();
+        REPAIR_IDENTITIES.with(|ids| {
+            let mut ids = ids.borrow_mut();
+            ids.insert(mounted.clone(), (u64::MAX - 1, 1));
+            ids.insert(sealed.clone(), (u64::MAX - 1, 2));
+        });
+
+        let first = remove_tree_contents(&PinnedDir::open(&root).unwrap());
+        let second = remove_tree_contents(&PinnedDir::open(&sealed_root).unwrap());
+        REPAIR_IDENTITIES.with(|ids| ids.borrow_mut().clear());
+
+        for result in [first, second] {
+            let error = result.expect_err("a mount inside the tree must stop the walk");
+            assert!(
+                error
+                    .get_ref()
+                    .is_some_and(|inner| inner.is::<ForeignFilesystemRetained>()),
+                "{error}"
+            );
+            assert!(error.to_string().contains("another filesystem"), "{error}");
+        }
+        assert_eq!(
+            fs::metadata(&sealed).unwrap().permissions().mode() & 0o7777,
+            0,
+            "the walk changed permissions on another filesystem"
+        );
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            fs::read_to_string(sealed.join("precious")).unwrap(),
+            "precious"
+        );
+        assert_eq!(
+            fs::read_to_string(mounted.join("precious")).unwrap(),
+            "precious"
+        );
+        assert_eq!(
+            fs::read_to_string(mounted.join("locked/precious")).unwrap(),
+            "precious"
+        );
+        assert_eq!(
+            fs::metadata(mounted.join("locked"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o555
+        );
+        fs::set_permissions(mounted.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_bundle_deletion_removes_read_only_files() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task, _) = counted_task(storage.path());
+        let nested = task.dirs.io.path().join("cache");
+        fs::create_dir(&nested).unwrap();
+        for path in [
+            nested.join("module.zip"),
+            task.paths.dir.join("wrapper.ps1"),
+        ] {
+            fs::write(&path, b"read-only").unwrap();
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(&path, permissions).unwrap();
+        }
+
+        delete_task_bundle(&task.paths).unwrap();
+
+        assert!(!task.paths.dir.exists());
+        assert!(task.dirs.session.list_names().unwrap().is_empty());
     }
 
     #[test]

@@ -8371,6 +8371,7 @@ mod tests {
                                 "witness".into(),
                                 2,
                             )]),
+                            ..Default::default()
                         },
                         ..Default::default()
                     },
