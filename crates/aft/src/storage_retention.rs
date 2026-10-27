@@ -6138,6 +6138,7 @@ mod storage_retention_tests {
                 pid: 4242,
                 hostname: "other-host".into(),
                 created_at_ms: 1_761_300_000_000,
+                nonce: None,
             })
             .unwrap(),
         )
