@@ -1060,12 +1060,43 @@ fn audit_worker_write_is_refused_before_any_broker_or_relay_traffic() {
     let mut delegated = Vec::new();
     let mut lookups = 0;
     for raw in [
-        vec!["issue", "comment", "7", "--body", "hello", "--repo", "cortexkit/aft"],
+        vec![
+            "issue",
+            "comment",
+            "7",
+            "--body",
+            "hello",
+            "--repo",
+            "cortexkit/aft",
+        ],
         vec!["pr", "review", "7", "--approve", "--repo", "cortexkit/aft"],
-        vec!["issue", "edit", "7", "--add-label", "bug", "--repo", "cortexkit/aft"],
-        vec!["issue", "close", "7", "--reason", "completed", "--repo", "cortexkit/aft"],
+        vec![
+            "issue",
+            "edit",
+            "7",
+            "--add-label",
+            "bug",
+            "--repo",
+            "cortexkit/aft",
+        ],
+        vec![
+            "issue",
+            "close",
+            "7",
+            "--reason",
+            "completed",
+            "--repo",
+            "cortexkit/aft",
+        ],
         vec!["pr", "close", "7", "--repo", "cortexkit/aft"],
-        vec!["api", "-X", "POST", "repos/cortexkit/aft/issues/7/comments", "-f", "body=hello"],
+        vec![
+            "api",
+            "-X",
+            "POST",
+            "repos/cortexkit/aft/issues/7/comments",
+            "-f",
+            "body=hello",
+        ],
     ] {
         let status = run_with(
             &args(&raw),
@@ -1117,7 +1148,15 @@ fn audit_worker_write_opens_no_broker_connection() {
     let _no_ticket = Env::set(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, None);
     let listener = UnixListener::bind(&socket).unwrap();
     let status = run_with(
-        &args(&["issue", "comment", "7", "--body", "hello", "--repo", "cortexkit/aft"]),
+        &args(&[
+            "issue",
+            "comment",
+            "7",
+            "--body",
+            "hello",
+            "--repo",
+            "cortexkit/aft",
+        ]),
         |_| panic!("worker write must not delegate"),
         |_, _, _, _| panic!("worker write must not reach identity lookup"),
     );
@@ -1184,7 +1223,9 @@ fn audit_worker_read_still_reaches_the_broker() {
                 unexpected => panic!("worker read sent an unexpected broker op: {unexpected}"),
             };
             let reply = serde_json::to_vec(&json!({"status": "ok", "data": data})).unwrap();
-            stream.write_all(&(reply.len() as u32).to_be_bytes()).unwrap();
+            stream
+                .write_all(&(reply.len() as u32).to_be_bytes())
+                .unwrap();
             stream.write_all(&reply).unwrap();
             served.lock().unwrap().push(operation.clone());
             if operation == "gh_shim.read_request" {
@@ -1194,7 +1235,15 @@ fn audit_worker_read_still_reaches_the_broker() {
     });
     let mut delegated = Vec::new();
     let status = run_with(
-        &args(&["pr", "view", "42", "--json", "number", "--repo", "cortexkit/aft"]),
+        &args(&[
+            "pr",
+            "view",
+            "42",
+            "--json",
+            "number",
+            "--repo",
+            "cortexkit/aft",
+        ]),
         |forwarded| {
             delegated.push(forwarded.to_vec());
             23
@@ -1209,7 +1258,11 @@ fn audit_worker_read_still_reaches_the_broker() {
     let seen = seen.lock().unwrap().clone();
     assert_eq!(
         seen,
-        vec!["gh_shim.session_context", "gh_shim.session_context", "gh_shim.read_request"],
+        vec![
+            "gh_shim.session_context",
+            "gh_shim.session_context",
+            "gh_shim.read_request"
+        ],
         "a worker read must authenticate its session and read through the broker"
     );
     server.join().unwrap();
@@ -1230,9 +1283,9 @@ fn audit_head_write_still_routes_through_the_relay() {
     let bindings: Vec<Value> = manifest
         .bindings
         .iter()
-        .map(|(repo, agent)| {
-            json!({"repository": repo, "agent_id": agent, "app_handle_id": "test"})
-        })
+        .map(
+            |(repo, agent)| json!({"repository": repo, "agent_id": agent, "app_handle_id": "test"}),
+        )
         .collect();
     let daemon = relay_client::tests::FakeRelayDaemon::spawn(Arc::new(move |body| {
         let operation = body["op"].as_str().unwrap_or("?");
@@ -1264,7 +1317,15 @@ fn audit_head_write_still_routes_through_the_relay() {
         crate::gh_shim_ticket::GH_SHIM_TICKET_ENV,
         Some(OsStr::new("head-ticket")),
     );
-    let argv = args(&["issue", "comment", "7", "--body", "hello", "--repo", "cortexkit/aft"]);
+    let argv = args(&[
+        "issue",
+        "comment",
+        "7",
+        "--body",
+        "hello",
+        "--repo",
+        "cortexkit/aft",
+    ]);
     let mut delegated = Vec::new();
     let status = run_with(
         &argv,
