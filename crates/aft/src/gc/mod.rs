@@ -1070,7 +1070,6 @@ mod storage_retention_tests {
         assert_eq!(report.space_reclaim.reclaimed_pages, 0);
         assert_eq!(fs::metadata(path).unwrap().len(), before);
     }
-    #[test]
     struct QueryPinFixture {
         _temp: tempfile::TempDir,
         view_dir: PathBuf,
@@ -1133,6 +1132,7 @@ mod storage_retention_tests {
         }
     }
 
+    #[test]
     fn query_pin_marking_reuses_shared_parents_once_per_view() {
         use crate::bash_background::persistence::work_counts;
         use crate::root_cache::ReadMarkerSweepContext;
