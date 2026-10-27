@@ -1100,8 +1100,37 @@ mod url_tests {
                 let raw = String::from_utf8_lossy(KEY);
                 assert!(!head.contains(raw.as_ref()), "{head}");
             }
-            for record in vault.audit_records() {
+            // Every hop of every fetch is audited: each covered first hop as a
+            // substitution, each off-rule second hop as literal, and the bad
+            // redirect has no second hop at all.
+            use secret_rules::audit::Decision::{Literal, Substituted};
+            let records = vault.audit_records();
+            let summary: Vec<(&str, secret_rules::audit::Decision, Option<&str>)> = records
+                .iter()
+                .map(|record| {
+                    (
+                        record.origin.as_str(),
+                        record.decision,
+                        record.host.as_deref(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                summary,
+                vec![
+                    ("secret-outline#0", Substituted, Some("api.secret.test")),
+                    ("secret-outline#1", Literal, Some("other.secret.test")),
+                    ("secret-outline#0", Substituted, Some("api.secret.test")),
+                    ("secret-outline#1", Literal, Some("api.secret.test")),
+                    ("secret-outline#0", Substituted, Some("api.secret.test")),
+                ]
+            );
+            for record in &records {
                 assert!(record.to_json_line_with_key(KEY).is_ok());
+                assert_eq!(
+                    record.scope.as_ref().map(|scope| scope.reference.as_str()),
+                    Some("secret-fetch")
+                );
             }
         }
 
@@ -1124,7 +1153,10 @@ mod url_tests {
             let text = run.text();
             assert_no_key(&text);
             assert!(text.contains(&url), "{text}");
-            assert!(server.targets().iter().all(|t| t.contains(ENCODED_KEY)));
+            let targets = server.targets();
+            assert!(!targets.is_empty(), "the request was never sent");
+            assert!(targets.iter().all(|t| t.contains(ENCODED_KEY)));
+            assert!(!text.contains("for url"), "{text}");
             assert_eq!(
                 vault.material_calls(),
                 1,

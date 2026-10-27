@@ -3445,6 +3445,44 @@ mod tests {
         assert!(!text.contains("fetch-secret-key"), "{text}");
         assert!(text.contains("key={{ck-secret:test}})"), "{text}");
     }
+
+    /// reqwest prints the request URL in its own error text; a placeholder
+    /// fetch's failure must drop it (the URL held the key), not merely scrub
+    /// the key out of it.
+    #[test]
+    fn a_placeholder_fetch_send_failure_drops_the_request_url() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let accepted: Vec<_> = listener.incoming().take(1).collect();
+            thread::sleep(Duration::from_secs(5));
+            drop(accepted);
+        });
+        let url = format!("http://{addr}/v1?key=fetch-secret-key%2F0123456789%2Babc");
+        let error = Client::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .unwrap()
+            .get(&url)
+            .send()
+            .expect_err("the silent server times the request out");
+        assert!(error.to_string().contains("for url"), "{error}");
+        let mut held = HeldKeys::default();
+        held.hold("test", b"fetch-secret-key/0123456789+abc")
+            .unwrap();
+        let deadline = FetchDeadline::for_current_call();
+        let failure = send_failure(
+            error,
+            Some(FetchPhase::Headers),
+            &deadline,
+            "http://api.test/v1?key={{ck-secret:test}}",
+            Some(&held),
+        );
+        let text = failure.to_string();
+        assert!(text.contains("timed out"), "{text}");
+        assert!(!text.contains("for url"), "{text}");
+        assert!(!text.contains("fetch-secret-key"), "{text}");
+    }
 }
 
 #[cfg(test)]
