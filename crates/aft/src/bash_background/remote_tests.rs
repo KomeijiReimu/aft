@@ -13380,15 +13380,13 @@ async fn runon_return_paths_copied_files_are_not_listed_as_left_on_the_server() 
     assert!(
         output.contains(
             "These files changed on the server and were NOT copied back:\n  \
-             sub/dist/absent.txt\n  sub/other.txt\n"
+             sub/dist/absent.txt\n  sub/other.txt"
         ),
         "{output}"
     );
-    // ck-motor sends no separate untracked list; its changed list holds them.
-    assert!(
-        output.contains("untracked files: not reported by the runner"),
-        "{output}"
-    );
+    // ck-motor sends no separate untracked list; its changed list holds them,
+    // and an absent untracked report stays silent.
+    assert!(!output.contains("untracked files"), "{output}");
     assert!(!output.contains("sub/dist/hello.txt"), "{output}");
 }
 
@@ -13432,7 +13430,7 @@ fn copied_back_files_leave_the_changed_list_on_linux_and_windows_runners() {
                 "Files requested back from the server (return_paths):\n  \
                  dist/hello.txt: returned (5 bytes)\n\
                  These files changed on the server and were NOT copied back:\n  \
-                 other.txt\n"
+                 other.txt"
             ),
             "{platform:?}: {report}"
         );
