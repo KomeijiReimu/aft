@@ -581,9 +581,11 @@ pub(crate) fn with_secret_bound_identity_for_test<R>(
     let mut data = test_identity_data(root, lifetime);
     data.call_mode = CallMode::Codemode;
     data.run_owner = Some(Arc::new(super::codemode::RunOwner {
-        agent_id: "secret-agent".into(),
+        kind: super::codemode::RunKind::Agent {
+            agent_id: "secret-agent".into(),
+        },
         run_id: "secret-run".into(),
-        head: head.clone(),
+        owner_route: head.clone(),
         run_route: super::RouteChannel {
             channel: 7,
             epoch: 1,
