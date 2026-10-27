@@ -7881,7 +7881,11 @@ impl BgTaskRegistry {
                             completion_preview::TRUNCATED_PREVIEW_WITHHELD.to_string(),
                         )
                     });
-                (matched.match_text, matched.context) = rendered;
+                let (match_text, context) = rendered;
+                matched.context = context;
+                if !matched.literal_pattern {
+                    matched.match_text = match_text;
+                }
             }
             matches.extend(found);
             if len < CHUNK as usize {
@@ -12320,6 +12324,8 @@ impl BgTaskRegistry {
                                 .match_batch
                                 .as_deref()
                                 .and_then(|batch| serde_json::from_str(batch).ok()),
+                            // Rendered before it was saved.
+                            literal_pattern: false,
                         });
                     }
                 }
@@ -27573,6 +27579,7 @@ mod tests {
                 context: "READY".into(),
                 once: false,
                 batch: None,
+                literal_pattern: false,
             },
         );
         assert_eq!(
@@ -27610,6 +27617,7 @@ mod tests {
                 context: "ignored".into(),
                 once: false,
                 batch: Some(batch),
+                literal_pattern: false,
             },
         );
         let mut frames = pattern_match_frames(&frames);
