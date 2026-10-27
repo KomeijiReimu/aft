@@ -442,33 +442,45 @@ fn can_start_match(key: &[u8], byte: u8) -> bool {
 /// with [`reveals_any`].
 fn find_base64_spans(window: &[u8], key: &[u8]) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
-    let mut runs = Vec::new();
+    // One group's characters with the gaps removed; reused for every group so
+    // the scan holds at most one copy of the window at a time.
+    let mut chars = Zeroizing::new(Vec::new());
     let mut index = 0;
     while index < window.len() {
         if !is_base64_byte(window[index]) {
             index += 1;
             continue;
         }
-        let start = index;
-        while index < window.len() && is_base64_byte(window[index]) {
-            index += 1;
+        let group_start = index;
+        let mut runs = 0usize;
+        chars.clear();
+        let group_end = loop {
+            let start = index;
+            while index < window.len() && is_base64_byte(window[index]) {
+                index += 1;
+            }
+            runs += 1;
+            if base64_run_contains(&window[start..index], key) {
+                spans.push((start, index));
+            }
+            chars.extend_from_slice(&window[start..index]);
+            let run_end = index;
+            let mut next = index;
+            while next < window.len() && is_base64_gap_byte(window[next]) {
+                next += 1;
+            }
+            if next > run_end && next < window.len() && is_base64_byte(window[next]) {
+                index = next;
+            } else {
+                break run_end;
+            }
+        };
+        if runs > 1 {
+            base64_group_spans(window, (group_start, group_end), &chars, key, &mut spans);
         }
-        runs.push((start, index));
-        if base64_run_contains(&window[start..index], key) {
-            spans.push((start, index));
-        }
+        index = group_end;
     }
-    let mut first = 0;
-    while first < runs.len() {
-        let mut last = first;
-        while last + 1 < runs.len() && is_base64_gap(&window[runs[last].1..runs[last + 1].0]) {
-            last += 1;
-        }
-        if last > first {
-            spans.extend(base64_group_spans(window, &runs[first..=last], key));
-        }
-        first = last + 1;
-    }
+    chars.iter_mut().for_each(|byte| *byte = 0);
     spans.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
     for span in spans {
@@ -477,42 +489,46 @@ fn find_base64_spans(window: &[u8], key: &[u8]) -> Vec<(usize, usize)> {
     merged
 }
 
-/// True when `gap`, the bytes between two base64 runs, is whitespace a
-/// reader removes before decoding (of any length).
-fn is_base64_gap(gap: &[u8]) -> bool {
-    !gap.is_empty()
-        && gap
-            .iter()
-            .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+/// Whitespace a reader removes from base64 before decoding.
+fn is_base64_gap_byte(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
 }
 
-/// The spans of a whitespace-separated base64 group (`runs`, in order) whose
-/// decoding contains `key`, each widened to the whole runs its bytes came
-/// from.
-fn base64_group_spans(window: &[u8], runs: &[(usize, usize)], key: &[u8]) -> Vec<(usize, usize)> {
-    // The group's characters with the gaps removed, and where each run starts
-    // among them.
-    let mut chars = Zeroizing::new(Vec::new());
-    let mut run_starts = Vec::with_capacity(runs.len());
-    for &(start, end) in runs {
-        run_starts.push(chars.len());
-        chars.extend_from_slice(&window[start..end]);
-    }
+/// Add to `spans` every span of the whitespace-separated base64 group at
+/// `group` (its `chars`, gaps removed) whose decoding contains `key`, each
+/// widened to the whole runs its bytes came from.
+///
+/// Memory stays proportional to the group: the decoded bytes and, per
+/// decoded byte, the index of the first character it came from (four bytes
+/// each). Its last character is always the next one, because two base64
+/// characters carry the eight bits of one byte.
+fn base64_group_spans(
+    window: &[u8],
+    group: (usize, usize),
+    chars: &[u8],
+    key: &[u8],
+    spans: &mut Vec<(usize, usize)>,
+) {
     // Most groups are ordinary words; only a group that decodes to the key
     // at all is decoded again to find where.
-    if !base64_run_contains(&chars, key) {
-        return Vec::new();
+    if !base64_run_contains(chars, key) {
+        return;
     }
-    let run_of = |char_index: usize| run_starts.partition_point(|start| *start <= char_index) - 1;
-    let mut spans = Vec::new();
+    if u32::try_from(chars.len()).is_err() {
+        // Too large to index compactly: replace the whole group.
+        spans.push(group);
+        return;
+    }
+    let mut matches: Vec<(usize, usize)> = Vec::new();
+    let mut decoded = Zeroizing::new(Vec::with_capacity(chars.len() * 3 / 4 + 1));
+    let mut first_chars: Vec<u32> = Vec::with_capacity(chars.len() * 3 / 4 + 1);
     for offset in 0..4 {
         let Some(slice) = chars.get(offset..) else {
             continue;
         };
-        // Each decoded byte with the indexes (in `chars`) of the first and
-        // last characters it came from.
-        let mut decoded = Zeroizing::new(Vec::with_capacity(slice.len()));
-        let mut sources: Vec<(usize, usize)> = Vec::with_capacity(slice.len());
+        decoded.iter_mut().for_each(|byte| *byte = 0);
+        decoded.clear();
+        first_chars.clear();
         let mut buffer = 0u32;
         let mut bits = 0u32;
         let mut oldest = offset;
@@ -531,7 +547,7 @@ fn base64_group_spans(window: &[u8], runs: &[(usize, usize)], key: &[u8]) -> Vec
             if bits >= 8 {
                 bits -= 8;
                 decoded.push((buffer >> bits) as u8);
-                sources.push((oldest, char_index));
+                first_chars.push(oldest as u32);
                 buffer &= (1 << bits) - 1;
                 oldest = char_index;
             }
@@ -540,17 +556,47 @@ fn base64_group_spans(window: &[u8], runs: &[(usize, usize)], key: &[u8]) -> Vec
             continue;
         }
         for start in 0..=decoded.len() - key.len() {
-            if &decoded[start..start + key.len()] != key {
-                continue;
+            if &decoded[start..start + key.len()] == key {
+                let first = first_chars[start] as usize;
+                let last = first_chars[start + key.len() - 1] as usize + 1;
+                matches.push((first, last));
             }
-            // Only the runs the key's own bits came from are replaced, so a
-            // separate spelling on the next line keeps its own replacement.
-            let first_run = run_of(sources[start].0);
-            let last_run = run_of(sources[start + key.len() - 1].1);
-            spans.push((runs[first_run].0, runs[last_run].1));
         }
     }
-    spans
+    if matches.is_empty() {
+        return;
+    }
+    // Where each needed character sits in the window, found in one pass.
+    let mut wanted: Vec<usize> = matches.iter().flat_map(|&(a, b)| [a, b]).collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let mut positions = Vec::with_capacity(wanted.len());
+    let mut char_index = 0;
+    for (at, byte) in window[group.0..group.1].iter().enumerate() {
+        if positions.len() == wanted.len() {
+            break;
+        }
+        if is_base64_byte(*byte) {
+            if wanted[positions.len()] == char_index {
+                positions.push(group.0 + at);
+            }
+            char_index += 1;
+        }
+    }
+    let position_of = |index: usize| positions[wanted.binary_search(&index).unwrap_or(0)];
+    for (first, last) in matches {
+        // Only the runs the key's own bits came from are replaced, so a
+        // separate spelling on the next line keeps its own replacement.
+        let mut start = position_of(first);
+        while start > group.0 && is_base64_byte(window[start - 1]) {
+            start -= 1;
+        }
+        let mut end = position_of(last) + 1;
+        while end < group.1 && is_base64_byte(window[end]) {
+            end += 1;
+        }
+        spans.push((start, end));
+    }
 }
 
 /// The end of a representation of `key` starting at `index`, if one starts
@@ -608,14 +654,20 @@ fn match_percent(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
     let mut decoded = Zeroizing::new(Vec::with_capacity(key.len()));
     while cursor < window.len() && decoded.len() < key.len() {
         let byte = window[cursor];
-        if byte == b'%' {
+        let value = if byte == b'%' {
             let (value, len) = decode_percent(window, cursor)?;
-            decoded.push(value);
             cursor += len;
+            value
         } else {
-            decoded.push(byte);
             cursor += 1;
+            byte
+        };
+        // Stop at the first byte that differs from the key: most positions
+        // fail on their first byte, which keeps the scan close to linear.
+        if value != key[decoded.len()] {
+            return None;
         }
+        decoded.push(value);
     }
 
     // The holdback keeps the window's last byte beyond any match that ends in
@@ -637,17 +689,22 @@ fn match_form(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
     let mut decoded = Zeroizing::new(Vec::with_capacity(key.len()));
     while cursor < window.len() && decoded.len() < key.len() {
         let byte = window[cursor];
-        if byte == b'%' {
+        let value = if byte == b'%' {
             let (value, len) = decode_percent(window, cursor)?;
-            decoded.push(value);
             cursor += len;
-        } else if byte == b'+' {
-            decoded.push(b' ');
-            cursor += 1;
+            value
         } else {
-            decoded.push(byte);
             cursor += 1;
+            if byte == b'+' {
+                b' '
+            } else {
+                byte
+            }
+        };
+        if value != key[decoded.len()] {
+            return None;
         }
+        decoded.push(value);
     }
     (decoded.as_slice() == key).then_some(cursor)
 }
@@ -658,6 +715,7 @@ fn match_json(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
     let mut decoded = Zeroizing::new(Vec::with_capacity(key.len() + 4));
     while cursor < window.len() && decoded.len() < key.len() {
         let byte = window[cursor];
+        let before = decoded.len();
         if byte == b'\\' {
             let (value, len) = decode_json_escape(window, cursor)?;
             decoded.extend_from_slice(&value);
@@ -665,6 +723,9 @@ fn match_json(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
         } else {
             decoded.push(byte);
             cursor += 1;
+        }
+        if !key[before..].starts_with(&decoded[before..]) {
+            return None;
         }
     }
     (decoded.as_slice() == key).then_some(cursor)
@@ -679,7 +740,11 @@ fn match_hex(window: &[u8], index: usize, key: &[u8]) -> Option<usize> {
     for pair in run.chunks(2) {
         let high = crate::placeholder::hex_value(pair[0])?;
         let low = crate::placeholder::hex_value(pair[1])?;
-        decoded.push((high << 4) | low);
+        let value = (high << 4) | low;
+        if value != key[decoded.len()] {
+            return None;
+        }
+        decoded.push(value);
     }
     (decoded.as_slice() == key).then_some(end)
 }
@@ -1082,6 +1147,17 @@ pub fn scrub_bytes(key: &[u8], label: &str, input: &[u8]) -> Result<Vec<u8>, Scr
 /// let one more layer carry a key past the check.
 pub const MAX_REVEAL_DEPTH: usize = 32;
 
+/// The most bytes [`reveals_any`] examines across all of its layers, as a
+/// multiple of the text's length (or of [`REVEAL_WORK_FLOOR`] for short
+/// text). Ordinary text costs a handful of layers; text that needs more than
+/// this is refused rather than examined further.
+const REVEAL_WORK_FACTOR: usize = 48;
+
+/// Short texts (a redirect target, a header) are budgeted as if they were
+/// this long, so that their deep layers are always followed to the depth
+/// limit.
+const REVEAL_WORK_FLOOR: usize = 64 * 1024;
+
 /// True when `text` spells `key` in a form the scrubber recognises, either as
 /// it stands or after a recipient undoes the changes a URL parser or a reader
 /// makes without being asked; see [`reveals_any`].
@@ -1109,7 +1185,9 @@ pub fn reveals_key(text: &[u8], key: &[u8]) -> bool {
 /// ordinary text decodes once (a `%20`, an `&amp;`, a `\*`) and is then left
 /// alone. A chain still changing after [`MAX_REVEAL_DEPTH`] layers makes this
 /// return true, so a spelling nested deeper than the check undoes is refused
-/// rather than trusted.
+/// rather than trusted, and so does text whose layers together exceed
+/// [`REVEAL_WORK_FACTOR`] times its length. Memory stays at the text plus two
+/// layers and the scan of one layer, each no larger than the text.
 pub fn reveals_any(text: &[u8], keys: &[&[u8]]) -> bool {
     let keys: Vec<(&[u8], Vec<Zeroizing<Vec<u8>>>)> = keys
         .iter()
@@ -1131,6 +1209,8 @@ pub fn reveals_any(text: &[u8], keys: &[&[u8]]) -> bool {
     if found(text) {
         return true;
     }
+    let budget = REVEAL_WORK_FACTOR.saturating_mul(text.len().max(REVEAL_WORK_FLOOR));
+    let mut spent = text.len();
     for chain in REVEAL_CHAINS {
         // Only the current layer is kept: memory stays at two copies of the
         // text whatever the depth.
@@ -1140,6 +1220,10 @@ pub fn reveals_any(text: &[u8], keys: &[&[u8]]) -> bool {
             let Some(next) = chain(current) else {
                 break;
             };
+            spent = spent.saturating_add(next.len());
+            if spent > budget {
+                return true;
+            }
             if found(&next) {
                 return true;
             }
@@ -1515,5 +1599,155 @@ mod tests {
             assert!(!out.windows(4).any(|w| w == b"Njc4"), "{shown}");
             assert!(reveals_key(input, key));
         }
+    }
+
+    /// Per-thread allocation meter for the work-ceiling tests.
+    mod meter {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        pub struct Counting;
+
+        thread_local! {
+            static LIVE: Cell<usize> = const { Cell::new(0) };
+            static PEAK: Cell<usize> = const { Cell::new(0) };
+        }
+
+        fn grow(bytes: usize) {
+            let _ = LIVE.try_with(|live| {
+                let now = live.get() + bytes;
+                live.set(now);
+                let _ = PEAK.try_with(|peak| {
+                    if now > peak.get() {
+                        peak.set(now);
+                    }
+                });
+            });
+        }
+
+        fn shrink(bytes: usize) {
+            let _ = LIVE.try_with(|live| live.set(live.get().saturating_sub(bytes)));
+        }
+
+        // SAFETY: every call forwards to the system allocator unchanged; the
+        // counters only observe sizes.
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let ptr = unsafe { System.alloc(layout) };
+                if !ptr.is_null() {
+                    grow(layout.size());
+                }
+                ptr
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) };
+                shrink(layout.size());
+            }
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+                let new = unsafe { System.realloc(ptr, layout, size) };
+                if !new.is_null() {
+                    shrink(layout.size());
+                    grow(size);
+                }
+                new
+            }
+        }
+
+        #[global_allocator]
+        static GLOBAL: Counting = Counting;
+
+        /// `work`'s result and the most bytes it held at once on this thread
+        /// beyond what was live before it started.
+        pub fn peak_of<T>(work: impl FnOnce() -> T) -> (T, usize) {
+            let base = LIVE.with(Cell::get);
+            PEAK.with(|peak| peak.set(base));
+            let out = work();
+            (out, PEAK.with(Cell::get).saturating_sub(base))
+        }
+    }
+
+    /// Inputs of about `size` bytes: one realistic document and four built to
+    /// make the residual check and the base64 grouping work hard. The key's
+    /// whitespace-split base64 sits at the end of the base64-heavy ones so
+    /// their group decode runs over the whole input.
+    fn work_inputs(size: usize) -> Vec<(&'static str, Vec<u8>)> {
+        let fill = |unit: &[u8], tail: &[u8]| {
+            let mut out = Vec::with_capacity(size + tail.len());
+            while out.len() + unit.len() <= size {
+                out.extend_from_slice(unit);
+            }
+            out.extend_from_slice(tail);
+            out
+        };
+        let split_key = b" MDEy MzQ1 Njc4 OWFi Y2Rl Zg==";
+        let mut nested = b"%".to_vec();
+        for _ in 0..12 {
+            nested = nested
+                .iter()
+                .flat_map(|byte| {
+                    if *byte == b'%' {
+                        b"%25".to_vec()
+                    } else {
+                        vec![*byte]
+                    }
+                })
+                .collect();
+        }
+        nested.extend_from_slice(b"41 ");
+        vec![
+            (
+                "realistic markdown",
+                fill(
+                    b"See [docs](https://example.com/a%20b?x=1&amp;y=2) and \\*args; Ben &amp; Jerry &lt;b&gt;.\n",
+                    b"",
+                ),
+            ),
+            ("deep percent nesting", fill(&nested, b"")),
+            ("many entities", fill(b"&amp;amp;amp;#42; &#x2a;&lt;&#42 ", b"")),
+            ("long base64 groups", fill(b"QUJD REVG R0hJ SktM TU5P UFFS ", split_key)),
+            ("alternating short runs", fill(b"a b ", split_key)),
+        ]
+    }
+
+    /// Peak bytes and time for the residual check and the whole-buffer scrub
+    /// on each input, with the ceiling the work must stay under.
+    fn assert_work_ceiling(size: usize) {
+        let key = b"0123456789abcdef";
+        for (name, input) in work_inputs(size) {
+            let started = std::time::Instant::now();
+            let (_, reveal_peak) = meter::peak_of(|| reveals_key(&input, key));
+            let reveal_time = started.elapsed();
+            let started = std::time::Instant::now();
+            let (_, scrub_peak) = meter::peak_of(|| scrub_bytes(key, "test", &input).unwrap());
+            let scrub_time = started.elapsed();
+            eprintln!(
+                "{name}: {} bytes; reveals_key {reveal_time:?}, peak {reveal_peak} bytes ({:.2}x); scrub_bytes {scrub_time:?}, peak {scrub_peak} bytes ({:.2}x)",
+                input.len(),
+                reveal_peak as f64 / input.len() as f64,
+                scrub_peak as f64 / input.len() as f64,
+            );
+            let ceiling = 8 * input.len() + (1 << 20);
+            assert!(
+                reveal_peak <= ceiling,
+                "{name}: reveals_key held {reveal_peak} bytes"
+            );
+            assert!(
+                scrub_peak <= ceiling,
+                "{name}: scrub_bytes held {scrub_peak} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn reveal_and_scrub_memory_stays_within_a_small_multiple_of_the_input() {
+        assert_work_ceiling(1 << 20);
+    }
+
+    /// The 8 MiB measurement reported for the fetch size cap; run with
+    /// `--release --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn measure_reveal_and_scrub_work_on_8_mib_inputs() {
+        assert_work_ceiling(8 << 20);
     }
 }
