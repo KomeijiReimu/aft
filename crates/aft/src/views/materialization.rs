@@ -684,6 +684,7 @@ fn materialize_reading(
                     name: symbol.name.clone(),
                     scoped_name: symbol.scoped_name.clone(),
                     kind: symbol.kind.clone(),
+                    is_test: symbol.is_test,
                     start_line: symbol.start_line,
                     start_col: symbol.start_col,
                     end_line: symbol.end_line,
@@ -795,6 +796,7 @@ fn materialize_reading(
                     "is_type_like",
                     "is_callgraph_entry_point",
                     "provenance",
+                    "is_test",
                 ],
                 params![
                     row.id,
@@ -813,6 +815,7 @@ fn materialize_reading(
                     0,
                     i64::from(row.entry_point),
                     PROVENANCE_TREESITTER,
+                    row.is_test.map(i64::from),
                 ],
                 changed.is_some(),
             )
@@ -1205,13 +1208,42 @@ fn materialize_reading(
             }
             ref_deletes.push(ref_id.clone());
         }
-        if row.kind == join::BlobRefKind::Call {
+        if matches!(
+            row.kind,
+            join::BlobRefKind::Call
+                | join::BlobRefKind::Construction
+                | join::BlobRefKind::CallbackRef
+        ) {
             if let (Some(source_node), Some(target_file), Some(edge_target_symbol)) = (
                 caller_node.clone(),
                 target_path.clone(),
                 target_symbol.clone(),
             ) {
                 pending_edges.push(PendingEdgeRow {
+                    kind: match row.kind {
+                        join::BlobRefKind::Construction
+                            if !target_node
+                                .as_deref()
+                                .map(|id| {
+                                    transaction
+                                        .query_row(
+                                            "SELECT kind FROM nodes WHERE id = ?1",
+                                            [id],
+                                            |row| row.get::<_, String>(0),
+                                        )
+                                        .optional()
+                                })
+                                .transpose()?
+                                .flatten()
+                                .is_some_and(|kind| {
+                                    matches!(kind.as_str(), "function" | "method")
+                                }) =>
+                        {
+                            "value_ref"
+                        }
+                        join::BlobRefKind::CallbackRef => "callback_ref",
+                        _ => "call",
+                    },
                     ref_id: ref_id.clone(),
                     source_node,
                     target_node: target_node.clone(),
@@ -1352,7 +1384,7 @@ fn materialize_reading(
                         row.target_node,
                         row.target_file,
                         row.target_symbol,
-                        "call",
+                        row.kind,
                         i64::from(row.line),
                         PROVENANCE_TREESITTER,
                     ],
@@ -1632,6 +1664,8 @@ const fn manifest_ref_kind(kind: join::BlobRefKind) -> &'static str {
     match kind {
         join::BlobRefKind::Call => "call",
         join::BlobRefKind::ValueRef => "value_ref",
+        join::BlobRefKind::Construction => "construction",
+        join::BlobRefKind::CallbackRef => "callback_ref",
         join::BlobRefKind::Import => "import",
         join::BlobRefKind::Module => "module",
         join::BlobRefKind::Reexport => "reexport",
@@ -1916,6 +1950,7 @@ struct OwnedFileRow {
 }
 
 struct OwnedNodeRow {
+    is_test: Option<bool>,
     id: String,
     file_path: String,
     name: String,
@@ -1956,6 +1991,7 @@ struct PendingRefRow {
 }
 
 struct PendingEdgeRow {
+    kind: &'static str,
     ref_id: String,
     source_node: String,
     target_node: Option<String>,

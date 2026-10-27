@@ -133,6 +133,8 @@ pub struct AstPreorderNode {
 /// pre-order position, not a per-path or database-generated identifier.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BlobSymbol {
+    #[serde(default)]
+    pub is_test: Option<bool>,
     pub ordinal: u32,
     pub name: String,
     pub scoped_name: String,
@@ -150,6 +152,8 @@ pub struct BlobSymbol {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlobRefKind {
+    Construction,
+    CallbackRef,
     Call,
     ValueRef,
     Import,
@@ -638,6 +642,7 @@ fn blob_symbol(
     default_export: &Option<String>,
 ) -> BlobSymbol {
     BlobSymbol {
+        is_test: meta.is_test,
         ordinal: 0,
         name: unqualified_symbol_name(scoped_name).to_string(),
         scoped_name: scoped_name.to_string(),
@@ -727,7 +732,11 @@ fn ordered_symbol_sites(
 fn call_ref(caller_symbol: &str, call: &callgraph::CallSite, kind: BlobRefKind) -> BlobRef {
     BlobRef {
         ordinal: 0,
-        kind,
+        kind: match call.kind {
+            callgraph::CallSiteKind::Construction => BlobRefKind::Construction,
+            callgraph::CallSiteKind::CallbackReference => BlobRefKind::CallbackRef,
+            callgraph::CallSiteKind::Call => kind,
+        },
         caller_symbol: Some(caller_symbol.to_string()),
         short_name: Some(call.callee_name.clone()),
         full_ref: Some(call.full_callee.clone()),
@@ -1065,8 +1074,8 @@ impl ParseBlob {
                 {
                     &mut macro_body_calls_by_macro
                 }
-                BlobRefKind::Call => &mut calls_by_symbol,
-                BlobRefKind::ValueRef => &mut value_refs_by_symbol,
+                BlobRefKind::Call | BlobRefKind::Construction => &mut calls_by_symbol,
+                BlobRefKind::ValueRef | BlobRefKind::CallbackRef => &mut value_refs_by_symbol,
                 _ => continue,
             };
             let Some(caller) = &raw.caller_symbol else {
@@ -1075,6 +1084,11 @@ impl ParseBlob {
             map.entry(bound_name(caller, path))
                 .or_default()
                 .push(callgraph::CallSite {
+                    kind: match raw.kind {
+                        BlobRefKind::Construction => callgraph::CallSiteKind::Construction,
+                        BlobRefKind::CallbackRef => callgraph::CallSiteKind::CallbackReference,
+                        _ => callgraph::CallSiteKind::Call,
+                    },
                     callee_name: raw.short_name.clone().unwrap_or_default(),
                     full_callee: raw.full_ref.clone().unwrap_or_default(),
                     line: raw.line,
@@ -1102,6 +1116,7 @@ impl ParseBlob {
             symbol_metadata.insert(
                 bound_name(&symbol.scoped_name, path),
                 SymbolMeta {
+                    is_test: symbol.is_test,
                     kind,
                     exported: symbol.exported,
                     signature: symbol.signature.clone(),
@@ -1199,6 +1214,7 @@ impl ParseBlob {
             .map(|symbol| {
                 let scoped_name = bound_name(&symbol.scoped_name, path);
                 super::NodeRecord {
+                    is_test: symbol.is_test,
                     id: format!("{path}:{}:{scoped_name}", symbol.ordinal),
                     file_path: path.to_string(),
                     name: bound_name(&symbol.name, path),
@@ -1288,6 +1304,8 @@ impl ParseBlob {
                         super::MACRO_BODY_CALL_REF_KIND
                     }
                     BlobRefKind::Call => "call",
+                    BlobRefKind::Construction => "construction",
+                    BlobRefKind::CallbackRef => "callback_ref",
                     BlobRefKind::ValueRef => "value_ref",
                     BlobRefKind::Import => "import",
                     BlobRefKind::Module => "module",

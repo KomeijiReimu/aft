@@ -1469,7 +1469,7 @@ fn callgraph_indexes_tsx_jsx_components_and_new_expressions() {
 
     let mut aft = AftProcess::spawn();
     configure_project(&mut aft, root);
-    for (id, symbol) in [("1", "Widget"), ("2", "Service")] {
+    for (id, symbol, count) in [("1", "Widget", 1), ("2", "Service", 0)] {
         let resp = aft.send(&format!(
             r#"{{"id":"{}","command":"callers","file":{},"symbol":"{}","depth":1}}"#,
             id,
@@ -1478,8 +1478,8 @@ fn callgraph_indexes_tsx_jsx_components_and_new_expressions() {
         ));
         assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
         assert_eq!(
-            resp["total_callers"], 1,
-            "{symbol} should be indexed from JSX/new: {resp:?}"
+            resp["total_callers"], count,
+            "JSX invokes a component; construction without a constructor does not invoke the class: {symbol}: {resp:?}"
         );
     }
     aft.shutdown();

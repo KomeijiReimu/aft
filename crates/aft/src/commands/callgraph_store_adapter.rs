@@ -54,6 +54,10 @@ fn is_zero(value: &usize) -> bool {
     *value == 0
 }
 
+pub(crate) const CALLBACK_REFERENCE_LABEL: &str = " (callback reference)";
+pub(crate) const UNRESOLVED_CALLERS_NOTE: &str = "Incomplete: {count} call site{plural} in the analyzed {language} code could not be resolved, so a dynamic or indirect call may still reach `{symbol}`.";
+const TEST_FILTER_NOTE: &str = "Test filtering incomplete: AFT could not tell whether {count} caller site{plural} {verb} test code, so {subject} still shown.";
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreHubSummary {
     pub message: String,
@@ -74,6 +78,12 @@ struct EdgeMarker {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreCallersResult {
+    #[serde(skip_serializing_if = "is_zero")]
+    pub callback_dependencies: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_reference_label: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_filter_note: Option<String>,
     pub symbol: String,
     pub file: String,
     pub callers: Vec<StoreCallerGroup>,
@@ -98,7 +108,7 @@ pub struct StoreCallersResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreIncompleteNote {
     pub complete: bool,
-    pub unresolved_method_calls: usize,
+    pub unresolved_call_sites: usize,
     pub incomplete_reason: String,
 }
 
@@ -111,12 +121,23 @@ fn empty_receiver_note(
     if count != 0 {
         return Ok(None);
     }
-    let sites = store.unresolved_method_sites_named(&target.name, target.lang)?;
-    let unresolved_method_calls = sites
+    let sites = store.unresolved_method_sites_named("", target.lang)?;
+    let unresolved_call_sites = sites
         .iter()
-        .filter(|s| include_tests || !is_test_file(&s.file))
+        .filter(|s| include_tests || !(is_test_file(&s.file) || s.is_test == Some(true)))
         .count();
-    Ok((unresolved_method_calls > 0).then(|| StoreIncompleteNote { complete: false, unresolved_method_calls, incomplete_reason: format!("Incomplete: {unresolved_method_calls} unresolved method call sites named `{}` could not be linked; use grep for `{}` before concluding there are no callers", target.name, target.name) }))
+    Ok((unresolved_call_sites > 0).then(|| StoreIncompleteNote {
+        complete: false,
+        unresolved_call_sites,
+        incomplete_reason: UNRESOLVED_CALLERS_NOTE
+            .replace("{count}", &unresolved_call_sites.to_string())
+            .replace(
+                "{plural}",
+                if unresolved_call_sites == 1 { "" } else { "s" },
+            )
+            .replace("{language}", &format!("{:?}", target.lang))
+            .replace("{symbol}", &target.name),
+    }))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -139,6 +160,10 @@ pub struct StoreCallerGroup {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreCallerEntry {
+    #[serde(skip_serializing_if = "is_false")]
+    pub test_status_unknown: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relation: Option<&'static str>,
     pub symbol: String,
     pub line: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -176,6 +201,12 @@ pub struct StoreCallTreeNode {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreImpactResult {
+    #[serde(skip_serializing_if = "is_zero")]
+    pub callback_dependencies: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_reference_label: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_filter_note: Option<String>,
     pub symbol: String,
     pub file: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -198,6 +229,8 @@ pub struct StoreImpactResult {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreImpactCaller {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relation: Option<&'static str>,
     pub caller_symbol: String,
     pub caller_file: String,
     pub line: u32,
@@ -435,7 +468,32 @@ fn lower_bound_trace_summary(
 }
 
 fn callsite_is_from_test(site: &StoreCallSite) -> bool {
-    is_test_file(&site.caller.file)
+    is_test_file(&site.caller.file) || site.caller_is_test == Some(true)
+}
+
+fn unknown_test_note(sites: &[StoreCallSite], include_tests: bool) -> Option<String> {
+    test_filter_note_for_count(unknown_test_caller_count(sites), include_tests)
+}
+
+fn unknown_test_caller_count(sites: &[StoreCallSite]) -> usize {
+    sites
+        .iter()
+        .filter(|site| {
+            site.caller.lang == crate::parser::LangId::Rust
+                && !is_test_file(&site.caller.file)
+                && site.caller_is_test.is_none()
+        })
+        .count()
+}
+
+fn test_filter_note_for_count(count: usize, include_tests: bool) -> Option<String> {
+    (!include_tests && count > 0).then(|| {
+        TEST_FILTER_NOTE
+            .replace("{count}", &count.to_string())
+            .replace("{plural}", if count == 1 { "" } else { "s" })
+            .replace("{verb}", if count == 1 { "is" } else { "are" })
+            .replace("{subject}", if count == 1 { "it is" } else { "they are" })
+    })
 }
 
 fn trace_path_starts_in_test(path: &StoreTracePath) -> bool {
@@ -565,6 +623,7 @@ pub fn callers_result(
             .then(left.caller.symbol.cmp(&right.caller.symbol))
     });
     let pre_filter_count = sites.len();
+    let unknown_test_callers = unknown_test_caller_count(&sites);
     let hidden_tests = sites
         .iter()
         .filter(|site| callsite_is_from_test(site))
@@ -574,6 +633,10 @@ pub fn callers_result(
         .filter(|site| include_tests || !callsite_is_from_test(site))
         .collect::<Vec<_>>();
     let post_filter_count = visible_sites.len();
+    let callback_dependencies = visible_sites
+        .iter()
+        .filter(|site| site.kind == "callback_ref")
+        .count();
 
     let summarize = hub_selector_activated(post_filter_count);
     let visible_sites = if summarize {
@@ -615,6 +678,10 @@ pub fn callers_result(
             .entry(site.caller.file.clone())
             .or_default()
             .push(StoreCallerEntry {
+                test_status_unknown: site.caller.lang == crate::parser::LangId::Rust
+                    && site.caller_is_test.is_none()
+                    && !is_test_file(&site.caller.file),
+                relation: (site.kind == "callback_ref").then_some("callback_reference"),
                 symbol: site.caller.symbol.clone(),
                 line: site.line,
                 approximate: edge_approximate(&site),
@@ -630,6 +697,12 @@ pub fn callers_result(
         Vec::new()
     };
     let via_count = via_entries.len();
+    let unknown_macro_callers = via_entries
+        .iter()
+        .filter(|(_, entry)| entry.test_status_unknown)
+        .count();
+    let test_filter_note =
+        test_filter_note_for_count(unknown_test_callers + unknown_macro_callers, include_tests);
     for (file, entry) in via_entries {
         groups.entry(file).or_default().push(entry);
     }
@@ -647,10 +720,13 @@ pub fn callers_result(
     );
 
     Ok(StoreCallersResult {
+        callback_dependencies,
+        callback_reference_label: (callback_dependencies > 0).then_some(CALLBACK_REFERENCE_LABEL),
+        test_filter_note,
         incomplete: empty_receiver_note(
             store,
             &target.representative,
-            total_callers + via_count,
+            post_filter_count + via_count,
             include_tests,
         )?,
         symbol: target.representative.symbol,
@@ -701,12 +777,16 @@ fn macro_via_entries(
         return Ok(Vec::new());
     }
 
-    let name_match = |symbol: String, line: u32, via: Option<String>| StoreCallerEntry {
-        symbol,
-        line,
-        approximate: Some(true),
-        resolved_by: Some("name_match".to_string()),
-        via,
+    let name_match = |symbol: String, line: u32, via: Option<String>, test_status_unknown: bool| {
+        StoreCallerEntry {
+            test_status_unknown,
+            relation: None,
+            symbol,
+            line,
+            approximate: Some(true),
+            resolved_by: Some("name_match".to_string()),
+            via,
+        }
     };
     let mut entries = Vec::new();
     let mut macros = BTreeSet::new();
@@ -714,8 +794,12 @@ fn macro_via_entries(
         let Some(macro_name) = site.local_name else {
             continue;
         };
-        if include_tests || !is_test_file(&site.file) {
-            entries.push((site.file, name_match(macro_name.clone(), site.line, None)));
+        if include_tests || !(is_test_file(&site.file) || site.is_test == Some(true)) {
+            let unknown = site.is_test.is_none() && !is_test_file(&site.file);
+            entries.push((
+                site.file,
+                name_match(macro_name.clone(), site.line, None, unknown),
+            ));
         }
         macros.insert(macro_name);
     }
@@ -725,7 +809,7 @@ fn macro_via_entries(
             break;
         }
         for site in store.ref_sites_named("call", &macro_name, remaining)? {
-            if (!include_tests && is_test_file(&site.file))
+            if (!include_tests && (is_test_file(&site.file) || site.is_test == Some(true)))
                 || listed.contains(&(site.file.clone(), site.line))
             {
                 continue;
@@ -733,9 +817,10 @@ fn macro_via_entries(
             let symbol = site
                 .caller_symbol
                 .unwrap_or_else(|| "<top-level>".to_string());
+            let unknown = site.is_test.is_none() && !is_test_file(&site.file);
             entries.push((
                 site.file,
-                name_match(symbol, site.line, Some(macro_name.clone())),
+                name_match(symbol, site.line, Some(macro_name.clone()), unknown),
             ));
         }
     }
@@ -888,6 +973,7 @@ pub fn impact_result(
             .then(left.caller.symbol.cmp(&right.caller.symbol))
     });
     let pre_filter_count = sites.len();
+    let test_filter_note = unknown_test_note(&sites, include_tests);
     let hidden_tests = sites
         .iter()
         .filter(|site| callsite_is_from_test(site))
@@ -897,6 +983,10 @@ pub fn impact_result(
         .filter(|site| include_tests || !callsite_is_from_test(site))
         .collect::<Vec<_>>();
     let post_filter_count = visible_sites.len();
+    let callback_dependencies = visible_sites
+        .iter()
+        .filter(|site| site.kind == "callback_ref")
+        .count();
 
     let summarize = hub_selector_activated(post_filter_count);
     let affected_files = visible_sites
@@ -970,6 +1060,7 @@ pub fn impact_result(
         let lines = source_lines.get(&site.caller.file).and_then(Option::as_ref);
         let stale = stale_files.contains(&site.caller.file);
         callers.push(StoreImpactCaller {
+            relation: (site.kind == "callback_ref").then_some("callback_reference"),
             caller_symbol: site.caller.symbol.clone(),
             caller_file: site.caller.file.clone(),
             line: site.line,
@@ -999,10 +1090,13 @@ pub fn impact_result(
     });
 
     Ok(StoreImpactResult {
+        callback_dependencies,
+        callback_reference_label: (callback_dependencies > 0).then_some(CALLBACK_REFERENCE_LABEL),
+        test_filter_note,
         incomplete: empty_receiver_note(
             store,
             &target.representative,
-            total_affected,
+            post_filter_count,
             include_tests,
         )?,
         symbol: target.representative.symbol,
@@ -1108,7 +1202,14 @@ fn trace_to_result_with_budget(
             let wanted = wanted.into_iter().collect::<Vec<_>>();
             let mut fetched = store.direct_callers_for_symbols(&wanted)?;
             for key in wanted {
-                let callers = dedup_call_sites(fetched.remove(&key).unwrap_or_default());
+                let callers = dedup_call_sites(
+                    fetched
+                        .remove(&key)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|site| site.kind == "call")
+                        .collect(),
+                );
                 callers_by_symbol.insert(key, callers);
             }
         }
@@ -3004,12 +3105,13 @@ fn dedup_call_site_count(sites: Vec<StoreCallSite>) -> usize {
         .len()
 }
 
-fn call_site_key(site: &StoreCallSite) -> (String, u32, String, String) {
+fn call_site_key(site: &StoreCallSite) -> (String, u32, String, String, String) {
     (
         site.caller.file.clone(),
         site.line,
         site.target_file.clone(),
         site.target_symbol.clone(),
+        site.kind.clone(),
     )
 }
 
@@ -3188,6 +3290,8 @@ mod trace_to_tests {
                 .entry((target.file.clone(), target.symbol.clone()))
                 .or_default()
                 .push(StoreCallSite {
+                    kind: "call".to_string(),
+                    caller_is_test: Some(false),
                     caller: caller.clone(),
                     target_file: target.file.clone(),
                     target_symbol: target.symbol.clone(),
@@ -3205,6 +3309,8 @@ mod trace_to_tests {
                 .entry((caller.file.clone(), caller.symbol.clone()))
                 .or_default()
                 .push(StoreCallSite {
+                    kind: "call".to_string(),
+                    caller_is_test: Some(false),
                     caller: caller.clone(),
                     target_file: target.file.clone(),
                     target_symbol: target.symbol.clone(),
@@ -4216,3 +4322,7 @@ mod trace_to_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "callgraph_regression_tests.rs"]
+mod callgraph_regression_tests;
