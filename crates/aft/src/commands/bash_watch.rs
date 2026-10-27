@@ -1489,8 +1489,11 @@ mod tests {
             let waited = job.wait(&crate::executor::JobCancellation::new());
             let _ = tx.send((job, waited, started.elapsed()));
         });
+        // The hard deadline must outlast the longest reply budget a test gives
+        // its watch (20 s), or a slow runner trips this guard while the watch
+        // is still inside its own budget.
         let (job, waited, elapsed) = rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(60))
             .expect("watch did not answer within the test's hard deadline");
         (job, waited.expect("watch was not cancelled"), elapsed)
     }
