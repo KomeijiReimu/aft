@@ -706,7 +706,11 @@ jobs:
     name: Cargo libtest archive (macOS)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
     runs-on: macos-26
-    timeout-minutes: 30
+    # A cold compile of the crate's lib tests takes 19-28 min on these
+    # runners, and a slow runner reached 30 min in 2 of 12 recent main runs.
+    # The job then shows as cancelled and fails the whole macOS unit suite
+    # without any test having run.
+    timeout-minutes: 45
     env:
       SCCACHE_GHA_ENABLED: "true"
       SCCACHE_IDLE_TIMEOUT: "0"
