@@ -772,3 +772,122 @@ fn views_on_aft_and_outside_edits_reach_the_fill() {
         "the outside edit was never embedded"
     );
 }
+
+/// The fields of a search answered while the semantic lane is reloading after
+/// an idle eviction: building, incomplete, lexical results with the lane's
+/// disclosure, and never a ready lane.
+fn assert_reloading_after_eviction(answer: &Value) {
+    assert_eq!(answer["semantic_status"], "building", "{answer:#}");
+    assert_eq!(answer["complete"], false, "{answer:#}");
+    assert_eq!(answer["lexical_only_fallback"], true, "{answer:#}");
+    assert!(
+        answer["note"].as_str().is_some_and(|note| !note.is_empty()),
+        "the reply must disclose the lexical fallback: {answer:#}"
+    );
+    let text = answer["text"].as_str().unwrap_or_default();
+    assert!(
+        !text.lines().any(|line| line == "semantic: ready"),
+        "the reply must not claim a ready semantic lane: {text}"
+    );
+}
+
+/// Evicts the root's artifacts as the idle reaper does until its views-on
+/// semantic lane is released. Eviction does not wait for a lane whose locks
+/// are held (its worker can still be publishing the fill the test waited
+/// for): it leaves that lane loaded, and the reaper releases it on a later
+/// pass. This repeats the eviction the same way.
+fn evict_until_lane_released(ctx: &AppContext) {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        assert!(ctx.evict_idle_artifacts(), "the root must be idle");
+        if !ctx.checkout_semantic().active() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "idle eviction never released the lane: {}",
+            ctx.checkout_semantic().describe()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+/// Idle eviction drops the trigram index too, and both lanes reload by
+/// design. Reloads the trigram index through a grep, which reloads only that
+/// index, and waits until it is ready, so the next search has a ready lexical
+/// lane however long the reload takes on this machine while the semantic lane
+/// is still released.
+fn reload_trigram_after_eviction(ctx: &AppContext) {
+    let grep = aft::commands::grep::handle_grep(
+        &request(json!({
+            "id": "views-semantic-grep",
+            "command": "grep",
+            "pattern": "parse_config_file",
+            "max_results": 1
+        })),
+        ctx,
+    );
+    assert!(grep.success, "grep failed: {grep:?}");
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        aft::runtime_drain::drain_search_index_events(ctx);
+        let ready = ctx
+            .search_index()
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|index| index.ready);
+        if ready {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the trigram index never reloaded after eviction"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// After an idle eviction releases a views-on root's semantic lane, the next
+/// search restarts the lane (the reload a views-off root's evicted index gets
+/// too) and that same search reports the lane as building with the
+/// lexical-fallback disclosure, not as ready. Once the view is back, searches
+/// are ready again.
+#[test]
+fn views_on_search_after_idle_eviction_reports_the_lane_reloading() {
+    let server = MockEmbedder::start();
+    let repo = repository();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = configure(&repo.main, storage.path(), &server, true);
+    wait_views_filled(&ctx);
+    evict_until_lane_released(&ctx);
+    reload_trigram_after_eviction(&ctx);
+    assert!(
+        !ctx.checkout_semantic().active(),
+        "reloading the trigram index must not restart the semantic lane: {}",
+        ctx.checkout_semantic().describe()
+    );
+
+    let query = "read a configuration file from disk";
+    assert_reloading_after_eviction(&search(&ctx, query));
+    assert!(
+        ctx.checkout_semantic().active(),
+        "the search must restart the lane: {}",
+        ctx.checkout_semantic().describe()
+    );
+    wait_views_filled(&ctx);
+    let deadline = Instant::now() + DEADLINE;
+    while !matches!(
+        &*ctx.semantic_index_status().read().unwrap(),
+        SemanticIndexStatus::Ready { .. }
+    ) {
+        assert!(
+            Instant::now() < deadline,
+            "the reloaded lane never became ready"
+        );
+        drain(&ctx);
+        thread::sleep(Duration::from_millis(20));
+    }
+    let answer = search(&ctx, query);
+    assert_eq!(answer["semantic_status"], "ready", "{answer:#}");
+    assert_eq!(answer["complete"], true, "{answer:#}");
+}
