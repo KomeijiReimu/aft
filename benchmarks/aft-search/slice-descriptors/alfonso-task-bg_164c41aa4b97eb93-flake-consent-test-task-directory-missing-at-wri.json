@@ -1,9 +1,0 @@
-{
-  "slice_class": "non_ranking",
-  "targeted_mechanism": "none",
-  "kind": "harness",
-  "fixtures": [
-    "harness-goldens"
-  ],
-  "note": "Test-only flake fix: the consent scratch-routing test now allocates its task bundles through the locked create_task_layout path instead of bare task_paths + write_task, so the detached persisted-task GC cannot rmdir an empty session directory between creation and the first write. No changed path matches RANKING_FENCE_PREFIXES; subc/ is outside the fence."
-}
