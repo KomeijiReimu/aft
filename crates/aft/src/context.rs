@@ -20039,7 +20039,11 @@ mod callgraph_store_for_ops_tests {
                 fixture.source.clone(),
             ]))
             .unwrap();
-        let outcome = crate::runtime_drain::drain_watcher_events_bounded(&fixture.ctx, 1);
+        // Drain to completion before forcing the quiet window to expire: a
+        // slice that exhausts its time budget parks in its apply phase with
+        // the publication still due, and a publication requested from that
+        // phase returns early without clearing the due mark.
+        let outcome = crate::runtime_drain::drain_watcher_to_completion_for_test(&fixture.ctx, 1);
         assert_eq!(outcome.processed, 1);
         let mut state = fixture.ctx.watcher_drain_slice().lock().take().unwrap();
         assert!(state.view_publication_due.is_some());
