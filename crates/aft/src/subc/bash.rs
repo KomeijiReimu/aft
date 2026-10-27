@@ -4063,12 +4063,11 @@ mod grant_path_tests {
         let started = Instant::now();
         let stored = loop {
             let conn = db.lock().unwrap();
-            let row = crate::db::bash_tasks::get_bash_task(&conn, "opencode", session, &task_id)
-                .unwrap();
+            let row =
+                crate::db::bash_tasks::get_bash_task(&conn, "opencode", session, &task_id).unwrap();
             let settled = row.as_ref().is_some_and(|row| row.status == "completed");
             let record =
-                crate::db::rich_ui::view_record_json(&conn, "opencode", session, &task_id)
-                    .unwrap();
+                crate::db::rich_ui::view_record_json(&conn, "opencode", session, &task_id).unwrap();
             drop(conn);
             if settled
                 && record
