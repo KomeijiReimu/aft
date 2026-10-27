@@ -10989,6 +10989,8 @@ impl BgTaskRegistry {
                         proxy.authorization.stamp().scope_epoch,
                     ))
             {
+                #[cfg(test)]
+                eprintln!("secret proxy authorization revoked before arming");
                 proxy.stop();
                 return Err(super::secrets::PROXY_UNAVAILABLE.to_owned());
             }

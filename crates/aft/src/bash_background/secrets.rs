@@ -165,9 +165,13 @@ impl Runtime {
         self.proxy.address()
     }
     pub(crate) fn arm(&mut self, pid: u32) -> Result<(), String> {
-        self.proxy
-            .arm_command(pid)
-            .map_err(|_| PROXY_UNAVAILABLE.to_owned())?;
+        self.proxy.arm_command(pid).map_err(|reason| {
+            #[cfg(test)]
+            eprintln!("secret proxy arming failed: {reason:?}");
+            #[cfg(not(test))]
+            let _ = reason;
+            PROXY_UNAVAILABLE.to_owned()
+        })?;
         self.armed = true;
         Ok(())
     }

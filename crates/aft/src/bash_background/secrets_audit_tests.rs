@@ -529,7 +529,9 @@ fn completion_cleanup(timeout: bool) {
             .is_none()
     });
     let scratch = std::fs::read_to_string(f.root.path().join("scratch-path")).unwrap();
-    wait(|| !Path::new(&scratch).exists());
+    // Completed commands retain ordinary scratch for later reads. Their secret
+    // bundle and proxy ownership must still be released immediately.
+    wait(|| !Path::new(&scratch).join("secret-trust.pem").exists());
     assert_eq!(f.vault.materials.load(Ordering::SeqCst), 1);
 }
 

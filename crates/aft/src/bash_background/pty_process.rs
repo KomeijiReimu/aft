@@ -133,12 +133,23 @@ pub(crate) fn spawn_pty_for_command(
                 .and_then(|task| task.secret_runtime())
                 .is_some()
         {
+            let secret_ready = spawn_plan
+                .prepared_task()
+                .and_then(|task| task.secret_runtime())
+                .is_some();
             let mut gated = vec![
                 OsString::from("-c"),
-                OsString::from("read -r ready || exit 125; exec \"$@\""),
+                OsString::from(if secret_ready {
+                    "printf '%s' ready > \"$1\" || exit 125; shift; read -r ready || exit 125; exec \"$@\""
+                } else {
+                    "read -r ready || exit 125; exec \"$@\""
+                }),
                 OsString::from("aft-memory-gate"),
-                shell_path.as_os_str().to_owned(),
             ];
+            if secret_ready {
+                gated.push(paths.io_dir.join("secret-ready").into_os_string());
+            }
+            gated.push(shell_path.as_os_str().to_owned());
             gated.append(&mut args);
             args = gated;
             std::ffi::OsStr::new("/bin/sh")
@@ -399,6 +410,29 @@ fn try_spawn_pty(
         master: Some(pair.master),
     };
     let child_pid = child.child.as_ref().unwrap().process_id();
+    #[cfg(unix)]
+    if spawn_plan
+        .prepared_task()
+        .and_then(|task| task.secret_runtime())
+        .is_some()
+    {
+        // PTY setup can close the spawn error pipe before exec finishes. A
+        // forked non-dumpable child is not inspectable until exec resets its
+        // state. The AFT-supplied shell gate writes readiness before waiting
+        // for the release line; user command execution follows that wait.
+        let ready = paths.io_dir.join("secret-ready");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::fs::read(&ready).ok().as_deref() == Some(b"ready") {
+                let _ = std::fs::remove_file(&ready);
+                break;
+            }
+            if std::time::Instant::now() >= until {
+                return Err(super::secrets::PROXY_UNAVAILABLE.to_owned());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
     #[cfg(unix)]
     registry.arm_secret_proxy(
         spawn_plan,
