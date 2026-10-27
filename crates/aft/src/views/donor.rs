@@ -208,9 +208,9 @@ pub(crate) fn seal(database: &Path) -> Result<SealRecord, String> {
         if crate::db::file_identity::open_connections(database) != 0 {
             return Err(error("seal", "the database is still open"));
         }
-        std::fs::File::open(database)
-            .and_then(|file| file.sync_all())
-            .map_err(|e| error("fsync", e))?;
+        // Windows refuses FlushFileBuffers on a read-only handle; the views
+        // helper opens the file for writing there.
+        super::sync_file(database).map_err(|e| error("fsync", e))?;
     }
     no_journal_siblings(database)?;
     let journal_mode = header_journal_mode(database)?;
@@ -293,9 +293,7 @@ pub(crate) fn clone_sealed(donor: &Path, destination: &Path) -> Result<CloneMech
         if cfg!(test) {
             verify_fingerprint(destination, &record)?;
         }
-        std::fs::File::open(destination)
-            .and_then(|file| file.sync_all())
-            .map_err(|e| error("fsync", e))?;
+        super::sync_file(destination).map_err(|e| error("fsync", e))?;
         if let Some(parent) = destination.parent() {
             super::sync_directory(parent).map_err(|e| error("fsync", e))?;
         }
