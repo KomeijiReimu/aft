@@ -1448,7 +1448,7 @@ test("each_line reminder keeps bounded rows and drop recovery hint", () => {
       match_text: "matching lines",
       match_offset: 0,
       context:
-        'stdout byte 0 ×2: ERROR a\n3 matching lines dropped. Read them with bash_status({ task_id: "bash-lines", output_offset: 16 }).',
+        'stdout byte 0 ×2: ERROR a\n3 matching lines dropped. Read them with bash_status({ task_id: "bash-lines", outputOffset: 16 }).',
       once: false,
       batch: {
         lines: [{ stream: "stdout", offset: 0, end_offset: 8, text: "ERROR a", count: 2 }],
@@ -1462,7 +1462,7 @@ test("each_line reminder keeps bounded rows and drop recovery hint", () => {
   expect(reminder).toContain("task bash-lines matching lines:");
   expect(reminder).toContain("stdout byte 0 ×2: ERROR a");
   expect(reminder).toContain(
-    '3 matching lines dropped. Read them with bash_status({ task_id: "bash-lines", output_offset: 16 }).',
+    '3 matching lines dropped. Read them with bash_status({ task_id: "bash-lines", outputOffset: 16 }).',
   );
 });
 

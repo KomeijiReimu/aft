@@ -150,7 +150,7 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
         .enum(["each_line"])
         .optional()
         .describe(
-          "Async-only: batch every matching complete line, fold consecutive duplicates, and report cap drops with bash_status byte offsets.",
+          "Async-only: batch every matching complete line, fold consecutive duplicates, and report cap drops with byte offsets.",
         ),
       once: z
         .boolean()
