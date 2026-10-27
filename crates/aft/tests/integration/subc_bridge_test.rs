@@ -11281,12 +11281,20 @@ fn minimal_bind_doc() -> Value {
     })
 }
 
+/// Write `doc` as the root's project config in one atomic replacement, so a
+/// reader in the daemon never sees a half-written document.
+///
+/// On Windows, replacing a file is refused with ERROR_ACCESS_DENIED (os error
+/// 5) while a handle on the destination is open without share-delete, and
+/// briefly after such a handle closes while Windows finishes removing its
+/// directory entry. The daemon reads this file on every bind and config
+/// reload, so the second case can happen here: retry it for a bounded time
+/// instead of failing the scenario. On Unix a rename over a file is never
+/// refused for this reason.
 fn write_bind_project_config(root: &std::path::Path, doc: &Value) {
     let path = root.join(".cortexkit").join("aft.jsonc");
     let parent = path.parent().expect("project config parent");
     std::fs::create_dir_all(parent).expect("create .cortexkit dir");
-    // An earlier bind may be reading this path while the next bind is sent.
-    // Publish a complete sibling file instead of truncating the live document.
     let mut temporary =
         tempfile::NamedTempFile::new_in(parent).expect("create project config temp");
     std::io::Write::write_all(
@@ -11294,7 +11302,28 @@ fn write_bind_project_config(root: &std::path::Path, doc: &Value) {
         &serde_json::to_vec(doc).expect("serialize bind doc"),
     )
     .expect("write project config temp");
-    temporary.persist(&path).expect("publish project config");
+    let mut attempt = 0u32;
+    loop {
+        match temporary.persist(&path) {
+            Ok(_) => return,
+            Err(error)
+                if cfg!(windows) && is_windows_sharing_retry(error.error.kind(), attempt) =>
+            {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                temporary = error.file;
+            }
+            Err(error) => panic!("publish project config: {:?}", error.error),
+        }
+    }
+}
+
+/// Whether a refused publish should be tried again: only the Windows
+/// replacement conflict, and only for the bounded number of attempts the
+/// caller allows.
+fn is_windows_sharing_retry(kind: std::io::ErrorKind, attempts_so_far: u32) -> bool {
+    const PUBLISH_ATTEMPTS: u32 = 40;
+    kind == std::io::ErrorKind::PermissionDenied && attempts_so_far < PUBLISH_ATTEMPTS
 }
 
 fn subc_mcp_principal() -> Principal {
