@@ -1395,6 +1395,7 @@ fn audit_worker_credential_command_keeps_the_credential_refusal() {
     let _no_ticket = Env::set(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, None);
     let _no_bypass = Env::set("GH_SHIM_BYPASS", None);
     let (_sink, lines) = capture_refusals_for_test();
+    let mut lookups = 0;
     for raw in [
         vec!["auth", "token"],
         vec!["auth", "status", "--show-token"],
@@ -1403,10 +1404,20 @@ fn audit_worker_credential_command_keeps_the_credential_refusal() {
         let status = run_with(
             &args(&raw),
             |_| panic!("a credential refusal must not delegate: {raw:?}"),
-            |_, _, _, _| panic!("a credential refusal must not reach identity lookup: {raw:?}"),
+            // The read-identity check runs before the credential arm and
+            // declines credential shapes without any lookup; it must still
+            // never report a worker session for them.
+            |_, _, _, _| {
+                lookups += 1;
+                Ok(None)
+            },
         );
         assert_eq!(status, 86, "{raw:?}");
     }
+    assert_eq!(
+        lookups, 3,
+        "each credential shape consults read identity once"
+    );
     let lines = lines.lock().unwrap();
     assert_eq!(
         lines.len(),
