@@ -292,21 +292,29 @@ async fn cancelled_call_notice_read_case(poll_native: bool) {
     let _shutdown = Shutdown(Arc::clone(&ctx));
     let executor = Arc::new(Executor::new());
     assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-    let (bash_tx, mut bash_rx) = mpsc::channel(8);
+    let (bash_tx, _bash_rx) = mpsc::channel(8);
     let connection = PersistentCancelSignal::new();
-    route_bash(
-        &executor,
-        &root,
-        &connection,
-        &bash_tx,
-        1,
-        json!({"command": "sleep 60", "background": true}),
-    )
-    .await;
-    let (_, data) = next_bash_reply(&mut bash_rx).await;
-    let task_id = data["task_id"].as_str().expect("background task id");
+    let task_id = ctx
+        .bash_background()
+        .spawn_with_shell_in_slot(
+            crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+            "sleep 60",
+            crate::bash_background::BashShell::Bash,
+            crate::bash_background::registry::resolve_posix_shell(),
+            CANCEL_SESSION.into(),
+            root.as_path().into(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(60)),
+            None,
+            dir.path().join("storage"),
+            crate::bash_background::TaskSlot::Background { max: 10 },
+            true,
+            false,
+            Some(root.as_path().into()),
+        )
+        .unwrap();
     ctx.bash_background()
-        .note_cancelled_call(task_id, CANCEL_SESSION);
+        .note_cancelled_call(&task_id, CANCEL_SESSION);
     let notice = format!("task {task_id} from your cancelled call is still running; check it with bash_status or stop it with bash_kill");
 
     if poll_native {
@@ -355,7 +363,7 @@ async fn cancelled_call_notice_read_case(poll_native: bool) {
 
     // The agent's taskId spelling must receive notices; the plugin's task_id poll must not.
     ctx.bash_background()
-        .note_cancelled_call(task_id, CANCEL_SESSION);
+        .note_cancelled_call(&task_id, CANCEL_SESSION);
     let mut status = route_cancel_test_tool(
         &executor,
         &root,
