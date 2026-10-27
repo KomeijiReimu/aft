@@ -14305,7 +14305,8 @@ impl AppContext {
     /// Every worker tool call asks for this, so the flag is read without the
     /// manager lock first: once it is set the call returns at once instead of
     /// waiting behind a language-server start or a diagnostics request that
-    /// holds the lock. Only the first worker call on a root takes the lock.
+    /// holds the lock. After one call sets the flag, later calls never take
+    /// the lock; only calls racing that first one may still contend for it.
     pub fn disable_rust_cargo_for_worker(&self) {
         if self
             .lsp_rust_worker_policy

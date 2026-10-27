@@ -6896,9 +6896,10 @@ mod route_tests {
     async fn worker_edit_builds_tool_launch_policy_only_when_a_tool_launches() {
         use crate::sandbox_spawn::{SandboxTaskKind, ToolLaunchPolicy};
         let _guard = EXCHANGE_LOCK.lock().await;
-        /// Content `launch` makes the call launch a formatter and, through a
-        /// second command's handle, a checker; any other content launches
-        /// nothing.
+        /// Content `launch` makes the call build a formatter command and,
+        /// through a second policy handle, a checker command (building a
+        /// command is what resolves the policy); any other content builds no
+        /// tool command.
         fn observe(request: RawRequest, ctx: &AppContext) -> Response {
             let policy = ToolLaunchPolicy::for_request(ctx);
             if request.params["content"].as_str() != Some("launch") {
