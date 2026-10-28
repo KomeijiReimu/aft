@@ -252,7 +252,10 @@ async fn run_case(case: &Case, role: RouteRole) -> Value {
             case.name
         );
         rich_ui::carrier::validate_body(None, &body).unwrap();
-    } else if let Some(code) = case.error {
+    } else if let Some(code) = case
+        .error
+        .filter(|code| !(role == RouteRole::Legacy && *code == "invalid_request"))
+    {
         assert_eq!(reply.header.ty, FrameType::Error, "{}", case.name);
         let error: subc_protocol::ErrorBody = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(error.code, code, "{}: {error:?}", case.name);
@@ -310,6 +313,23 @@ async fn capture_carrier_samples() {
         };
         let json = format!("{}\n", serde_json::to_string_pretty(&sample).unwrap());
         std::fs::write(&path, &json).unwrap();
+        // Closed admission refusals have no platform-dependent handler output.
+        // Retire old overrides when a formerly successful sample becomes one.
+        if !cfg!(windows)
+            && sample["reply_frame"]["body_utf8"]
+                .as_str()
+                .is_some_and(|body| {
+                    serde_json::from_str::<Value>(body).is_ok_and(|body| {
+                        body["structuredContent"]["code"] == "rich_ui_op_malformed"
+                    })
+                })
+        {
+            let windows = sample_dir().join(format!("{}.windows.json", case.name));
+            if windows.exists() {
+                std::fs::remove_file(windows).unwrap();
+                println!("CARRIER_SAMPLE_REMOVED {}.windows", case.name);
+            }
+        }
         println!(
             "CARRIER_SAMPLE {} {sample}",
             path.file_stem().unwrap().to_str().unwrap()

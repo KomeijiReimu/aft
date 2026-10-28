@@ -1,10 +1,10 @@
 {
   "request_frame": {
     "header_hex": "7a0000000200002900010000000700000000000000",
-    "body_utf8": "{\"op\":\"tool.call\",\"name\":\"aft_zoom\",\"preset\":\"worker\",\"arguments\":{\"batch\":[{\"target\":\"main.rs\",\"symbols\":[\"greeting\"]}]}}"
+    "body_utf8": "{\"name\":\"aft_zoom\",\"preset\":\"worker\",\"arguments\":{\"batch\":[{\"target\":\"main.rs\",\"symbols\":[\"greeting\"]}]},\"op\":\"tool.call\"}"
   },
   "reply_frame": {
-    "header_hex": "d50000000201002900010000000700000000000000",
-    "body_utf8": "{\"content\":[{\"type\":\"text\",\"text\":\"main.rs:1-3 [function greeting]\\n\\n1: fn greeting() -> &'static str {\\n2:     \\\"hello phone\\\"\\n3: }\\n4: \\n5: fn main() {\\n6:     println!(\\\"{}\\\", greeting());\"}],\"isError\":false}"
+    "header_hex": "c50000000201002900010000000700000000000000",
+    "body_utf8": "{\"content\":[{\"type\":\"text\",\"text\":\"rich_ui_op_malformed\"}],\"isError\":true,\"structuredContent\":{\"success\":false,\"code\":\"rich_ui_op_malformed\",\"message\":\"A versioned rich UI operation is required.\"}}"
   }
 }

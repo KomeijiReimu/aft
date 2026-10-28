@@ -127,6 +127,7 @@ async fn operation_non_carrier_keeps_shell_precedence_and_structured_content_omi
         let mut identity = occipital_identity(&root, RouteRole::ToolProviderV1);
         let data = Arc::get_mut(&mut identity.0).unwrap();
         data.scope = None;
+        data.tool_result_body = true;
         if let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut data.spawn_principal {
             *principal_id = Some("third-party:reader".into());
         }
