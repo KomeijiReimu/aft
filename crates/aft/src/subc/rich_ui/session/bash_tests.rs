@@ -411,35 +411,67 @@ async fn command_status_frame_keys_replay_only_the_carrier_frame_not_the_viewed_
         false,
     );
     let args = json!({"rich_ui_op":"bash_status@1", "task":"viewed"});
-    let first = exchange_keyed(
-        &f,
-        "bash_status",
-        args.clone(),
-        "worker",
-        Some("frame-1"),
-        71,
-    )
-    .await;
-    let body: Value = serde_json::from_slice(&first.body).unwrap();
-    assert_eq!(body["structuredContent"]["running"], true);
-    task.mark_terminal(BgTaskStatus::Completed, Some(5), None);
-    persistence::write_task_at(&layout, &task).unwrap();
-    save_row(&f, &layout, &task);
-    let retry = exchange_keyed(
-        &f,
-        "bash_status",
-        args.clone(),
-        "worker",
-        Some("frame-1"),
-        72,
-    )
-    .await;
-    assert_eq!(retry.body, first.body);
-    assert_eq!(retry.header.corr, 72);
-    let fresh = exchange_keyed(&f, "bash_status", args, "worker", Some("frame-2"), 73).await;
-    let fresh: Value = serde_json::from_slice(&fresh.body).unwrap();
-    assert_eq!(
-        fresh["structuredContent"],
-        json!({"running":false,"exitCode":5})
-    );
+    let executor = Arc::new(Executor::new());
+    assert!(executor.register_actor(f.carrier.root.clone(), f.ctx.clone()));
+    let routes = HashMap::from([
+        (route_key(41, 9), f.carrier.clone()),
+        (route_key(43, 9), f.policy.clone()),
+    ]);
+    let metrics = Arc::new(DispatchPathMetrics::new());
+    let (edge, mut ready) = tool_provider::LedgerEdge::new();
+    let (writer, mut replies) = mpsc::channel(10);
+    let (proxy, proxy_task) = edge.proxy(writer, executor.clone(), metrics.clone());
+    let mut first_bytes = Vec::new();
+    for (key, corr, replay) in [
+        ("frame-1", 71, false),
+        ("frame-1", 72, true),
+        ("frame-2", 73, false),
+    ] {
+        let request = decoded_request("bash_status", args.clone(), "worker", Some(key), corr);
+        assert!(edge
+            .defer(request, &routes, &executor, &proxy, &metrics)
+            .is_ok());
+        if !replay {
+            let admitted = tokio::time::timeout(Duration::from_secs(5), ready.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let outgoing = tool_provider::route_tests::exchange_decoded_with_capabilities(
+                admitted,
+                &routes,
+                &executor,
+                &metrics,
+                |_request, _ctx| panic!("status must use its observation-only handler"),
+                PROOFS,
+            )
+            .await;
+            proxy.send(outgoing).await.unwrap();
+        }
+        let mut reply = tokio::time::timeout(Duration::from_secs(5), replies.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        reply.project_tool_result().unwrap();
+        assert_eq!(reply.header.corr, corr);
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        if corr == 71 {
+            assert_eq!(body["structuredContent"]["running"], true);
+            first_bytes = reply.body.clone();
+            task.mark_terminal(BgTaskStatus::Completed, Some(5), None);
+            persistence::write_task_at(&layout, &task).unwrap();
+            save_row(&f, &layout, &task);
+        } else if replay {
+            assert_eq!(reply.body, first_bytes);
+            assert!(
+                ready.try_recv().is_err(),
+                "a settled retry must not dispatch again"
+            );
+        } else {
+            assert_eq!(
+                body["structuredContent"],
+                json!({"running":false,"exitCode":5})
+            );
+        }
+    }
+    proxy_task.abort();
 }

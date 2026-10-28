@@ -615,16 +615,13 @@ async fn exchange(f: &Fixture, name: &str, args: Value, preset: &str) -> Frame {
     exchange_keyed(f, name, args, preset, None, 71).await
 }
 
-async fn exchange_keyed(
-    f: &Fixture,
+fn decoded_request(
     name: &str,
     args: Value,
     preset: &str,
     key: Option<&str>,
     corr: u64,
-) -> Frame {
-    let executor = Arc::new(Executor::new());
-    assert!(executor.register_actor(f.carrier.root.clone(), f.ctx.clone()));
+) -> DecodedFrame {
     let frame = Frame::build(
         FrameType::Request,
         control_flags(),
@@ -642,18 +639,31 @@ async fn exchange_keyed(
         .unwrap(),
     )
     .unwrap();
-    let routes = HashMap::from([
-        (route_key(41, 9), f.carrier.clone()),
-        (route_key(43, 9), f.policy.clone()),
-    ]);
-    let decoded = DecodedFrame {
+    DecodedFrame {
         frame,
         parsed_body: Default::default(),
         confinement: None,
         launch_restore: None,
         codemode_policies: None,
         phase_trace: PhaseTrace::new(Instant::now()),
-    };
+    }
+}
+
+async fn exchange_keyed(
+    f: &Fixture,
+    name: &str,
+    args: Value,
+    preset: &str,
+    key: Option<&str>,
+    corr: u64,
+) -> Frame {
+    let executor = Arc::new(Executor::new());
+    assert!(executor.register_actor(f.carrier.root.clone(), f.ctx.clone()));
+    let routes = HashMap::from([
+        (route_key(41, 9), f.carrier.clone()),
+        (route_key(43, 9), f.policy.clone()),
+    ]);
+    let decoded = decoded_request(name, args, preset, key, corr);
     let reply = tool_provider::route_tests::exchange_decoded_with_capabilities(
         decoded,
         &routes,

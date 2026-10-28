@@ -128,13 +128,29 @@ fn carrier_status_skips_head_worker_and_unscoped_project_fallbacks() {
         .to_bash_task_row("opencode", &layout.paths)
         .unwrap();
     crate::db::rich_ui::upsert_task_row_with_view(&db.lock().unwrap(), &row, &metadata).unwrap();
-    let req = request(&metadata.task_id, "head-session");
     for scope in [Some(head), None] {
+        if scope.is_none() {
+            // Relaxed project lookup applies only to unstamped tasks, not to
+            // the scoped worker used by the head's positive control above.
+            let plain =
+                create_task_layout(&root, "other-session", "bash-0000000000000092").unwrap();
+            metadata.task_id = plain.paths.task_id.clone();
+            metadata.session_id = "other-session".into();
+            metadata.scope = None;
+            write_task_at(&plain, &metadata).unwrap();
+            fs::write(&plain.paths.stdout, "project-output").unwrap();
+            fs::write(&plain.paths.stderr, "").unwrap();
+            let row = metadata.to_bash_task_row("opencode", &plain.paths).unwrap();
+            crate::db::rich_ui::upsert_task_row_with_view(&db.lock().unwrap(), &row, &metadata)
+                .unwrap();
+        }
+        let req = request(&metadata.task_id, "head-session");
         crate::access_policy::with_scope(scope, || {
             let agent = crate::commands::bash_status::handle(&req, &ctx);
             assert!(
                 agent.success,
-                "ordinary head/project fallback must read worker: {:?}",
+                "ordinary head/project fallback must read worker (scoped={}): {:?}",
+                crate::access_policy::current_scope().is_some(),
                 agent.data
             );
             let carrier =
