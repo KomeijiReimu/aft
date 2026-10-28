@@ -12126,21 +12126,31 @@ impl AppContext {
             max_file_size: config.search_index_max_file_size,
         };
         let family = self.memoized_artifact_cache_key(&root);
-        let view = {
-            let mut slot = self.lexical_view.lock();
-            if !slot
-                .as_ref()
-                .is_some_and(|view| view.matches(&root, &storage, &family, policy))
-            {
-                match crate::views::trigram::LexicalView::new(root, storage, family, policy) {
-                    Ok(view) => *slot = Some(Arc::new(view)),
-                    Err(error) => return Some(Err(error)),
+        // Building the view, recording a watcher gap and binding the checkout
+        // can take long on a cold or loaded machine, and other queries may
+        // wait behind them. None of it is this request's read, so it does not
+        // spend the request's filesystem deadline.
+        let acquired = crate::bounded_io::excluding_wait(|| {
+            let view = {
+                let mut slot = self.lexical_view.lock();
+                if !slot
+                    .as_ref()
+                    .is_some_and(|view| view.matches(&root, &storage, &family, policy))
+                {
+                    match crate::views::trigram::LexicalView::new(root, storage, family, policy) {
+                        Ok(view) => *slot = Some(Arc::new(view)),
+                        Err(error) => return Err(error),
+                    }
                 }
-            }
-            slot.as_ref().unwrap().clone()
+                slot.as_ref().unwrap().clone()
+            };
+            self.record_checkout_pending_watcher_gap();
+            Ok(view.snapshot())
+        });
+        let result = match acquired {
+            Ok(result) => result,
+            Err(error) => return Some(Err(error)),
         };
-        self.record_checkout_pending_watcher_gap();
-        let result = view.snapshot();
         if pinned_config_for(self.config_pin_key()).is_some() {
             LEXICAL_QUERY_SNAPSHOTS.with(|snapshots| {
                 snapshots

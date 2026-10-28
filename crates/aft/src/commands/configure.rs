@@ -14301,6 +14301,79 @@ mod tests {
         assert_eq!(ctx.lexical_view_route_counts(), [0, 0, 1]);
     }
 
+    /// A grep whose lexical view takes longer to bind than the request's whole
+    /// filesystem deadline still reads and answers: the bind is shared view
+    /// work, not the request's read. On a loaded Windows runner the first grep
+    /// after configure spent its deadline waiting for the bind and was refused
+    /// with `read_deadline_exceeded` before reading anything.
+    #[test]
+    fn lexical_views_grep_after_a_bind_longer_than_its_deadline_still_reads() {
+        // Holds the process environment lock for the whole test, as the other
+        // lexical views tests do.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        struct Slow {
+            source: Arc<dyn crate::views::trigram::LexicalSnapshotSource>,
+            delay: Duration,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl crate::views::trigram::LexicalSnapshotSource for Slow {
+            fn acquire(&self) -> Result<crate::views::snapshot::Snapshot, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(self.delay);
+                crate::views::trigram::LexicalSnapshotSource::acquire(self.source.as_ref())
+            }
+            fn record_change(&self, path: &Path) {
+                crate::views::trigram::LexicalSnapshotSource::record_change(
+                    self.source.as_ref(),
+                    path,
+                );
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("shared.ts"),
+            "export const OLDER_COMMIT_TOKEN = 1;\nneedle alpha\n",
+        )
+        .unwrap();
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(
+                &configure_lexical_views(&root, &temp.path().join("storage")),
+                &ctx
+            )
+            .success
+        );
+        let initialized = ctx.lexical_view_snapshot("bind").unwrap();
+        assert!(initialized.is_ok(), "{:?}", initialized.err());
+        let request = RawRequest {
+            id: "lexical-views-slow-bind".into(),
+            command: "grep".into(),
+            lsp_hints: None,
+            session_id: None,
+            params: json!({"pattern": "TOKEN|needle", "include": "**/*.ts"}),
+        };
+        let expected = crate::commands::grep::handle_grep(&request, &ctx);
+        assert!(expected.success, "{:?}", expected.data);
+        assert!(!expected.data["matches"].as_array().unwrap().is_empty());
+        let slow = Arc::new(Slow {
+            source: ctx.lexical_source_for_test(),
+            delay: Duration::from_millis(1500),
+            calls: Default::default(),
+        });
+        ctx.install_lexical_source_for_test(slow.clone());
+        // The request's filesystem deadline (1 s) is shorter than the bind.
+        let actual = crate::bounded_io::with_budget(
+            Some(crate::bounded_io::Budget::after(Duration::from_secs(1))),
+            || crate::commands::grep::handle_grep(&request, &ctx),
+        );
+        assert_eq!(slow.calls.load(Ordering::SeqCst), 1);
+        assert!(actual.success, "{:?}", actual.data);
+        assert_eq!(actual.data["matches"], expected.data["matches"]);
+        assert_eq!(actual.data["text"], expected.data["text"]);
+    }
+
     #[test]
     fn lexical_views_public_kill_child() {
         // Holds the process environment lock for the whole test. These views
