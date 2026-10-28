@@ -10421,14 +10421,17 @@ async fn handle_tool_call(
                 )
                 .await;
             }
-            Ok(Some(_operation)) => {
-                // A published operation alone grants no access to a session.
-                // Refuse rather than dispatch without a proven session policy.
-                return send_provider_error(
+            Ok(Some(operation)) => {
+                return rich_ui::session::submit(
                     tx,
-                    metrics,
                     frame,
-                    rich_ui::chunks::refusal("session_not_bound"),
+                    identity,
+                    routes,
+                    executor,
+                    active_tool_calls,
+                    metrics,
+                    operation,
+                    dispatch,
                 )
                 .await;
             }

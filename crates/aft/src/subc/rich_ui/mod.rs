@@ -36,5 +36,6 @@ pub(crate) mod jcs_number;
 pub(crate) mod operations;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod schema;
+pub(super) mod session;
 #[cfg(test)]
 mod vectors;
