@@ -169,7 +169,7 @@ fn output_incomplete_tail_waits_for_completion_or_invalidating_byte_or_exit() {
             validate(&result);
             assert_eq!(
                 result["items"][0]["text"],
-                String::from_utf8_lossy(&completed[boundary..])
+                String::from_utf8_lossy(&completed[boundary..]).as_ref()
             );
             assert_eq!(result["items"][0]["bytes"], 2 + suffix.len());
             assert!(result["next"].is_null());
@@ -192,6 +192,9 @@ fn output_exhausted_running_stream_can_grow_and_cursor_rejects_other_identities(
     let encoded = result["next"].as_str().unwrap();
     assert!(encoded.len() <= 1024);
     let offsets = c.decode(encoded).unwrap();
+    let empty_again = page(&c, offsets, &backend(b"", b"", offsets, false, false), 1).unwrap();
+    assert_eq!(empty_again["items"], json!([]));
+    assert_ne!(empty_again["next"], encoded);
     let result = page(
         &c,
         offsets,
@@ -218,4 +221,24 @@ fn output_exhausted_running_stream_can_grow_and_cursor_rejects_other_identities(
     for invalid in ["!", "", &"a".repeat(1025)] {
         assert!(c.decode(invalid).is_none());
     }
+}
+
+#[test]
+fn cursor_mac_matches_independent_hmac_sha256_vector() {
+    let c = cursor("session", "task");
+    // Python's hmac.digest over compact JSON identity plus the binary payload.
+    let expected = "AQAAAAAAAAAHAAAAAAAAAAsAAAAAAAAAA_3ae2v-CyA0Og34gE8Mr0JmglrN9t8c8S5F20jkvw1R";
+    assert_eq!(
+        c.encode(Offsets {
+            stdout: 7,
+            stderr: 11,
+            read_sequence: 3
+        }),
+        expected
+    );
+    let decoded = c.decode(expected).unwrap();
+    assert_eq!(
+        (decoded.stdout, decoded.stderr, decoded.read_sequence),
+        (7, 11, 3)
+    );
 }

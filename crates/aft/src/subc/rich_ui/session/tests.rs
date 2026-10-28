@@ -612,6 +612,17 @@ fn worker_without_candidate_is_unbound_even_without_database() {
 const MANIFEST: &[u8] = include_bytes!("../../../../tests/fixtures/rich_ui/manifest.jcs.json");
 
 async fn exchange(f: &Fixture, name: &str, args: Value, preset: &str) -> Frame {
+    exchange_keyed(f, name, args, preset, None, 71).await
+}
+
+async fn exchange_keyed(
+    f: &Fixture,
+    name: &str,
+    args: Value,
+    preset: &str,
+    key: Option<&str>,
+    corr: u64,
+) -> Frame {
     let executor = Arc::new(Executor::new());
     assert!(executor.register_actor(f.carrier.root.clone(), f.ctx.clone()));
     let frame = Frame::build(
@@ -619,10 +630,15 @@ async fn exchange(f: &Fixture, name: &str, args: Value, preset: &str) -> Frame {
         control_flags(),
         41,
         9,
-        71,
-        serde_json::to_vec(
-            &json!({"op":"tool.call", "name":name, "arguments":args, "preset":preset}),
-        )
+        corr,
+        serde_json::to_vec(&{
+            let mut body =
+                json!({"op":"tool.call", "name":name, "arguments":args, "preset":preset});
+            if let Some(key) = key {
+                body["call_key"] = key.into();
+            }
+            body
+        })
         .unwrap(),
     )
     .unwrap();

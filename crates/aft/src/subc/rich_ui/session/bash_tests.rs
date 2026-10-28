@@ -87,6 +87,7 @@ fn reopen(f: &Fixture) {
 
 #[tokio::test]
 async fn command_views_resolve_storage_segment_and_fresh_status_after_exit() {
+    let _storage_env = crate::test_env::without_storage_override();
     let _manifest =
         super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     for kind in ["head", "worker"] {
@@ -122,6 +123,7 @@ async fn command_views_resolve_storage_segment_and_fresh_status_after_exit() {
 
 #[tokio::test]
 async fn command_output_cursor_survives_reopen_and_uses_database_key() {
+    let _storage_env = crate::test_env::without_storage_override();
     let _manifest =
         super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let f = Fixture::new("worker");
@@ -146,7 +148,7 @@ async fn command_output_cursor_survives_reopen_and_uses_database_key() {
     let first = query(&f, "bash_output", "call", json!({"limit":1})).await;
     assert_eq!(
         first["structuredContent"]["items"],
-        json!([{"stream":"stdout","text":"one\n","bytes":4,"continued":false,"firstAvailableOffset":null,"prefixDropped":false}])
+        json!([{"stream":"stdout","text":"one\n","bytes":4,"continued":false,"firstAvailableOffset":null,"prefixDropped":true}])
     );
     let cursor = first["structuredContent"]["next"].clone();
     let key: Vec<u8> = f
@@ -171,7 +173,7 @@ async fn command_output_cursor_survives_reopen_and_uses_database_key() {
     .await;
     assert_eq!(
         second["structuredContent"]["items"],
-        json!([{"stream":"stderr","text":"two\n","bytes":4,"continued":false,"firstAvailableOffset":null,"prefixDropped":false}])
+        json!([{"stream":"stderr","text":"two\n","bytes":4,"continued":false,"firstAvailableOffset":null,"prefixDropped":true}])
     );
     assert!(second["structuredContent"]["next"].is_null());
     assert_eq!(
@@ -220,6 +222,7 @@ async fn command_output_cursor_survives_reopen_and_uses_database_key() {
 
 #[tokio::test]
 async fn command_views_refuse_foreign_minted_duplicates_and_erased_rows() {
+    let _storage_env = crate::test_env::without_storage_override();
     let _manifest =
         super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     for fault in ["foreign", "minted", "duplicate", "erased", "worker-owned"] {
@@ -279,6 +282,7 @@ async fn command_views_refuse_foreign_minted_duplicates_and_erased_rows() {
 
 #[tokio::test]
 async fn command_output_pty_has_no_stderr_and_keeps_escape_bytes() {
+    let _storage_env = crate::test_env::without_storage_override();
     let _manifest =
         super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let f = Fixture::new("head");
@@ -294,6 +298,148 @@ async fn command_output_pty_has_no_stderr_and_keeps_escape_bytes() {
     let body = query(&f, "bash_output", "call", json!({})).await;
     assert_eq!(
         body["structuredContent"],
-        json!({"items":[{"stream":"pty","text":"\x1b[31mpty\x1b[0m","bytes":12,"continued":false,"firstAvailableOffset":null,"prefixDropped":false}],"next":null})
+        json!({"items":[{"stream":"pty","text":"\x1b[31mpty\x1b[0m","bytes":12,"continued":false,"firstAvailableOffset":null,"prefixDropped":true}],"next":null})
+    );
+}
+
+#[tokio::test]
+async fn command_output_reports_unknown_origin_for_trimmed_and_legacy_artifacts() {
+    let _storage_env = crate::test_env::without_storage_override();
+    let _manifest =
+        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let f = Fixture::new("head");
+    let (layout, _) = seed(
+        &f,
+        TASK,
+        &f.policy.session,
+        principal(&f.policy).unwrap(),
+        "call",
+        true,
+        false,
+    );
+    let live = query(&f, "bash_output", "call", json!({"limit":1})).await;
+    assert_eq!(
+        live["structuredContent"]["items"][0]["firstAvailableOffset"],
+        0
+    );
+    assert_eq!(
+        live["structuredContent"]["items"][0]["prefixDropped"],
+        false
+    );
+    let mut task = persistence::read_task_at(&layout).unwrap();
+    task.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+    persistence::write_task_at(&layout, &task).unwrap();
+    save_row(&f, &layout, &task);
+    let dropped = persistence::replace_artifact_with_tail(
+        &layout.paths,
+        persistence::TaskArtifact::Stdout,
+        2,
+    )
+    .unwrap();
+    assert_eq!(dropped, 2);
+    let trimmed = query(&f, "bash_output", "call", json!({})).await;
+    assert_eq!(trimmed["structuredContent"]["items"][0]["text"], "e\n");
+    for item in trimmed["structuredContent"]["items"].as_array().unwrap() {
+        assert_eq!(item["firstAvailableOffset"], Value::Null);
+        assert_eq!(item["prefixDropped"], true);
+    }
+}
+
+#[tokio::test]
+async fn command_status_observation_leaves_completion_for_agents_next_call() {
+    let _storage_env = crate::test_env::without_storage_override();
+    let _manifest =
+        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let f = Fixture::new("head");
+    let (layout, _) = seed(
+        &f,
+        TASK,
+        &f.policy.session,
+        principal(&f.policy).unwrap(),
+        "call",
+        false,
+        false,
+    );
+    let harness: crate::harness::Harness = f.policy.harness.parse().unwrap();
+    f.ctx.bash_background().set_harness(harness.clone());
+    f.ctx.bash_background().set_db_pool(f.ctx.db().unwrap());
+    f.ctx
+        .bash_background()
+        .replay_session(
+            &f.dir.path().join("storage").join(harness.storage_segment()),
+            &f.policy.session,
+        )
+        .unwrap();
+    assert!(f
+        .ctx
+        .bash_background()
+        .has_completions_for_session(Some(&f.policy.session)));
+    let observed = query(&f, "bash_status", "call", json!({})).await;
+    assert_eq!(observed["structuredContent"]["running"], false);
+    assert!(
+        !persistence::read_task_at(&layout)
+            .unwrap()
+            .completion_delivered
+    );
+    let mut ordinary = Response::success("ordinary", json!({}));
+    let mut text = String::new();
+    crate::response_finalize::finalize_tool_response_with_visibility(
+        &mut ordinary,
+        &mut text,
+        &f.ctx,
+        &f.policy.session,
+        "read",
+        true,
+        true,
+    );
+    assert_eq!(ordinary.data["bg_completions"][0]["task_id"], TASK);
+}
+
+#[tokio::test]
+async fn command_status_frame_keys_replay_only_the_carrier_frame_not_the_viewed_call() {
+    let _storage_env = crate::test_env::without_storage_override();
+    let _manifest =
+        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let f = Fixture::new("head");
+    let (layout, mut task) = seed(
+        &f,
+        TASK,
+        &f.policy.session,
+        principal(&f.policy).unwrap(),
+        "viewed",
+        true,
+        false,
+    );
+    let args = json!({"rich_ui_op":"bash_status@1", "task":"viewed"});
+    let first = exchange_keyed(
+        &f,
+        "bash_status",
+        args.clone(),
+        "worker",
+        Some("frame-1"),
+        71,
+    )
+    .await;
+    let body: Value = serde_json::from_slice(&first.body).unwrap();
+    assert_eq!(body["structuredContent"]["running"], true);
+    task.mark_terminal(BgTaskStatus::Completed, Some(5), None);
+    persistence::write_task_at(&layout, &task).unwrap();
+    save_row(&f, &layout, &task);
+    let retry = exchange_keyed(
+        &f,
+        "bash_status",
+        args.clone(),
+        "worker",
+        Some("frame-1"),
+        72,
+    )
+    .await;
+    assert_eq!(retry.body, first.body);
+    assert_eq!(retry.header.corr, 72);
+    let fresh = exchange_keyed(&f, "bash_status", args, "worker", Some("frame-2"), 73).await;
+    let fresh: Value = serde_json::from_slice(&fresh.body).unwrap();
+    assert_eq!(
+        fresh["structuredContent"],
+        json!({"running":false,"exitCode":5})
     );
 }

@@ -156,6 +156,9 @@ fn page(
         .map_err(|_| "result_schema_mismatch")?
         .is_terminal();
     let pty = data["mode"] == "pty";
+    // Persisted tasks do not record artifact origins. A terminal/legacy bundle
+    // may already have lost a prefix, so never invent an original offset for it.
+    let prefix_unknown = terminal || data["output_truncated"] != false;
     let read = |name, field: &str, more: &str| -> Result<Stream, &'static str> {
         Ok(Stream {
             name,
@@ -197,11 +200,17 @@ fn page(
                 advanced.stderr += bytes as u64;
             }
             let item = json!({"stream":stream.name, "text":text, "bytes":bytes,
-                "continued":false, "firstAvailableOffset":null, "prefixDropped":false});
+                "continued":false, "firstAvailableOffset":if prefix_unknown { None } else { Some(0) },
+                "prefixDropped":prefix_unknown});
             items.push(item);
-            // Include the cursor and JSON escaping in the page budget. A cursor
-            // is larger than null, so this also bounds a final page.
-            let candidate = envelope(cursor, advanced, items.clone(), false);
+            // Budget the complete serialized page, including JSON escaping and
+            // the cursor (or null when this item drains both terminal streams).
+            let candidate_drained = terminal
+                && streams.iter().enumerate().all(|(i, stream)| {
+                    !stream.more
+                        && consumed[i] + if i == index { bytes } else { 0 } == stream.bytes.len()
+                });
+            let candidate = envelope(cursor, advanced, items.clone(), candidate_drained);
             if serde_json::to_vec(&candidate)
                 .map_err(|_| "result_schema_mismatch")?
                 .len()
