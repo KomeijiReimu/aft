@@ -1301,10 +1301,35 @@ fn audit_head_write_still_routes_through_the_relay() {
     use std::sync::Arc;
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(20);
-    let manifest: Manifest = serde_json::from_str(include_str!(
+    let mut manifest_value: Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/gh_shim/v20-manifest.json"
     ))
     .unwrap();
+    // The fixture manifests review only macOS and Linux, but the shim
+    // classifies with current_platform(): anywhere else the exercised tuple
+    // would read as undeclared and the write could never route. Extend the
+    // exercised tuple to the running platform so run_with can reach the relay
+    // on every platform this test runs on. Nothing else about the fixture
+    // changes.
+    if let Some(entries) = manifest_value
+        .get_mut("tiers")
+        .and_then(|tiers| tiers.get_mut("governed"))
+        .and_then(Value::as_array_mut)
+    {
+        for entry in entries {
+            if entry.get("tuple").and_then(Value::as_str) != Some("issue comment") {
+                continue;
+            }
+            if let Some(platforms) = entry.get_mut("platform").and_then(Value::as_array_mut) {
+                let current = Value::String(current_platform().to_string());
+                if !platforms.contains(&current) {
+                    platforms.push(current);
+                }
+            }
+        }
+    }
+    let manifest: Manifest = serde_json::from_value(manifest_value).unwrap();
+    tests::write_signed_manifest(&fixture.paths, manifest.clone(), unix_seconds());
     let bindings: Vec<Value> = manifest
         .bindings
         .iter()
