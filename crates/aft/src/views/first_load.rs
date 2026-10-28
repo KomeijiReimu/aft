@@ -6030,7 +6030,7 @@ impl CheckoutDriver {
                             || crate::watcher_backend::subscription::current(self.owner.root())
                                 != guard.subscription;
                         if stale {
-                            eprintln!("semantic subscription stale root={:?} steady_supported={} recorded={:?} current={:?}", self.owner.root(), guard.steady_supported, guard.subscription, crate::watcher_backend::subscription::status(self.owner.root()));
+                            eprintln!("semantic subscription stale root={:?} scope={} thread={:?} steady_supported={} recorded={:?} current={:?}\n{}", self.owner.root(), self.owner.scope(), std::thread::current().name(), guard.steady_supported, guard.subscription, crate::watcher_backend::subscription::status(self.owner.root()), std::backtrace::Backtrace::force_capture());
                         }
                         stale
                     })
