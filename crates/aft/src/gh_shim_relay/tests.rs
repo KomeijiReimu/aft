@@ -563,6 +563,42 @@ fn authority_never_widens_across_reconnect() {
     assert_eq!(bot_authority(&ticket, &routes), Some(original));
 }
 
+// Exercise relay admission rather than only the immutable-authority helper:
+// a captured Call ticket must not adopt the session's replacement scope.
+#[tokio::test]
+async fn audit_proof_call_ticket_must_not_adopt_a_rebound_agent() {
+    let original = delegating_stamp();
+    let live = crate::bash_background::registry::with_scope_spawn(Some(original.clone()), || {
+        crate::gh_shim_ticket::ScopedTicket::issue("audit-call-rebind", "call", "/p")
+    });
+    let redeemed = crate::gh_shim_ticket::redeem(live.value().unwrap()).unwrap();
+    assert_eq!(redeemed.launch.unwrap().authority, original);
+    let mut replacement = delegating_stamp();
+    replacement.scope_ref = "different-head".into();
+    replacement.scope_epoch = 99;
+    replacement.attributes.agent_id = Some("agent-replacement".into());
+    let routes = scopes_for("audit-call-rebind", Some(replacement));
+    let mut params = bot_params(live.value().unwrap(), "audit-call-rebound-write");
+    params["request"]["metadata"]["agent_id"] = json!("agent-replacement");
+    let transport = FakeTransport::scoped();
+    let answer = relay(
+        &transport,
+        RelayCall {
+            operation: BOT_REQUEST_OPERATION,
+            params: &params,
+            first_party: true,
+            route_scopes: &routes,
+        },
+        &|_| {},
+    )
+    .await;
+    assert!(
+        transport.calls().is_empty(),
+        "the Call ticket captured another head/agent, but relay forwarded under the replacement: {:?}",
+        answer.data
+    );
+}
+
 fn background_ticket(
     root: &std::path::Path,
     session: &str,

@@ -15,6 +15,8 @@ use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp, ScopeStatus};
 mod crash;
 #[path = "pty_dispatch_tests.rs"]
 mod pty;
+#[path = "audit_proof_tests.rs"]
+mod audit_proofs;
 
 struct Env(&'static str, Option<OsString>);
 impl Env {
