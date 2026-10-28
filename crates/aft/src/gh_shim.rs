@@ -7867,6 +7867,13 @@ mod v22_tests;
 // use read as dead there; the module compiles in both profiles.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod tests {
+    /// Deadline for tests that expect rung discovery to finish. The product
+    /// budget is 2 s; a loaded Windows runner has exceeded it, which turns the
+    /// answer into R1 (budget exhausted) and fails tests that are not about the
+    /// budget. Tests of the budget itself (expired deadlines, slow test
+    /// daemons, probe stages) keep `DISCOVERY_BUDGET` so they still time out.
+    const TEST_DISCOVERY_DEADLINE: Duration = Duration::from_secs(60);
+
     #[cfg(unix)]
     #[test]
     fn supplemental_numeric_id_probe_does_not_accept_an_expired_deadline() {
@@ -8393,7 +8400,7 @@ mod tests {
             &paths,
             Path::new("/cwd"),
             123,
-            std::time::Instant::now() + DISCOVERY_BUDGET,
+            std::time::Instant::now() + TEST_DISCOVERY_DEADLINE,
             Some(&doc),
         );
         assert_eq!(record.record.rung, Rung::R1);
@@ -8422,7 +8429,7 @@ mod tests {
             &paths,
             Path::new("/cwd"),
             1,
-            std::time::Instant::now() + DISCOVERY_BUDGET,
+            std::time::Instant::now() + TEST_DISCOVERY_DEADLINE,
             Some(&doc),
         );
         assert_eq!(record.record.rung, Rung::R1);
@@ -8445,7 +8452,7 @@ mod tests {
             &paths,
             Path::new("/cwd"),
             1,
-            std::time::Instant::now() + DISCOVERY_BUDGET,
+            std::time::Instant::now() + TEST_DISCOVERY_DEADLINE,
             Some("{}"),
         );
         assert_eq!(record.record.rung, Rung::R1);
@@ -10615,7 +10622,7 @@ mod tests {
             "subc": { "connection_file": connection_file }
         })
         .to_string();
-        let future_deadline = || std::time::Instant::now() + DISCOVERY_BUDGET;
+        let future_deadline = || std::time::Instant::now() + TEST_DISCOVERY_DEADLINE;
         let r1_cases = [
             (
                 R1Reason::DisabledByConfig,
@@ -15270,7 +15277,7 @@ INHERITED FLAGS
                     &paths,
                     &project,
                     TEST_NOW,
-                    Instant::now() + DISCOVERY_BUDGET,
+                    Instant::now() + TEST_DISCOVERY_DEADLINE,
                     Some(&doc),
                 );
                 let same_repo = repo == Some("cortexkit/motor");
@@ -15346,7 +15353,7 @@ INHERITED FLAGS
             &paths,
             &unbound,
             now,
-            Instant::now() + DISCOVERY_BUDGET,
+            Instant::now() + TEST_DISCOVERY_DEADLINE,
             Some(&doc),
         );
         assert_eq!(unbound_determination.record.rung, Rung::R2);
@@ -15370,7 +15377,7 @@ INHERITED FLAGS
             &target,
             &bound,
             now + 1,
-            Instant::now() + DISCOVERY_BUDGET,
+            Instant::now() + TEST_DISCOVERY_DEADLINE,
             Some(&doc),
         );
         assert!(

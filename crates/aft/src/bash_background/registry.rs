@@ -5666,6 +5666,10 @@ impl BgTaskRegistry {
         writer
             .flush()
             .map_err(|error| format!("failed to flush PTY writer: {error}"))?;
+        // Record that typed input reached the terminal, so a task that later
+        // seems to ignore its input can be told apart from one that never got
+        // it. Only the size is logged: the input can contain secrets.
+        crate::slog_info!("bash_write task={task_id} bytes={}", input.len());
         Ok(input.len())
     }
 
