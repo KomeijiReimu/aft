@@ -288,7 +288,7 @@ fn bash_kill_scope_completion_is_an_expected_owner_stop() {
 }
 
 #[test]
-fn bash_kill_scope_next_bash_family_reply_names_cancellation_once() {
+fn bash_kill_scope_next_agent_reply_names_cancellation_once() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = crate::config::Config::default();
     config.project_root = Some(dir.path().into());
@@ -301,23 +301,13 @@ fn bash_kill_scope_next_bash_family_reply_names_cancellation_once() {
     let task = tasks.start(&stamp, "session", "sleep 30", true);
     assert!(tasks.cancel(&stamp).success);
     let mut response = Response::success("next", json!({}));
-    let mut unrelated = String::new();
-    crate::response_finalize::finalize_tool_response(
-        &mut response,
-        &mut unrelated,
-        &ctx,
-        "session",
-        "read",
-        false,
-    );
-    assert!(!unrelated.contains("cancelled by owner"));
     let mut next = String::new();
     crate::response_finalize::finalize_tool_response(
         &mut response,
         &mut next,
         &ctx,
         "session",
-        "bash_status",
+        "read",
         false,
     );
     assert!(
