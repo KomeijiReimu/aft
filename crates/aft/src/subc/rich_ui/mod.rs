@@ -16,10 +16,11 @@
 //!   until the publication prerequisites are reviewed.
 //! - `chunks`: the `rich_ui.manifest_chunk` and `rich_ui.template_chunk`
 //!   provider reads that serve manifest and template bytes to Occipital.
+//! - `session`: stamped session roles, policy-route selection and read dispatch.
 //!
 //! Operation admission is live but fails closed without a published manifest.
-//! Query translation and result projection are staged for the policy-route and
-//! handler integrations; their dead-code allowances remain module-local.
+//! Session reads use the selected policy route; task lookup and the bash
+//! output/watch integrations remain fail-closed until their handlers are ready.
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod admission;
@@ -36,5 +37,6 @@ pub(crate) mod jcs_number;
 pub(crate) mod operations;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod schema;
+pub(super) mod session;
 #[cfg(test)]
 mod vectors;

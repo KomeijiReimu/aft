@@ -249,6 +249,24 @@ impl DatabaseWaits {
         if carrier_precheck_failed(identity, body) {
             return Err(decoded);
         }
+        if identity.role == tool_provider::RouteRole::ToolProviderV1
+            && super::occipital_carrier_route(identity)
+            && super::route_request_is_tool_call(body)
+        {
+            // Worker role and confinement both depend on the policy route's
+            // preset row. Do not let the carrier's disables or preset reject
+            // the call before that row can be read.
+            if identity
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.kind == subc_protocol::scope::ScopeKind::Worker)
+                && ctx.database_runtime_initializing()
+            {
+                let deadline_ms = body.get("deadline_ms").and_then(Value::as_u64);
+                return self.wait(decoded, route, &ctx, "tool.call".into(), deadline_ms, true);
+            }
+            return Err(decoded);
+        }
         // A scoped worker's saved confinement lives in aft.db, and the bind
         // reply goes out while that database may still be opening. Its
         // catalog fetch and tool calls wait for the open rather than be
@@ -378,6 +396,13 @@ impl DatabaseWaits {
             return Err(decoded);
         };
         if carrier_precheck_failed(identity, body) {
+            return Err(decoded);
+        }
+        // V1 carrier policy is resolved on its executor job, including saved
+        // confinement. Legacy calls still need the ordinary pre-admission read.
+        if identity.role == tool_provider::RouteRole::ToolProviderV1
+            && super::occipital_carrier_route(identity)
+        {
             return Err(decoded);
         }
         // Catalog fetches and the other provider operations run on the
