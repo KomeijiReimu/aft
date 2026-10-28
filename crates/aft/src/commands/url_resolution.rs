@@ -878,8 +878,9 @@ mod url_tests {
                     seen.borrow_mut().push((path.to_path_buf(), path.exists()));
                 })))
             });
-            // Direct handlers bypass run_tool_call's 25s budget; outline would
-            // otherwise use bounded_io::command's 5s filesystem fallback.
+            // Direct handlers bypass run_tool_call's 25s budget. Outline uses
+            // bounded_io::command's 5s IO_BUDGET instead, leaving only 2s after
+            // the fetch's 3s read-back/reply reserve.
             let _io = crate::bounded_io::enter_if_absent(Duration::from_secs(25));
             let call = || match req.command.as_str() {
                 "outline" => super::super::super::outline::handle_outline(req, &fixture.ctx),
@@ -1522,8 +1523,9 @@ mod url_tests {
                         .push(std::fs::read(path).unwrap_or_default());
                 })))
             });
-            // Match run_tool_call rather than outline's 5s filesystem fallback,
-            // without replacing a shorter budget installed by a deadline test.
+            // Use run_tool_call's 25s budget: bounded_io::command's 5s IO_BUDGET
+            // otherwise leaves outline fetches 2s after the 3s read-back/reply
+            // reserve. Preserve shorter budgets installed by deadline tests.
             let _io = crate::bounded_io::enter_if_absent(Duration::from_secs(25));
             let call = || match req.command.as_str() {
                 "outline" => super::super::super::outline::handle_outline(req, &fixture.ctx),
