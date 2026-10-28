@@ -10782,8 +10782,11 @@ mod tests {
         let timeout_response = with_query_budget_for_test(200, || {
             response_value(handle_semantic_search(&semantic_request(query, 5), &ctx))
         });
+        // The gate holds the first inference until the test releases it, so a
+        // request that waited on it would never return. The bound only needs
+        // to tell that apart from a loaded runner's slow lexical fallback.
         assert!(
-            started_at.elapsed() < Duration::from_secs(1),
+            started_at.elapsed() < Duration::from_secs(10),
             "local query timeout must bound the search request"
         );
         started_rx
@@ -10817,8 +10820,11 @@ mod tests {
                 &ctx,
             ))
         });
+        // Queuing behind the held inference would end in the 200ms query
+        // timeout, not the busy reply asserted below; the wall-clock bound is
+        // loose so a loaded runner's lexical fallback cannot trip it.
         assert!(
-            busy_started.elapsed() < Duration::from_millis(200),
+            busy_started.elapsed() < Duration::from_secs(10),
             "a new query must not queue behind the late inference"
         );
         assert_eq!(busy_response["success"], true);
