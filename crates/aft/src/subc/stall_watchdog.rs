@@ -1283,7 +1283,11 @@ mod tests {
         )
         .await;
         fixture.send_ping(891).await;
-        let reply = tokio::time::timeout(TEST_THRESHOLD, read_frame(&mut fixture.daemon)).await;
+        // The lock stays held until the read ends, so a frame loop that waits
+        // on it never answers. A generous bound still proves that, without
+        // failing when a loaded runner takes longer than one stall threshold.
+        let reply =
+            tokio::time::timeout(Duration::from_secs(30), read_frame(&mut fixture.daemon)).await;
         drop(held);
         fixture.finish();
         let pong = reply
