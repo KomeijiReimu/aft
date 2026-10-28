@@ -3104,7 +3104,9 @@ fn transient_fill_recovery_does_not_reread_or_reembed_stored_content() {
     runtime.driver().take_reconcile_work();
     runtime.plane().take_source_reads();
     online.store(true, Ordering::SeqCst);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // A loaded Windows runner can take more than 5 s to reach the next retry
+    // and finish the fill; a fill that never settles still fails here.
+    let deadline = Instant::now() + Duration::from_secs(30);
     let settled = loop {
         match observer.rx.recv_deadline(deadline) {
             Ok("retry") => continue,
