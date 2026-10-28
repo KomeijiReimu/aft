@@ -564,17 +564,19 @@ async fn exchange(f: &Fixture, name: &str, args: Value, preset: &str) -> Frame {
         (route_key(41, 9), f.carrier.clone()),
         (route_key(43, 9), f.policy.clone()),
     ]);
-    let operation = super::super::admission::prepare(name, &args).unwrap();
-    let (writer, mut replies) = mpsc::channel(4);
-    submit(
-        &writer,
-        &frame,
-        f.carrier.clone(),
+    let decoded = DecodedFrame {
+        frame,
+        parsed_body: Default::default(),
+        confinement: None,
+        launch_restore: None,
+        codemode_policies: None,
+        phase_trace: PhaseTrace::new(Instant::now()),
+    };
+    let reply = tool_provider::route_tests::exchange_decoded_with_actor(
+        decoded,
         &routes,
         &executor,
-        &Arc::default(),
         &Arc::new(DispatchPathMetrics::new()),
-        operation,
         |request, ctx| {
             assert_eq!(request.command, "read");
             assert!(matches!(
@@ -589,13 +591,8 @@ async fn exchange(f: &Fixture, name: &str, args: Value, preset: &str) -> Frame {
             crate::commands::read::handle_read(&request, ctx)
         },
     )
-    .await
-    .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), replies.recv())
-        .await
-        .unwrap()
-        .unwrap()
-        .frame
+    .await;
+    reply.frame
 }
 
 #[tokio::test]
@@ -717,4 +714,113 @@ async fn worker_opening_database_waits_for_every_carrier_operation() {
         resumed.await;
         reads_and_calls(&f, PROOFS, true);
     }
+}
+
+fn read_under_policy(f: &Fixture, path: &Path, carried: bool) -> Response {
+    let args = json!({"file":path});
+    let run = |_| {
+        let request: RawRequest =
+            serde_json::from_value(json!({"id":"policy-read","command":"read","file":path}))
+                .unwrap();
+        crate::commands::read::handle_read(&request, &f.ctx)
+    };
+    if carried {
+        f.resolve()
+            .with_policy(&f.ctx, "policy-read", "read", args, run)
+            .unwrap_or_else(|r| r)
+    } else {
+        crate::sandbox_spawn::with_authenticated_principal(f.policy.spawn_principal.clone(), || {
+            call_policy::with_tool_call_policy(
+                &f.ctx,
+                &f.policy,
+                "policy-read",
+                crate::access_policy::AskRoute::Deny,
+                BindTrust::FirstParty,
+                "read",
+                args,
+                run,
+                |r| r.unwrap_or_else(|r| r),
+            )
+        })
+    }
+}
+
+#[test]
+fn outside_allow_paths_cannot_override_carrier_force_restriction_or_ask_deny() {
+    for kind in ["head", "worker"] {
+        let f = Fixture::new(kind);
+        access_grants::register(&f.policy, &f.ctx).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join("outside.txt");
+        std::fs::write(&path, "outside\n").unwrap();
+        let db = f.ctx.db().unwrap();
+        let grant = crate::access_policy::AccessGrant {
+            path: crate::access_policy::policy_path(outside.path()),
+            kind: crate::access_policy::GrantKind::Subtree,
+            operation: crate::access_policy::AccessOperation::Read,
+        };
+        crate::db::access_grants::insert(
+            &db.lock().unwrap(),
+            &access_grants::scope_key(&f.policy),
+            &grant,
+        )
+        .unwrap();
+        assert!(
+            read_under_policy(&f, &path, false).success,
+            "session's own grant is the control"
+        );
+        assert_eq!(
+            read_under_policy(&f, &path, true).data["code"],
+            "path_outside_root"
+        );
+        let ungranted = tempfile::tempdir().unwrap();
+        let ungranted_path = ungranted.path().join("not-granted.txt");
+        std::fs::write(&ungranted_path, "ask\n").unwrap();
+        assert_eq!(
+            read_under_policy(&f, &ungranted_path, true).data["code"],
+            "path_outside_root"
+        );
+        let inside = f.dir.path().join("inside.txt");
+        std::fs::write(&inside, "inside\n").unwrap();
+        assert!(read_under_policy(&f, &inside, true).success);
+    }
+}
+
+#[test]
+fn confined_worker_uses_policy_principal_and_keeps_native_fence_code() {
+    let f = Fixture::new("worker");
+    remote_policy::catalog(
+        json!({"preset":"worker","params":{"confine":"root"}}),
+        &f.policy,
+        &f.ctx,
+    )
+    .unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let path = outside.path().join("outside.txt");
+    std::fs::write(&path, "outside\n").unwrap();
+    assert_eq!(
+        read_under_policy(&f, &path, true).data["code"],
+        "path_outside_confined_root"
+    );
+}
+
+#[tokio::test]
+async fn flow_read_carrier_keeps_earlier_principal_refusal() {
+    let _manifest = super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let mut f = Fixture::new("ephemeral");
+    Arc::get_mut(&mut f.carrier.0)
+        .unwrap()
+        .scope
+        .as_mut()
+        .unwrap()
+        .scope_ref = "flow-read/probe".into();
+    let reply = exchange(
+        &f,
+        "read",
+        json!({"rich_ui_op":"read@1","path":"x"}),
+        "head",
+    )
+    .await;
+    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(body["code"], "file_read_exact_route_not_admitted", "{body}");
 }

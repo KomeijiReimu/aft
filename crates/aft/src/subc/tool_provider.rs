@@ -5051,7 +5051,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod route_tests {
+pub(in crate::subc) mod route_tests {
     mod carrier_samples;
     #[path = "../../rich_ui/admission/route_tests.rs"]
     mod operation_admission;
@@ -5196,7 +5196,7 @@ mod route_tests {
         exchange_decoded_with_actor(decoded, &routes, &executor, metrics, dispatch).await
     }
 
-    async fn exchange_decoded_with_actor(
+    pub(in crate::subc) async fn exchange_decoded_with_actor(
         decoded: DecodedFrame,
         routes: &HashMap<RouteChannel, RouteIdentity>,
         executor: &Arc<Executor>,

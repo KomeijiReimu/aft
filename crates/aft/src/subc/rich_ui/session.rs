@@ -11,7 +11,11 @@ pub(super) struct ProofCapabilities {
 
 impl ProofCapabilities {
     fn from_manifest(manifest: &ModuleManifest) -> Self {
-        let provides = &manifest.capabilities.provides;
+        let provides = manifest
+            .capabilities
+            .as_ref()
+            .map(|c| c.provides.as_slice())
+            .unwrap_or_default();
         Self {
             call_modes: provides.iter().any(|s| s == "call-modes/v1"),
             on_behalf_of: provides.iter().any(|s| s == "scope-on-behalf-of/v1"),
@@ -361,6 +365,7 @@ pub(in crate::subc) async fn submit(
                 request.header.corr,
                 serde_json::to_vec(error).expect("error serializes"),
             )
+            .map(WriterFrame::plain)
             .map_err(SubcError::FrameBuild)
         } else {
             wire::build_carrier_response_frame(
