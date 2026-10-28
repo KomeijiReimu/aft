@@ -6,15 +6,16 @@ type MetadataContext = { metadata?: (update: Record<string, unknown>) => unknown
 export function metadataUpdater(context: MetadataContext) {
   let pending = Promise.resolve();
   return (metadata: Record<string, unknown>): Promise<void> => {
-    pending = pending.then(async () => {
-      const result = context.metadata?.({ metadata });
-      if (Effect.isEffect(result))
-        await Effect.runPromise(result as Effect.Effect<unknown, unknown>);
-      else await result;
-    });
-    // Progress callbacks cannot await. Attach a rejection handler now; the next
-    // awaited update still reports a host failure without an unhandled rejection.
-    void pending.catch(() => {});
+    pending = pending
+      .then(async () => {
+        const result = context.metadata?.({ metadata });
+        if (Effect.isEffect(result))
+          await Effect.runPromise(result as Effect.Effect<unknown, unknown>);
+        else await result;
+      })
+      // A failed live UI update must not turn successful command output into a tool
+      // failure, and later updates must still be allowed to run.
+      .catch(() => {});
     return pending;
   };
 }
