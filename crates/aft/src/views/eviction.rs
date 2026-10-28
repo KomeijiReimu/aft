@@ -1298,6 +1298,11 @@ fn enforce_with_schedule(
     options: EnforceOptions<'_>,
     scheduled: Option<bool>,
 ) -> Result<EnforcementReport, EvictionError> {
+    // V3 members and their namespace budget are collected by storage retention.
+    // A v3-only owner has no legacy registry connection to measure or evict.
+    if registry.is_v3_only() {
+        return Ok(EnforcementReport::default());
+    }
     let budget = registry.disk_budget();
     let deadline = options.deadline;
     let _ = registry.reclaim_dead_sessions();
@@ -3354,12 +3359,40 @@ mod tests {
         write_tree(&root_b, "b");
         let b = semantic_view(storage.path(), "b", &root_b);
         drop(semantic_view(storage.path(), "a", &root_a));
-        let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
-        registry.set_disk_budget(budget(0, u64::MAX));
-
-        let report = enforce(&registry, EnforceOptions::default()).unwrap();
-
-        assert_eq!(evicted(&report), ["a"], "{:?}", report.held);
+        // Semantic members now live in v3, so legacy soft-limit enforcement
+        // cannot evict them. Commit an idle member's eviction and let the v3
+        // collector finish it, including removal of its base reference.
+        let scope = crate::views::semantic_runtime::view_scope("a");
+        crate::blob_store::v3::publish(storage.path(), FAMILY, 0, None, |publication| {
+            publication.registry.with_barrier(|tx| {
+                assert_eq!(
+                    tx.execute(
+                        "UPDATE members SET state=?2 WHERE scope=?1",
+                        rusqlite::params![scope, crate::views::registry::STATE_EVICTING],
+                    )?,
+                    1
+                );
+                Ok(())
+            })
+        })
+        .unwrap();
+        let report = crate::storage_retention::run_pass_with_budget_for_test(
+            &crate::root_cache::StoragePaths::same(storage.path()),
+            Duration::from_secs(120),
+        );
+        assert_eq!(report.removed_roots, 1, "{report:?}");
+        assert!(
+            !crate::blob_store::v3::view_dir(storage.path(), FAMILY, &scope)
+                .unwrap()
+                .exists()
+        );
+        assert!(crate::blob_store::v3::view_dir(
+            storage.path(),
+            FAMILY,
+            &crate::views::semantic_runtime::view_scope("b")
+        )
+        .unwrap()
+        .exists());
         fs::write(
             root_a.join("src").join("delta.rs"),
             "pub fn delta_cache_insert() {}\n",

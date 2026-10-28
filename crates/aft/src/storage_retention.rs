@@ -13461,11 +13461,9 @@ mod v3_collector_tests {
         }
     }
 
-    /// Every path this build runs for ordinary users, with views off and on,
-    /// leaves a storage root that v0.60.0 prepared without any v3 file and
-    /// with its reader floor unchanged: configure, the deferred configure
-    /// work, an enforcement pass, two retention passes (which include the v3
-    /// collector) and both modes of `aft cache prune-legacy`.
+    /// Views-off configure must leave a v0.60.0 reader floor alone. Views-on
+    /// configure may promote the root, but both v3 floor domains must be durable
+    /// before its first v3 publication. Maintenance must preserve that boundary.
     #[test]
     fn no_production_path_writes_v3_over_a_v0_60_0_floor() {
         use crate::migration::prune_legacy::{prune_legacy, PruneOptions};
@@ -13497,6 +13495,27 @@ mod v3_collector_tests {
             assert!(output.status.success(), "git {args:?}: {output:?}");
         }
         fs::write(storage.join("reader-floor.json"), V0_60_0_FLOOR).unwrap();
+        let first_publication = Arc::new(Mutex::new(None));
+        let observed = Arc::clone(&first_publication);
+        let observed_storage = storage.clone();
+        let _hook = observe_test_hook(
+            &storage,
+            Arc::new(move |step| {
+                if step != "v3-floor-raised" {
+                    return;
+                }
+                let mut first = observed.lock().unwrap();
+                if first.is_none() {
+                    *first = Some((
+                        crate::reader_floor::read(&observed_storage)
+                            .unwrap()
+                            .unwrap(),
+                        observed_storage.join("blobs/v3").exists(),
+                        crate::durability::take(),
+                    ));
+                }
+            }),
+        );
         let embedder = fixed_vector_embedder();
         for views in [false, true] {
             let ctx = crate::context::AppContext::new(
@@ -13532,7 +13551,7 @@ mod v3_collector_tests {
             assert!(response.success, "{}", response.data);
             crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
             if views {
-                // The checkout's semantic runtime owns the v2 family registry;
+                // The checkout's semantic runtime owns the v3 family registry;
                 // wait for it to load as the binary's drain loop would.
                 let deadline = Instant::now() + Duration::from_secs(120);
                 let registry = loop {
@@ -13548,6 +13567,14 @@ mod v3_collector_tests {
                     std::thread::sleep(Duration::from_millis(50));
                 };
                 crate::views::eviction::enforce(&registry, Default::default()).unwrap();
+            } else {
+                assert!(!storage.join("blobs/v3").exists());
+                assert!(first_publication.lock().unwrap().is_none());
+                assert_eq!(
+                    fs::read_to_string(storage.join("reader-floor.json")).unwrap(),
+                    V0_60_0_FLOOR,
+                    "views-off configure must not promote the reader floor"
+                );
             }
         }
         for _ in 0..2 {
@@ -13574,13 +13601,9 @@ mod v3_collector_tests {
             .unwrap();
             assert!(!out.is_empty());
         }
-        assert!(storage.join("blobs/v2").exists(), "views-on never ran");
-        assert!(!storage.join("blobs/v3").exists());
-        // No production path may write a v3 floor key. Every other store in
-        // the floor is either as v0.60.0 left it or at the version this build
-        // writes for it (`PersistedStore::written`, the value its startup
-        // baseline raises to), so version bumps of other stores do not fail
-        // this test while a stray or invented key does.
+        assert!(storage.join("blobs/v3").exists(), "views-on never ran");
+        // Non-v3 stores may advance to this build's baseline, but publication
+        // must never invent a store key or remove an older reader requirement.
         use crate::persisted_format::PersistedStore;
         let stores = |text: &str| -> BTreeMap<String, u64> {
             serde_json::from_value(
@@ -13591,11 +13614,22 @@ mod v3_collector_tests {
         let before = stores(V0_60_0_FLOOR);
         let floor = fs::read_to_string(storage.join("reader-floor.json")).unwrap();
         let after = stores(&floor);
+        let first = first_publication.lock().unwrap();
+        let (published_floor, v3_existed, syncs) = first.as_ref().expect("v3 publication observed");
+        assert!(!v3_existed, "v3 data existed before the floor boundary");
+        #[cfg(unix)]
+        assert!(
+            syncs.contains(&(crate::durability::EventKind::DirectorySync, storage.clone())),
+            "the reader floor must be synced before publication: {syncs:?}"
+        );
+        #[cfg(not(unix))]
+        let _ = syncs;
         for v3 in [
             PersistedStore::ViewsV3Registry,
             PersistedStore::ViewsV3Store,
         ] {
-            assert!(!after.contains_key(v3.name()), "v3 floor key: {floor}");
+            assert_eq!(published_floor.get(v3), Some(u64::from(v3.written())));
+            assert_eq!(after.get(v3.name()), Some(&u64::from(v3.written())));
         }
         for (name, version) in &after {
             let store = PersistedStore::from_name(name)

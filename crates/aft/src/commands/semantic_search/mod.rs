@@ -10123,10 +10123,10 @@ mod tests {
             .unwrap(),
         );
         runtime.load().unwrap();
-        // The file is inherited from the base. Its fill publishes a base
-        // readiness successor, not a new worker generation. Leave the scored
-        // index rebuild to the readiness sample, as in the worker's publish
-        // window.
+        // The file is inherited from the base. Its fill publishes the base's
+        // readiness successor, recorded in bound_generation below. Leave the
+        // scored index rebuild to the readiness sample, as in the worker's
+        // publish window.
         let published_before = runtime
             .installed()
             .generation()

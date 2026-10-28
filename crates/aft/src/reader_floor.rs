@@ -277,6 +277,8 @@ pub fn publish_v3_with_floor<T>(
             (PersistedStore::ViewsV3Store, store_version),
         ],
     )?;
+    #[cfg(test)]
+    crate::storage_retention::test_hook(storage_root, "v3-floor-raised");
     Ok(write())
 }
 
