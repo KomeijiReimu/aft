@@ -1773,6 +1773,14 @@ describe("bash tool adapter", () => {
 
     // Verify progress callbacks were invoked
     expect(progressCallbacks.length).toBe(2);
+    expect(updates).toEqual([
+      expect.objectContaining({
+        content: [{ type: "text", text: "line1\n" }],
+      }),
+      expect.objectContaining({
+        content: [{ type: "text", text: "line1\nline2\n" }],
+      }),
+    ]);
 
     // Verify final result has the output
     const finalResult = result as { content: Array<{ text: string }> };

@@ -160,7 +160,9 @@ test("cancelled worker watch does not acknowledge a racing inline completion", a
       sessionID: "child",
       directory: process.cwd(),
       abort: abort.signal,
-      metadata: (value: Record<string, unknown>) => metadata.push(value),
+      // The bash tools send OpenCode's { title?, metadata? } update shape.
+      metadata: (value: { metadata?: Record<string, unknown> }) =>
+        metadata.push(value.metadata ?? {}),
     } as never);
     expect(commands).toEqual(["bash_status"]);
     expect(metadata.at(-1)?.waited).toMatchObject({ reason: "aborted" });

@@ -1685,6 +1685,7 @@ struct ReverseCorrKey {
 }
 
 struct PendingBashAsk {
+    handles_progress: bool,
     route: RouteChannel,
     tool_corr: u64,
     tool_flags: Flags,
@@ -2890,6 +2891,7 @@ fn purge_deleted_root_residents(
     );
 
     for route in stale_routes.iter().copied() {
+        metrics.held_bash_calls.clear_progress_for_route(route);
         reclaimed_routes.insert(route);
         remove_installed_route(installed_route_epochs, route);
         remove_route_channel(routes, root_channels, route);
@@ -3504,6 +3506,7 @@ async fn handle_bash_elicitation_reply(
                 routes.get(&key.route).map(access_grants::ask_route),
             );
             bash::submit_deferred_bash(
+                pending.handles_progress,
                 executor,
                 bash_deferred_tx,
                 bash_poll_touch_tx,
@@ -3932,6 +3935,7 @@ async fn teardown_installed_route(
     if let Some(cancel) = route_bash_cancels.remove(&channel) {
         cancel.token.cancel();
     }
+    metrics.held_bash_calls.clear_progress_for_route(channel);
     for resolved in pending_responses.drain_route(channel, executor) {
         deliver_resolved_subc_response(
             tx,
@@ -5068,6 +5072,7 @@ where
         .as_ref()
         .map(|hooks| Arc::clone(&hooks.metrics))
         .unwrap_or(dispatch_path_metrics);
+    let _progress_lifetime = drain::ProgressLifetimeGuard::new(Arc::clone(&dispatch_path_metrics));
     // Lives until this function returns, i.e. for the whole attached session,
     // including teardown. Dropping it stops the thread.
     #[cfg(test)]
@@ -6616,6 +6621,7 @@ where
         }
     };
 
+    dispatch_path_metrics.held_bash_calls.clear_all_progress();
     a0.stop();
     let loop_result = if matches!(loop_result, Ok(ModuleLoopExit::Graceful)) {
         candidate_requests
@@ -10388,6 +10394,12 @@ async fn handle_tool_call(
     }
     let mut route_request = if identity.role == tool_provider::RouteRole::ToolProviderV1 {
         note_route_tool_call(&identity, metrics);
+        let mut envelope = envelope;
+        let handles_progress = envelope
+            .as_object_mut()
+            .and_then(|body| body.remove("handles_progress"))
+            .and_then(|value| value.as_bool())
+            == Some(true);
         let mut call = match serde_json::from_value::<
             cortexkit_role_tool_provider::call::ToolCallRequest,
         >(envelope)
@@ -10497,6 +10509,7 @@ async fn handle_tool_call(
         }
         RouteRequest::ToolCall(ToolCallRequest {
             name: call.name,
+            handles_progress,
             arguments,
             edit_slot_survives: None,
             preview: false,
@@ -10987,6 +11000,7 @@ async fn handle_tool_call(
                     corr: reverse_corr,
                 },
                 PendingBashAsk {
+                    handles_progress: call.handles_progress,
                     route: route_id,
                     tool_corr: frame.header.corr,
                     tool_flags: frame.header.flags,
@@ -11050,6 +11064,7 @@ async fn handle_tool_call(
             access_grants::ask_route_for_call(&identity, &bare_name, &arguments),
         ));
         bash::submit_deferred_bash(
+            call.handles_progress,
             executor,
             bash_deferred_tx,
             bash_poll_touch_tx,
@@ -12179,6 +12194,7 @@ fn decode_legacy_route_request(envelope: Value) -> Result<RouteRequest, SubcErro
             };
             Ok(RouteRequest::ToolCall(ToolCallRequest {
                 name,
+                handles_progress: false,
                 arguments,
                 edit_slot_survives: None,
                 preview: false,
@@ -12230,6 +12246,9 @@ fn provider_shell_selector(name: &str, args: &mut serde_json::Map<String, Value>
 /// `schema_pin`) keep the shared type's wire names.
 #[derive(Debug, Deserialize)]
 struct ToolCallRequest {
+    /// The transport has a receiver for request-scoped progress pushes.
+    #[serde(default)]
+    handles_progress: bool,
     name: String,
     #[serde(default)]
     arguments: Value,
@@ -16491,6 +16510,7 @@ mod tests {
             asks.insert(
                 ReverseCorrKey { route, corr: 100 },
                 PendingBashAsk {
+                    handles_progress: false,
                     route,
                     tool_corr: 78,
                     tool_flags: control_flags(),

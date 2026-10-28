@@ -54,9 +54,9 @@ impl TestPty {
     }
 }
 
-/// How long a test waits for a task it expects to finish. Generous because a
-/// loaded CI runner can take seconds to start a shell (PowerShell on Windows
-/// especially); waits that expect nothing to happen stay short.
+/// Allow slow shell startup when polling for completion on a loaded CI runner;
+/// waits that expect nothing to happen stay short.
+#[cfg(unix)]
 const POSITIVE_COMPLETION_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[cfg(unix)]
@@ -447,53 +447,98 @@ fn wait_until_process_exits(pid: i32) -> bool {
 #[test]
 fn bash_streams_progress_and_returns_final_response() {
     let mut aft = AftProcess::spawn();
-
-    let response = aft.send(r#"{"id":"bash-1","method":"bash","params":{"command":"echo hello"}}"#);
-    assert_eq!(response["id"], "bash-1");
+    let frames = aft.send_until(
+        r#"{"id":"bash-1","method":"bash","handles_progress":true,"params":{"command":"echo hello; sleep 1","foreground_orchestrate":true,"wait":true}}"#,
+        |frame| frame["id"] == "bash-1",
+    );
+    let response = frames.last().unwrap();
     assert_eq!(response["success"], true);
+    assert!(response["output"]
+        .as_str()
+        .unwrap()
+        .replace("\r\n", "\n")
+        .starts_with("hello\n"));
+    assert_eq!(response["exit_code"], 0);
     assert!(
-        matches!(
-            response["status"].as_str(),
-            Some("running" | "completed" | "failed" | "killed" | "timed_out" | "fate_unknown")
-        ),
-        "unexpected spawn status: {response:?}"
+        frames[..frames.len() - 1].iter().any(|frame| {
+            frame["type"] == "progress"
+                && frame["request_id"] == "bash-1"
+                && frame["kind"] == "stdout"
+                && frame["chunk"]
+                    .as_str()
+                    .is_some_and(|chunk| chunk.replace("\r\n", "\n") == "hello\n")
+        }),
+        "missing stdout progress before terminal reply: {frames:?}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn bash_progress_requires_transport_opt_in() {
+    let mut aft = AftProcess::spawn();
+    let frames = aft.send_until(
+        r#"{"id":"bash-no-progress","method":"bash","params":{"command":"echo hello; sleep 1","foreground_orchestrate":true,"wait":true}}"#,
+        |frame| frame["id"] == "bash-no-progress",
+    );
+    assert_eq!(frames.last().unwrap()["success"], true);
+    assert!(
+        frames.iter().all(|frame| frame["type"] != "progress"),
+        "unexpected progress: {frames:?}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn bash_progress_opt_in_is_cleared_after_reply_before_id_reuse() {
+    let mut aft = AftProcess::spawn();
+    let frames = aft.send_until(
+        r#"{"id":"bash-reused","method":"bash","handles_progress":true,"params":{"command":"echo first; sleep 1","foreground_orchestrate":true,"wait":true}}"#,
+        |frame| frame["id"] == "bash-reused",
+    );
+    assert_eq!(frames.last().unwrap()["success"], true);
+    assert!(
+        frames[..frames.len() - 1]
+            .iter()
+            .any(|frame| frame["type"] == "progress" && frame["request_id"] == "bash-reused"),
+        "missing progress for the opted-in call: {frames:?}"
     );
 
-    let task_id = response["task_id"].as_str().unwrap();
-    let started = std::time::Instant::now();
-    let status = loop {
-        let status = aft.send(
-            &serde_json::json!({
-                "id": "bash-1-status",
-                "method": "bash_status",
-                "params": { "task_id": task_id }
-            })
-            .to_string(),
-        );
-        if status["status"] == "completed" {
-            break status;
-        }
-        // This test checks what a finished task reports, not how fast the shell
-        // starts; a task that never finishes still fails here, with its last
-        // status.
+    let frames = aft.send_until(
+        r#"{"id":"bash-reused","method":"bash","params":{"command":"echo second; sleep 1","foreground_orchestrate":true,"wait":true}}"#,
+        |frame| frame["id"] == "bash-reused",
+    );
+    assert_eq!(frames.last().unwrap()["success"], true);
+    assert!(
+        frames.iter().all(|frame| frame["type"] != "progress"),
+        "a completed call must not opt a reused ID into progress: {frames:?}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn bash_progress_masks_environment_secrets() {
+    let mut aft = AftProcess::spawn();
+    let secret = "progress-secret-1052-very-sensitive-value";
+    let frames = aft.send_until(&serde_json::json!({
+        "id": "bash-mask-progress", "method": "bash", "handles_progress": true,
+        "params": { "command": format!("echo {secret}; sleep 1"), "env": {"PROGRESS_SECRET_TOKEN": secret}, "foreground_orchestrate": true, "wait": true }
+    }).to_string(), |frame| frame["id"] == "bash-mask-progress");
+    let progress = frames
+        .iter()
+        .filter(|frame| frame["type"] == "progress")
+        .collect::<Vec<_>>();
+    assert!(!progress.is_empty(), "no progress: {frames:?}");
+    for frame in progress {
         assert!(
-            started.elapsed() < POSITIVE_COMPLETION_WAIT,
-            "task did not complete within {POSITIVE_COMPLETION_WAIT:?}; last status: {status:?}"
+            !frame["chunk"].as_str().unwrap().contains(secret),
+            "secret in progress: {frame:?}"
         );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    };
-    assert_eq!(
-        status["output_preview"]
-            .as_str()
-            .unwrap()
-            .replace("\r\n", "\n"),
-        "hello\n"
-    );
-    assert_eq!(status["exit_code"], 0);
-    assert!(status["duration_ms"].is_u64());
-
-    let status = aft.shutdown();
-    assert!(status.success());
+        assert!(
+            frame["chunk"].as_str().unwrap().contains("REDACTED"),
+            "expected redaction: {frame:?}"
+        );
+    }
+    assert!(aft.shutdown().success());
 }
 
 #[test]

@@ -4535,6 +4535,7 @@ pub struct AppContext {
     #[cfg(test)]
     path_restriction_root_canonicalizations: AtomicUsize,
     force_restrict_requests: parking_lot::Mutex<BTreeMap<String, usize>>,
+    progress_requests: parking_lot::Mutex<HashSet<String>>,
     pub harness: parking_lot::Mutex<Option<Harness>>,
     canonical_cache_root: parking_lot::Mutex<Option<PathBuf>>,
     is_worktree_bridge: parking_lot::Mutex<bool>,
@@ -5417,6 +5418,7 @@ impl AppContext {
             #[cfg(test)]
             path_restriction_root_canonicalizations: AtomicUsize::new(0),
             force_restrict_requests: parking_lot::Mutex::new(BTreeMap::new()),
+            progress_requests: parking_lot::Mutex::new(HashSet::new()),
             harness: parking_lot::Mutex::new(None),
             canonical_cache_root: parking_lot::Mutex::new(None),
             is_worktree_bridge: parking_lot::Mutex::new(false),
@@ -9156,6 +9158,20 @@ impl AppContext {
 
     pub fn request_force_restrict(&self, req_id: &str) -> bool {
         self.force_restrict_requests.lock().contains_key(req_id)
+    }
+
+    /// Records a transport capability, never an agent-supplied tool argument.
+    pub fn record_request_handles_progress(&self, req_id: &str) {
+        self.progress_requests.lock().insert(req_id.to_owned());
+    }
+
+    pub fn request_handles_progress(&self, req_id: &str) -> bool {
+        self.progress_requests.lock().contains(req_id)
+    }
+
+    /// Terminal replies retire the capability before the ID can be reused.
+    pub fn clear_request_handles_progress(&self, req_id: &str) {
+        self.progress_requests.lock().remove(req_id);
     }
 
     /// The outside-roots rule this request is judged under: the configured
