@@ -16,6 +16,7 @@ import {
   watchTimeoutSteer,
 } from "@cortexkit/aft-bridge";
 import { type ToolContext, tool } from "@opencode-ai/plugin";
+import { Effect } from "effect";
 import { withEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import {
   __resetBgNotificationStateForTests,
@@ -1002,7 +1003,8 @@ describe("OpenCode bash adapter", () => {
   });
 
   test("progress callback forwards rolling output previews through ctx.metadata", async () => {
-    const metadata = mock(() => {});
+    const applied: unknown[] = [];
+    const metadata = mock((update: unknown) => Effect.sync(() => { applied.push(update); }));
     const { tool: bash } = createHarness((_command, _params, options) => {
       options?.onProgress?.({ text: "hello " });
       options?.onProgress?.({ text: "world" });
@@ -1016,17 +1018,22 @@ describe("OpenCode bash adapter", () => {
       ),
     );
 
-    expect(metadata.mock.calls[0][0]).toEqual({ output: "hello ", description: "Print greeting" });
+    expect(metadata.mock.calls[0][0]).toEqual({ metadata: { output: "hello ", description: "Print greeting" } });
     expect(metadata.mock.calls[1][0]).toEqual({
+      metadata: {
       output: "hello world",
       description: "Print greeting",
+      },
     });
     expect(metadata.mock.calls.at(-1)?.[0]).toEqual({
+      metadata: {
       output: "hello world",
       description: "Print greeting",
       exit: 0,
       truncated: false,
+      },
     });
+    expect(applied).toEqual(metadata.mock.calls.map(([update]) => update));
   });
 
   test("bg_completions are captured for notification hooks, not appended by bash adapter", async () => {
