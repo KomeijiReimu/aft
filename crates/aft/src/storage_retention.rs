@@ -13516,10 +13516,10 @@ mod v3_collector_tests {
                 assert!(after.contains_key(name), "{name} left the floor: {after:?}");
             }
         };
-        let first_publication = Arc::new(Mutex::new(None));
+        let publications = Arc::new(Mutex::new(Vec::new()));
         let publication_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls = Arc::clone(&publication_calls);
-        let observed = Arc::clone(&first_publication);
+        let observed = Arc::clone(&publications);
         let observed_storage = storage.clone();
         let _hook = observe_test_hook(
             &storage,
@@ -13531,19 +13531,21 @@ mod v3_collector_tests {
                     crate::durability::take();
                     return;
                 }
-                if step != "v3-floor-raised" {
+                let Some(versions) = step.strip_prefix("v3-floor-raised:") else {
                     return;
-                }
-                let mut first = observed.lock().unwrap();
-                if first.is_none() {
-                    *first = Some((
-                        crate::reader_floor::read(&observed_storage)
-                            .unwrap()
-                            .unwrap(),
-                        observed_storage.join("blobs/v3").exists(),
-                        crate::durability::take(),
-                    ));
-                }
+                };
+                let (registry, store) = versions.split_once(':').unwrap();
+                observed.lock().unwrap().push((
+                    crate::reader_floor::read(&observed_storage)
+                        .unwrap()
+                        .unwrap(),
+                    observed_storage.join("blobs/v3").exists(),
+                    crate::durability::take(),
+                    (
+                        registry.parse::<u64>().unwrap(),
+                        store.parse::<u64>().unwrap(),
+                    ),
+                ));
             }),
         );
         let embedder = fixed_vector_embedder();
@@ -13599,7 +13601,7 @@ mod v3_collector_tests {
                 crate::views::eviction::enforce(&registry, Default::default()).unwrap();
             } else {
                 assert!(!storage.join("blobs/v3").exists());
-                assert!(first_publication.lock().unwrap().is_none());
+                assert!(publications.lock().unwrap().is_empty());
                 assert_eq!(
                     publication_calls.load(std::sync::atomic::Ordering::SeqCst),
                     0
@@ -13645,27 +13647,47 @@ mod v3_collector_tests {
         let floor = fs::read_to_string(storage.join("reader-floor.json")).unwrap();
         let after = stores(&floor);
         check_baseline(&after);
-        let first = first_publication.lock().unwrap();
-        let (published_floor, v3_existed, syncs) = first.as_ref().expect("v3 publication observed");
-        assert!(!v3_existed, "v3 data existed before the floor boundary");
-        #[cfg(unix)]
+        let publications = publications.lock().unwrap();
+        let (_, v3_existed, _, _) = publications.first().expect("v3 publication observed");
         assert!(
-            syncs.contains(&(crate::durability::EventKind::DirectorySync, storage.clone())),
-            "the reader floor must be synced before publication: {syncs:?}"
+            !v3_existed,
+            "v3 data existed before the first floor boundary"
         );
-        #[cfg(not(unix))]
-        let _ = syncs;
-        for (v3, first_version) in [
-            (
-                PersistedStore::ViewsV3Registry,
-                crate::blob_store::v3::REGISTRY_BASE_REFS_VERSION,
-            ),
-            (
-                PersistedStore::ViewsV3Store,
-                crate::blob_store::v3::FORMAT_VERSION,
-            ),
+        for (published_floor, _, syncs, (registry, store)) in publications.iter() {
+            for (domain, required) in [
+                (PersistedStore::ViewsV3Registry, registry),
+                (PersistedStore::ViewsV3Store, store),
+            ] {
+                assert!(
+                    published_floor
+                        .get(domain)
+                        .is_some_and(|version| version >= *required),
+                    "{domain:?} must cover {required} before publication: {published_floor:?}"
+                );
+            }
+            #[cfg(unix)]
+            assert!(
+                syncs.contains(&(crate::durability::EventKind::DirectorySync, storage.clone())),
+                "the reader floor must be synced before publication: {syncs:?}"
+            );
+            #[cfg(not(unix))]
+            let _ = syncs;
+        }
+        for required_registry in [
+            crate::blob_store::v3::REGISTRY_BASE_REFS_VERSION,
+            crate::blob_store::v3::REGISTRY_VERIFICATION_VERSION,
         ] {
-            assert_eq!(published_floor.get(v3), Some(u64::from(first_version)));
+            assert!(
+                publications
+                    .iter()
+                    .any(|(_, _, _, (registry, _))| *registry == u64::from(required_registry)),
+                "the production path must exercise registry schema {required_registry}"
+            );
+        }
+        for v3 in [
+            PersistedStore::ViewsV3Registry,
+            PersistedStore::ViewsV3Store,
+        ] {
             assert_eq!(after.get(v3.name()), Some(&u64::from(v3.written())));
         }
     }

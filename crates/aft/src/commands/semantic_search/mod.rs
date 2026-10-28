@@ -10123,16 +10123,18 @@ mod tests {
             .unwrap(),
         );
         runtime.load().unwrap();
-        // The file is inherited from the base. Its fill publishes the base's
-        // readiness successor, recorded in bound_generation below. Leave the
-        // scored index rebuild to the readiness sample, as in the worker's
-        // publish window.
+        // The file is inherited from the base. Its fill replaces the composed
+        // base generation; the worker manifest's base header stays fixed.
+        // Do not build the scored index here. The source.sample() call below
+        // must supply it even when publication has finished but the worker's
+        // index rebuild has not.
         let published_before = runtime
             .installed()
             .generation()
-            .base_header()
-            .cloned()
-            .unwrap();
+            .base()
+            .unwrap()
+            .name()
+            .to_owned();
         runtime
             .refresh(
                 crate::views::semantic::FillBudget::default(),
@@ -10140,13 +10142,8 @@ mod tests {
             )
             .unwrap();
         assert_ne!(
-            runtime
-                .installed()
-                .generation()
-                .base_header()
-                .unwrap()
-                .bound_generation,
-            published_before.bound_generation,
+            runtime.installed().generation().base().unwrap().name(),
+            published_before,
             "the fill must install the base readiness successor"
         );
         assert!(slot.install(epoch, Arc::clone(&runtime)));

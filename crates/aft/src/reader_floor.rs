@@ -280,7 +280,10 @@ pub fn publish_v3_with_floor<T>(
         ],
     )?;
     #[cfg(test)]
-    crate::storage_retention::test_hook(storage_root, "v3-floor-raised");
+    crate::storage_retention::test_hook(
+        storage_root,
+        &format!("v3-floor-raised:{registry_version}:{store_version}"),
+    );
     Ok(write())
 }
 

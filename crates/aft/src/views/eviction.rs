@@ -3320,6 +3320,10 @@ mod tests {
             .collect()
     }
 
+    // Retention enumerates content-addressed family names, not the descriptive
+    // legacy registry name used by the other eviction fixtures.
+    const SEMANTIC_FAMILY: &str = "0123456789abcdef";
+
     fn semantic_view(
         storage: &Path,
         scope: &str,
@@ -3327,7 +3331,7 @@ mod tests {
     ) -> crate::views::semantic_runtime::CheckoutSemantic {
         let runtime = crate::views::semantic_runtime::CheckoutSemantic::new(
             &crate::root_cache::StoragePaths::same(storage),
-            FAMILY,
+            SEMANTIC_FAMILY,
             scope,
             root,
             crate::views::semantic::SemanticProducer::current(
@@ -3363,7 +3367,7 @@ mod tests {
         // cannot evict them. Commit an idle member's eviction and let the v3
         // collector finish it, including removal of its base reference.
         let scope = crate::views::semantic_runtime::view_scope("a");
-        crate::blob_store::v3::publish(storage.path(), FAMILY, 0, None, |publication| {
+        crate::blob_store::v3::publish(storage.path(), SEMANTIC_FAMILY, 0, None, |publication| {
             publication.registry.with_barrier(|tx| {
                 assert_eq!(
                     tx.execute(
@@ -3382,13 +3386,13 @@ mod tests {
         );
         assert_eq!(report.removed_roots, 1, "{report:?}");
         assert!(
-            !crate::blob_store::v3::view_dir(storage.path(), FAMILY, &scope)
+            !crate::blob_store::v3::view_dir(storage.path(), SEMANTIC_FAMILY, &scope)
                 .unwrap()
                 .exists()
         );
         assert!(crate::blob_store::v3::view_dir(
             storage.path(),
-            FAMILY,
+            SEMANTIC_FAMILY,
             &crate::views::semantic_runtime::view_scope("b")
         )
         .unwrap()
