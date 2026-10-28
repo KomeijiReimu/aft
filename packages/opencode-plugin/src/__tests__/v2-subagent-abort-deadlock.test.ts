@@ -29,13 +29,22 @@ function deferred() {
   return { promise, resolve };
 }
 
-async function promptly(work: Promise<unknown>): Promise<boolean> {
+// A deadlocked hook never returns, so a generous bound still tells the two
+// apart on a loaded runner. Only the check that a call is still blocked uses a
+// short bound, since waiting longer there proves nothing more.
+const SETTLES_WITHIN_MS = 5_000;
+const STILL_BLOCKED_AFTER_MS = 250;
+
+async function promptly(
+  work: Promise<unknown>,
+  boundMs: number = SETTLES_WITHIN_MS,
+): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       work.then(() => true),
       new Promise<false>((resolve) => {
-        timer = setTimeout(() => resolve(false), 250);
+        timer = setTimeout(() => resolve(false), boundMs);
       }),
     ]);
   } finally {
@@ -276,7 +285,7 @@ test("V2 abort settlement: a primary tool still joins admission and ack without 
     handling = r.nudge();
     await r.admissionEntered;
     after = r.after();
-    expect(await promptly(after)).toBe(false);
+    expect(await promptly(after, STILL_BLOCKED_AFTER_MS)).toBe(false);
     gate.resolve();
     expect(await promptly(after)).toBe(true);
     await handling;
