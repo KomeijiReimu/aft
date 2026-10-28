@@ -42,6 +42,13 @@ pub(super) fn describe_answer_ends_scope(reply: &ModuleControlResponseToModule) 
     )
 }
 
+/// A live rebind does not end ordinary commands, but old-epoch grants must
+/// never authorize another request from a surviving secret command.
+#[cfg(unix)]
+fn secret_authorization_rebound(stamp: &ScopeStamp, reply: &ModuleControlResponseToModule) -> bool {
+    matches!(reply, ModuleControlResponseToModule::ScopeDescribe { status: subc_protocol::scope::ScopeStatus::Live, scope_epoch: Some(epoch), .. } if *epoch != stamp.scope_epoch)
+}
+
 pub(super) fn stamp_key(stamp: &ScopeStamp) -> (String, String, u64) {
     (
         principal_id(&Some(stamp.owner.clone())).expect("scope owner is verified"),
@@ -119,6 +126,9 @@ where
         let mut retry = HashMap::new();
         let mut pending = HashSet::new();
         let mut next_poll: HashMap<_, tokio::time::Instant> = HashMap::new();
+        // Only unix refreshes the set from secret proxy authorizations.
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut secret_authorizations: HashSet<(String, String, u64)> = HashSet::new();
         let mut inflight = tokio::task::JoinSet::new();
         let mut next_scan = tokio::time::Instant::now() + interval;
         loop {
@@ -139,7 +149,9 @@ where
                 .iter()
                 .filter(|(key, _)| {
                     !pending.contains(*key)
-                        && (!routed_now.contains(*key) || retry.contains_key(*key))
+                        && (!routed_now.contains(*key)
+                            || secret_authorizations.contains(*key)
+                            || retry.contains_key(*key))
                 })
                 .map(|(_, due)| *due)
                 .min()
@@ -165,13 +177,18 @@ where
                 }
                 _ = tokio::time::sleep_until(wake_at) => {
                     let scopes = scope_source().await;
+                    #[cfg(unix)]
+                    {
+                        let executor = executor.clone();
+                        secret_authorizations = tokio::task::spawn_blocking(move || executor.actor_contexts().into_iter().flat_map(|ctx| ctx.bash_background().secret_authorization_scope_stamps()).map(|stamp| stamp_key(&stamp)).collect()).await.unwrap_or_default();
+                    }
                     next_scan = tokio::time::Instant::now() + interval;
                     retry.retain(|key, _| scopes.iter().any(|stamp| &stamp_key(stamp) == key));
                     next_poll.retain(|key, _| scopes.iter().any(|stamp| &stamp_key(stamp) == key));
                     let routed = routed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
                     for stamp in scopes {
                         let key = stamp_key(&stamp);
-                        if (!routed.contains(&key) || retry.contains_key(&key))
+                        if (!routed.contains(&key) || secret_authorizations.contains(&key) || retry.contains_key(&key))
                             && next_poll.get(&key).is_none_or(|due| tokio::time::Instant::now() >= *due)
                             && pending.insert(key.clone()) {
                             queued.insert(key, stamp);
@@ -184,6 +201,14 @@ where
                         // periodic tick. Wait a full interval after its answer
                         // before rechecking shell tasks with that owner/ref/epoch.
                         next_poll.insert(key.clone(), tokio::time::Instant::now() + interval);
+                        #[cfg(unix)]
+                        if reply.as_ref().is_ok_and(|answer| secret_authorization_rebound(&stamp, answer)) {
+                            let executor = executor.clone();
+                            let described = stamp.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                for ctx in executor.actor_contexts() { ctx.bash_background().revoke_secret_authorization(&described); }
+                            }).await;
+                        }
                         if reply.as_ref().is_ok_and(describe_answer_ends_scope) {
                             #[cfg(feature = "test-timing-hooks")]
                             crate::slog_info!("scope diagnostic phase=describe_ended scope_epoch={}", stamp.scope_epoch);
@@ -222,6 +247,84 @@ async fn work_scopes(
     })
     .await
     .unwrap_or_default()
+}
+
+#[cfg(all(test, unix))]
+pub(crate) async fn confirm_secret_rebind_for_test(
+    ctx: Arc<AppContext>,
+    stamp: ScopeStamp,
+    task_id: &str,
+) {
+    let executor = Arc::new(Executor::new());
+    let root = ProjectRootId::from_path(ctx.config().project_root.as_ref().unwrap()).unwrap();
+    executor.register_actor(root, ctx.clone());
+    let (writer, mut frames) = mpsc::channel(8);
+    let pending = readiness::PendingControlReplies::default();
+    let control = Arc::new(readiness::DaemonControl::new(
+        writer,
+        Arc::new(DispatchPathMetrics::new()),
+        PROTOCOL_VERSION,
+        vec![subc_protocol::scope::SCOPE_DESCRIBE_OP.into()],
+        vec![],
+        pending.clone(),
+        HELLO_CORR + 1,
+    ));
+    let source = ctx.clone();
+    let (scopes, mut ended, worker) =
+        start_with_scope_source(control, executor, Duration::from_millis(20), move || {
+            let source = source.clone();
+            async move {
+                tokio::task::spawn_blocking(move || source.bash_background().live_scope_stamps())
+                    .await
+                    .unwrap()
+            }
+        });
+    // A still-open head route must not suppress authorization-epoch checks.
+    scopes.routed.lock().unwrap().insert(stamp_key(&stamp));
+    let until = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut answered_head = false;
+    loop {
+        if answered_head
+            && ctx
+                .bash_background()
+                .secret_proxy_address_for_test(task_id)
+                .is_none()
+        {
+            break;
+        }
+        let frame = tokio::time::timeout_at(until, frames.recv())
+            .await
+            .expect("head epoch change was not applied")
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        let is_head = body["ref"].as_str() == Some(stamp.scope_ref.as_str());
+        let answer = ModuleControlResponseToModule::ScopeDescribe {
+            status: subc_protocol::scope::ScopeStatus::Live,
+            scope_epoch: Some(if is_head { stamp.scope_epoch + 1 } else { 1 }),
+            daemon_incarnation: "audit".into(),
+            owner_synced: true,
+            owner_configured: true,
+            scope: None,
+        };
+        answered_head |= is_head;
+        assert!(pending.resolve(
+            Frame::build(
+                FrameType::Response,
+                control_flags(),
+                0,
+                0,
+                frame.header.corr,
+                serde_json::to_vec(&answer).unwrap()
+            )
+            .unwrap()
+        ));
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        ended.try_recv().is_err(),
+        "a rebind is not an ordinary scope end"
+    );
+    worker.abort();
 }
 
 async fn revoke(executor: Arc<Executor>, stamp: &ScopeStamp) -> Vec<crate::db::call_ledger::Key> {

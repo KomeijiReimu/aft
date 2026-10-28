@@ -98,6 +98,7 @@ fn reap_killed_child(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_pty_for_command(
+    registry: &super::registry::BgTaskRegistry,
     spawn_plan: &SpawnPlan,
     task_id: &str,
     session_id: &str,
@@ -126,13 +127,36 @@ pub(crate) fn spawn_pty_for_command(
         } else {
             vec![OsString::from("-c"), OsString::from(user_command)]
         };
-        let program = if memory_monitor.is_some() {
+        let program = if memory_monitor.is_some()
+            || spawn_plan
+                .prepared_task()
+                .and_then(|task| task.secret_runtime())
+                .is_some()
+        {
+            let secret_ready = spawn_plan
+                .prepared_task()
+                .and_then(|task| task.secret_runtime())
+                .is_some();
             let mut gated = vec![
                 OsString::from("-c"),
-                OsString::from("read -r ready || exit 125; exec \"$@\""),
+                OsString::from(if secret_ready {
+                    "printf '%s' ready > \"$1\" || exit 125; shift; read -r ready || exit 125; exec \"$@\""
+                } else {
+                    "read -r ready || exit 125; exec \"$@\""
+                }),
                 OsString::from("aft-memory-gate"),
-                shell_path.as_os_str().to_owned(),
             ];
+            if secret_ready {
+                // The child can write command scratch, not task-record paths.
+                gated.push(
+                    spawn_plan
+                        .temp_dir()
+                        .ok_or(super::secrets::PROXY_UNAVAILABLE)?
+                        .join("secret-ready")
+                        .into_os_string(),
+                );
+            }
+            gated.push(shell_path.as_os_str().to_owned());
             gated.append(&mut args);
             args = gated;
             std::ffi::OsStr::new("/bin/sh")
@@ -140,6 +164,7 @@ pub(crate) fn spawn_pty_for_command(
             shell_path.as_os_str()
         };
         try_spawn_pty(
+            registry,
             spawn_plan,
             task_id,
             session_id,
@@ -261,6 +286,7 @@ pub(crate) fn spawn_pty_for_command(
             };
 
             try_spawn_pty(
+                registry,
                 spawn_plan,
                 task_id,
                 session_id,
@@ -312,6 +338,7 @@ fn windows_wrapper_path(
 
 #[allow(clippy::too_many_arguments)]
 fn try_spawn_pty(
+    #[cfg_attr(windows, allow(unused_variables))] registry: &super::registry::BgTaskRegistry,
     spawn_plan: &SpawnPlan,
     task_id: &str,
     session_id: &str,
@@ -390,6 +417,38 @@ fn try_spawn_pty(
         master: Some(pair.master),
     };
     let child_pid = child.child.as_ref().unwrap().process_id();
+    #[cfg(unix)]
+    if spawn_plan
+        .prepared_task()
+        .and_then(|task| task.secret_runtime())
+        .is_some()
+    {
+        // PTY setup can close the spawn error pipe before exec finishes. A
+        // forked non-dumpable child is not inspectable until exec resets its
+        // state. The AFT-supplied shell gate writes readiness before waiting
+        // for the release line; user command execution follows that wait.
+        let ready = spawn_plan
+            .temp_dir()
+            .ok_or(super::secrets::PROXY_UNAVAILABLE)?
+            .join("secret-ready");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::fs::read(&ready).ok().as_deref() == Some(b"ready") {
+                let _ = std::fs::remove_file(&ready);
+                break;
+            }
+            if std::time::Instant::now() >= until {
+                return Err(super::secrets::PROXY_UNAVAILABLE.to_owned());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    #[cfg(unix)]
+    registry.arm_secret_proxy(
+        spawn_plan,
+        task_id,
+        child_pid.ok_or(super::secrets::PROXY_UNAVAILABLE)?,
+    )?;
     // Preserve group identity for scratch cleanup even if setup returns no runtime.
     *spawned_pgid = child_pid.map(|pid| pid as i32);
     if let Some(monitor) = memory_monitor.as_mut() {
@@ -413,7 +472,19 @@ fn try_spawn_pty(
         .unwrap()
         .take_writer()
         .map_err(|error| format!("take PTY writer failed: {error}"))?;
-    if memory_monitor.is_some() {
+    if memory_monitor.is_some() || {
+        #[cfg(unix)]
+        {
+            spawn_plan
+                .prepared_task()
+                .and_then(|task| task.secret_runtime())
+                .is_some()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    } {
         use std::io::Write;
         #[cfg(windows)]
         if memory_file_gate {
@@ -973,6 +1044,7 @@ fn lifecycle_pty_setup_failure_terminates_and_reaps_child() {
         .with(|failure| *failure.borrow_mut() = Some((dir.path().join("ready"), pid.clone())));
     let mut spawned_pgid = None;
     let result = try_spawn_pty(
+        &super::registry::BgTaskRegistry::new(Default::default()),
         &SpawnPlan::Unsandboxed,
         "bash-0000000000000901",
         "session",
@@ -1014,6 +1086,7 @@ fn approved_pty_worker_admission_failure(worker: super::worker_thread::Worker) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         super::worker_thread::with_refusal(worker, || {
             try_spawn_pty(
+                &super::registry::BgTaskRegistry::new(Default::default()),
                 &SpawnPlan::Unsandboxed,
                 "bash-0000000000000010",
                 "session",

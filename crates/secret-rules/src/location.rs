@@ -37,6 +37,30 @@ pub enum Location {
     Json(String),
 }
 
+/// The vault's location spellings (wire-contract §15 `secret.deposit`):
+/// `authorization_bearer`, `header:<name>`, `query:<name>` or
+/// `json_pointer:<pointer>`.
+///
+/// AFT reads them from a `secret.use` release, which names where to put the
+/// released key. The crate's own [`location_kind_token`] spelling stays as it
+/// is: audit records name the location they evaluated, and that vocabulary is
+/// already committed.
+pub fn parse_vault_location(token: &str) -> Option<Location> {
+    if token == "authorization_bearer" {
+        return Some(Location::Bearer);
+    }
+    let (prefix, name) = token.split_once(':')?;
+    if name.is_empty() {
+        return None;
+    }
+    match prefix {
+        "header" => Some(Location::Header(name.to_string())),
+        "query" => Some(Location::Query(name.to_string())),
+        "json_pointer" => Some(Location::Json(name.to_string())),
+        _ => None,
+    }
+}
+
 /// Short name of a location kind, used in audit records.
 pub fn location_kind_token(location: &Location) -> String {
     match location {
@@ -538,14 +562,18 @@ fn is_token_byte(byte: u8) -> bool {
 /// appears in. The check covers every supplied key, the rule's own included,
 /// in every spelling the scrubber recognises; such a pair refuses instead of
 /// being written. A key that contains the whole placeholder refuses too, as
-/// P3 does for a rule's own key.
+/// the admissibility check does for a rule's own key, and so does a key that
+/// overlaps the placeholder's start or end, which the written placeholder
+/// could re-form.
 fn replacement_collides(rule: &LabelRule, keys: &[(String, Vec<u8>)]) -> Option<RequestRefusal> {
     let placeholder = crate::placeholder::placeholder_text(&rule.label);
     keys.iter()
         .any(|(_, key)| {
             !key.is_empty()
                 && (crate::scrub::replacement_discloses(placeholder.as_bytes(), key)
-                    || crate::material::key_is_substring_of_placeholder(key, &rule.label))
+                    || crate::material::key_is_substring_of_placeholder(key, &rule.label)
+                    || crate::material::key_contains_placeholder_prefix(key)
+                    || crate::material::key_overlaps_placeholder(key, placeholder.as_bytes()))
         })
         .then_some(RequestRefusal::ReplacementDisclosesKey)
 }

@@ -23,12 +23,12 @@ pub use audit::{
 };
 pub use location::{
     apply_target_edits, evaluate_request_with_connect, is_json_content_type, location_kind_token,
-    Edit, HeaderEdit, HeaderEditKind, HeaderField, HeaderValueForm, LabelOutcome, LabelRule,
-    Location, RequestOutcome, RequestRefusal, RequestView,
+    parse_vault_location, Edit, HeaderEdit, HeaderEditKind, HeaderField, HeaderValueForm,
+    LabelOutcome, LabelRule, Location, RequestOutcome, RequestRefusal, RequestView,
 };
 pub use material::{
-    check_admissible, encode_for_location, key_is_substring_of_placeholder, MaterialRefusal,
-    MIN_KEY_LEN,
+    check_admissible, encode_for_location, key_contains_placeholder_prefix,
+    key_is_substring_of_placeholder, key_overlaps_placeholder, MaterialRefusal, MIN_KEY_LEN,
 };
 pub use placeholder::{
     contains_placeholder_prefix, contains_placeholder_prefix_loose, is_label, mentions_label,
@@ -37,7 +37,10 @@ pub use placeholder::{
 pub use redirect::{
     evaluate_redirect, location_mentions, resolve_location, split_absolute, RedirectOutcome,
 };
-pub use scrub::{scrub_bytes, KeyPatterns, MatcherSet, ScrubError, Scrubber};
+pub use scrub::{
+    reveal_outcome, reveals_any, reveals_key, scrub_bytes, KeyPatterns, MatcherSet, RevealOutcome,
+    ScrubError, Scrubber, MAX_REVEAL_DEPTH,
+};
 pub use target::{
     authority_matches_connect, canonical_host, canonicalize_path, normalize_path_prefix,
     normalize_request_target, path_covers, ConnectAuthority, NormalizedPath, RequestTarget,

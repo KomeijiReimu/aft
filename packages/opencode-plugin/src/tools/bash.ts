@@ -39,6 +39,8 @@ import { runAsk } from "./permissions.js";
 
 const z = tool.schema;
 const METADATA_PREVIEW_LIMIT = 30 * 1024;
+export const BASH_SECRET_HOST_FALLBACK_REFUSAL =
+  "Secret placeholder commands need AFT's shell; OpenCode's built-in shell cannot run them.";
 // Default hard timeout of 30 minutes when the caller omits a timeout. This
 // sizes the bridge transport timeout for bash calls where the server blocks
 // until the command completes or is killed.
@@ -698,6 +700,9 @@ export function createBashTool(
       } catch (error) {
         const fallbackCause = classifyBashHostFallbackError(error);
         if (fallbackCause === undefined) throw error;
+        if (command.includes("{{ck-secret:")) {
+          throw new Error(BASH_SECRET_HOST_FALLBACK_REFUSAL);
+        }
         if (!backgroundDisabled && rawRequestedBackground) {
           throw refuseAftModuleOptionWithoutFallback(
             error,

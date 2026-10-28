@@ -614,7 +614,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "url_fetch.rs",
-        enclosing_item: "read_response_body, download_to_cache",
+        enclosing_item: "read_response_body, read_response_body_with, download_to_cache, fetch_with_secrets",
         location_or_primitive: "URL download byte ceiling and UTF-8 prefix repair",
         reason: "the producer stops after a bounded prefix and one lookahead byte; cached metadata discloses the cut with the known size or an explicit lower bound, separately from the rendered output ceiling",
     },

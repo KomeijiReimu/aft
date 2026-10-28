@@ -221,6 +221,8 @@ mod consent;
 pub(crate) use consent::directory_scope;
 #[cfg(all(test, unix))]
 mod deleted_root_reclaim_tests;
+// The secret vault seam and its consent adapter. They read ragged route
+// fields, so they live under `subc` rather than the public `secret` types.
 mod drain;
 mod flow_read;
 mod health;
@@ -229,6 +231,14 @@ mod idle_reap_frame_loop_tests;
 #[cfg(test)]
 mod idle_root_retention_tests;
 mod perf_sweep;
+mod secret_consent;
+#[cfg(all(test, unix))]
+pub(crate) use secret_consent::with_secret_bound_identity_for_test;
+#[cfg(test)]
+pub(crate) use secret_consent::with_secret_identity_for_test;
+pub(crate) use secret_consent::{
+    current_call_scopes, current_secret_audit_scope, resolve_current_secret_label, LaunchDecision,
+};
 mod standalone;
 #[doc(hidden)]
 pub use self::health::SubcTestHealthRollupProbe;
@@ -251,6 +261,8 @@ mod rich_ui;
 mod rich_ui_chunk_route_tests;
 mod run_scope;
 mod scope_describe;
+#[cfg(all(test, unix))]
+pub(crate) use scope_describe::confirm_secret_rebind_for_test;
 #[cfg(test)]
 mod scope_workdir_tests;
 mod stall_watchdog;
@@ -3482,6 +3494,9 @@ async fn handle_bash_elicitation_reply(
 
     if frame.header.ty == FrameType::Response && bash_elicitation_reply_is_allow(&frame.body) {
         if routes.contains_key(&key.route) {
+            let _secret_identity = secret_consent::SecretIdentityGuard::install_optional(
+                routes.get(&key.route).cloned(),
+            );
             let _grant_scope = crate::access_policy::scope_guard(
                 routes.get(&key.route).map(access_grants::policy_scope_key),
             );
@@ -10998,6 +11013,7 @@ async fn handle_tool_call(
 
         let _grant_scope =
             crate::access_policy::scope_guard(Some(access_grants::policy_scope_key(&identity)));
+        let _secret_identity = secret_consent::SecretIdentityGuard::install(identity.clone());
         let _ask_route = crate::access_policy::ask_route_guard(Some(
             access_grants::ask_route_for_call(&identity, &bare_name, &arguments),
         ));
@@ -11119,9 +11135,17 @@ async fn handle_tool_call(
             .map(|run| run.io_budget.clone())
             .unwrap_or_else(|| crate::bounded_io::Budget::after(Duration::from_secs(25)));
         phase_trace.mark_executor_submitted();
+        // The vault scopes are read once per submitted call, outside the job,
+        // from the same identity the job runs with. A launch inside the job
+        // reads them through `SecretScopeGuard`, so a background command keeps
+        // them for its whole life.
+        let secret_scopes = Some(secret_consent::call_scopes(&identity_for_run));
         let job: crate::executor::ExecutorJob = Box::new(move |ctx| {
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
             let _deferred_wake_scope = completion_wake.install();
+            let _secret_scope = secret_consent::SecretScopeGuard::install(secret_scopes.clone());
+            let _secret_identity =
+                secret_consent::SecretIdentityGuard::install(identity_for_run.clone());
             let _grant_scope = crate::access_policy::scope_guard(Some(
                 access_grants::policy_scope_key(&identity_for_run),
             ));

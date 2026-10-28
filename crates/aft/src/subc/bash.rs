@@ -1627,6 +1627,10 @@ pub(super) fn submit_deferred_bash(
     let spawn_timing_for_test = timing_for_test.clone();
     let run_scope = cancel.run_scope.clone();
     let scope_stamp = cancel.scope.clone();
+    let secret_identity = super::secret_consent::current_identity();
+    let secret_scopes = secret_identity
+        .as_ref()
+        .map(super::secret_consent::call_scopes);
     let run_scoped = run_scope.is_some();
     let server_completion = server_completion || run_scoped;
     // Local startup must answer early enough for its reply to be queued and
@@ -2017,6 +2021,12 @@ pub(super) fn submit_deferred_bash(
                     };
                     let (response, storage_dir) =
                         crate::sandbox_spawn::with_authenticated_principal(spawn_principal, || {
+                            // Declared first so its test-only drop check runs after
+                            // both guards restore this exact executor thread.
+                            #[cfg(test)]
+                            let _secret_restored = super::secret_consent::SecretContextRestoreCheck::new();
+                            let _secret_identity = super::secret_consent::SecretIdentityGuard::install_optional(secret_identity);
+                            let _secret_scopes = super::secret_consent::SecretScopeGuard::install(secret_scopes);
                             let _grant_scope = crate::access_policy::scope_guard(grant_scope);
                             let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
                             crate::sandbox_spawn::with_worker_jail(worker_jail, || {
@@ -4114,6 +4124,129 @@ mod grant_path_tests {
         assert_eq!(persisted["schema_pin"], pin);
         assert_eq!(stored.1["schema_pin"], pin);
         assert_eq!(stored.1["task_id"], task_id);
+    }
+
+    fn secret_bash_scope_probe(req: RawRequest, _: &AppContext) -> Response {
+        use crate::secret::{Material, MaterialError, Resolution, SecretScope, SecretVault};
+        struct Vault(std::sync::atomic::AtomicUsize);
+        impl SecretVault for Vault {
+            fn resolve(&self, scope: &SecretScope, _: &str) -> Resolution {
+                assert_eq!(scope.reference(), "secret-bash");
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Resolution::Unavailable
+            }
+            fn material(
+                &self,
+                _: &SecretScope,
+                _: &str,
+                _: &str,
+            ) -> Result<Material, MaterialError> {
+                panic!("launch must not request material")
+            }
+            fn audit(
+                &self,
+                _: &secret_rules::audit::AuditRecordV1,
+            ) -> Result<(), crate::secret::AuditError> {
+                Ok(())
+            }
+        }
+        let vault = Vault(std::sync::atomic::AtomicUsize::new(0));
+        let decision = super::super::secret_consent::resolve_current_secret_label(&vault, "test");
+        let super::super::secret_consent::LaunchDecision::Refuse(outcome) = decision else {
+            panic!("unavailable vault must refuse");
+        };
+        Response::error_with_data(
+            &req.id,
+            outcome.code().unwrap(),
+            "scope probe",
+            json!({"resolve_calls": vault.0.load(std::sync::atomic::Ordering::SeqCst)}),
+        )
+    }
+
+    #[tokio::test]
+    async fn secret_bash_dedicated_executor_keeps_scope_on_resume_and_clears_it() {
+        let (dir, root) = super::super::test_support::test_root("secret-bash-dedicated");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| {
+            config.project_root = Some(dir.path().into());
+            config.storage_dir = Some(dir.path().join("storage"));
+        });
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx);
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let stamp: subc_protocol::scope::ScopeStamp = serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"secret-bash","kind":"worker","scope_epoch":1,"owner_authorized":true})).unwrap();
+        for (stamped, resumed) in [(true, false), (true, true), (false, false)] {
+            let (tx, mut rx) = mpsc::channel(8);
+            let (touch, _touch_rx) = mpsc::channel(8);
+            let submit = || {
+                submit_deferred_bash(
+                    &executor,
+                    &tx,
+                    &touch,
+                    &metrics,
+                    secret_bash_scope_probe,
+                    root.clone(),
+                    root.as_path().into(),
+                    "secret-bash".into(),
+                    "secret-bash".into(),
+                    RouteChannel {
+                        channel: 1,
+                        epoch: 1,
+                    },
+                    1,
+                    Flags::new(false, Priority::Interactive, false),
+                    PROTOCOL_VERSION,
+                    json!({"command":"echo '{{ck-secret:test}}'", "scope":{"ref":"forged-head"}}),
+                    crate::subc_format::FormatContext::default(),
+                    BashWaitCancel {
+                        run_scope: None,
+                        scope: stamped.then(|| stamp.clone()),
+                        late_results: false,
+                        ledger_carrier: None,
+                        connection: PersistentCancelSignal::new(),
+                        route: PersistentCancelSignal::new(),
+                        drain: drain::ModuleDrainWindow::default(),
+                    },
+                    BindTrust::FirstParty,
+                    crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+                    None,
+                    None,
+                    // The secret probe carries no v1 schema pin.
+                    None,
+                    resumed.then(|| vec![]),
+                    None,
+                    false,
+                    false,
+                    false,
+                    false,
+                    super::remote_policy::RemoteSource::None,
+                    Instant::now(),
+                )
+            };
+            if stamped {
+                crate::subc::with_secret_identity_for_test(root.as_path(), stamp.clone(), submit);
+            } else {
+                submit();
+            }
+            let done = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let response = done.response_for_test();
+            assert_eq!(
+                response.data["code"],
+                if stamped {
+                    "secrets_unavailable"
+                } else {
+                    "secret_refused"
+                }
+            );
+            assert_eq!(response.data["resolve_calls"], usize::from(stamped));
+            assert!(matches!(
+                super::super::secret_consent::current_call_scopes(),
+                Err(crate::secret::Ineligibility::NoScope)
+            ));
+        }
     }
     #[cfg(unix)]
     static CHANGED_FILES_BUDGET_FOR_TEST: std::sync::Mutex<

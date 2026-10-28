@@ -220,6 +220,7 @@ fn real_probe_uses_same_launcher_and_no_user_flags() {
     let record = dir.path().join("probe-argv");
     crate::executable_cache::write_executable(&launcher, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n# Real launchers report unenforceable rules on stderr; that must not cost the hint.\necho 'sandbox-launch: unenforced=[socket_deny]' >&2\n[ \"$1\" = sandbox-launch ] || exit 1\nshift 3\n[ \"$1\" = -- ] || exit 1\nshift\nexec \"$@\"\n", record.display()).as_bytes()).unwrap();
     let profile = SandboxProfile {
+        secret_proxy: false,
         data_policy: Default::default(),
         v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
         mode: crate::config::SandboxMode::Strict,
