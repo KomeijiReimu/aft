@@ -188,6 +188,28 @@ fn effective_identity(
 }
 
 impl Session {
+    fn viewed_task(&self, ctx: &AppContext, key: &str) -> Result<String, ErrorBody> {
+        let refusal = super::chunks::refusal;
+        let requester = principal(&self.identity).ok_or_else(|| refusal("task_not_found"))?;
+        let harness = self
+            .identity
+            .harness
+            .parse::<crate::harness::Harness>()
+            .map_err(|_| refusal("task_not_found"))?
+            .storage_segment();
+        let db = ctx.db().ok_or_else(|| refusal("database_unavailable"))?;
+        let conn = db.lock().map_err(|_| refusal("database_unavailable"))?;
+        crate::bash_background::viewed_task::resolve(
+            &conn,
+            &harness,
+            &self.identity.session,
+            requester,
+            key,
+        )
+        .map_err(|_| refusal("database_unavailable"))?
+        .ok_or_else(|| refusal("task_not_found"))
+    }
+
     pub(super) fn admit(&self, ctx: &AppContext, name: &str) -> Result<(), ErrorBody> {
         tool_provider::admit_call_mode(name, &self.identity.call_mode)?;
         remote_policy::admit_confined(ctx, &self.identity, name)?;
@@ -304,15 +326,31 @@ pub(in crate::subc) async fn submit(
                     json!({"body":super::carrier::error_body(&error.code)}),
                 );
             }
-            // Calls specifying a task fail closed until task resolution and the
-            // bash output/watch handlers are connected to carrier dispatch.
-            if operation.task.is_some() {
+            let task_id = match operation
+                .task
+                .as_deref()
+                .map(|key| session.viewed_task(ctx, key))
+                .transpose()
+            {
+                Ok(task) => task,
+                Err(error) => {
+                    return Response::success(
+                        job_id,
+                        json!({"body":super::carrier::error_body(&error.code)}),
+                    )
+                }
+            };
+            // Watch dispatch is connected separately so it can enforce its
+            // absolute reply budget without inheriting the worker wait window.
+            if entry["id"] == "bash_watch" {
                 return Response::success(
                     job_id,
-                    json!({"body":super::carrier::error_body("task_not_found")}),
+                    json!({"body":super::carrier::error_body("operation_version_unsupported")}),
                 );
             }
-            let args = match operation.translate_query(None, ctx.config().bash.watch_sync_max_ms) {
+            let args = match operation
+                .translate_query(task_id.as_deref(), ctx.config().bash.watch_sync_max_ms)
+            {
                 Ok(args) => args,
                 Err(error) => {
                     return Response::success(
@@ -344,8 +382,24 @@ pub(in crate::subc) async fn submit(
             let result = log_ctx::with_session(Some(identity.session.clone()), || {
                 session
                     .with_policy(ctx, &job_id, &name, args, |args| {
+                        let observe = |request: RawRequest, ctx: &AppContext| {
+                            if entry["id"] == "bash_output" {
+                                super::bash_output::handle(
+                                    &request,
+                                    ctx,
+                                    &identity.harness,
+                                    &operation.arguments,
+                                )
+                            } else if name == "bash_status" {
+                                crate::commands::bash_status::handle_with_observation_only(
+                                    &request, ctx, true,
+                                )
+                            } else {
+                                dispatch(request, ctx)
+                            }
+                        };
                         let ToolCallOutcome::Unary(mut result) = run_tool_call(
-                            &name, args, &format, &tool_ctx, ctx, &dispatch, None, None,
+                            &name, args, &format, &tool_ctx, ctx, &observe, None, None,
                         );
                         // File and search handlers return native metadata; their
                         // rendered tool text is the session-read result field.

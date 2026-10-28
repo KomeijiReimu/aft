@@ -30,7 +30,7 @@ fn identity(root: &Path, kind: &str, id: &str, channel: u16) -> RouteIdentity {
     RouteIdentity(Arc::new(RouteIdentityData {
         root: ProjectRootId::from_path(root).unwrap(),
         project_root: root.into(),
-        harness: "runner/raw harness".into(),
+        harness: "mcp:runner/raw harness".into(),
         session: "session".into(),
         role: tool_provider::RouteRole::ToolProviderV1,
         trust: BindTrust::FirstParty,
@@ -39,7 +39,7 @@ fn identity(root: &Path, kind: &str, id: &str, channel: u16) -> RouteIdentity {
             route_channel: channel,
             route_epoch: 9,
             project_root: root.into(),
-            harness: "runner/raw harness".into(),
+            harness: "mcp:runner/raw harness".into(),
             session_id: "session".into(),
             principal_id: Some(id.into()),
         },
@@ -1008,3 +1008,6 @@ async fn unresolved_policy_is_typed_and_database_and_preset_errors_precede_mode(
         );
     }
 }
+
+#[path = "bash_tests.rs"]
+mod bash_tests;
