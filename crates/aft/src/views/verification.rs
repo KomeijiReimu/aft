@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use super::io::at;
 use super::RelPath;
 
 #[cfg(test)]
@@ -68,7 +69,7 @@ impl NativeStat {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            let m = fs::symlink_metadata(path)?;
+            let m = fs::symlink_metadata(path).map_err(|e| at("reading metadata", path, e))?;
             Ok(Self {
                 identity: FileIdentity::Unix {
                     dev: m.dev(),
@@ -88,7 +89,7 @@ impl NativeStat {
         }
         #[cfg(windows)]
         {
-            windows_stat(path)
+            windows_stat(path).map_err(|e| at("reading native metadata", path, e))
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -110,7 +111,8 @@ impl NativeStat {
         match Self::read(path) {
             Ok(stat) => Ok(stat),
             Err(error) => {
-                let (metadata, identity) = crate::file_identity::symlink_metadata(path)?;
+                let (metadata, identity) = crate::file_identity::symlink_metadata(path)
+                    .map_err(|e| at("reading fallback metadata", path, e))?;
                 let crate::file_identity::FileIdentity::Known { volume, index } = identity else {
                     return Err(error);
                 };
@@ -284,7 +286,7 @@ fn metadata_source(path: &Path, hash: &mut blake3::Hasher) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             hash.update(&[0]);
         }
-        Err(e) => return Err(e),
+        Err(e) => return Err(at("reading policy input", path, e)),
     }
     Ok(())
 }
@@ -449,9 +451,11 @@ pub(crate) fn policy_inputs(root: &Path) -> io::Result<Vec<PathBuf>> {
         for name in [".gitattributes", ".gitignore", ".ignore", ".aftignore"] {
             out.push(root.join(name));
         }
-        for entry in fs::read_dir(root)? {
-            let entry = entry?;
-            let kind = entry.file_type()?;
+        for entry in fs::read_dir(root).map_err(|e| at("listing policy directory", root, e))? {
+            let entry = entry.map_err(|e| at("reading policy directory entry", root, e))?;
+            let kind = entry
+                .file_type()
+                .map_err(|e| at("reading policy entry type", &entry.path(), e))?;
             let name = entry.file_name();
             if name == ".git" {
                 continue;
@@ -494,7 +498,13 @@ pub(crate) fn policy_inputs(root: &Path) -> io::Result<Vec<PathBuf>> {
                 paths.push(common.join("info/exclude"));
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(at(
+                    "reading Git common directory marker",
+                    &common_marker,
+                    error,
+                ))
+            }
         }
         paths.push(common_marker);
     }
@@ -505,18 +515,19 @@ pub(crate) fn policy_inputs(root: &Path) -> io::Result<Vec<PathBuf>> {
 pub(crate) fn gitdir(root: &Path) -> io::Result<PathBuf> {
     let marker = root.join(".git");
     if marker.is_dir() {
-        return fs::canonicalize(marker);
+        return fs::canonicalize(&marker).map_err(|e| at("resolving Git directory", &marker, e));
     }
-    let bytes = fs::read(marker)?;
+    let bytes = fs::read(&marker).map_err(|e| at("reading Git directory marker", &marker, e))?;
     let path = bytes
         .strip_prefix(b"gitdir: ")
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid gitdir marker"))?;
     let path = path_from_bytes(path.trim_ascii())?;
-    fs::canonicalize(if path.is_absolute() {
+    let path = if path.is_absolute() {
         path
     } else {
         root.join(path)
-    })
+    };
+    fs::canonicalize(&path).map_err(|e| at("resolving Git directory", &path, e))
 }
 
 /// Captured even for strict loads: admission waits cannot transfer an old
@@ -563,17 +574,23 @@ impl BindGuard {
                 root.to_path_buf(),
                 Duration::from_secs(2),
             );
-            let head = queries.head_tree()?;
+            let head = queries
+                .head_tree()
+                .map_err(|e| at("querying Git HEAD tree in", root, e))?;
             if head.status.success() {
                 head_tree = Some(head.stdout);
             }
             let path = directory.join("index");
             match NativeStat::strict_read(&path) {
                 Ok(before) => {
-                    let bytes = fs::read(&path)?;
+                    let bytes = fs::read(&path).map_err(|e| at("reading Git index", &path, e))?;
                     let after = NativeStat::strict_read(&path)?;
                     if before != after {
-                        return Err(io::Error::other("Git index changed during verification"));
+                        return Err(at(
+                            "verifying Git index",
+                            &path,
+                            io::Error::other("Git index changed during verification"),
+                        ));
                     }
                     index = Some((before, *blake3::hash(&bytes).as_bytes()));
                     let format = if head_tree
@@ -686,16 +703,27 @@ pub(crate) fn write_evidence(
         // through the views helper, which opens the file for writing there.
         super::sync_file(&staging)?;
         if destination.exists() {
-            fs::remove_file(&staging)?;
+            fs::remove_file(&staging)
+                .map_err(|e| at("removing evidence staging file", &staging, e))?;
         } else {
-            fs::rename(&staging, &destination)?;
+            fs::rename(&staging, &destination).map_err(|e| {
+                at(
+                    &format!("renaming evidence {} to", staging.display()),
+                    &destination,
+                    e,
+                )
+            })?;
         }
         super::sync_directory(&dir)?;
         Ok(())
     })();
     if let Err(error) = result {
         let _ = fs::remove_file(&staging);
-        return Err(io::Error::other(error.to_string()));
+        return Err(at(
+            "writing stat evidence",
+            &destination,
+            io::Error::other(error.to_string()),
+        ));
     }
     Ok(())
 }
@@ -868,13 +896,23 @@ pub(crate) fn write_tree_proof(
         // Windows refuses FlushFileBuffers on a read-only handle, so sync
         // through the views helper, which opens the file for writing there.
         super::sync_file(&staging)?;
-        fs::rename(&staging, &destination)?;
+        fs::rename(&staging, &destination).map_err(|e| {
+            at(
+                &format!("renaming tree proof {} to", staging.display()),
+                &destination,
+                e,
+            )
+        })?;
         super::sync_directory(dir)?;
         Ok(())
     })();
     if let Err(error) = result {
         let _ = fs::remove_file(&staging);
-        return Err(io::Error::other(error.to_string()));
+        return Err(at(
+            "writing tree proof",
+            &destination,
+            io::Error::other(error.to_string()),
+        ));
     }
     Ok(())
 }

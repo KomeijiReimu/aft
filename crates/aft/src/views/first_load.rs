@@ -6576,6 +6576,46 @@ mod v3_bootstrap_tests {
     }
 
     #[test]
+    fn checkout_driver_directory_policy_error_names_operation_and_path() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let _attributes = super::super::verification::known_attribute_sources_for_test(root.path());
+        let policy_path = root.path().join("nested/.gitignore");
+        std::fs::create_dir_all(&policy_path).unwrap();
+        let driver = trigram_driver(root.path(), storage.path());
+        let error = match driver.reconcile(&driver.access()) {
+            Ok(_) => panic!("directory policy input must not be accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("view loader [driver]"), "{error}");
+        assert!(error.contains("reading policy input"), "{error}");
+        assert!(
+            error.contains(&policy_path.display().to_string()),
+            "{error}"
+        );
+        assert!(policy_path.is_dir());
+    }
+
+    #[test]
+    fn checkout_driver_directory_git_index_error_names_operation_and_path() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let _attributes = super::super::verification::known_attribute_sources_for_test(root.path());
+        let index_path = root.path().join(".git/index");
+        std::fs::create_dir_all(&index_path).unwrap();
+        let driver = trigram_driver(root.path(), storage.path());
+        let error = match driver.reconcile(&driver.access()) {
+            Ok(_) => panic!("directory Git index must not be accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("reading Git index"), "{error}");
+        assert!(error.contains(&index_path.display().to_string()), "{error}");
+        assert!(index_path.is_dir());
+    }
+
+    #[test]
     fn absolute_changes_match_canonical_roots_for_missing_descendants() {
         let _serial = crate::blob_store::v3::serial_for_test();
         let root = tempfile::tempdir().unwrap();
