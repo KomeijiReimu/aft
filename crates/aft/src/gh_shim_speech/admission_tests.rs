@@ -226,9 +226,10 @@ async fn foreground_call_cannot_acquire_a_current_only_repository() {
     args[repo] = json!("new-owner/new-repo");
     let answer = post_params(&fixture, &params, &fixture.routes(true)).await;
     assert_eq!(
-        answer.data["refusal_code"], "task_gh_policy_denied",
+        answer.data["refusal_code"], "task_gh_identity_conflict",
         "{:?}",
         answer.data
     );
+    assert_eq!(answer.data["reason"], "binding_changed");
     assert_eq!(fixture.plex.state.lock().unwrap().sends, 0);
 }
