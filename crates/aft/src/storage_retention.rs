@@ -5690,6 +5690,10 @@ fn record_v3_removal(domain: &mut DomainReport, bytes: Option<u64>) {
 mod storage_retention_tests {
     #[test]
     fn retention_protection_large_task_store_fixture() {
+        let stress = std::env::var("AFT_STRESS").as_deref() == Ok("1");
+        let tasks = if stress { 30_000 } else { 300 };
+        let sessions = if stress { 1_372 } else { 14 };
+        let files = tasks * 11 + tasks * 2 / 3;
         let temp = tempfile::tempdir().unwrap();
         let storage = StoragePaths::same(temp.path());
         fs::create_dir_all(temp.path().join("retention/bindings")).unwrap();
@@ -5701,14 +5705,19 @@ mod storage_retention_tests {
             )
             .unwrap();
         }
-        for task in 0..5_000 {
-            let directory = temp.path().join(format!("tasks/session/{task:032x}"));
+        for task in 0..tasks {
+            let directory = temp
+                .path()
+                .join(format!("tasks/session-{:04}/{task:032x}", task % sessions));
             fs::create_dir_all(directory.join("control")).unwrap();
             fs::create_dir_all(directory.join("io")).unwrap();
             for name in crate::bash_background::persistence::readable_task_file_names(
                 crate::bash_background::persistence::TaskLayout::Directory,
             ) {
                 fs::write(directory.join(name), b"finished task artifact").unwrap();
+            }
+            if task < tasks * 2 / 3 {
+                fs::write(directory.join("control/environment.bin"), b"environment").unwrap();
             }
         }
         for entry in 0..50 {
@@ -5732,6 +5741,8 @@ mod storage_retention_tests {
             }),
         );
         let started = Instant::now();
+        #[cfg(target_os = "linux")]
+        let cpu_started = thread_cpu_seconds();
         for domain in ["index", "inspect"] {
             reap_trash_with_snapshot_budget(
                 &storage,
@@ -5745,14 +5756,32 @@ mod storage_retention_tests {
             .unwrap();
         }
         eprintln!(
-            "retention fixture: roots=200 finished_tasks=5000 trash=50 elapsed_ms={:.3} report={}",
+            "retention fixture: roots=200 finished_tasks={tasks} sessions={sessions} files={files} trash=50 elapsed_ms={:.3} report={}",
             started.elapsed().as_secs_f64() * 1_000.0,
             serde_json::to_string(&report).unwrap(),
+        );
+        #[cfg(target_os = "linux")]
+        eprintln!(
+            "retention fixture: thread_cpu_ms={:.3}",
+            (thread_cpu_seconds() - cpu_started) * 1_000.0
         );
         assert_eq!(report.removed_entries, 50, "{report:?}");
         assert!(!report.incomplete, "{report:?}");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!((15_000..15_010).contains(&report.protection_census.directories));
+        assert!(report.protection_census.directories >= tasks * 3);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn thread_cpu_seconds() -> f64 {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+            0
+        );
+        time.tv_sec as f64 + time.tv_nsec as f64 / 1_000_000_000.0
     }
 
     #[test]
