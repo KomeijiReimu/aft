@@ -3791,6 +3791,40 @@ fn semantic_member_base_owner_fills_its_base_and_writes_nothing_outside_v3() {
     assert_eq!(outside_v3, Vec::<String>::new());
 }
 
+#[test]
+fn base_successor_rebind_keeps_filled_answers_vouched_without_a_subscription() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    assert!(crate::watcher_backend::subscription::current(root.path()).is_none());
+    let runtime = open(storage.path(), "scope", root.path());
+    let binds = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&binds);
+    *lock(&runtime.before_bind_verify) = Some(Box::new(move |runtime| {
+        // The first bind reconciles the refresh's subscription check. The
+        // second only picks up the base readiness successor after filling.
+        if observed.fetch_add(1, Ordering::SeqCst) == 1 {
+            let answer = query(runtime, "alpha");
+            assert!(
+                answer.complete(),
+                "base rebind invalidated filled vectors: {answer:?}"
+            );
+            assert_eq!(
+                rows(runtime.root(), &answer.results),
+                cold(runtime.root(), "alpha").0
+            );
+            // Skipping a redundant check must not hide an actual delivery gap.
+            runtime.driver().record_watcher_overflow();
+            assert!(query(runtime, "alpha").unvouched);
+        }
+    }));
+    let report = refresh(&runtime, &Model::default());
+    assert_eq!(report.deferred, 0, "{report:?}");
+    assert_eq!(binds.load(Ordering::SeqCst), 2);
+    assert_eq!(runtime.base_successor_count(), 1);
+    assert!(query(&runtime, "alpha").complete());
+}
+
 /// A checkout without a steady watcher subscription (macOS, or a root whose
 /// watcher is not running) is the case where the driver's subscription check
 /// marks the checkout overflowed on every check. Searches read the installed

@@ -6025,14 +6025,10 @@ impl CheckoutDriver {
                     .install_cut()
                     .and_then(|cut| cut.verification.as_ref())
                     .is_some_and(|guard| {
-                        let stale = !guard.steady_supported
+                        !guard.steady_supported
                             || guard.subscription.is_none()
                             || crate::watcher_backend::subscription::current(self.owner.root())
-                                != guard.subscription;
-                        if stale {
-                            eprintln!("semantic subscription stale root={:?} scope={} thread={:?} steady_supported={} recorded={:?} current={:?}\n{}", self.owner.root(), self.owner.scope(), std::thread::current().name(), guard.steady_supported, guard.subscription, crate::watcher_backend::subscription::status(self.owner.root()), std::backtrace::Backtrace::force_capture());
-                        }
-                        stale
+                                != guard.subscription
                     })
         };
         if stale {

@@ -2339,11 +2339,8 @@ impl SemanticPlane {
         let view = self.query_view(access, snapshot);
         let mut state = lock(&view);
         let mut members = snapshot.membership();
-        let ignore_changed = ignore_rules_changed(root, snapshot, &members);
-        let unvouched = snapshot.watcher() != WatcherState::Healthy || ignore_changed;
-        if unvouched {
-            eprintln!("semantic unvouched root={root:?} watcher={:?} ignore_changed={ignore_changed}", snapshot.watcher());
-        }
+        let unvouched = snapshot.watcher() != WatcherState::Healthy
+            || ignore_rules_changed(root, snapshot, &members);
         let mut pending = BTreeSet::new();
         let mut failed = BTreeSet::new();
         if unvouched {

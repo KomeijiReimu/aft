@@ -110,6 +110,8 @@ pub struct CheckoutSemantic {
     searches: AtomicU64,
     /// Readiness successors this view published as its base's owner.
     base_successors: AtomicU64,
+    #[cfg(test)]
+    before_bind_verify: Mutex<Option<Box<dyn Fn(&CheckoutSemantic) + Send + Sync>>>,
     /// Wakes the fill worker after an AFT write to this checkout. It is held
     /// here because the intent registry keeps only weak references.
     _wake_on_write: Arc<dyn WriteIntentListener>,
@@ -207,6 +209,8 @@ impl CheckoutSemantic {
             unavailable: Mutex::new(None),
             searches: AtomicU64::new(0),
             base_successors: AtomicU64::new(0),
+            #[cfg(test)]
+            before_bind_verify: Mutex::new(None),
             _wake_on_write: listener,
         })
     }
@@ -264,11 +268,23 @@ impl CheckoutSemantic {
     /// itself repeats the check, which is a no-op only on a checkout already
     /// marked overflowed.
     fn bind(&self) -> Result<Snapshot, String> {
+        self.bind_with_subscription_check(true)
+    }
+
+    fn bind_with_subscription_check(&self, check_subscription: bool) -> Result<Snapshot, String> {
         #[cfg(test)]
         let _profile = crate::blob_store::v3::work_profile::span("semantic_bind");
         #[cfg(test)]
         let seed_profile = crate::blob_store::v3::work_profile::span("bind_seed");
-        let installed = self.driver.installed_snapshot();
+        let installed = if check_subscription {
+            self.driver.installed_snapshot()
+        } else {
+            self.installed()
+        };
+        #[cfg(test)]
+        if let Some(hook) = &*lock(&self.before_bind_verify) {
+            hook(self);
+        }
         let seed = match super::base_refs::open_foreign_v3(
             &self.storage,
             self.owner.family(),
@@ -324,9 +340,13 @@ impl CheckoutSemantic {
                 .with_install_cut(cut.clone())
                 .with_reconciled_epoch(snapshot.reconciled_epoch().unwrap_or(cut.epoch));
         }
-        self.driver
-            .install(&self.access, &snapshot, revision)
-            .map_err(|error| error.to_string())?;
+        if check_subscription {
+            self.driver.install(&self.access, &snapshot, revision)
+        } else {
+            self.driver
+                .install_without_subscription_check(&self.access, &snapshot)
+        }
+        .map_err(|error| error.to_string())?;
         Ok(self.driver.installed_cut().0)
     }
 
@@ -513,7 +533,14 @@ impl CheckoutSemantic {
         if published {
             #[cfg(test)]
             let _profile = crate::blob_store::v3::work_profile::span("base_rebind");
-            self.bind().map_err(RefreshError::classify)?;
+            // The refresh checked subscription continuity before filling. A
+            // base readiness publication changes no source files, so repeating
+            // that check here would mark an unwatched checkout overflowed while
+            // its already-filled vectors are being served. Still verify-bind
+            // the successor and validate its cut; recorded edits and real
+            // watcher gaps must be reconciled before installation.
+            self.bind_with_subscription_check(false)
+                .map_err(RefreshError::classify)?;
         }
         Ok(report)
     }

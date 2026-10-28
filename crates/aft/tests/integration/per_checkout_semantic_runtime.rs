@@ -354,7 +354,10 @@ fn search(ctx: &AppContext, query: &str) -> Value {
     .unwrap();
     eprintln!(
         "semantic search query={query:?} elapsed={:?} status={} complete={}\n{}",
-        started.elapsed(), answer["status"], answer["complete"], answer["text"]
+        started.elapsed(),
+        answer["status"],
+        answer["complete"],
+        answer["text"]
     );
     if answer["complete"] != true {
         eprintln!("incomplete semantic search reply: {answer:#}");
