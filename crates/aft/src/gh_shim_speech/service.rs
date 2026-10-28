@@ -125,6 +125,7 @@ pub(crate) struct Service {
     root: PathBuf,
     runtime: Mutex<Option<Runtime>>,
     lease: Mutex<Option<Arc<crate::root_cache::SpeechServingLease>>>,
+    lifecycle: Mutex<lifecycle::State>,
     pending_tasks: Mutex<HashSet<String>>,
     pending_ids: Mutex<HashSet<(String, String)>>,
     #[cfg(test)]
@@ -138,6 +139,28 @@ pub(crate) struct Service {
 }
 
 static SERVICES: OnceLock<Mutex<HashMap<PathBuf, Arc<Service>>>> = OnceLock::new();
+mod lifecycle;
+pub(crate) use lifecycle::RuntimeGuard;
+
+fn new_service(root: PathBuf) -> Arc<Service> {
+    Arc::new(Service {
+        store: Store::new(root.join("aft.db")),
+        root,
+        runtime: Mutex::new(None),
+        lease: Mutex::new(None),
+        lifecycle: Mutex::new(Default::default()),
+        pending_tasks: Mutex::new(HashSet::new()),
+        pending_ids: Mutex::new(HashSet::new()),
+        #[cfg(test)]
+        test_partners: Mutex::new(None),
+        pending_scopes: Mutex::new(HashSet::new()),
+        admission: Mutex::new(()),
+        cache: Mutex::new(HashMap::new()),
+        flights: Mutex::new(HashMap::new()),
+        on_end: Mutex::new(None),
+        notified: Mutex::new(HashSet::new()),
+    })
+}
 impl std::fmt::Debug for Service {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SpeechService")
@@ -172,27 +195,28 @@ pub(crate) fn start(
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    // A live or retired runtime is never reconfigured into its successor.
+    // Keeping separate service identities fences late callbacks from the old run.
     let service = services
-        .entry(root.clone())
-        .or_insert_with(|| {
-            Arc::new(Service {
-                store: Store::new(root.join("aft.db")),
-                root: root.clone(),
-                runtime: Mutex::new(None),
-                lease: Mutex::new(None),
-                pending_tasks: Mutex::new(HashSet::new()),
-                pending_ids: Mutex::new(HashSet::new()),
-                #[cfg(test)]
-                test_partners: Mutex::new(None),
-                pending_scopes: Mutex::new(HashSet::new()),
-                admission: Mutex::new(()),
-                cache: Mutex::new(HashMap::new()),
-                flights: Mutex::new(HashMap::new()),
-                on_end: Mutex::new(None),
-                notified: Mutex::new(HashSet::new()),
-            })
+        .get(&root)
+        .filter(|service| {
+            !service
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .managed
         })
-        .clone();
+        .cloned()
+        .unwrap_or_else(|| new_service(root.clone()));
+    {
+        let mut state = service
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.managed = true;
+        state.accepting = true;
+    }
+    services.insert(root.clone(), service.clone());
     *service
         .runtime
         .lock()
@@ -224,6 +248,13 @@ pub(crate) fn start(
 
 impl Service {
     pub(crate) fn try_serve(&self) -> bool {
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !lifecycle.accepting {
+            return false;
+        }
         if self
             .runtime
             .lock()
@@ -291,6 +322,7 @@ impl Service {
     }
 
     pub(crate) fn revoke(self: &Arc<Self>, incarnation: &str, reason: &str) -> Result<(), Refusal> {
+        let work = self.track_finalization();
         let _gate = self
             .admission
             .lock()
@@ -310,6 +342,7 @@ impl Service {
             let inc = incarnation.to_string();
             let reason = reason.to_string();
             std::thread::spawn(move || {
+                let _work = work;
                 let mut delay = Duration::from_millis(100);
                 loop {
                     std::thread::sleep(delay);
@@ -333,6 +366,7 @@ impl Service {
         scope: &ScopeStamp,
         proof: ValidatedEnd,
     ) -> Result<(), Refusal> {
+        let work = self.track_finalization();
         let key = ScopeKey::from_stamp(scope);
         if proof.key() != &key || proof.evidence().get("scope") != Some(&serde_json::json!(scope)) {
             return Err(Refusal::scoped(
@@ -383,6 +417,7 @@ impl Service {
             let service = Arc::clone(self);
             let scope = scope.clone();
             std::thread::spawn(move || {
+                let _work = work;
                 let mut delay = Duration::from_millis(100);
                 loop {
                     std::thread::sleep(delay);
@@ -445,6 +480,7 @@ impl Service {
             .as_ref()
             .map(|runtime| runtime.handle.clone());
         let Some(handle) = handle else { return };
+        let work = self.track_finalization();
         for (_, scope) in &scopes {
             self.invalidate(scope);
         }
@@ -452,6 +488,7 @@ impl Service {
         // An unqualified provider error is not proof that a particular scope ended.
         // Refresh descriptions asynchronously without delaying the original GitHub reply.
         let _ = handle.spawn(async move {
+            let _work = work;
             let deadline = tokio::time::Instant::now() + Duration::from_millis(9_750);
             for (role, scope) in scopes {
                 let _ = service.check_scope(&scope, role, deadline).await;
@@ -465,6 +502,7 @@ mod tests;
 
 impl LaunchContext {
     pub(crate) fn prepare(&self) -> PreparedLaunch {
+        let _work = self.service.track_finalization();
         let started = Instant::now();
         let mut prepared = PreparedLaunch {
             context: self.clone(),
@@ -862,24 +900,7 @@ pub(crate) fn record_service(root: &Path) -> Arc<Service> {
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .entry(root.clone())
-        .or_insert_with(|| {
-            Arc::new(Service {
-                store: Store::new(root.join("aft.db")),
-                root,
-                runtime: Mutex::new(None),
-                lease: Mutex::new(None),
-                pending_tasks: Mutex::new(HashSet::new()),
-                pending_ids: Mutex::new(HashSet::new()),
-                #[cfg(test)]
-                test_partners: Mutex::new(None),
-                pending_scopes: Mutex::new(HashSet::new()),
-                admission: Mutex::new(()),
-                cache: Mutex::new(HashMap::new()),
-                flights: Mutex::new(HashMap::new()),
-                on_end: Mutex::new(None),
-                notified: Mutex::new(HashSet::new()),
-            })
-        })
+        .or_insert_with(|| new_service(root))
         .clone()
 }
 
@@ -895,6 +916,7 @@ impl Service {
         session: &str,
         task: &str,
     ) -> Result<(), Refusal> {
+        let work = self.track_finalization();
         let _gate = self
             .admission
             .lock()
@@ -920,6 +942,7 @@ impl Service {
         } else if first {
             let service = Arc::clone(self);
             std::thread::spawn(move || {
+                let _work = work;
                 let mut delay = Duration::from_millis(100);
                 loop {
                     std::thread::sleep(delay);

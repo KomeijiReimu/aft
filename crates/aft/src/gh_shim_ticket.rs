@@ -576,10 +576,12 @@ fn revoke(ticket: &str) {
 
 fn queue_terminal_marker(speech: Arc<SpeechTicket>) {
     if speech.stored.load(Ordering::SeqCst) {
+        let work = speech.prepared.context.service.track_finalization();
         // Task-file publication can hold task state, so durable SQL runs afterward.
         // Once removed from memory, a ticket minted by this daemon cannot use the
         // database-backed redemption path reserved for tickets from an earlier daemon.
         std::thread::spawn(move || {
+            let _work = work;
             let _ = speech
                 .prepared
                 .context

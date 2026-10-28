@@ -5188,7 +5188,8 @@ where
         format!("{:p}", Arc::as_ptr(&control)),
         control.advertises(subc_protocol::scope::SCOPE_DESCRIBE_OP),
     );
-    let (scope_describes, mut scopes_ended_rx, scope_describe_task) =
+    let speech_runtime = speech.runtime_guard();
+    let (scope_describes, mut scopes_ended_rx, mut scope_describe_task) =
         scope_describe::start_for_speech(
             control.clone(),
             executor.clone(),
@@ -6729,6 +6730,14 @@ where
     health_rollup_worker.shutdown();
     // The flip retries until accepted; the connection ending is what stops it.
     scope_describe_task.abort();
+    // Cancellation is not a join guarantee. If the monitor does not stop in
+    // 100 ms, keep the locks: it may still publish scope-end revocations.
+    if tokio::time::timeout(Duration::from_millis(100), &mut scope_describe_task)
+        .await
+        .is_err()
+    {
+        speech_runtime.retain_until_process_exit();
+    }
     ledger_edge.detach_shells(&executor, None).await;
     if let Some(task) = readiness_task {
         task.abort();
@@ -6810,6 +6819,11 @@ where
         }
     }
 
+    // No new relay can enter after the frame loop. Retire the speech owner
+    // before joining the writer: its runtime also owns a control sender.
+    // Relays may still enqueue bot writes or finish durable state. Their work
+    // guards retain the serving/storage locks until both operations finish.
+    speech_runtime.retire();
     // The run-scope coordinator owns a writer sender even when no run is live.
     // Release it before joining the writer so an idle connection can drain.
     drop(run_scopes);
@@ -9078,7 +9092,12 @@ fn spawn_gh_relay(
     let frame = frame.clone();
     let relay = Arc::clone(relay);
     let metrics = Arc::clone(metrics);
+    let speech_work = route_scopes
+        .speech
+        .as_ref()
+        .map(|speech| speech.track_finalization());
     tokio::spawn(async move {
+        let _speech_work = speech_work;
         let decoded = serde_json::from_slice::<Value>(&frame.body).unwrap_or(Value::Null);
         let operation = decoded
             .get("op")

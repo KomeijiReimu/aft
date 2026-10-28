@@ -2688,3 +2688,29 @@ async fn published_sdk_reservation_canceled_open_registers_and_releases_without_
     assert_eq!(daemon.closes(1).await.len(), 1);
     assert!(daemon.requests().is_empty());
 }
+
+#[tokio::test]
+async fn never_issued_bot_ticket_is_unknown_before_serving_or_authority() {
+    let root = tempfile::tempdir().unwrap();
+    drop(crate::db::open(&root.path().join("aft.db")).unwrap());
+    let service = crate::gh_shim_speech::service::record_service(root.path());
+    assert!(!service.try_serve(), "the fixture has no serving runtime");
+    let mut routes = RouteScopes::default();
+    routes.speech = Some(service);
+    let params = bot_params("0123456789abcdef0123456789abcdef", "never-issued");
+    let transport = FakeTransport::scoped();
+    let answer = relay(
+        &transport,
+        RelayCall {
+            operation: BOT_REQUEST_OPERATION,
+            params: &params,
+            first_party: true,
+            route_scopes: &routes,
+        },
+        &|_| {},
+    )
+    .await;
+    assert_eq!(answer.data["refusal_code"], "ticket_unknown");
+    assert_eq!(answer.data["stage"], "ticket");
+    assert!(transport.calls().is_empty());
+}

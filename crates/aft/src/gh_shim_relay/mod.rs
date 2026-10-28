@@ -383,6 +383,31 @@ async fn relay_inner<T: RelayTransport>(
             );
         };
         let memory_ticket = crate::gh_shim_ticket::redeem(ticket);
+        if memory_ticket.is_none() {
+            let cold_operation = call.operation == BOT_REQUEST_OPERATION
+                || (call.operation == BINDINGS_READ_OPERATION
+                    && params.get("purpose").and_then(Value::as_str) == Some("speech"));
+            let recognized = match (
+                cold_operation,
+                call.route_scopes.speech.as_ref(),
+                crate::gh_shim_ticket::speech_digest(ticket),
+            ) {
+                (true, Some(service), Some(digest)) => {
+                    match service.store.recognizes_ticket_digest(&digest) {
+                        Ok(recognized) => recognized,
+                        Err(error) => break 'reply RelayReply::task_refused(error),
+                    }
+                }
+                _ => false,
+            };
+            if !recognized {
+                break 'reply RelayReply::refused(
+                    "ticket_unknown",
+                    "ticket",
+                    "the command's session ticket is not live; it ended or was never issued",
+                );
+            }
+        }
         let durable_background =
             crate::gh_shim_ticket::speech_for_ticket(ticket).is_some_and(|speech| {
                 speech.background.load(std::sync::atomic::Ordering::SeqCst)
@@ -926,6 +951,7 @@ async fn post_captured(
         .speech
         .as_ref()
         .ok_or_else(|| Refusal::new(Code::AuthorityUnavailable, "not_serving_mode"))?;
+    let _runtime_work = service.begin_post()?;
     service.check_pending(None, launch, &redeemed.session_id, &redeemed.task_id)?;
     if !service.try_serve() {
         return Err(Refusal::new(

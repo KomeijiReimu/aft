@@ -272,6 +272,7 @@ impl RelayTransport for FakePlex {
 }
 
 struct Fixture {
+    _runtime: crate::gh_shim_speech::service::RuntimeGuard,
     _dir: tempfile::TempDir,
     _env: Vec<Env>,
     ctx: Arc<crate::context::AppContext>,
@@ -431,6 +432,7 @@ impl Fixture {
             "fixture-control".into(),
             true,
         );
+        let runtime = service.runtime_guard();
         let read = plex.clone();
         let reserve = plex.clone();
         if !options.sdk_daemon {
@@ -634,6 +636,7 @@ impl Fixture {
         let request = governed_wire_request(&rung.record, agent, request);
         let params = json!({"ticket":ticket,"request_nonce":"dispatch-post","request":request,"invocation":invocation});
         Self {
+            _runtime: runtime,
             _dir: dir,
             _env: env,
             ctx,
@@ -690,6 +693,10 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = self.ctx.bash_background().kill(&self.task, &self.session);
         self.ctx.bash_background().detach();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !self._runtime.retire() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 

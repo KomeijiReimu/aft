@@ -283,6 +283,18 @@ impl Store {
 }
 
 impl Store {
+    /// A digest hit identifies issued state only. Authorizing it still requires
+    /// loading the saved authority and checking revocation, scopes and execution.
+    pub(crate) fn recognizes_ticket_digest(&self, digest: &[u8]) -> Result<bool, Refusal> {
+        self.connect()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM gh_speech_authorities WHERE ticket_digest=?1)",
+                [digest],
+                |row| row.get(0),
+            )
+            .map_err(db_error)
+    }
+
     pub(crate) fn get(&self, incarnation: &str) -> Result<StoredAuthority, Refusal> {
         let conn = self.connect()?;
         let value = load(&conn, incarnation)?;
