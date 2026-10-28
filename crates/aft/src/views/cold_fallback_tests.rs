@@ -763,7 +763,12 @@ fn callgraph_previous_producer_reextracts_callbacks_and_inline_test_status() {
                 impact_result(&store, Path::new("src/lib.rs"), "transform", 5, true).unwrap(),
             )
             .unwrap(),
-            "1 affected site (1 by callback reference) · 1 file\nsrc/lib.rs:3\n  ↳ checks (callback reference)",
+            // Impact shows the caller's source line whenever the file still
+            // matches the store, as the views-off render does
+            // (callgraph_regression_tests). A v1 view used to fail that check
+            // because it records each file's call-graph blob key, not its
+            // content hash, which hid the row.
+            "1 affected site (1 by callback reference) · 1 file\nsrc/lib.rs:3\n  ↳ checks (callback reference)\n  fn checks() { spawn(transform); }",
         ),
         (
             "callers",

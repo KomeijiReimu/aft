@@ -236,7 +236,7 @@ struct RegistryInner {
     durable_storage: Mutex<Option<PathBuf>>,
     family: String,
     path: PathBuf,
-    connection: Mutex<TrackedConnection>,
+    connection: Option<Mutex<TrackedConnection>>,
     /// The disk limits this process applies to the family; see
     /// `views::eviction`. Shared by every handle on this registry file.
     budget: Mutex<super::eviction::DiskBudget>,
@@ -299,6 +299,30 @@ impl RegistryLocation {
 }
 
 impl FamilyRegistry {
+    /// Identity and barrier access for a v3-only owner. No legacy connection is
+    /// opened, including during session cleanup.
+    fn open_v3(storage: &Path, family: &str) -> RegistryResult<Self> {
+        let path = crate::blob_store::v3::family_dir(storage, family)
+            .map_err(token_store_error)?
+            .join("members.sqlite");
+        Ok(Self {
+            inner: Arc::new(RegistryInner {
+                storage: storage.to_path_buf(),
+                durable_storage: Mutex::new(None),
+                family: family.to_owned(),
+                path,
+                connection: None,
+                budget: Mutex::new(Default::default()),
+                size_caches: Mutex::default(),
+                ended_sessions: Mutex::new(Vec::new()),
+            }),
+        })
+    }
+
+    pub fn is_v3_only(&self) -> bool {
+        self.inner.connection.is_none()
+    }
+
     /// Opens the registry, creating it when absent.
     pub fn open(storage: &Path, family: &str) -> RegistryResult<Self> {
         let dir = family_dir(storage, family)?;
@@ -371,7 +395,7 @@ impl FamilyRegistry {
                 durable_storage: Mutex::new(None),
                 family: family.to_owned(),
                 path,
-                connection: Mutex::new(connection),
+                connection: Some(Mutex::new(connection)),
                 budget: Mutex::new(super::eviction::DiskBudget::default()),
                 size_caches: Mutex::default(),
                 ended_sessions: Mutex::new(Vec::new()),
@@ -408,13 +432,18 @@ impl FamilyRegistry {
             durable_storage: Mutex::new(None),
             family: family.to_owned(),
             path: path.clone(),
-            connection: Mutex::new(connection),
+            connection: Some(Mutex::new(connection)),
             budget: Mutex::new(super::eviction::DiskBudget::default()),
             size_caches: Mutex::default(),
             ended_sessions: Mutex::new(Vec::new()),
         });
         {
-            let mut connection = lock(&inner.connection);
+            let mut connection = lock(
+                inner
+                    .connection
+                    .as_ref()
+                    .expect("legacy registry connection"),
+            );
             if create {
                 crate::blob_store::retry_while_busy(
                     Duration::from_millis(crate::blob_store::BUSY_TIMEOUT_MS),
@@ -446,21 +475,23 @@ impl FamilyRegistry {
     /// The registry connection, after writing any session ends queued while
     /// it was busy, so that nothing read through it sees a session that has
     /// already ended in this process.
-    fn connection(&self) -> MutexGuard<'_, TrackedConnection> {
+    fn connection(&self) -> RegistryResult<MutexGuard<'_, TrackedConnection>> {
+        let mutex = self.inner.connection.as_ref().ok_or_else(|| {
+            RegistryError::Incompatible(
+                "legacy registry operation on a v3-only registration".into(),
+            )
+        })?;
         #[cfg(test)]
         CONNECTION_BLOCKED.with(|hook| {
-            if matches!(
-                self.inner.connection.try_lock(),
-                Err(std::sync::TryLockError::WouldBlock)
-            ) {
+            if matches!(mutex.try_lock(), Err(std::sync::TryLockError::WouldBlock)) {
                 if let Some(blocked) = hook.borrow_mut().take() {
                     blocked.send(()).unwrap();
                 }
             }
         });
-        let connection = lock(&self.inner.connection);
+        let connection = lock(mutex);
         flush_ended_sessions(&self.inner, &connection);
-        connection
+        Ok(connection)
     }
 
     pub fn storage(&self) -> &Path {
@@ -534,6 +565,11 @@ impl FamilyRegistry {
         scope: &str,
         root: &Path,
     ) -> RegistryResult<ViewRegistration> {
+        if self.is_v3_only() {
+            return Err(RegistryError::Incompatible(
+                "use ViewRegistration::register_v3 for v3-only owners".into(),
+            ));
+        }
         self.bind_durable_storage(durable_storage)?;
         if matches!(root.try_exists(), Ok(true)) {
             let paths = crate::root_cache::StoragePaths::new(
@@ -554,7 +590,7 @@ impl FamilyRegistry {
             owner.start_time,
             SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
-        let mut connection = self.connection();
+        let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(RUNTIME_SCHEMA)?;
         let previous: Option<String> = tx
@@ -633,7 +669,7 @@ impl FamilyRegistry {
 
     /// Every recorded view session, live or not.
     pub fn sessions(&self) -> RegistryResult<Vec<SessionRecord>> {
-        let connection = self.connection();
+        let connection = self.connection()?;
         read_sessions(&connection, None)
     }
 
@@ -647,7 +683,7 @@ impl FamilyRegistry {
             .filter(|session| !crate::pins::owner_is_live(&session.owner))
             .map(|session| session.session_id)
             .collect::<Vec<_>>();
-        let connection = self.connection();
+        let connection = self.connection()?;
         for session_id in &dead {
             connection.execute(
                 "DELETE FROM view_sessions WHERE session_id = ?1",
@@ -668,7 +704,7 @@ impl FamilyRegistry {
             owner.start_time,
             READER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
-        self.connection().execute(
+        self.connection()?.execute(
             "INSERT INTO readers (reader_id, label, owner_pid, owner_start, registered_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -687,11 +723,11 @@ impl FamilyRegistry {
     }
 
     pub fn members(&self) -> RegistryResult<Vec<MemberRecord>> {
-        read_members(&self.connection())
+        read_members(&*self.connection()?)
     }
 
     pub(crate) fn members_bounded(&self, limit: usize) -> RegistryResult<Vec<MemberRecord>> {
-        let connection = self.connection();
+        let connection = self.connection()?;
         let members = read_members_limited(&connection, limit.saturating_add(1))?;
         if members.len() > limit {
             return Err(RegistryError::Incompatible(format!(
@@ -702,13 +738,13 @@ impl FamilyRegistry {
     }
 
     pub fn member(&self, scope: &str) -> RegistryResult<Option<MemberRecord>> {
-        Ok(read_members(&self.connection())?
+        Ok(read_members(&*self.connection()?)?
             .into_iter()
             .find(|member| member.scope == scope))
     }
 
     pub fn readers(&self) -> RegistryResult<Vec<ReaderRecord>> {
-        let connection = self.connection();
+        let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT reader_id, label, owner_pid, owner_start, registered_at_ms
              FROM readers ORDER BY reader_id",
@@ -728,7 +764,7 @@ impl FamilyRegistry {
     }
 
     pub fn gc_epoch(&self) -> RegistryResult<u64> {
-        let epoch: i64 = self.connection().query_row(
+        let epoch: i64 = self.connection()?.query_row(
             "SELECT gc_epoch FROM registry_meta WHERE singleton = 1",
             [],
             |row| row.get(0),
@@ -738,7 +774,7 @@ impl FamilyRegistry {
 
     /// Records a successful publication of `scope`.
     pub fn note_publish(&self, scope: &str) -> RegistryResult<()> {
-        self.connection().execute(
+        self.connection()?.execute(
             "UPDATE members SET last_publish_ms = ?2 WHERE scope = ?1",
             params![scope, now_ms() as i64],
         )?;
@@ -759,7 +795,7 @@ impl FamilyRegistry {
     /// A live owner keeps the lease; a dead owner's lease is taken over.
     pub(crate) fn acquire_sweep(&self) -> RegistryResult<Option<SweepLease>> {
         let owner = current_owner();
-        let mut connection = self.connection();
+        let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let holder: Option<(i64, i64)> = tx
             .query_row(
@@ -812,7 +848,18 @@ impl FamilyRegistry {
         &self,
         body: impl FnOnce(&rusqlite::Connection) -> RegistryResult<T>,
     ) -> RegistryResult<T> {
-        body(&self.connection())
+        if self.is_v3_only() {
+            return crate::blob_store::v3::LedgerReader::open_existing(
+                self.storage(),
+                self.family(),
+            )
+            .map_err(token_store_error)?
+            .read(|c| {
+                body(c).map_err(|e| crate::blob_store::v3::Error::Io(std::io::Error::other(e)))
+            })
+            .map_err(token_store_error);
+        }
+        body(&*self.connection()?)
     }
 
     /// Runs `body` inside one IMMEDIATE transaction on the registry. This is
@@ -822,7 +869,14 @@ impl FamilyRegistry {
         &self,
         body: impl FnOnce(&rusqlite::Transaction<'_>) -> RegistryResult<T>,
     ) -> RegistryResult<T> {
-        let mut connection = self.connection();
+        if self.is_v3_only() {
+            return super::base_refs::with_base_barrier(self.storage(), self.family(), |tx| {
+                flush_ended_sessions(&self.inner, tx);
+                body(tx).map_err(|e| super::base_refs::BaseRefError::Io(std::io::Error::other(e)))
+            })
+            .map_err(|e| RegistryError::Io(std::io::Error::other(e)));
+        }
+        let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let value = body(&tx)?;
         tx.commit()?;
@@ -851,7 +905,7 @@ impl FamilyRegistry {
             .filter(|reader| !crate::pins::owner_is_live(&reader.owner))
             .map(|reader| reader.reader_id)
             .collect::<Vec<_>>();
-        let connection = self.connection();
+        let connection = self.connection()?;
         for reader_id in &dead {
             connection.execute(
                 "DELETE FROM readers WHERE reader_id = ?1",
@@ -900,7 +954,7 @@ impl SweepLease {
     /// A forced admission pass ignores it. Failed or partial passes do not
     /// postpone a retry.
     pub(crate) fn due(&self, force: bool) -> RegistryResult<bool> {
-        let connection = self.registry.connection();
+        let connection = self.registry.connection()?;
         connection.execute_batch("CREATE TABLE IF NOT EXISTS sweep_schedule (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), completed_at_ms INTEGER NOT NULL)")?;
         let last: Option<i64> = connection
             .query_row(
@@ -917,7 +971,7 @@ impl SweepLease {
     }
 
     pub(crate) fn completed(&self) -> RegistryResult<()> {
-        self.registry.connection().execute("INSERT INTO sweep_schedule VALUES (1, ?1) ON CONFLICT(singleton) DO UPDATE SET completed_at_ms = excluded.completed_at_ms", params![now_ms() as i64])?;
+        self.registry.connection()?.execute("INSERT INTO sweep_schedule VALUES (1, ?1) ON CONFLICT(singleton) DO UPDATE SET completed_at_ms = excluded.completed_at_ms", params![now_ms() as i64])?;
         Ok(())
     }
 
@@ -934,10 +988,12 @@ impl SweepLease {
             return;
         }
         self.released = true;
-        let _ = self.registry.connection().execute(
+        if let Ok(connection) = self.registry.connection() {
+            let _ = connection.execute(
             "DELETE FROM sweep_lease WHERE singleton = 1 AND owner_pid = ?1 AND owner_start = ?2",
             params![i64::from(self.owner.pid), self.owner.start_time as i64],
         );
+        }
     }
 }
 
@@ -993,7 +1049,16 @@ impl Drop for ViewSession {
             ended_at_ms: now_ms(),
         };
         lock(&self.registry.inner.ended_sessions).push(ended);
-        match self.registry.inner.connection.try_lock() {
+        let Some(connection) = &self.registry.inner.connection else {
+            let registry = self.registry.clone();
+            let _ = std::thread::Builder::new()
+                .name("aft-v3-view-session-end".into())
+                .spawn(move || {
+                    let _ = registry.with_barrier(|_| Ok(()));
+                });
+            return;
+        };
+        match connection.try_lock() {
             Ok(connection) => flush_ended_sessions(&self.registry.inner, &connection),
             Err(std::sync::TryLockError::Poisoned(poisoned)) => {
                 flush_ended_sessions(&self.registry.inner, &poisoned.into_inner())
@@ -1039,6 +1104,36 @@ pub struct SessionRecord {
 }
 
 impl ViewRegistration {
+    /// Registers only in blobs/v3. It grants no legacy store-write capability.
+    pub fn register_v3(
+        storage: &Path,
+        family: &str,
+        scope: &str,
+        root: &Path,
+    ) -> RegistryResult<Self> {
+        let registry = FamilyRegistry::open_v3(storage, family)?;
+        let root = std::fs::canonicalize(root)?;
+        let owner = current_owner();
+        let session_id = super::base_refs::fresh_nonce();
+        let view_dir = registry.with_barrier(|tx| {
+            let dir = super::base_refs::register_view_in(tx, storage, family, scope, &root)
+                .map_err(|e| RegistryError::Io(std::io::Error::other(e)))?;
+            tx.execute("INSERT INTO view_sessions(session_id,scope,owner_pid,owner_start,opened_at_ms) VALUES(?1,?2,?3,?4,?5)",
+                params![session_id, scope, owner.pid, owner.start_time as i64, now_ms()])?;
+            Ok(dir)
+        })?;
+        Ok(Self {
+            registry: registry.clone(),
+            scope: scope.to_owned(),
+            root,
+            view_dir,
+            session: Arc::new(ViewSession {
+                registry,
+                session_id,
+                scope: scope.to_owned(),
+            }),
+        })
+    }
     pub fn registry(&self) -> &FamilyRegistry {
         &self.registry
     }
@@ -1065,6 +1160,9 @@ impl ViewRegistration {
     }
 
     pub fn write_access(&self) -> StoreWriteAccess {
+        if self.registry.is_v3_only() {
+            return StoreWriteAccess::v3_only(self.registry.storage(), self.family());
+        }
         StoreWriteAccess::for_registered_view(self.registry.storage(), self.registry.family())
     }
 
@@ -1072,8 +1170,21 @@ impl ViewRegistration {
         Ok(FamilyStore::open(&self.write_access(), plane)?)
     }
 
+    /// The v3 member of this checkout: the same family and scope, under
+    /// `blobs/v3/<family>/views/<scope>`.
+    pub fn v3_route(&self) -> super::snapshot::V3Route {
+        super::snapshot::V3Route {
+            storage: self.registry().storage().to_path_buf(),
+            family: self.family().to_owned(),
+            scope: self.scope().to_owned(),
+        }
+    }
+
     /// The view's own pointer and manifests in `views/v2/<scope>`.
     pub fn view_store(&self) -> RegistryResult<super::ViewStore> {
+        if self.registry.is_v3_only() {
+            return Ok(super::ViewStore::open_dir(self.view_dir.clone())?);
+        }
         let view = super::ViewStore::open_dir(self.view_dir.clone())?
             .with_sweep_registry(self.registry.clone());
         view.recover_abandoned_derived(Some(self.registry()));
@@ -1201,10 +1312,12 @@ impl ReaderRegistration {
 
 impl Drop for ReaderRegistration {
     fn drop(&mut self) {
-        let _ = self.registry.connection().execute(
-            "DELETE FROM readers WHERE reader_id = ?1",
-            params![self.reader_id],
-        );
+        if let Ok(connection) = self.registry.connection() {
+            let _ = connection.execute(
+                "DELETE FROM readers WHERE reader_id = ?1",
+                params![self.reader_id],
+            );
+        }
     }
 }
 
@@ -1400,6 +1513,191 @@ fn now_ms() -> u64 {
     crate::pins::now_ms()
 }
 
+pub const VIEW_TOKEN_TTL_MS: u64 = 600_000;
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ViewToken {
+    pub token: String,
+    pub expires_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TokenUse {
+    Accepted { expected_tree: String },
+    Forged,
+    Expired,
+    WrongRoot,
+    WrongTree,
+    IdentityMismatch,
+    Replayed,
+}
+
+/// Canonicalize an existing parent without requiring the future checkout to
+/// exist. A later symlink substitution changes the canonical consumption root.
+pub fn canonical_token_root(path: &Path) -> std::io::Result<PathBuf> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "token root must be absolute without parent components",
+        ));
+    }
+    let mut parent = path;
+    let mut suffix = Vec::new();
+    while !parent.try_exists()? {
+        suffix.push(
+            parent
+                .file_name()
+                .ok_or_else(|| std::io::Error::other("no existing root ancestor"))?
+                .to_os_string(),
+        );
+        parent = parent
+            .parent()
+            .ok_or_else(|| std::io::Error::other("no existing root ancestor"))?;
+    }
+    let mut result = std::fs::canonicalize(parent)?;
+    for component in suffix.into_iter().rev() {
+        result.push(component);
+    }
+    Ok(result)
+}
+
+fn token_store_error(error: crate::blob_store::v3::Error) -> RegistryError {
+    RegistryError::Io(std::io::Error::other(error))
+}
+
+/// Minting is advisory and creates only the registered v3 token row. No base,
+/// source bytes, view pointer or legacy row is written.
+pub fn mint_view_token(
+    storage: &Path,
+    family: &str,
+    root: &Path,
+    tree: &str,
+    now_ms: u64,
+) -> RegistryResult<ViewToken> {
+    if !matches!(tree.len(), 40 | 64)
+        || !tree
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(RegistryError::InvalidScope(
+            "expected tree must be a lowercase Git object ID".into(),
+        ));
+    }
+    let root = canonical_token_root(root)?;
+    let root_bytes = encode_root(&root).ok_or_else(|| {
+        RegistryError::InvalidScope("token root cannot be represented exactly".into())
+    })?;
+    let mut nonce = [0u8; 32];
+    getrandom::fill(&mut nonce)
+        .map_err(|error| RegistryError::Io(std::io::Error::other(error.to_string())))?;
+    let token = crate::blob_store::v2::to_hex(&nonce);
+    let expires_ms = now_ms
+        .checked_add(VIEW_TOKEN_TTL_MS)
+        .ok_or_else(|| RegistryError::InvalidScope("token clock overflow".into()))?;
+    let lock =
+        crate::blob_store::v3::ReservationLock::acquire(storage).map_err(token_store_error)?;
+    let mut registry = crate::blob_store::v3::open_verification_registry(storage, family, &lock)
+        .map_err(token_store_error)?;
+    registry.with_barrier(|tx| {
+        tx.execute("DELETE FROM view_tokens WHERE expires_ms<=?1", [now_ms])?;
+        tx.execute("INSERT INTO view_tokens(nonce,root,expected_tree,minted_ms,expires_ms) VALUES(?1,?2,?3,?4,?5)", params![token, root_bytes, tree, now_ms, expires_ms])?;
+        Ok(())
+    }).map_err(token_store_error)?;
+    Ok(ViewToken { token, expires_ms })
+}
+
+/// A token never supplies a freshness proof. Even an accepted token only
+/// suggests which tree to pre-warm; callers must still reconcile the checkout.
+pub fn consume_view_token(
+    storage: &Path,
+    family: &str,
+    token: &str,
+    root: &Path,
+    now_ms: u64,
+) -> RegistryResult<TokenUse> {
+    let root = canonical_token_root(root)?;
+    let directory = match super::verification::gitdir(&root) {
+        Ok(directory) => directory,
+        Err(_) => return Ok(TokenUse::IdentityMismatch),
+    };
+    let identities = match (
+        super::verification::NativeStat::strict_read(&root),
+        super::verification::NativeStat::strict_read(&directory),
+    ) {
+        (Ok(root), Ok(gitdir)) => (root.identity, (directory, gitdir.identity)),
+        _ => return Ok(TokenUse::IdentityMismatch),
+    };
+    let queries =
+        crate::git_index_reader::GitQueries::new(root.clone(), std::time::Duration::from_secs(2));
+    let tree = queries.head_tree()?;
+    if !tree.status.success() {
+        return Ok(TokenUse::WrongTree);
+    }
+    let tree = String::from_utf8_lossy(&tree.stdout).trim().to_owned();
+    let bound_root = serde_json::to_vec(&identities.0)
+        .map_err(|e| RegistryError::Io(std::io::Error::other(e)))?;
+    let bound_gitdir = serde_json::to_vec(&identities.1)
+        .map_err(|e| RegistryError::Io(std::io::Error::other(e)))?;
+    consume_token_identity(
+        storage,
+        family,
+        token,
+        &root,
+        &tree,
+        &bound_root,
+        &bound_gitdir,
+        now_ms,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consume_token_identity(
+    storage: &Path,
+    family: &str,
+    token: &str,
+    root: &Path,
+    tree: &str,
+    root_identity: &[u8],
+    gitdir_identity: &[u8],
+    now_ms: u64,
+) -> RegistryResult<TokenUse> {
+    // A forged token does not create a family or advance its reader floor.
+    if !crate::blob_store::v3::family_dir(storage, family)
+        .map_err(token_store_error)?
+        .join("members.sqlite")
+        .try_exists()?
+    {
+        return Ok(TokenUse::Forged);
+    }
+    let lock =
+        crate::blob_store::v3::ReservationLock::acquire(storage).map_err(token_store_error)?;
+    let mut registry =
+        crate::blob_store::v3::RegistryWriter::open_for_barrier(storage, family, &lock)
+            .map_err(token_store_error)?;
+    if registry.registry_version().map_err(token_store_error)?
+        < crate::blob_store::v3::REGISTRY_VERIFICATION_VERSION
+    {
+        return Ok(TokenUse::Forged);
+    }
+    registry.with_barrier(|tx| {
+        type Row = (Vec<u8>, String, u64, u64, Option<Vec<u8>>, Option<Vec<u8>>, Option<u64>);
+        let row: Option<Row> = tx.query_row("SELECT root,expected_tree,minted_ms,expires_ms,bound_root,bound_gitdir,consumed_ms FROM view_tokens WHERE nonce=?1", [token], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional()?;
+        let Some((expected_root, expected_tree, minted, expires, bound_root, bound_gitdir, consumed)) = row else { return Ok(TokenUse::Forged); };
+        if now_ms < minted || now_ms >= expires { return Ok(TokenUse::Expired); }
+        if Some(expected_root) != encode_root(root) { return Ok(TokenUse::WrongRoot); }
+        if expected_tree != tree { return Ok(TokenUse::WrongTree); }
+        if consumed.is_some() {
+            return Ok(if bound_root.as_deref() == Some(root_identity) && bound_gitdir.as_deref() == Some(gitdir_identity) { TokenUse::Replayed } else { TokenUse::IdentityMismatch });
+        }
+        let changed = tx.execute("UPDATE view_tokens SET bound_root=?1,bound_gitdir=?2,consumed_ms=?3 WHERE nonce=?4 AND consumed_ms IS NULL", params![root_identity, gitdir_identity, now_ms, token])?;
+        Ok(if changed == 1 { TokenUse::Accepted { expected_tree } } else { TokenUse::Replayed })
+    }).map_err(token_store_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1528,7 +1826,7 @@ mod tests {
         super::super::generation::schedule_generation_sweep(view.clone());
         entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         let held = {
-            let mut connection = registry.connection();
+            let mut connection = registry.connection().unwrap();
             connection.busy_timeout(Duration::ZERO).unwrap();
             let blocked = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1676,5 +1974,259 @@ mod tests {
             matches!(result, Err(PinError::NotRegistered(_))),
             "{result:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod view_token_tests {
+    use super::*;
+    const TREE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn view_token_upgrade_preserves_existing_registry_two_members_and_sessions() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        super::super::base_refs::with_base_barrier(storage.path(), "family", |tx| {
+            super::super::base_refs::register_view_in(
+                tx,
+                storage.path(),
+                "family",
+                "before",
+                root.path(),
+            )?;
+            tx.execute(
+                "INSERT INTO view_sessions VALUES('before-session','before',123,456,789)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let reader =
+            crate::blob_store::v3::LedgerReader::open_existing(storage.path(), "family").unwrap();
+        assert_eq!(
+            reader
+                .read(|c| Ok(c
+                    .query_row("SELECT format_version FROM format_meta", [], |r| r
+                        .get::<_, u32>(0))?))
+                .unwrap(),
+            2
+        );
+        mint_view_token(
+            storage.path(),
+            "family",
+            &root.path().join("future"),
+            TREE,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            reader
+                .read(|c| Ok(c
+                    .query_row("SELECT format_version FROM format_meta", [], |r| r
+                        .get::<_, u32>(0))?))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            reader
+                .read(|c| Ok(c.query_row(
+                    "SELECT COUNT(*) FROM members WHERE scope='before'",
+                    [],
+                    |r| r.get::<_, u32>(0)
+                )?))
+                .unwrap(),
+            1
+        );
+        assert_eq!(reader.read(|c| Ok(c.query_row("SELECT owner_pid,owner_start,opened_at_ms FROM view_sessions WHERE session_id='before-session'", [], |r| Ok((r.get::<_, u32>(0)?,r.get::<_, u32>(1)?,r.get::<_, u32>(2)?)))?)).unwrap(), (123,456,789));
+    }
+
+    #[test]
+    fn view_token_mints_before_root_exists_and_binds_both_identities_once() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let storage = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(parent.path()).unwrap().join("future");
+        let minted = mint_view_token(storage.path(), "family", &root, TREE, 10).unwrap();
+        assert!(!root.exists());
+        let ledger =
+            crate::blob_store::v3::LedgerReader::open_existing(storage.path(), "family").unwrap();
+        assert!(ledger.read(|c| Ok(c.query_row("SELECT bound_root IS NULL AND bound_gitdir IS NULL AND consumed_ms IS NULL FROM view_tokens", [], |r| r.get::<_, bool>(0))?)).unwrap());
+        assert_eq!(
+            consume_token_identity(
+                storage.path(),
+                "family",
+                &minted.token,
+                &root,
+                TREE,
+                b"root-id",
+                b"gitdir-id",
+                11
+            )
+            .unwrap(),
+            TokenUse::Accepted {
+                expected_tree: TREE.into()
+            }
+        );
+        assert_eq!(
+            consume_token_identity(
+                storage.path(),
+                "family",
+                &minted.token,
+                &root,
+                TREE,
+                b"root-id",
+                b"gitdir-id",
+                12
+            )
+            .unwrap(),
+            TokenUse::Replayed
+        );
+        for (root_id, gitdir_id) in [
+            (b"replacement".as_slice(), b"gitdir-id".as_slice()),
+            (b"root-id".as_slice(), b"replacement".as_slice()),
+        ] {
+            assert_eq!(
+                consume_token_identity(
+                    storage.path(),
+                    "family",
+                    &minted.token,
+                    &root,
+                    TREE,
+                    root_id,
+                    gitdir_id,
+                    12
+                )
+                .unwrap(),
+                TokenUse::IdentityMismatch
+            );
+        }
+        let floor = crate::reader_floor::read(storage.path()).unwrap().unwrap();
+        assert_eq!(floor.stores["views_v3_registry"], 3);
+        assert_eq!(floor.stores["views_v3_store"], 1);
+        assert!(!storage.path().join("blobs/family").exists());
+        assert!(!storage.path().join("blobs/v2").exists());
+    }
+
+    #[test]
+    fn view_token_concurrent_first_consumption_has_exactly_one_winner() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let storage = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(parent.path()).unwrap().join("future");
+        let token = mint_view_token(storage.path(), "family", &root, TREE, 1).unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let outcomes = std::thread::scope(|scope| {
+            let jobs: Vec<_> = (0..2)
+                .map(|_| {
+                    let start = &start;
+                    let token = &token.token;
+                    let root = &root;
+                    let storage = storage.path();
+                    scope.spawn(move || {
+                        start.wait();
+                        consume_token_identity(
+                            storage, "family", token, root, TREE, b"root", b"gitdir", 2,
+                        )
+                        .unwrap()
+                    })
+                })
+                .collect();
+            jobs.into_iter()
+                .map(|j| j.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|r| matches!(r, TokenUse::Accepted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|r| **r == TokenUse::Replayed)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn view_token_forged_expired_wrong_root_and_wrong_tree_never_consume() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let storage = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(parent.path()).unwrap().join("future");
+        assert_eq!(
+            consume_token_identity(
+                storage.path(),
+                "family",
+                "forged",
+                &root,
+                TREE,
+                b"r",
+                b"g",
+                1
+            )
+            .unwrap(),
+            TokenUse::Forged
+        );
+        assert!(!storage.path().join("blobs/v3").exists());
+        let token = mint_view_token(storage.path(), "family", &root, TREE, 10).unwrap();
+        for (nonce, path, tree, now, expected) in [
+            ("forged", root.clone(), TREE, 11, TokenUse::Forged),
+            (
+                &token.token,
+                root.join("wrong"),
+                TREE,
+                11,
+                TokenUse::WrongRoot,
+            ),
+            (
+                &token.token,
+                root.clone(),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                11,
+                TokenUse::WrongTree,
+            ),
+            (
+                &token.token,
+                root.clone(),
+                TREE,
+                token.expires_ms,
+                TokenUse::Expired,
+            ),
+            (&token.token, root.clone(), TREE, 9, TokenUse::Expired),
+        ] {
+            assert_eq!(
+                consume_token_identity(
+                    storage.path(),
+                    "family",
+                    nonce,
+                    &path,
+                    tree,
+                    b"r",
+                    b"g",
+                    now
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        assert!(matches!(
+            consume_token_identity(
+                storage.path(),
+                "family",
+                &token.token,
+                &root,
+                TREE,
+                b"r",
+                b"g",
+                11
+            )
+            .unwrap(),
+            TokenUse::Accepted { .. }
+        ));
     }
 }

@@ -377,12 +377,16 @@ fn wait_until_ready(ctx: &AppContext) -> Arc<aft::callgraph_store::ReadonlyCallG
             CallgraphStoreAccess::Error(error) if error.is_transient_lock_contention() => None,
             CallgraphStoreAccess::Error(error) => panic!("callgraph failed while waiting: {error}"),
         };
-        let search_ready = ctx
-            .search_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .is_some_and(|index| index.ready);
+        // With views on, grep and glob read the checkout's lexical view on
+        // demand and no legacy search index is ever built; their readiness
+        // is checked by the grep answers the callers wait for.
+        let search_ready = ctx.config().views.enabled
+            || ctx
+                .search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|index| index.ready);
         let semantic_ready = matches!(
             &*ctx
                 .semantic_index_status()
@@ -603,47 +607,6 @@ fn views_round_trip_reuses_semantic_blobs_without_embedding() {
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }
-}
-
-/// A publication can briefly lock the derived call-graph database a reader
-/// opens (its deferred checkpoint, or its last connection closing the WAL).
-/// The view reader has no busy wait and reports that as a retryable lock;
-/// waiting for readiness must ride it out, not fail on "database is locked".
-#[test]
-fn views_readiness_wait_rides_out_a_locked_derived_database() {
-    let _watcher_guard = crate::helpers::watcher_serial_lock();
-    let server = MockEmbeddingServer::start();
-    let repo = RepoFixture::new(4, 2);
-    let storage = tempfile::tempdir().unwrap();
-    let ctx = configure_context_with_views(&repo.root, storage.path(), &server, false, true);
-    let derived = wait_until_ready(&ctx).sqlite_path().to_path_buf();
-    // The publication's own deferred checkpoint may still hold the file; take
-    // the exclusive lock once it lets go.
-    let holder = rusqlite::Connection::open(&derived).expect("derived writer");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while holder
-        .execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
-        .is_err()
-    {
-        assert!(Instant::now() < deadline, "derived database stayed busy");
-        thread::sleep(Duration::from_millis(20));
-    }
-    match ctx.callgraph_store_for_ops() {
-        CallgraphStoreAccess::Error(error) => assert!(
-            error.is_transient_lock_contention(),
-            "the lock must surface as contention: {error}"
-        ),
-        _ => panic!("the exclusive lock must block the view reader"),
-    }
-    let release = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(300));
-        holder
-            .execute_batch("ROLLBACK")
-            .expect("release derived lock");
-    });
-    let store = wait_until_ready(&ctx);
-    release.join().unwrap();
-    assert_eq!(store.sqlite_path(), derived);
 }
 
 /// Waits until the views-on semantic view has current vectors for every

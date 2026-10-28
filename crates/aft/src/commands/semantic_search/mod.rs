@@ -610,7 +610,22 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
             },
         };
 
-        let trigram =
+        let trigram = if let Some(snapshot) = self.ctx.lexical_view_snapshot("aft_search") {
+            match snapshot {
+                Ok(snapshot) => TrigramReadiness {
+                    status: IndexStatus::Ready,
+                    snapshot: Some(Arc::new(snapshot)),
+                    evicted: false,
+                    lock_contended: false,
+                },
+                Err(_) => TrigramReadiness {
+                    status: IndexStatus::Fallback,
+                    snapshot: None,
+                    evicted: false,
+                    lock_contended: false,
+                },
+            }
+        } else {
             match try_read_with_budget(self.ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET) {
                 Some(index) if index.as_ref().is_some_and(SearchIndex::is_ready) => {
                     TrigramReadiness {
@@ -658,7 +673,8 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                     evicted: false,
                     lock_contended: true,
                 },
-            };
+            }
+        };
 
         let symbol_cache = self.ctx.symbol_cache();
         let symbol = match try_read_with_budget(&symbol_cache, INTERACTIVE_ARTIFACT_READ_BUDGET) {
@@ -690,6 +706,9 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
     }
 
     fn bounded_first_search_wait(&self) -> extensions::ReadinessWait {
+        if self.ctx.lexical_views_enabled() {
+            return extensions::ReadinessWait::Completed;
+        }
         // A writer-held pointer cannot be advanced by the loader drain below;
         // preserve the interactive contention bound instead of sleeping 2.5s.
         if matches!(
@@ -820,6 +839,8 @@ fn handle_semantic_search_with_disk_fallback(
     ctx: &AppContext,
     allow_disk_fallback: bool,
 ) -> Response {
+    let config = ctx.config();
+    let _pin = config.views.enabled.then(|| ctx.pin_config_to(config));
     use extensions::{RawQuery, Root, Token};
 
     let page_request = match paging::parse_public_page_request(&req.params) {
@@ -955,6 +976,11 @@ fn handle_semantic_search_with_disk_fallback(
     // The extensions come from the search_b2 install point: A-side defaults
     // until campaign B2 installs its router, plans, variants and readiness.
     let extensions = crate::search_b2::install_defaults();
+    if external_root.is_none() {
+        if let Some(Err(error)) = ctx.lexical_view_snapshot("aft_search") {
+            return Response::error(&req.id, "internal_error", error);
+        }
+    }
     if let Some((pattern_text, compiled)) = pattern {
         return handle_pattern_request(
             req,
@@ -4074,7 +4100,12 @@ fn regex_route_collection(
     compiled: &pattern_compile::CompiledPattern,
     include_tests: bool,
 ) -> Option<std::io::Result<crate::search_index::GrepFileCollection>> {
-    let snapshot = {
+    let snapshot = if let Some(snapshot) = ctx.lexical_view_snapshot("aft_search") {
+        match snapshot {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Some(Err(std::io::Error::other(error))),
+        }
+    } else {
         #[cfg(test)]
         regex_route_lock_hook(false);
         let Some(guard) =
@@ -4916,8 +4947,12 @@ fn run_engine_ranking(
             return Err("request_cancelled".to_string());
         }
     }
-    let context_index = borrowed_index
-        .is_none()
+    let view_snapshot = if borrowed_index.is_none() {
+        ctx.lexical_view_snapshot("aft_search").transpose()?
+    } else {
+        None
+    };
+    let context_index = (borrowed_index.is_none() && view_snapshot.is_none())
         .then(|| try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET));
     let empty_index = SearchIndex::new();
     let index = borrowed_index
@@ -4929,8 +4964,10 @@ fn run_engine_ranking(
                 .and_then(|guard| guard.as_ref())
         })
         .unwrap_or(&empty_index);
-    let generation = borrowed_index
-        .map(|(_, generation)| generation.clone())
+    let generation = view_snapshot
+        .as_ref()
+        .map(|snapshot| GenerationToken::new_with_str(&snapshot.content_generation()))
+        .or_else(|| borrowed_index.map(|(_, generation)| generation.clone()))
         .unwrap_or_else(|| {
             GenerationToken::new_with_str(&format!(
                 "{}:{}",
@@ -4938,7 +4975,8 @@ fn run_engine_ranking(
                 ctx.semantic_index_rx_generation()
             ))
         });
-    let snapshot = index.snapshot();
+    let index_ready = view_snapshot.is_some() || index.is_ready();
+    let snapshot = view_snapshot.unwrap_or_else(|| index.snapshot());
     let content_tokens = query_shape::extract_content_tokens(query);
     let token_refs = content_tokens
         .iter()
@@ -5024,8 +5062,8 @@ fn run_engine_ranking(
     let mut exact_candidates =
         if plan.contains(SearchLaneKind::Exact) || plan.shape == SearchShape::Identifier {
             let outcome = exact_lane::ExactLane::with_memo(ctx.search_exact_memo())
-                .search_scoped(
-                    Some(&index),
+                .search_scoped_snapshot(
+                    index_ready.then_some(&snapshot),
                     project_root,
                     generation.clone(),
                     exact_input,
@@ -5092,8 +5130,8 @@ fn run_engine_ranking(
             for (fact_input, exact_form) in fact_inputs {
                 // Only phrase evidence is kept from these passes.
                 let outcome = lane
-                    .search_scoped(
-                        Some(&index),
+                    .search_scoped_snapshot(
+                        index_ready.then_some(&snapshot),
                         project_root,
                         generation.clone(),
                         &fact_input,
@@ -5162,35 +5200,35 @@ fn run_engine_ranking(
         && exact_candidates.is_empty()
         && exact_disclosures.is_empty()
         && index_disclosures.is_empty()
-        && index.is_ready())
-    .then(|| nearest_names::looked_up_identifiers(exact_input))
-    .flatten()
-    .filter(|identifiers| {
-        // Absence is checked over every indexed file, tests included: a name
-        // that only a test uses still exists, and the ordinary ranking says
-        // more about it than a not-found answer would.
-        identifiers.iter().all(|identifier| {
-            snapshot
-                .whole_corpus_exact_pass(identifier, project_root, None)
-                .map(|matches| matches.is_empty())
-                .unwrap_or_else(|error| {
-                    index_disclosures.push(error.to_string());
-                    false
-                })
+        && index_ready)
+        .then(|| nearest_names::looked_up_identifiers(exact_input))
+        .flatten()
+        .filter(|identifiers| {
+            // Absence is checked over every indexed file, tests included: a name
+            // that only a test uses still exists, and the ordinary ranking says
+            // more about it than a not-found answer would.
+            identifiers.iter().all(|identifier| {
+                snapshot
+                    .whole_corpus_exact_pass(identifier, project_root, None)
+                    .map(|matches| matches.is_empty())
+                    .unwrap_or_else(|error| {
+                        index_disclosures.push(error.to_string());
+                        false
+                    })
+            })
         })
-    })
-    .map(|identifiers| {
-        let target = identifiers.last().expect("at least one identifier");
-        nearest_names::NotFoundAnswer {
-            query: exact_lane::exact_phrase(exact_input).to_string(),
-            names: nearest_names::nearest_names(
-                target,
-                lexical_candidates
-                    .iter()
-                    .map(|candidate| candidate.path.as_path()),
-            ),
-        }
-    });
+        .map(|identifiers| {
+            let target = identifiers.last().expect("at least one identifier");
+            nearest_names::NotFoundAnswer {
+                query: exact_lane::exact_phrase(exact_input).to_string(),
+                names: nearest_names::nearest_names(
+                    target,
+                    lexical_candidates
+                        .iter()
+                        .map(|candidate| candidate.path.as_path()),
+                ),
+            }
+        });
     // A code literal that no indexed file contains (tests included) gets the
     // same kind of answer: the reply says so first, and the files that only
     // share its words are labelled similar rather than presented as matches.
@@ -5205,26 +5243,26 @@ fn run_engine_ranking(
     let literal_absent = (not_found.is_none()
         && plan.shape == SearchShape::CodeLiteral
         && exact_disclosures.is_empty()
-        && index.is_ready())
-    .then(|| exact_lane::exact_phrase(exact_input))
-    .filter(|phrase| phrase.len() >= 3)
-    .filter(|phrase| {
-        match literal_presence(
-            ctx,
-            &snapshot,
-            project_root,
-            &generation,
-            phrase,
-            &exact_candidates,
-        ) {
-            Ok(presence) => presence == memo::LiteralPresence::Absent,
-            Err(error) => {
-                index_disclosures.push(error.to_string());
-                false
+        && index_ready)
+        .then(|| exact_lane::exact_phrase(exact_input))
+        .filter(|phrase| phrase.len() >= 3)
+        .filter(|phrase| {
+            match literal_presence(
+                ctx,
+                &snapshot,
+                project_root,
+                &generation,
+                phrase,
+                &exact_candidates,
+            ) {
+                Ok(presence) => presence == memo::LiteralPresence::Absent,
+                Err(error) => {
+                    index_disclosures.push(error.to_string());
+                    false
+                }
             }
-        }
-    })
-    .map(str::to_string);
+        })
+        .map(str::to_string);
 
     let path_lookup_candidates = if plan.contains(SearchLaneKind::PathLookup) {
         let query_path_tokens = query
@@ -7461,6 +7499,9 @@ fn search_index_ready_with_budget(
     ctx: &AppContext,
     wait_budget: Duration,
 ) -> Result<bool, SearchIndexWaitError> {
+    if let Some(snapshot) = ctx.lexical_view_snapshot("aft_search") {
+        return Ok(snapshot.is_ok());
+    }
     let deadline = Instant::now() + wait_budget;
     loop {
         if search_cancellation_requested() {

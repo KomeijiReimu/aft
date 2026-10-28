@@ -38,6 +38,8 @@ const MAX_DIRECTORY_SECTIONS: usize = 8;
 const MAX_DISPLAY_DIRECTORIES: usize = 6;
 
 pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
+    let config = ctx.config();
+    let _pin = config.views.enabled.then(|| ctx.pin_config_to(config));
     ctx.with_read_policy_snapshot(&req.id, || {
         crate::context::confinement::with_floor_disclosure(|| {
             crate::bounded_io::command(req, ctx, handle_glob_inner)
@@ -590,7 +592,14 @@ fn glob_root(
     }
     let search_root_text = search_root.to_string_lossy();
     let search_scope = resolve_search_scope(project_root, Some(search_root_text.as_ref()));
-    let indexed_snapshot = {
+    let view_snapshot = (search_scope.use_index && !ignored_target)
+        .then(|| ctx.lexical_view_snapshot("glob"))
+        .flatten();
+    let indexed_snapshot = if let Some(snapshot) = view_snapshot {
+        // Failed view acquisition uses the bounded current-tree walk, never a
+        // borrowed legacy snapshot that may describe another checkout.
+        snapshot.ok()
+    } else {
         let search_index = ctx
             .search_index()
             .read()

@@ -872,20 +872,6 @@ thread_local! {
     static UNINDEXED_RECEIVERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Keep the former lookup algorithm as an independent byte/parity oracle and
-/// work-count control. The switch exists only in test builds and is thread-local.
-#[cfg(test)]
-pub(crate) fn with_unindexed_receiver_lookup<T>(run: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            UNINDEXED_RECEIVERS.with(|mode| mode.set(self.0));
-        }
-    }
-    let _restore = Restore(UNINDEXED_RECEIVERS.with(|mode| mode.replace(true)));
-    run()
-}
-
 fn unindexed_constructor_present(
     function: Node<'_>,
     source: &str,

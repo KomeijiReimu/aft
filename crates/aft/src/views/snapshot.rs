@@ -89,7 +89,26 @@ pub struct ComposedGeneration {
     delta: Arc<ManifestV2>,
     base: Option<Arc<ComposedGeneration>>,
     overrides: BTreeMap<RelPath, EntryV2>,
+    route: Option<V3Route>,
     _residency: Option<Residency>,
+}
+
+/// Where a v3 generation's artifacts live: plane rows in
+/// `blobs/v3/<family>/<plane>.sqlite`, and its manifest, pointer and derived
+/// files in the member directory `blobs/v3/<family>/views/<scope>`. A
+/// generation without a route is a v2 generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct V3Route {
+    pub storage: std::path::PathBuf,
+    pub family: String,
+    pub scope: String,
+}
+
+impl V3Route {
+    pub fn member_dir(&self) -> std::path::PathBuf {
+        crate::blob_store::v3::view_dir(&self.storage, &self.family, &self.scope)
+            .unwrap_or_else(|_| self.storage.join("blobs/v3/invalid"))
+    }
 }
 
 /// Compatibility name for callers that open a flat generation. Both names
@@ -111,6 +130,7 @@ impl ComposedGeneration {
             delta: Arc::new(manifest),
             base: None,
             overrides: BTreeMap::new(),
+            route: None,
             _residency: residency,
         }
     }
@@ -159,8 +179,20 @@ impl ComposedGeneration {
             delta: Arc::new(delta),
             base: Some(base),
             overrides,
+            route: None,
             _residency: residency,
         })
+    }
+
+    /// Marks this generation as stored in the v3 namespace at `route`.
+    pub fn with_v3_route(mut self, route: V3Route) -> Self {
+        self.route = Some(route);
+        self
+    }
+
+    /// The v3 location of this generation, or `None` for a v2 generation.
+    pub fn v3_route(&self) -> Option<&V3Route> {
+        self.route.as_ref()
     }
 
     pub fn name(&self) -> &str {
@@ -503,6 +535,7 @@ pub struct LiveEntry {
     /// The watcher or intent sequence that produced this state.
     pub seq: u64,
     pub attachments: BTreeMap<FamilyPlane, PlaneAttachment>,
+    pub reconciliation: super::readiness::ReconciledDelta,
 }
 
 impl fmt::Debug for LiveEntry {
@@ -521,6 +554,7 @@ impl LiveEntry {
             disk,
             seq,
             attachments: BTreeMap::new(),
+            reconciliation: Default::default(),
         }
     }
 }
@@ -787,6 +821,12 @@ impl LiveDelta {
                 reconciled_epoch: None,
                 publication_base: None,
                 readers: None,
+                needs_reconcile: self.base.name() == "empty"
+                    || !self.intent.is_empty()
+                    || self.watcher != WatcherState::Healthy
+                    || self.entries.values().any(|entry| {
+                        entry.reconciliation != super::readiness::ReconciledDelta::Reconciled
+                    }),
             }),
         }
     }
@@ -1280,6 +1320,7 @@ mod mutation_tests {
             epoch: live.epoch(),
             version: live.version(),
             intent_version: 0,
+            verification: None,
         };
         let changed = RelPath::new(b"changed.rs".to_vec()).unwrap();
         let transient = RelPath::new(b"transient.rs".to_vec()).unwrap();
@@ -1342,6 +1383,7 @@ mod mutation_tests {
             epoch: live.epoch(),
             version: live.version(),
             intent_version: 0,
+            verification: None,
         };
         let mut walked = LiveDelta::new(live.base().clone());
         walked.apply(file.clone(), LiveEntry::new(DiskState::of_bytes(b"B"), 2));
@@ -1376,6 +1418,7 @@ mod mutation_tests {
             epoch: live.epoch(),
             version: live.version(),
             intent_version: 0,
+            verification: None,
         };
         let mut walked = LiveDelta::new(live.base().clone());
         walked.apply(file.clone(), LiveEntry::new(DiskState::of_bytes(b"B"), 2));
@@ -1628,6 +1671,7 @@ pub fn carry_disk_state_only(path: &RelPath, generation: &ComposedGeneration) ->
 
 #[derive(Clone, Debug)]
 struct SnapshotInner {
+    needs_reconcile: bool,
     reconciled_epoch: Option<u64>,
     publication_base: Option<Option<String>>,
     generation: Arc<ComposedGeneration>,
@@ -1650,6 +1694,7 @@ pub struct InstallCut {
     pub epoch: u64,
     pub version: u64,
     pub intent_version: u64,
+    pub(crate) verification: Option<Arc<super::verification::BindGuard>>,
 }
 
 /// A lease on resident adapters. Query snapshots retain this lease, so removing
@@ -1953,6 +1998,12 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Checks the cached reconciliation flag. Work is summarized when the
+    /// immutable snapshot is created, not by scanning the delta on each query.
+    pub fn needs_reconcile(&self) -> bool {
+        self.inner.needs_reconcile
+    }
+
     pub(crate) fn with_publication_base(mut self, base: Option<String>) -> Self {
         Arc::make_mut(&mut self.inner).publication_base = Some(base);
         self

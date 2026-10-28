@@ -836,6 +836,10 @@ pub fn mark_semantic_corpus_refresh_success(ctx: &AppContext) {
 }
 
 pub fn drain_search_index_events(ctx: &AppContext) {
+    if ctx.config().views.enabled {
+        ctx.retire_search_index_rx("lexical views replace the legacy search loader");
+        return;
+    }
     let (latest, disconnected, receiver_generation, receiver_epoch) = {
         let rx_ref = ctx
             .search_index_rx()
@@ -2400,6 +2404,9 @@ fn spawn_search_corpus_refresh_admitted(
     config: Arc<aft::config::Config>,
     generation: u64,
 ) {
+    if config.views.enabled || ctx.config().views.enabled {
+        return;
+    }
     {
         let mut search_index = ctx
             .search_index()
@@ -2426,12 +2433,14 @@ fn spawn_search_corpus_refresh_admitted(
     let content_generation_flag = ctx.configure_content_generation_flag();
     let persist_epoch_flag = ctx.search_persist_epoch_flag();
     let persist_epoch = ctx.next_search_persist_epoch();
+    let publication_gate = ctx.legacy_search_publication_gate();
     let lifecycle = ctx.subc_lifecycle_admission();
     let cold_build_limiter = ctx.cold_build_limiter();
     ctx.search_corpus_refresh_lane.submit(
         root.clone(),
         Box::new(move |cancel| {
             let _terminal_guard = receiver_terminal_guard;
+            let _publication = publication_gate.install();
             log_ctx::with_session(session_id, || {
                 let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while_with_limiter(
                     &cold_build_limiter,
@@ -2468,6 +2477,7 @@ fn spawn_search_corpus_refresh_admitted(
                 };
                 let keep_going = || {
                     !cancel.load(std::sync::atomic::Ordering::Acquire)
+                        && publication_gate.allowed()
                         && lifecycle.is_current(&generation_flag, generation)
                         && persist_epoch_flag.current() == persist_epoch
                 };
@@ -2555,7 +2565,7 @@ pub fn refresh_project_corpus(ctx: &AppContext, reason: &str, ignore_rules_chang
             }
         }
 
-        if config.indexes.trigram && !ctx.shared_artifacts_read_only() {
+        if config.indexes.trigram && !config.views.enabled && !ctx.shared_artifacts_read_only() {
             spawn_search_corpus_refresh_admitted(ctx, root.clone(), config.clone(), generation);
             status_changed = true;
             aft::slog_info!("{}", search_refresh_started_log(reason));
@@ -2740,10 +2750,13 @@ fn watcher_path_is_generated_for_callgraph(ctx: &AppContext, path: &Path) -> boo
 }
 
 fn published_view_owns_callgraph_writes(ctx: &AppContext) -> bool {
-    ctx.config().views.enabled
-        && ctx
-            .view_runtime_snapshot()
-            .is_some_and(|view| view.generation.is_some() && view.manifest.is_some())
+    // A views-routed root reads its call graph from its v3 view only, so no
+    // legacy store refresh runs for it.
+    ctx.views_route_root()
+        || ctx.config().views.enabled
+            && ctx
+                .view_runtime_snapshot()
+                .is_some_and(|view| view.generation.is_some() && view.manifest.is_some())
 }
 
 fn enqueue_legacy_callgraph_refresh_for_watcher(
@@ -2945,6 +2958,9 @@ fn next_watcher_apply_phase(stage: WatcherDrainApplyPhase) -> WatcherDrainApplyP
 }
 
 fn refresh_search_index_path(ctx: &AppContext, path: &Path) {
+    if ctx.config().views.enabled {
+        return;
+    }
     let max_file_size = ctx
         .search_index()
         .read()
@@ -3140,6 +3156,9 @@ impl Drop for FileMutationGuard<'_> {
 /// read-after-write ordering. Preparation reads at most the index's file-size
 /// limit, just as it does for a watcher update.
 pub(crate) fn refresh_search_index_after_write(ctx: &AppContext, path: &Path) {
+    if ctx.config().views.enabled {
+        return;
+    }
     if !ctx.heavy_root_work_allowed()
         || (ctx.shared_artifacts_read_only() && !ctx.ram_overlay_active())
     {
@@ -4080,6 +4099,11 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 if ctx.config().views.enabled {
                     // Changed ignore rules change which files the checkout has.
                     ctx.note_checkout_changed_for_callgraph();
+                    if ctx.views_route_root() {
+                        // The v3 checkout views reconcile their membership
+                        // in full at their next read.
+                        ctx.record_checkout_watcher_overflow();
+                    }
                     ctx.reset_view_publication_retry();
                     state.view_publication_paths.clear();
                     state.view_publication_full = true;
@@ -4955,201 +4979,6 @@ mod tests {
         advance_ignore_rule_refresh_clock(Duration::from_millis(1));
         drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
         assert_eq!(ignore_rule_refreshes_for_test(), 1);
-    }
-
-    fn view_publication_context_for_reason_test(
-        root: &Path,
-        storage: &Path,
-    ) -> (
-        Arc<AppContext>,
-        crossbeam_channel::Sender<WatcherDispatchEvent>,
-    ) {
-        for arguments in [
-            vec!["init", "--quiet"],
-            vec!["add", "."],
-            vec![
-                "-c",
-                "user.name=Fixture",
-                "-c",
-                "user.email=fixture@example.invalid",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "--quiet",
-                "-m",
-                "fixture",
-            ],
-        ] {
-            let output = std::process::Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(arguments)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        let (ctx, tx) = watcher_context(root);
-        ctx.update_config(|config| {
-            config.views.enabled = true;
-            config.indexes.semantic = false;
-            config.indexes.callgraph = false;
-        });
-        ctx.set_cache_writer_capabilities(true, true);
-        ctx.rebuild_gitignore();
-        let scope = crate::path_identity::project_scope_key(root);
-        let view = crate::views::ViewStore::open(storage, &scope).unwrap();
-        ctx.install_view_runtime(
-            crate::context::ViewRuntimeSnapshot {
-                query_pin: None,
-                storage: storage.to_path_buf(),
-                family: crate::search_index::artifact_cache_key(root),
-                scope,
-                view_dir: view.view_dir().to_path_buf(),
-                generation: None,
-                manifest: None,
-                head_fingerprint: String::new(),
-                head_metadata: crate::alias::capture_git_head_metadata(root, None).unwrap(),
-                pending_paths: BTreeSet::new(),
-                pending_inputs: Default::default(),
-            },
-            None,
-        );
-        // Seed a current manifest so periodic verification does not add an
-        // unrelated scheduling reason to these watcher publications.
-        ctx.publish_view_paths(BTreeSet::new(), true).unwrap();
-        (Arc::new(ctx), tx)
-    }
-
-    fn publish_due_view_for_reason_test(ctx: &AppContext) {
-        let mut state = ctx.watcher_drain_slice().lock().take().unwrap();
-        // Make the publication deadline runnable without advancing the ignore
-        // refresh test clock.
-        if state.view_publication_due.is_some() {
-            state.view_publication_due = Some(Instant::now());
-        }
-        publish_view_if_quiet(ctx, &mut state);
-        *ctx.watcher_drain_slice().lock() = Some(state);
-    }
-
-    #[test]
-    fn delayed_view_publication_retains_ignore_reason_after_edit() {
-        let _reset = begin_ignore_rule_refresh_test();
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let source = root.join("changed.rs");
-        let ignore = root.join(".aftignore");
-        std::fs::write(&source, "pub fn value() -> i32 { 1 }\n").unwrap();
-        std::fs::write(&ignore, "old/\n").unwrap();
-        let (ctx, tx) = view_publication_context_for_reason_test(&root, storage.path());
-        let before = crate::views::assembly::publication_scheduling_for_test(&root).len();
-
-        std::fs::write(&source, "pub fn value() -> i32 { 2 }\n").unwrap();
-        std::fs::write(&ignore, "generated/\n").unwrap();
-        tx.send(WatcherDispatchEvent::Paths(vec![source])).unwrap();
-        send_ignore_rule_change(&tx, ignore);
-        drain_watcher_to_completion_for_test(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
-        publish_due_view_for_reason_test(&ctx);
-
-        let first = crate::views::assembly::publication_scheduling_for_test(&root);
-        assert_eq!(first.len(), before + 1);
-        assert!(
-            first[before].contains("schedule_event_kinds=paths,ignore_rules "),
-            "{}",
-            first[before]
-        );
-        assert_eq!(ignore_rule_refreshes_for_test(), 0);
-        assert_eq!(
-            ctx.watcher_drain_slice()
-                .lock()
-                .as_ref()
-                .unwrap()
-                .view_publication_reason
-                .events,
-            0
-        );
-
-        advance_ignore_rule_refresh_clock(Duration::from_millis(4_999));
-        drain_watcher_to_completion_for_test(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
-        assert_eq!(ignore_rule_refreshes_for_test(), 0);
-        assert_eq!(
-            crate::views::assembly::publication_scheduling_for_test(&root).len(),
-            before + 1
-        );
-        advance_ignore_rule_refresh_clock(Duration::from_millis(1));
-        drain_watcher_to_completion_for_test(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
-        assert_eq!(ignore_rule_refreshes_for_test(), 1);
-        publish_due_view_for_reason_test(&ctx);
-
-        let publications = crate::views::assembly::publication_scheduling_for_test(&root);
-        assert_eq!(publications.len(), before + 2);
-        let second = &publications[before + 1];
-        assert!(
-            second.contains("schedule_event_kinds=ignore_rules "),
-            "second publication lost ignore_rules: {second}"
-        );
-        assert!(second.contains("schedule_full_read=true"), "{second}");
-    }
-
-    #[test]
-    fn delayed_view_publication_retains_deferred_rescan_reason() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        std::fs::write(root.join("source.rs"), "pub fn value() {}\n").unwrap();
-        let (ctx, tx) = view_publication_context_for_reason_test(&root, storage.path());
-        let before = crate::views::assembly::publication_scheduling_for_test(&root).len();
-        ctx.watcher_counters().note_overflow_ignore_relevance(false);
-        tx.send(WatcherDispatchEvent::RescanRequired(RescanReason::Unknown))
-            .unwrap();
-        let (reached, release) = install_watcher_rescan_gate_for_test(&ctx);
-        let worker_ctx = ctx.clone();
-        let drain = std::thread::spawn(move || {
-            drain_watcher_events_bounded(&worker_ctx, WATCHER_PATH_DRAIN_BATCH_CAP)
-        });
-        reached.recv_timeout(Duration::from_secs(5)).unwrap();
-        ctx.watcher_counters().note_overflow_ignore_relevance(false);
-        assert!(ctx
-            .watcher_counters()
-            .note_overflow(RescanReason::KernelDropped, Vec::new()));
-        release.send(()).unwrap();
-        assert!(drain.join().unwrap().has_more);
-        assert!(
-            ctx.watcher_drain_slice()
-                .lock()
-                .as_ref()
-                .unwrap()
-                .rescan_required
-        );
-        publish_due_view_for_reason_test(&ctx);
-        assert_eq!(
-            crate::views::assembly::publication_scheduling_for_test(&root).len(),
-            before + 1
-        );
-        assert_eq!(
-            ctx.watcher_drain_slice()
-                .lock()
-                .as_ref()
-                .unwrap()
-                .view_publication_reason
-                .events,
-            0
-        );
-
-        drain_watcher_to_completion_for_test(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
-        publish_due_view_for_reason_test(&ctx);
-        let publications = crate::views::assembly::publication_scheduling_for_test(&root);
-        assert_eq!(publications.len(), before + 2);
-        let second = &publications[before + 1];
-        assert!(
-            second.contains("schedule_event_kinds=rescan "),
-            "second publication lost rescan: {second}"
-        );
-        assert!(second.contains("schedule_full_read=true"), "{second}");
     }
 
     #[test]
@@ -8776,7 +8605,7 @@ mod tests {
 mod watcher_slice_tests {
     use super::*;
     use crate::config::Config;
-    use crate::context::{default_language_provider_factory, AppContext, ViewRuntimeSnapshot};
+    use crate::context::{default_language_provider_factory, AppContext};
 
     #[test]
     fn request_watcher_drain_applies_at_most_one_slice() {
@@ -8849,46 +8678,15 @@ mod watcher_slice_tests {
     }
 
     #[test]
-    fn views_published_watcher_batch_skips_legacy_refresh_and_still_schedules_publication() {
+    fn views_routed_watcher_batch_skips_legacy_refresh_and_publishes_no_v1_view() {
         let root = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
         let (ctx, tx) = context_with_watcher(root.path());
         ctx.update_config(|config| {
             config.indexes.callgraph = true;
             config.views.enabled = true;
         });
         ctx.set_cache_writer_capabilities(false, false);
-        let family = crate::search_index::artifact_cache_key(root.path());
-        let scope = crate::path_identity::project_scope_key(root.path());
-        let view = crate::views::ViewStore::open(storage.path(), &scope).unwrap();
-        ctx.install_view_runtime(
-            ViewRuntimeSnapshot {
-                query_pin: None,
-                storage: storage.path().to_path_buf(),
-                family,
-                scope,
-                view_dir: view.view_dir().to_path_buf(),
-                generation: Some("1-published".to_owned()),
-                manifest: Some(
-                    crate::views::Manifest::new(std::iter::empty::<(
-                        crate::views::RelPath,
-                        crate::views::ManifestEntry,
-                    )>())
-                    .unwrap(),
-                ),
-                head_fingerprint: "published".to_owned(),
-                head_metadata: crate::alias::capture_git_head_metadata(root.path(), None)
-                    .unwrap_or_else(|_| crate::alias::GitHeadMetadata {
-                        head_path: root.path().join(".git/HEAD"),
-                        head_mtime: None,
-                        resolved_ref_path: None,
-                        resolved_ref_mtime: None,
-                    }),
-                pending_paths: BTreeSet::new(),
-                pending_inputs: Default::default(),
-            },
-            None,
-        );
+        assert!(ctx.views_route_root());
         reset_legacy_watcher_refreshes_for_test();
         tx.send(WatcherDispatchEvent::Paths(vec![root
             .path()
@@ -8901,15 +8699,16 @@ mod watcher_slice_tests {
         assert_eq!(
             legacy_watcher_refreshes_for_test(),
             0,
-            "a published view must own watcher callgraph writes"
+            "a routed root's v3 views must own watcher callgraph writes"
         );
-        assert!(
-            ctx.watcher_drain_slice()
-                .lock()
-                .as_ref()
-                .is_some_and(|state| state.view_publication_due.is_some()),
-            "view publication must remain scheduled"
-        );
+        // Even once the batch's publication deadline passes, nothing is
+        // assembled or published into a v1 view.
+        if let Some(state) = ctx.watcher_drain_slice().lock().as_mut() {
+            state.view_publication_due = Some(Instant::now());
+        }
+        drain_watcher_to_completion_for_test(&ctx, 1);
+        assert_eq!(ctx.view_publication_attempts_for_test(), 0);
+        assert!(ctx.view_runtime_snapshot().is_none());
 
         ctx.update_config(|config| config.views.enabled = false);
         tx.send(WatcherDispatchEvent::Paths(vec![root

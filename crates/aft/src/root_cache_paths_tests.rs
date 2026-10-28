@@ -656,6 +656,11 @@ fn cache_root_reader_floor_refusals_cover_external_artifacts() {
 
 #[test]
 fn cache_root_doctor_ignores_harness_redirects_and_keeps_user_base() {
+    // Cache-root preparation resolves the storage root through the process
+    // environment, where AFT_STORAGE_DIR overrides the configured root. A test
+    // that sets it holds this lock; reclaiming meanwhile would prepare and
+    // clean another test's live storage.
+    let _env = crate::test_env::process_env_lock();
     let (_temp, storage, cache, _project, ctx) = fixture(true);
     fs::create_dir_all(cache.join("index")).unwrap();
     fs::create_dir_all(storage.join("index")).unwrap();
