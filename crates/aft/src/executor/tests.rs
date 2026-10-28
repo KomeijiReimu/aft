@@ -40,7 +40,6 @@ fn blocked_file_read_releases_root_reader_and_executor_slot() {
     let probe = crate::bounded_io::tests::block_directory_probe(external.path(), &fifo);
     assert!(executor.register_actor(root.clone(), test_ctx()));
     let req = crate::protocol::RawRequest {
-        handles_progress: false,
         id: "blocked-read".into(),
         command: "read".into(),
         lsp_hints: None,

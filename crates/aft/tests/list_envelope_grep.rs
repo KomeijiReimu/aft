@@ -398,7 +398,6 @@ fn handle_grep_attaches_envelope_when_capped() {
     .with_test_checkpoint_store();
 
     let req = aft::protocol::RawRequest {
-        handles_progress: false,
         id: "grep-live-1".into(),
         command: "grep".into(),
         lsp_hints: None,

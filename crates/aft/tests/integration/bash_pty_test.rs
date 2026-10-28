@@ -542,7 +542,6 @@ fn pty_write_to_cat() {
     let paths = spawned_paths(storage.path(), &task_id);
 
     let request = aft::protocol::RawRequest {
-        handles_progress: false,
         id: "write-cat".into(),
         command: "bash_write".into(),
         lsp_hints: None,
@@ -583,7 +582,6 @@ fn pty_interactive_shell_keeps_terminal_stdin() {
     let paths = spawned_paths(storage.path(), &task_id);
     read_pty_until(&paths.pty, "tty-present", Duration::from_secs(2));
     let request = aft::protocol::RawRequest {
-        handles_progress: false,
         id: "interactive-input".into(),
         command: "bash_write".into(),
         lsp_hints: None,

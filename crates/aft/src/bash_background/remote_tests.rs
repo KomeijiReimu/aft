@@ -1094,7 +1094,6 @@ async fn runon_executor_refusal_never_spawns_locally_and_returns_error() {
         assert_runon_refusal(&refusal_response(done), reason);
         let status = crate::commands::bash_status::handle(
             &crate::protocol::RawRequest {
-                handles_progress: false,
                 id: "runon-status".into(),
                 command: "bash_status".into(),
                 session_id: Some("session".into()),
@@ -1218,7 +1217,6 @@ async fn prefix_routing_executor_refusal_still_spawns_locally_with_advisory() {
             "the prefix must actually route remotely"
         );
         let status_request = crate::protocol::RawRequest {
-            handles_progress: false,
             id: "prefix-status".into(),
             command: "bash_status".into(),
             session_id: Some("session".into()),
@@ -4405,7 +4403,6 @@ async fn kill_restarted_unknown(
     scope: Option<subc_protocol::scope::ScopeStamp>,
 ) -> crate::protocol::Response {
     let request = crate::protocol::RawRequest {
-        handles_progress: false,
         id: "restart-unknown-kill".into(),
         command: "bash_kill".into(),
         lsp_hints: None,
@@ -5017,7 +5014,6 @@ async fn exec_remote_bash_no_policy_and_disabled_are_byte_identical_local_output
         let dir = tempfile::tempdir().unwrap();
         let ctx = restarted_context(dir.path());
         let request = crate::protocol::RawRequest {
-            handles_progress: false,
             id: "parity".into(),
             command: "bash".into(),
             session_id: Some("session".into()),
@@ -5255,7 +5251,6 @@ fn handle_with_policy(
         .entry("workdir")
         .or_insert_with(|| serde_json::json!(ctx.config().project_root));
     let request = crate::protocol::RawRequest {
-        handles_progress: false,
         id: "runon".into(),
         command: "bash".into(),
         session_id: Some("session".into()),
@@ -6347,7 +6342,6 @@ async fn a_reporting_runner_report_is_printed_after_the_output() {
 /// The bash call the OpenCode and Pi plugins send for a model's `runon` call.
 fn orchestrated_request(params: serde_json::Value) -> crate::protocol::RawRequest {
     crate::protocol::RawRequest {
-        handles_progress: false,
         id: "runon".into(),
         command: "bash".into(),
         session_id: Some("session".into()),
@@ -7054,7 +7048,6 @@ async fn runon_capture_recovered_terminal_status_omits_in_flight_warning() {
             .replay_session(dir.path(), "session")
             .unwrap();
         let request = crate::protocol::RawRequest {
-            handles_progress: false,
             id: "recovered-capture-status".into(),
             command: "bash_status".into(),
             params: serde_json::json!({"task_id":task_id}),
@@ -8662,7 +8655,6 @@ async fn configure_sends_an_owed_runner_cancel_without_binding_its_project() {
             let _storage = crate::test_env::without_storage_override();
             crate::commands::configure::handle_configure(
                 &crate::protocol::RawRequest {
-                    handles_progress: false,
                     id: "configure-other-project".into(),
                     command: "configure".into(),
                     lsp_hints: None,

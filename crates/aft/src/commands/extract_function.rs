@@ -562,7 +562,6 @@ mod tests {
 
     fn make_request(id: &str, command: &str, params: serde_json::Value) -> RawRequest {
         RawRequest {
-            handles_progress: false,
             id: id.to_string(),
             command: command.to_string(),
             params,
@@ -800,7 +799,6 @@ mod approved_audit11 {
         };
         let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
         let req = RawRequest {
-            handles_progress: false,
             id: "guard".into(),
             command: "extract_function".into(),
             params: serde_json::json!({"file": path, "name": "helper", "start_line": start, "end_line": end, "validate": "off"}),

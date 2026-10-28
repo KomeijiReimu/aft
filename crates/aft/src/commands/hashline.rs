@@ -330,7 +330,6 @@ mod tests {
         session_id: impl Into<Option<String>>,
     ) -> RawRequest {
         RawRequest {
-            handles_progress: false,
             id: format!("hashline-{command}-test"),
             command: command.to_string(),
             lsp_hints: None,

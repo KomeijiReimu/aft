@@ -123,7 +123,6 @@ fn scenario(name: &str, files: &[(&str, &str)]) -> Scenario {
 
 fn request(command: &str, params: Value) -> RawRequest {
     RawRequest {
-        handles_progress: false,
         id: format!("fixture-{command}"),
         command: command.to_string(),
         lsp_hints: None,

@@ -581,7 +581,7 @@ pub fn build_bash_outcome(
     let task_id_for_poll = task_id.clone();
     let request_id_for_poll = request_id.clone();
     let session_id_for_poll = session_id.clone();
-    let mut progress = req.handles_progress().then(|| {
+    let mut progress = ctx.request_handles_progress(&req.id).then(|| {
         crate::bash_background::progress::BashProgressPump::new(
             ctx,
             task_id.clone(),

@@ -405,7 +405,6 @@ fn zoom_target_symbol_names(
     memo: &mut ZoomTargetMemo,
 ) -> Result<Vec<String>, Response> {
     let target_req = RawRequest {
-        handles_progress: req.handles_progress(),
         id: req.id.clone(),
         command: req.command.clone(),
         lsp_hints: req.lsp_hints.clone(),

@@ -393,7 +393,6 @@ async fn cancelled_call_notice_read_case(intervening: NoticeInterveningCall, sta
 
     let text = if standalone {
         let mut request = RawRequest {
-            handles_progress: false,
             id: "standalone".into(),
             command: "tool_call".into(),
             params: json!({"name": "read", "arguments": {"path": path}, "preview": true}),

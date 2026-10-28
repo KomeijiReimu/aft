@@ -2706,7 +2706,6 @@ mod tests {
     fn github_read_response_preserves_engine_text_and_attachment_metadata() {
         let _decoder_guard = image_decoder_test_guard();
         let request = RawRequest {
-            handles_progress: false,
             id: "github-response".to_string(),
             command: "read".to_string(),
             lsp_hints: None,
@@ -2749,7 +2748,6 @@ mod tests {
     fn github_image_result_budget_attaches_prefix_and_lists_omitted_links() {
         let _decoder_guard = image_decoder_test_guard();
         let request = RawRequest {
-            handles_progress: false,
             id: "github-budget".into(),
             command: "read".into(),
             lsp_hints: None,
@@ -2827,7 +2825,6 @@ mod tests {
     #[test]
     fn github_image_budget_refuses_when_page_text_itself_cannot_fit() {
         let request = RawRequest {
-            handles_progress: false,
             id: "github-text-budget".into(),
             command: "read".into(),
             lsp_hints: None,
@@ -2856,7 +2853,6 @@ mod tests {
     #[test]
     fn github_image_fitting_keeps_the_reserved_return_window() {
         let request = RawRequest {
-            handles_progress: false,
             id: "github-return-window".into(),
             command: "read".into(),
             lsp_hints: None,
@@ -2920,7 +2916,6 @@ mod tests {
             Value::String(file.to_string_lossy().to_string()),
         );
         RawRequest {
-            handles_progress: false,
             id: "test".to_string(),
             command: "read".to_string(),
             lsp_hints: None,
@@ -3524,7 +3519,6 @@ mod hashline_wiring_tests {
 
     fn request_for(path: &Path) -> RawRequest {
         RawRequest {
-            handles_progress: false,
             id: "hashline-read-test".to_string(),
             command: "read".to_string(),
             lsp_hints: None,

@@ -609,7 +609,6 @@ line 6"#;
             },
         );
         let req = RawRequest {
-            handles_progress: false,
             id: "conflicts-file-path".to_string(),
             command: "git_conflicts".to_string(),
             lsp_hints: None,

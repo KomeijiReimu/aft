@@ -290,6 +290,20 @@ struct HeldBashCall {
     /// Set once the call reaches its foreground wait; until then the module
     /// loop cannot detach the command because it does not exist yet.
     detach: Option<BashDetachTarget>,
+    _progress: Option<Arc<RequestProgress>>,
+}
+
+struct RequestProgress {
+    context: std::sync::Weak<crate::context::AppContext>,
+    request_id: String,
+}
+
+impl Drop for RequestProgress {
+    fn drop(&mut self) {
+        if let Some(context) = self.context.upgrade() {
+            context.clear_request_handles_progress(&self.request_id);
+        }
+    }
 }
 
 /// Every bash call whose route request has not yet received a terminal frame.
@@ -311,9 +325,27 @@ impl HeldBashCalls {
                 phase: BashHoldPhase::Spawning,
                 claim: Arc::clone(&claim),
                 detach: None,
+                _progress: None,
             },
         );
         claim
+    }
+
+    /// The held call retains the opt-in to receive progress updates until answered or abandoned.
+    pub(super) fn record_progress(
+        &self,
+        route: RouteChannel,
+        corr: u64,
+        context: &Arc<crate::context::AppContext>,
+        request_id: &str,
+    ) {
+        if let Some(call) = self.lock().get_mut(&(route, corr)) {
+            call._progress = Some(Arc::new(RequestProgress {
+                context: Arc::downgrade(context),
+                request_id: request_id.to_owned(),
+            }));
+            context.record_request_handles_progress(request_id);
+        }
     }
 
     pub(super) fn set_phase(&self, route: RouteChannel, corr: u64, phase: BashHoldPhase) {

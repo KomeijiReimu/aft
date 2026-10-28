@@ -20,7 +20,6 @@ fn context(root: &Path, denied: &Path) -> AppContext {
 
 fn request(command: &str, params: serde_json::Value) -> RawRequest {
     RawRequest {
-        handles_progress: false,
         id: "policy-test".into(),
         command: command.into(),
         session_id: Some("policy-session".into()),

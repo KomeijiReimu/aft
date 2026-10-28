@@ -4535,6 +4535,7 @@ pub struct AppContext {
     #[cfg(test)]
     path_restriction_root_canonicalizations: AtomicUsize,
     force_restrict_requests: parking_lot::Mutex<BTreeMap<String, usize>>,
+    progress_requests: parking_lot::Mutex<HashSet<String>>,
     pub harness: parking_lot::Mutex<Option<Harness>>,
     canonical_cache_root: parking_lot::Mutex<Option<PathBuf>>,
     is_worktree_bridge: parking_lot::Mutex<bool>,
@@ -5417,6 +5418,7 @@ impl AppContext {
             #[cfg(test)]
             path_restriction_root_canonicalizations: AtomicUsize::new(0),
             force_restrict_requests: parking_lot::Mutex::new(BTreeMap::new()),
+            progress_requests: parking_lot::Mutex::new(HashSet::new()),
             harness: parking_lot::Mutex::new(None),
             canonical_cache_root: parking_lot::Mutex::new(None),
             is_worktree_bridge: parking_lot::Mutex::new(false),
@@ -9156,6 +9158,20 @@ impl AppContext {
 
     pub fn request_force_restrict(&self, req_id: &str) -> bool {
         self.force_restrict_requests.lock().contains_key(req_id)
+    }
+
+    /// Records a transport capability, never an agent-supplied tool argument.
+    pub fn record_request_handles_progress(&self, req_id: &str) {
+        self.progress_requests.lock().insert(req_id.to_owned());
+    }
+
+    pub fn request_handles_progress(&self, req_id: &str) -> bool {
+        self.progress_requests.lock().contains(req_id)
+    }
+
+    /// Terminal replies retire the capability before the ID can be reused.
+    pub fn clear_request_handles_progress(&self, req_id: &str) {
+        self.progress_requests.lock().remove(req_id);
     }
 
     /// The outside-roots rule this request is judged under: the configured
@@ -18198,7 +18214,6 @@ mod force_restrict_tests {
             let ctx = test_context(Some(root.path().into()), false);
             ctx.update_config(|config| config.harness = Some(harness));
             let request = crate::protocol::RawRequest {
-                handles_progress: false,
                 id: "native".into(),
                 command: "read".into(),
                 session_id: Some("session".into()),
@@ -18576,7 +18591,6 @@ mod callgraph_store_for_ops_tests {
             let _wait = force_async_callgraph_builds(&ctx);
             let response = crate::commands::callers::handle_callers(
                 &RawRequest {
-                    handles_progress: false,
                     id: "busy-callers".into(),
                     command: "callers".into(),
                     lsp_hints: None,
@@ -19547,7 +19561,6 @@ mod callgraph_store_for_ops_tests {
 
     fn configure_request_with_params(params: serde_json::Value) -> RawRequest {
         RawRequest {
-            handles_progress: false,
             id: "cfg".to_string(),
             command: "configure".to_string(),
             lsp_hints: None,
@@ -19631,7 +19644,6 @@ mod callgraph_store_for_ops_tests {
                 .iter()
                 .any(|reason| reason == "home_root"));
             let status_request = RawRequest {
-                handles_progress: false,
                 id: "home-status".to_string(),
                 command: "status".to_string(),
                 lsp_hints: None,
@@ -19671,7 +19683,6 @@ mod callgraph_store_for_ops_tests {
             );
 
             let navigation = RawRequest {
-                handles_progress: false,
                 id: "home-callers".to_string(),
                 command: "callers".to_string(),
                 lsp_hints: None,
@@ -20478,7 +20489,6 @@ mod callgraph_store_for_ops_tests {
         fn callers(&self) -> crate::protocol::Response {
             crate::commands::callers::handle_callers(
                 &RawRequest {
-                    handles_progress: false,
                     id: "views-callers".to_owned(),
                     command: "callers".to_owned(),
                     lsp_hints: None,
@@ -20738,7 +20748,6 @@ mod callgraph_store_for_ops_tests {
         let inspect = || {
             crate::commands::inspect::handle_inspect(
                 &RawRequest {
-                    handles_progress: false,
                     id: "views-inspect".to_owned(),
                     command: "inspect".to_owned(),
                     lsp_hints: None,
@@ -20818,7 +20827,6 @@ mod callgraph_store_for_ops_tests {
         let zoom = || {
             crate::commands::zoom::handle_zoom(
                 &RawRequest {
-                    handles_progress: false,
                     id: "views-zoom".to_owned(),
                     command: "zoom".to_owned(),
                     lsp_hints: None,

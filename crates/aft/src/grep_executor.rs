@@ -2791,7 +2791,6 @@ mod tests {
         budget: crate::bounded_io::Budget,
     ) -> (Duration, usize, usize) {
         let request = crate::protocol::RawRequest {
-            handles_progress: false,
             id: "grep-io-measurement".into(),
             command: "grep".into(),
             session_id: None,

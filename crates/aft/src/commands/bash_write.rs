@@ -292,7 +292,6 @@ mod tests {
         for wrapped in [false, true] {
             let params = json!({ "task_id": false, "input": "x".repeat(MAX_INPUT_BYTES + 1) });
             let request = RawRequest {
-                handles_progress: false,
                 id: "write-preflight".into(),
                 command: "bash_write".into(),
                 session_id: Some("write-test".into()),

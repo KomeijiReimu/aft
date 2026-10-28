@@ -11103,7 +11103,6 @@ async fn handle_tool_call(
     }
     let lane = command_lane(&bare_name);
     let tool_call_context = ToolCallContext {
-        handles_progress: call.handles_progress,
         project_root: identity.project_root.clone(),
         session_id: Some(identity.session.clone()),
         request_id: request_id.clone(),
@@ -17867,7 +17866,6 @@ mod tests {
         let ctx = test_ctx();
         ctx.mark_subc_bound();
         let request = crate::protocol::RawRequest {
-            handles_progress: false,
             id: "parent-bind".into(),
             command: "configure".into(),
             session_id: None,

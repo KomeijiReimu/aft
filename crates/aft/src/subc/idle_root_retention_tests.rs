@@ -1218,7 +1218,6 @@ const SESSION: &str = "retention-session";
 
 fn request(command: &str, params: serde_json::Value) -> crate::protocol::RawRequest {
     crate::protocol::RawRequest {
-        handles_progress: false,
         id: format!("{command}-retention"),
         command: command.to_string(),
         lsp_hints: None,

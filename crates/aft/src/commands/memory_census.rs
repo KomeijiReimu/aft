@@ -456,7 +456,6 @@ mod tests {
             crate::config::Config::default(),
         );
         let request = RawRequest {
-            handles_progress: false,
             id: "memory-census".to_string(),
             command: MEMORY_CENSUS_OPERATION.to_string(),
             lsp_hints: None,

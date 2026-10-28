@@ -197,6 +197,31 @@ async fn observe_deferred_bash_wait(
     })
 }
 
+#[cfg(test)]
+mod progress_lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn progress_record_is_cleared_when_held_call_is_removed_or_abandoned() {
+        let context = super::super::test_support::test_ctx();
+        let route = RouteChannel {
+            channel: 1,
+            epoch: 1,
+        };
+        for removed in [true, false] {
+            let calls = drain::HeldBashCalls::default();
+            calls.insert(route, 1);
+            calls.record_progress(route, 1, &context, "progress-lifetime");
+            assert!(context.request_handles_progress("progress-lifetime"));
+            if removed {
+                calls.remove(route, 1);
+            }
+            drop(calls);
+            assert!(!context.request_handles_progress("progress-lifetime"));
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod frame_loop_lock_tests {
     use super::*;
@@ -405,7 +430,6 @@ mod frame_loop_lock_tests {
         tokio::time::timeout(
             Duration::from_secs(60),
             run_deferred_bash_wait(
-                false,
                 executor,
                 completion_tx,
                 poll_touch_tx,
@@ -1858,6 +1882,11 @@ pub(super) fn submit_deferred_bash(
     let admitted = Arc::new(AtomicBool::new(false));
     let admitted_for_spawn = Arc::clone(&admitted);
     let claim = metrics.held_bash_calls.insert(route, corr);
+    if handles_progress {
+        metrics
+            .held_bash_calls
+            .record_progress(route, corr, &spawn_ctx, &request_id);
+    }
     let (spawn_control_tx, spawn_control_rx) = oneshot::channel::<BashSpawnControl>();
     let (spawn_text_tx, spawn_text_rx) = oneshot::channel::<String>();
     let root_for_spawn = root.clone();
@@ -2014,7 +2043,7 @@ pub(super) fn submit_deferred_bash(
                     let command_timeout_ms = settings.timeout.unwrap_or_else(|| {
                         crate::bash_background::registry::DEFAULT_BG_TIMEOUT.as_millis() as u64
                     });
-                    let raw_req = RawRequest { handles_progress: false, id: request_id_for_spawn.clone(),
+                    let raw_req = RawRequest { id: request_id_for_spawn.clone(),
                     command: "bash".to_string(),
                     lsp_hints: None,
                     session_id: Some(session_for_spawn.clone()),
@@ -2620,7 +2649,6 @@ pub(super) fn submit_deferred_bash(
                 };
                 let repeat_for_deadline = repeat.clone();
                 let wait_future = run_deferred_bash_wait(
-                    handles_progress,
                     executor,
                     completion_tx.clone(),
                     poll_touch_tx,
@@ -2853,7 +2881,6 @@ fn startup_refusal_reason(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_deferred_bash_wait(
-    handles_progress: bool,
     executor: Arc<Executor>,
     completion_tx: mpsc::Sender<BashDeferredCompletion>,
     poll_touch_tx: mpsc::Sender<ProjectRootId>,
@@ -2903,7 +2930,7 @@ async fn run_deferred_bash_wait(
         return;
     };
     let registry = wait_ctx.bash_background().clone();
-    let mut progress = handles_progress.then(|| {
+    let mut progress = wait_ctx.request_handles_progress(&request_id).then(|| {
         crate::bash_background::progress::BashProgressPump::new(
             &wait_ctx,
             task_id.clone(),
@@ -4591,7 +4618,6 @@ mod grant_path_tests {
         };
         let session = "detach-log-session";
         let request = RawRequest {
-            handles_progress: false,
             id: "detach-log".into(),
             command: "bash".into(),
             lsp_hints: None,
@@ -4648,7 +4674,6 @@ mod grant_path_tests {
         // A failed metadata write must not destroy the task id that the caller
         // already received. Exercise the same status handler the caller can use.
         let status_request = RawRequest {
-            handles_progress: false,
             id: "status-after-detach-error".into(),
             command: "bash_status".into(),
             lsp_hints: None,
@@ -6098,7 +6123,6 @@ mod grant_path_tests {
         let status = || {
             crate::commands::bash_status::handle(
                 &RawRequest {
-                    handles_progress: false,
                     id: "capture-status".into(),
                     command: "bash_status".into(),
                     params: json!({"task_id":task_id}),
@@ -6318,7 +6342,6 @@ mod grant_path_tests {
             let status = || {
                 crate::commands::bash_status::handle(
                     &RawRequest {
-                        handles_progress: false,
                         id: "restart-capture-status".into(),
                         command: "bash_status".into(),
                         params: json!({"task_id":task_id}),
@@ -6784,7 +6807,6 @@ mod grant_path_tests {
         let kill = tokio::task::spawn_blocking(move || {
             crate::commands::bash_kill::handle(
                 &RawRequest {
-                    handles_progress: false,
                     id: "kill-before-submit".into(),
                     command: "bash_kill".into(),
                     lsp_hints: None,
@@ -6870,7 +6892,6 @@ mod grant_path_tests {
     fn admission_status(ctx: &AppContext, task_id: &str) -> Response {
         crate::commands::bash_status::handle(
             &RawRequest {
-                handles_progress: false,
                 id: "admission-status".into(),
                 command: "bash_status".into(),
                 lsp_hints: None,
@@ -6905,7 +6926,6 @@ mod grant_path_tests {
             tokio::task::spawn_blocking(move || {
                 crate::commands::bash_kill::handle(
                     &RawRequest {
-                        handles_progress: false,
                         id: "kill-admission".into(),
                         command: "bash_kill".into(),
                         lsp_hints: None,
@@ -8810,7 +8830,6 @@ mod grant_path_tests {
                 with_spawn_commit_time_for_test(now, || {
                     running_bash_stub(
                         RawRequest {
-                            handles_progress: false,
                             id: "deadline-call".into(),
                             command: "bash".into(),
                             lsp_hints: None,

@@ -346,7 +346,6 @@ pub enum ToolCallOutcome {
 /// These fields cannot be supplied through the agent's arguments object.
 #[derive(Debug, Clone)]
 pub struct ToolCallContext {
-    pub handles_progress: bool,
     pub project_root: PathBuf,
     pub session_id: Option<String>,
     pub request_id: String,
@@ -1011,7 +1010,6 @@ fn raw_request_from_translated(
     let lsp_hints = params.remove("lsp_hints").filter(|value| !value.is_null());
 
     Ok(RawRequest {
-        handles_progress: ctx.handles_progress,
         id: ctx.request_id.clone(),
         command,
         lsp_hints,
@@ -1248,7 +1246,6 @@ mod tests {
     ) -> String {
         let format = crate::subc_format::FormatContext::from_tool_call(name, &args, root);
         let tool_ctx = ToolCallContext {
-            handles_progress: false,
             project_root: root.to_path_buf(),
             session_id: Some("slow-shape".into()),
             request_id: "slow-shape".into(),
@@ -1719,7 +1716,6 @@ mod tests {
 
         fn context(preview: bool) -> ToolCallContext {
             ToolCallContext {
-                handles_progress: false,
                 project_root: PathBuf::from("/workspace"),
                 session_id: Some("session-realistic".to_string()),
                 request_id: "subc-7-42".to_string(),

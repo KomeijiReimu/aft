@@ -62,7 +62,6 @@ fn context_with_search(root: &std::path::Path, aft_search_registered: bool) -> A
 
 fn request(command: &str, params: Value) -> RawRequest {
     RawRequest {
-        handles_progress: false,
         id: "test".to_string(),
         command: command.to_string(),
         lsp_hints: None,

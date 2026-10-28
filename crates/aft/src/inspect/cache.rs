@@ -4112,7 +4112,6 @@ pub(crate) mod tests {
         ctx.isolate_cold_build_limiter_for_test(2);
         ctx.set_harness(crate::harness::Harness::Opencode);
         let request = crate::protocol::RawRequest {
-            handles_progress: false,
             id: "upgrade-configure".to_string(),
             command: "configure".to_string(),
             lsp_hints: None,
@@ -4258,7 +4257,6 @@ pub(crate) mod tests {
         let envelope = format!("{list}_list_envelope");
         let page = |offset| {
             let request = crate::protocol::RawRequest {
-                handles_progress: false,
                 id: format!("upgrade-{list}-{offset}"),
                 command: "inspect".to_string(),
                 lsp_hints: None,

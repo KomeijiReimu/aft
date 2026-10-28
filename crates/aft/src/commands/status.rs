@@ -747,7 +747,6 @@ mod tests {
 
     fn request() -> RawRequest {
         RawRequest {
-            handles_progress: false,
             id: "status".to_string(),
             command: "status".to_string(),
             lsp_hints: None,
@@ -888,7 +887,6 @@ mod tests {
     fn removal_status_reports_an_empty_storage_root_as_zero_state() {
         let storage = tempfile::tempdir().expect("create storage root");
         let request = RawRequest {
-            handles_progress: false,
             params: json!({ "removal_storage_dir": storage.path() }),
             ..request()
         };

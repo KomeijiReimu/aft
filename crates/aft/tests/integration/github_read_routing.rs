@@ -595,7 +595,6 @@ fn github_read_forced_restrict_refuses_before_any_filesystem_or_gh_work() {
     )
     .with_test_checkpoint_store();
     let request = RawRequest {
-        handles_progress: false,
         id: "restricted-github-read".to_string(),
         command: "read".to_string(),
         lsp_hints: None,

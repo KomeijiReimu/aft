@@ -44,7 +44,6 @@ impl Fixture {
 
 fn request(command: &str, params: Value) -> RawRequest {
     RawRequest {
-        handles_progress: false,
         id: "audit2".into(),
         command: command.into(),
         session_id: Some("audit-session".into()),
@@ -1581,7 +1580,6 @@ fn audit6_windows_recursive_delete_stays_with_the_held_root() {
 
 fn request_with_id(id: &str, command: &str, params: Value) -> RawRequest {
     RawRequest {
-        handles_progress: false,
         id: id.into(),
         ..request(command, params)
     }
@@ -1705,7 +1703,6 @@ fn native_arguments(harness: crate::harness::Harness, params: Value) -> Value {
     let f = Fixture::new();
     f.ctx.update_config(|config| config.harness = Some(harness));
     let request = RawRequest {
-        handles_progress: false,
         id: "native".into(),
         command: "tool_call".into(),
         session_id: Some("audit-session".into()),

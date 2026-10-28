@@ -5044,7 +5044,6 @@ mod tests {
             serde_json::json!({"directory":temp.path()}),
         ] {
             let req = RawRequest {
-                handles_progress: false,
                 id: "broad".into(),
                 command: "outline".into(),
                 session_id: None,

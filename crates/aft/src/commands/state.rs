@@ -464,7 +464,6 @@ mod tests {
 
     fn state_request(command: &str, params: serde_json::Value) -> RawRequest {
         RawRequest {
-            handles_progress: false,
             id: "state".to_string(),
             command: command.to_string(),
             lsp_hints: None,

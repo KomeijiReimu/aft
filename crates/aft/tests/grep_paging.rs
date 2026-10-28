@@ -39,7 +39,6 @@ fn grep_ctx(project: &Path) -> aft::context::AppContext {
 /// returning the JSON payload and the text the agent reads.
 fn run_grep(ctx: &aft::context::AppContext, params: Value) -> (Value, String) {
     let req = aft::protocol::RawRequest {
-        handles_progress: false,
         id: "grep-page".into(),
         command: "grep".into(),
         lsp_hints: None,

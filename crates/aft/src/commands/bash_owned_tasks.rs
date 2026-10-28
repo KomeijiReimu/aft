@@ -121,7 +121,6 @@ mod tests {
         fn request(&self, session: Option<&str>, params: serde_json::Value) -> serde_json::Value {
             serde_json::to_value(handle(
                 &RawRequest {
-                    handles_progress: false,
                     id: "owned".into(),
                     command: "bash_owned_tasks".into(),
                     lsp_hints: None,

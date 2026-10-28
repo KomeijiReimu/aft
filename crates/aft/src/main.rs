@@ -756,8 +756,9 @@ fn main() {
         }
 
         let mut shutdown_after_response = false;
-        let response = match serde_json::from_str::<RawRequest>(trimmed) {
-            Ok(req) => {
+        let mut progress_request_id = None;
+        let response = match parse_transport_request(trimmed) {
+            Ok((req, handles_progress)) => {
                 if let Some(response) = duplicate_pending_response(&req, &pending) {
                     Some(response)
                 } else {
@@ -798,6 +799,10 @@ fn main() {
                     // has no separate root selector, so do not infer a runtime from
                     // a file path inside an individual tool's arguments.
                     let runtime = registry.current();
+                    if handles_progress {
+                        runtime.record_request_handles_progress(&request_id);
+                    }
+                    progress_request_id = Some(request_id.clone());
                     runtime.note_request();
                     // Keep the request's configuration snapshot pinned through
                     // standalone response finalization.
@@ -868,7 +873,13 @@ fn main() {
         };
 
         if let Some(response) = response {
-            if let Err(e) = write_response(registry.current(), &response) {
+            let result = write_response(registry.current(), &response);
+            if let Some(request_id) = progress_request_id {
+                registry
+                    .current()
+                    .clear_request_handles_progress(&request_id);
+            }
+            if let Err(e) = result {
                 aft::slog_error!("stdout write error: {}", e);
                 break;
             }
@@ -1192,7 +1203,9 @@ fn finalize_ready_pending(
             &resolved.session_id,
             &resolved.attach_command,
         );
-        write(&resolved.response)
+        let result = write(&resolved.response);
+        ctx.clear_request_handles_progress(&resolved.response.id);
+        result
     })
 }
 
@@ -2213,6 +2226,17 @@ fn write_response_to_writer(writer: &mut impl Write, response: &Response) -> io:
     Ok(())
 }
 
+fn parse_transport_request(line: &str) -> serde_json::Result<(RawRequest, bool)> {
+    let mut raw: serde_json::Value = serde_json::from_str(line)?;
+    let handles_progress = raw
+        .as_object_mut()
+        .and_then(|body| body.remove("handles_progress"))
+        .map(serde_json::from_value::<bool>)
+        .transpose()?
+        .unwrap_or(false);
+    serde_json::from_value(raw).map(|req| (req, handles_progress))
+}
+
 fn parse_error_request_id(line: &str) -> String {
     serde_json::from_str::<serde_json::Value>(line)
         .ok()
@@ -2789,7 +2813,6 @@ mod pending_response_tests {
         }))));
         let session_id = "session-wait-detach";
         let request = RawRequest {
-            handles_progress: false,
             id: "wait-detach".to_string(),
             command: "bash".to_string(),
             lsp_hints: None,
@@ -2831,7 +2854,6 @@ mod pending_response_tests {
 
         let detach = super::dispatch(
             RawRequest {
-                handles_progress: false,
                 id: "wait-detach-signal".to_string(),
                 command: "bash_wait_detach".to_string(),
                 lsp_hints: None,
@@ -3180,7 +3202,6 @@ mod deferred_semantic_search_tests {
 
     fn request(id: &str, command: &str, params: serde_json::Value) -> RawRequest {
         RawRequest {
-            handles_progress: false,
             id: id.to_string(),
             command: command.to_string(),
             lsp_hints: None,
@@ -4822,7 +4843,6 @@ mod watcher_filter_tests {
         ] {
             let response = dispatch(
                 RawRequest {
-                    handles_progress: false,
                     id: command.to_string(),
                     command: command.to_string(),
                     params: serde_json::json!({}),

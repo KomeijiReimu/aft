@@ -10,7 +10,6 @@ use serde_json::json;
 
 fn status_request() -> RawRequest {
     RawRequest {
-        handles_progress: false,
         id: "memory-status".to_string(),
         command: "status".to_string(),
         lsp_hints: None,
