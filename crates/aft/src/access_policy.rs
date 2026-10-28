@@ -8,6 +8,29 @@ use crate::sandbox_profile::{SandboxDataPolicy, SandboxProfile, SandboxProfileEr
 
 thread_local! {
     static REQUEST_SCOPE: std::cell::RefCell<Option<crate::db::access_grants::ScopeKey>> = const { std::cell::RefCell::new(None) };
+    static SCOPE_GRANTS_SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A rich UI carrier is untrusted: grants approved for the agent must not widen
+/// what the phone can read. Keep its scope identity, but ignore scope grants
+/// until this thread-local guard drops, including during path traversal.
+pub(crate) fn suppress_scope_grants() -> ScopeGrantsGuard {
+    ScopeGrantsGuard(
+        SCOPE_GRANTS_SUPPRESSED.with(|slot| slot.replace(true)),
+        std::marker::PhantomData,
+    )
+}
+
+pub(crate) struct ScopeGrantsGuard(bool, std::marker::PhantomData<*const ()>);
+
+impl Drop for ScopeGrantsGuard {
+    fn drop(&mut self) {
+        SCOPE_GRANTS_SUPPRESSED.with(|slot| slot.set(self.0));
+    }
+}
+
+fn scope_grants_suppressed() -> bool {
+    SCOPE_GRANTS_SUPPRESSED.with(std::cell::Cell::get)
 }
 
 pub(crate) fn with_scope<R>(
@@ -788,6 +811,12 @@ impl AccessPolicy {
         worker: bool,
         rust_sources: &WorkerRustSources,
     ) {
+        // Policies captured by a handler's off-thread work must also carry no
+        // agent grants; a thread-local decision check alone would not do that.
+        if scope_grants_suppressed() {
+            self.grants.clear();
+            return;
+        }
         self.grants = stored;
         if worker {
             self.grants.extend(rust_sources.grants());
@@ -872,10 +901,11 @@ impl AccessPolicy {
                     .any(|root| path.starts_with(root)))
             || exceptions.iter().any(|root| path.starts_with(root))
             || (operation == AccessOperation::Read && owned_artifact)
-            || self
-                .grants
-                .iter()
-                .any(|grant| grant.covers(operation, path))
+            || (!scope_grants_suppressed()
+                && self
+                    .grants
+                    .iter()
+                    .any(|grant| grant.covers(operation, path)))
         {
             AccessDecision::Allow
         } else {
@@ -1411,6 +1441,72 @@ fn resolve_policy_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn carrier_scope_grants_guard_is_nested_thread_local_and_unwind_safe() {
+        assert!(!super::scope_grants_suppressed());
+        {
+            let _outer = super::suppress_scope_grants();
+            {
+                let _inner = super::suppress_scope_grants();
+                assert!(super::scope_grants_suppressed());
+            }
+            assert!(super::scope_grants_suppressed());
+            assert!(!std::thread::spawn(super::scope_grants_suppressed)
+                .join()
+                .unwrap());
+        }
+        assert!(!super::scope_grants_suppressed());
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = super::suppress_scope_grants();
+            panic!("exercise scope-grant guard unwinding");
+        });
+        assert!(!super::scope_grants_suppressed());
+    }
+
+    #[test]
+    fn carrier_scope_grants_guard_masks_existing_and_captured_policies_only_while_installed() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let grant = AccessGrant {
+            path: policy_path(outside.path()),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        };
+        let mut existing = policy(root.path(), &root.path().join("store"));
+        existing.outside = AccessDecision::Deny(AccessDenial::OutsideRoots);
+        existing.install_scope_grants(vec![grant.clone()], false);
+        assert_eq!(
+            existing.decide(AccessOperation::Read, outside.path(), false),
+            AccessDecision::Allow
+        );
+        let captured;
+        {
+            let _guard = suppress_scope_grants();
+            assert_eq!(
+                existing.decide(AccessOperation::Read, outside.path(), false),
+                AccessDecision::Deny(AccessDenial::OutsideRoots)
+            );
+            let mut policy = existing.clone();
+            policy.install_scope_grants(vec![grant], false);
+            captured = policy;
+        }
+        assert_eq!(
+            existing.decide(AccessOperation::Read, outside.path(), false),
+            AccessDecision::Allow
+        );
+        assert_eq!(
+            std::thread::spawn(move || captured.decide(
+                AccessOperation::Read,
+                outside.path(),
+                false
+            ))
+            .join()
+            .unwrap(),
+            AccessDecision::Deny(AccessDenial::OutsideRoots)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn environment_store_denies_resolve_dotdot_and_symlink_targets() {

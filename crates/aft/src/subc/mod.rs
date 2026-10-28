@@ -5016,6 +5016,7 @@ where
     let launch_nonce = crate::launch_nonce::current();
     let mut manifest = build_manifest_without(&catalog_disabled);
     manifest::declare_provenance(&mut manifest, crate::launch_nonce::provenance());
+    let rich_ui_proofs = rich_ui::session::ProofCapabilities::from_manifest(&manifest);
     let manifest_provides = manifest.provides.clone();
     let hello_at = tokio::time::Instant::now();
     let hello = ModuleHelloBody {
@@ -5967,7 +5968,7 @@ where
                             // The tool-call future is polled on this loop's
                             // thread, so it is boxed to keep its own frame on
                             // the heap instead of widening this loop's frame.
-                            Box::pin(handle_tool_call(
+                            Box::pin(handle_tool_call_with_capabilities(
                                 &writer_tx,
                                 &frame,
                                 parsed_body,
@@ -5998,6 +5999,7 @@ where
                                 tool_response_body_limit,
                                 &module_drain,
                                 Some(&control),
+                                rich_ui_proofs,
                             ))
                             .await
                         };
@@ -10201,11 +10203,83 @@ fn bash_watch_warning_wait_ms(
     })
 }
 
+// Direct decoder fixtures use the build's default HELLO capabilities. The live
+// loop passes the snapshot of the actual HELLO sent on that connection instead.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn handle_tool_call(
+    tx: &WriterSender,
+    frame: &Frame,
+    parsed_body: Option<Result<Value, serde_json::Error>>,
+    confinement: Option<remote_policy::CarriedConfinement>,
+    phase_trace: PhaseTrace,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    pending_binds: &HashMap<RouteChannel, PendingBind>,
+    reclaimed_routes: &ReclaimedRoutes,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    executor: &Arc<Executor>,
+    active_tool_calls: &ActiveToolCalls,
+    pending_deferred_setups: &Arc<PendingDeferredSetups>,
+    shutdown: &Arc<Notify>,
+    connection_cancel: &PersistentCancelSignal,
+    bash_deferred_tx: &mpsc::Sender<bash::BashDeferredCompletion>,
+    bash_poll_touch_tx: &mpsc::Sender<ProjectRootId>,
+    metrics: &Arc<DispatchPathMetrics>,
+    route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
+    pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
+    next_bash_ask_corr: &mut u64,
+    bg_subs: &mut HashMap<RouteChannel, BgSub>,
+    bg_sub_by_session: &mut BgSubsBySession,
+    bg_wake_pending: &mut BgWakePending,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    dispatch: DispatchFn,
+    deferred_response_tx: &DeferredResponseSender,
+    allow_native_passthrough: bool,
+    tool_response_body_limit: usize,
+    module_drain: &drain::ModuleDrainWindow,
+    daemon_control: Option<&Arc<readiness::DaemonControl>>,
+) -> Result<(), SubcError> {
+    handle_tool_call_with_capabilities(
+        tx,
+        frame,
+        parsed_body,
+        confinement,
+        phase_trace,
+        routes,
+        pending_binds,
+        reclaimed_routes,
+        live_roots,
+        executor,
+        active_tool_calls,
+        pending_deferred_setups,
+        shutdown,
+        connection_cancel,
+        bash_deferred_tx,
+        bash_poll_touch_tx,
+        metrics,
+        route_bash_cancels,
+        pending_bash_asks,
+        next_bash_ask_corr,
+        bg_subs,
+        bg_sub_by_session,
+        bg_wake_pending,
+        bg_wake_epoch,
+        dispatch,
+        deferred_response_tx,
+        allow_native_passthrough,
+        tool_response_body_limit,
+        module_drain,
+        daemon_control,
+        rich_ui::session::ProofCapabilities::from_manifest(&manifest::build_manifest()),
+    )
+    .await
+}
+
 /// Route-channel tool call: `{name, arguments}` → executor lane → dispatch to
 /// the sync command core → wrap the structured Response in a CallToolResult
 /// `{content, isError}`. Tool-result mapping: the whole `{success, ...}` Response
 /// serialized into ONE text block; `isError` carries `success == false`.
-async fn handle_tool_call(
+async fn handle_tool_call_with_capabilities(
     tx: &WriterSender,
     frame: &Frame,
     parsed_body: Option<Result<Value, serde_json::Error>>,
@@ -10236,6 +10310,7 @@ async fn handle_tool_call(
     tool_response_body_limit: usize,
     module_drain: &drain::ModuleDrainWindow,
     daemon_control: Option<&Arc<readiness::DaemonControl>>,
+    rich_ui_proofs: rich_ui::session::ProofCapabilities,
 ) -> Result<(), SubcError> {
     metrics.mark_frame_loop_entry("handle_tool_call", frame);
     let module_draining = module_drain.is_active();
@@ -10432,6 +10507,7 @@ async fn handle_tool_call(
                     metrics,
                     operation,
                     dispatch,
+                    rich_ui_proofs,
                 )
                 .await;
             }

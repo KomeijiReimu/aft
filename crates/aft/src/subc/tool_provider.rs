@@ -5203,6 +5203,27 @@ pub(in crate::subc) mod route_tests {
         metrics: &Arc<DispatchPathMetrics>,
         dispatch: DispatchFn,
     ) -> WriterFrame {
+        exchange_decoded_with_capabilities(
+            decoded,
+            routes,
+            executor,
+            metrics,
+            dispatch,
+            crate::subc::rich_ui::session::ProofCapabilities::from_manifest(
+                &manifest::build_manifest(),
+            ),
+        )
+        .await
+    }
+
+    pub(in crate::subc) async fn exchange_decoded_with_capabilities(
+        decoded: DecodedFrame,
+        routes: &HashMap<RouteChannel, RouteIdentity>,
+        executor: &Arc<Executor>,
+        metrics: &Arc<DispatchPathMetrics>,
+        dispatch: DispatchFn,
+        proofs: crate::subc::rich_ui::session::ProofCapabilities,
+    ) -> WriterFrame {
         let (writer, mut replies) = mpsc::channel(8);
         let (bash_tx, _bash_rx) = mpsc::channel(8);
         let (touch_tx, _touch_rx) = mpsc::channel(8);
@@ -5212,7 +5233,7 @@ pub(in crate::subc) mod route_tests {
             wake: crate::response_finalize::DeferredResponseWake::default(),
         };
         let frame = decoded.frame;
-        handle_tool_call(
+        handle_tool_call_with_capabilities(
             &writer,
             &frame,
             None,
@@ -5243,6 +5264,7 @@ pub(in crate::subc) mod route_tests {
             1024 * 1024,
             &drain::ModuleDrainWindow::default(),
             None,
+            proofs,
         )
         .await
         .unwrap();

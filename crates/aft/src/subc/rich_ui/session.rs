@@ -4,13 +4,13 @@ use super::super::*;
 use subc_protocol::scope::{ScopeKind, ScopeStamp};
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct ProofCapabilities {
+pub(in crate::subc) struct ProofCapabilities {
     call_modes: bool,
     on_behalf_of: bool,
 }
 
 impl ProofCapabilities {
-    fn from_manifest(manifest: &ModuleManifest) -> Self {
+    pub(in crate::subc) fn from_manifest(manifest: &ModuleManifest) -> Self {
         let provides = manifest
             .capabilities
             .as_ref()
@@ -21,10 +21,6 @@ impl ProofCapabilities {
             on_behalf_of: provides.iter().any(|s| s == "scope-on-behalf-of/v1"),
         }
     }
-}
-
-fn capabilities() -> ProofCapabilities {
-    ProofCapabilities::from_manifest(&manifest::build_manifest())
 }
 
 fn principal(identity: &RouteIdentity) -> Option<&str> {
@@ -208,6 +204,7 @@ impl Session {
         crate::sandbox_spawn::with_authenticated_principal(
             self.identity.spawn_principal.clone(),
             || {
+                let _agent_grants = crate::access_policy::suppress_scope_grants();
                 call_policy::with_tool_call_policy(
                     ctx,
                     &self.identity,
@@ -237,6 +234,7 @@ pub(in crate::subc) async fn submit(
     metrics: &Arc<DispatchPathMetrics>,
     operation: super::admission::Operation,
     dispatch: DispatchFn,
+    capabilities: ProofCapabilities,
 ) -> Result<(), SubcError> {
     let route = route_key(frame.header.channel, frame.header.epoch);
     let id = format!("subc-{}-{}", route.channel, frame.header.corr);
@@ -247,6 +245,7 @@ pub(in crate::subc) async fn submit(
         .expect("validated target")
         .to_owned();
     let entry = operation.entry.clone();
+    let io_budget = crate::bounded_io::Budget::after(plain_run_io_budget(frame.header.corr));
     let ledger_key = serde_json::from_slice::<Value>(&frame.body)
         .ok()
         .and_then(|body| {
@@ -269,7 +268,9 @@ pub(in crate::subc) async fn submit(
             flags: frame.header.flags,
         },
         Box::new(move |ctx| {
-            let session = match resolve(ctx, &carrier, &routes, capabilities()) {
+            let _config_pin = ctx.pin_config();
+            let _io = crate::bounded_io::enter(Some(io_budget));
+            let session = match resolve(ctx, &carrier, &routes, capabilities) {
                 Ok(session) => session,
                 Err(error)
                     if matches!(
@@ -332,10 +333,17 @@ pub(in crate::subc) async fn submit(
             let result = log_ctx::with_session(Some(identity.session.clone()), || {
                 session
                     .with_policy(ctx, &job_id, &name, args, |args| {
-                        let ToolCallOutcome::Unary(result) = run_tool_call(
+                        let ToolCallOutcome::Unary(mut result) = run_tool_call(
                             &name, args, &format, &tool_ctx, ctx, &dispatch, None, None,
                         );
-                        result.response
+                        // File and search handlers return native metadata; their
+                        // rendered tool text is the session-read result field.
+                        if result.response.success {
+                            if let Some(data) = result.response.data.as_object_mut() {
+                                data.insert("text".into(), Value::String(result.text));
+                            }
+                        }
+                        crate::bounded_io::finish_response(result.response)
                     })
                     .unwrap_or_else(|response| response)
             });
@@ -355,29 +363,23 @@ pub(in crate::subc) async fn submit(
         if !claim_active_tool_call(&active, route, request.header.corr) {
             return;
         }
-        let reply = if let Some(error) = response.data.get("session_error") {
-            Frame::build_with_version(
-                request.header.ver,
-                FrameType::Error,
-                request.header.flags,
-                route.channel,
-                route.epoch,
-                request.header.corr,
-                serde_json::to_vec(error).expect("error serializes"),
-            )
-            .map(WriterFrame::plain)
-            .map_err(SubcError::FrameBuild)
-        } else {
-            wire::build_carrier_response_frame(
-                &request,
-                None,
-                response
-                    .data
-                    .get("body")
-                    .cloned()
-                    .unwrap_or_else(|| super::carrier::error_body("executor_failure")),
-            )
-        };
+        if let Some(error) = response.data.get("session_error") {
+            let error = serde_json::from_value(error.clone()).expect("session error serializes");
+            if let Err(error) = send_provider_error(&tx, &metrics, &request, error).await {
+                log::warn!("carrier session refusal could not be queued: {error}");
+            }
+            finish_active_tool_call(&active, route, request.header.corr);
+            return;
+        }
+        let reply = wire::build_carrier_response_frame(
+            &request,
+            None,
+            response
+                .data
+                .get("body")
+                .cloned()
+                .unwrap_or_else(|| super::carrier::error_body("executor_failure")),
+        );
         match reply {
             Ok(reply) => {
                 if let Err(error) =

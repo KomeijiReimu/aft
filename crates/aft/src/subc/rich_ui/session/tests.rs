@@ -9,7 +9,11 @@ const READS: &[&str] = &[
     "zoom",
     "callgraph",
 ];
-const CALLS: &[&str] = &["bash_status", "bash_status", "bash_watch"];
+const CALLS: &[(&str, &str)] = &[
+    ("bash_status", "bash_status"),
+    ("bash_output", "bash_status"),
+    ("bash_watch", "bash_watch"),
+];
 const PROOFS: ProofCapabilities = ProofCapabilities {
     call_modes: true,
     on_behalf_of: true,
@@ -120,12 +124,12 @@ fn reads_and_calls(f: &Fixture, caps: ProofCapabilities, calls: bool) {
     for name in READS {
         session.admit(&f.ctx, name).unwrap();
     }
-    for name in CALLS {
+    for (id, name) in CALLS {
         let result = session.admit(&f.ctx, name);
         if calls {
             result.unwrap();
         } else {
-            assert_eq!(result.unwrap_err().code, "unknown_tool");
+            assert_eq!(result.unwrap_err().code, "unknown_tool", "{id}");
         }
     }
     assert_eq!(
@@ -531,6 +535,10 @@ fn effective_principal_is_rebuilt_and_installed_for_read_and_watch_dispatch() {
                         crate::access_policy::current_ask_route(),
                         crate::access_policy::AskRoute::Deny
                     ));
+                    assert_eq!(
+                        crate::access_policy::current_scope(),
+                        Some(access_grants::policy_scope_key(&f.carrier))
+                    );
                 })
                 .unwrap();
         }
@@ -623,7 +631,7 @@ async fn exchange(f: &Fixture, name: &str, args: Value, preset: &str) -> Frame {
         codemode_policies: None,
         phase_trace: PhaseTrace::new(Instant::now()),
     };
-    let reply = tool_provider::route_tests::exchange_decoded_with_actor(
+    let reply = tool_provider::route_tests::exchange_decoded_with_capabilities(
         decoded,
         &routes,
         &executor,
@@ -641,6 +649,7 @@ async fn exchange(f: &Fixture, name: &str, args: Value, preset: &str) -> Frame {
             ));
             crate::commands::read::handle_read(&request, ctx)
         },
+        PROOFS,
     )
     .await;
     reply.frame
@@ -694,18 +703,25 @@ async fn carrier_presets_never_promote_flow_head_and_task_seam_fails_closed() {
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(body, super::super::carrier::error_body("unknown_tool"));
     }
-    let f = Fixture::new("worker");
-    let reply = exchange(
-        &f,
-        "bash_status",
-        json!({"rich_ui_op":"bash_status@1", "task":"call"}),
-        "reader",
-    )
-    .await;
-    assert_eq!(
-        serde_json::from_slice::<Value>(&reply.body).unwrap(),
-        super::super::carrier::error_body("task_not_found")
-    );
+    for kind in ["head", "worker"] {
+        let f = Fixture::new(kind);
+        for op in ["bash_status", "bash_output", "bash_watch"] {
+            let name = if op == "bash_output" {
+                "bash_status"
+            } else {
+                op
+            };
+            let mut args = json!({"rich_ui_op":format!("{op}@1"), "task":"call"});
+            if op == "bash_watch" {
+                args["pattern"] = "done".into();
+            }
+            let reply = exchange(&f, name, args, "reader").await;
+            assert_eq!(
+                serde_json::from_slice::<Value>(&reply.body).unwrap(),
+                super::super::carrier::error_body("task_not_found")
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -858,6 +874,40 @@ fn confined_worker_uses_policy_principal_and_keeps_native_fence_code() {
         read_under_policy(&f, &path, true).data["code"],
         "path_outside_confined_root"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn carrier_symlink_inside_root_cannot_use_agent_outside_grant() {
+    for kind in ["head", "worker"] {
+        let f = Fixture::new(kind);
+        access_grants::register(&f.policy, &f.ctx).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("outside.txt");
+        std::fs::write(&target, "outside\n").unwrap();
+        let link = f.dir.path().join("inside-link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let grant = crate::access_policy::AccessGrant {
+            path: crate::access_policy::policy_path(outside.path()),
+            kind: crate::access_policy::GrantKind::Subtree,
+            operation: crate::access_policy::AccessOperation::Read,
+        };
+        crate::db::access_grants::insert(
+            &f.ctx.db().unwrap().lock().unwrap(),
+            &access_grants::scope_key(&f.policy),
+            &grant,
+        )
+        .unwrap();
+        assert!(read_under_policy(&f, &link, false).success);
+        assert_eq!(
+            read_under_policy(&f, &link, true).data["code"],
+            "path_outside_root"
+        );
+        assert!(
+            read_under_policy(&f, &target, false).success,
+            "the carrier guard must not leak into the next agent read"
+        );
+    }
 }
 
 #[tokio::test]
