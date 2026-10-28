@@ -2891,6 +2891,7 @@ fn purge_deleted_root_residents(
     );
 
     for route in stale_routes.iter().copied() {
+        metrics.held_bash_calls.clear_progress_for_route(route);
         reclaimed_routes.insert(route);
         remove_installed_route(installed_route_epochs, route);
         remove_route_channel(routes, root_channels, route);
@@ -3934,6 +3935,7 @@ async fn teardown_installed_route(
     if let Some(cancel) = route_bash_cancels.remove(&channel) {
         cancel.token.cancel();
     }
+    metrics.held_bash_calls.clear_progress_for_route(channel);
     for resolved in pending_responses.drain_route(channel, executor) {
         deliver_resolved_subc_response(
             tx,
@@ -5070,6 +5072,7 @@ where
         .as_ref()
         .map(|hooks| Arc::clone(&hooks.metrics))
         .unwrap_or(dispatch_path_metrics);
+    let _progress_lifetime = drain::ProgressLifetimeGuard::new(Arc::clone(&dispatch_path_metrics));
     // Lives until this function returns, i.e. for the whole attached session,
     // including teardown. Dropping it stops the thread.
     #[cfg(test)]
@@ -6618,6 +6621,7 @@ where
         }
     };
 
+    dispatch_path_metrics.held_bash_calls.clear_all_progress();
     a0.stop();
     let loop_result = if matches!(loop_result, Ok(ModuleLoopExit::Graceful)) {
         candidate_requests

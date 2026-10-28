@@ -220,6 +220,68 @@ mod progress_lifetime_tests {
             assert!(!context.request_handles_progress("progress-lifetime"));
         }
     }
+
+    #[test]
+    fn cancelling_before_a_detach_target_clears_progress_but_keeps_the_hold() {
+        let context = super::super::test_support::test_ctx();
+        let calls = drain::HeldBashCalls::default();
+        let route = RouteChannel {
+            channel: 1,
+            epoch: 1,
+        };
+        calls.insert(route, 1);
+        calls.record_progress(route, 1, &context, "cancelled-progress");
+        assert!(context.request_handles_progress("cancelled-progress"));
+        assert!(calls.request_cancel(route, 1));
+        assert!(!context.request_handles_progress("cancelled-progress"));
+        assert_eq!(calls.phase(route, 1), Some(drain::BashHoldPhase::Spawning));
+    }
+
+    #[test]
+    fn retiring_a_route_prevents_late_cleanup_from_erasing_reused_id_progress() {
+        let context = super::super::test_support::test_ctx();
+        let calls = drain::HeldBashCalls::default();
+        let old_route = RouteChannel {
+            channel: 1,
+            epoch: 1,
+        };
+        let new_route = RouteChannel {
+            channel: 1,
+            epoch: 2,
+        };
+        calls.insert(old_route, 1);
+        calls.record_progress(old_route, 1, &context, "subc-1-1");
+        calls.clear_progress_for_route(old_route);
+        assert!(!context.request_handles_progress("subc-1-1"));
+        calls.insert(new_route, 1);
+        calls.record_progress(new_route, 1, &context, "subc-1-1");
+        calls.remove(old_route, 1);
+        assert!(context.request_handles_progress("subc-1-1"));
+        calls.remove(new_route, 1);
+        assert!(!context.request_handles_progress("subc-1-1"));
+    }
+
+    #[test]
+    fn connection_cleanup_clears_progress_while_response_tasks_retain_metrics() {
+        let context = super::super::test_support::test_ctx();
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let lifetime = drain::ProgressLifetimeGuard::new(Arc::clone(&metrics));
+        let route = RouteChannel {
+            channel: 1,
+            epoch: 1,
+        };
+        metrics.held_bash_calls.insert(route, 1);
+        metrics
+            .held_bash_calls
+            .record_progress(route, 1, &context, "connection-progress");
+        assert!(context.request_handles_progress("connection-progress"));
+        drop(lifetime);
+        assert!(!context.request_handles_progress("connection-progress"));
+        assert_eq!(
+            metrics.held_bash_calls.phase(route, 1),
+            Some(drain::BashHoldPhase::Spawning)
+        );
+    }
 }
 
 #[cfg(all(test, unix))]
