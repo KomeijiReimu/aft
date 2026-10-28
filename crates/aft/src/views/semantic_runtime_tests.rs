@@ -2316,6 +2316,7 @@ fn multi_round_fill_yields_to_a_queued_waiter_between_rounds() {
     let limiter = Arc::clone(&schedule.limiter);
     let model = Arc::new(Model::default());
     let mut queued_waiter = None;
+    let mut queue_holder = None;
     let outcome = catch_up(
         &Arc::downgrade(&slot),
         epoch,
@@ -2327,9 +2328,9 @@ fn multi_round_fill_yields_to_a_queued_waiter_between_rounds() {
         },
         &mut |texts| {
             if queued_waiter.is_none() {
-                // While the first round holds the only slot, queue another
-                // maintenance request and record how many rounds had embedded
-                // when it was admitted.
+                // Occupy the yielded slot so the maintenance request queues
+                // before the first round returns from the backend.
+                queue_holder = limiter.try_acquire();
                 let waiter_limiter = Arc::clone(&limiter);
                 let waiter_model = Arc::clone(&model);
                 queued_waiter = Some(std::thread::spawn(move || {
@@ -2354,7 +2355,9 @@ fn multi_round_fill_yields_to_a_queued_waiter_between_rounds() {
                     std::thread::yield_now();
                 }
             }
-            model.embed(texts)
+            let result = model.embed(texts);
+            drop(queue_holder.take());
+            result
         },
     );
     assert!(matches!(outcome, FillOutcome::Settled));
@@ -2411,6 +2414,21 @@ fn semantic_fill_releases_cold_slot_during_model_call_and_readmits_before_store(
     entered_rx.recv().unwrap();
     let non_semantic = limiter.try_acquire();
     let admitted_during_model_call = non_semantic.is_some();
+    if admitted_during_model_call {
+        let graph_storage = tempfile::tempdir().unwrap();
+        let graph_root = tempfile::tempdir().unwrap();
+        write_tree(
+            graph_root.path(),
+            &[
+                ("a.ts", "export function target() {}\n"),
+                (
+                    "b.ts",
+                    "import { target } from './a';\nexport function caller() { target(); }\n",
+                ),
+            ],
+        );
+        build_independent_callgraph(graph_root.path(), graph_storage.path());
+    }
     let pending_during_call = query(&runtime, "delayed vector").pending.len();
     release_tx.send(()).unwrap();
     let (readmitted, pending_before_store) = if admitted_during_model_call {
@@ -2455,6 +2473,194 @@ fn build_independent_callgraph(root: &Path, storage: &Path) {
             .len(),
         1
     );
+}
+
+#[test]
+fn semantic_fill_inflight_memory_is_bounded_before_large_source_preparation() {
+    const ROOTS: usize = 5;
+    let storage: Vec<_> = (0..ROOTS).map(|_| tempfile::tempdir().unwrap()).collect();
+    let roots: Vec<_> = (0..ROOTS).map(|_| tempfile::tempdir().unwrap()).collect();
+    let cold = crate::cold_build_limiter::isolated_limiter(2);
+    let preparation = crate::cold_build_limiter::isolated_limiter(PREPARATION_LIMIT);
+    let inflight = crate::cold_build_limiter::isolated_limiter(INFLIGHT_FILL_LIMIT);
+    let (entered_tx, entered_rx) = crossbeam_channel::unbounded();
+    let (release_tx, release_rx) = crossbeam_channel::unbounded();
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let mut lanes = Vec::new();
+    let mut workers = Vec::new();
+    for (i, root) in roots.iter().enumerate() {
+        // More than 32 queued files requires cold admission before source reads.
+        for file in 0..33 {
+            write_tree(
+                root.path(),
+                &[(
+                    &format!("file_{file}.rs"),
+                    &format!("pub fn root_{i}_group_{}() {{}}\n", file % 2),
+                )],
+            );
+        }
+        let (slot, epoch, wake, runtime) = served_lane(storage[i].path(), root.path());
+        runtime.plane().take_source_reads();
+        let mut schedule = fast_schedule(root.path());
+        schedule.limiter = Arc::clone(&cold);
+        let weak = Arc::downgrade(&slot);
+        let worker_runtime = Arc::clone(&runtime);
+        let preparation = Arc::clone(&preparation);
+        let inflight = Arc::clone(&inflight);
+        let entered = entered_tx.clone();
+        let release = release_rx.clone();
+        let active = Arc::clone(&active);
+        let peak = Arc::clone(&peak);
+        workers.push(std::thread::spawn(move || {
+            catch_up_with_limiters(
+                &weak,
+                epoch,
+                &worker_runtime,
+                &schedule,
+                FillBudget {
+                    max_batch: 1,
+                    ..FillBudget::default()
+                },
+                &mut |texts| {
+                    assert_eq!(texts.len(), 1, "model request exceeded batch bound");
+                    let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(count, Ordering::SeqCst);
+                    entered.send(i).unwrap();
+                    release.recv().unwrap();
+                    let result = Model::default().embed(texts);
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    result
+                },
+                &preparation,
+                &inflight,
+            )
+        }));
+        lanes.push((slot, wake, runtime));
+    }
+    let first: Vec<_> = (0..INFLIGHT_FILL_LIMIT)
+        .map(|_| entered_rx.recv().unwrap())
+        .collect();
+    wait_until("other fills waiting for memory admission", || {
+        inflight.census().queued.len() == ROOTS - INFLIGHT_FILL_LIMIT
+    });
+    assert_eq!(inflight.census().holders.len(), INFLIGHT_FILL_LIMIT);
+    assert!(
+        cold.census().holders.is_empty(),
+        "backend waits held cold slots"
+    );
+    assert!(
+        entered_rx.try_recv().is_err(),
+        "third batch entered backend"
+    );
+    for (i, (_, _, runtime)) in lanes.iter().enumerate() {
+        let reads = runtime.plane().take_source_reads();
+        assert_eq!(reads.len(), if first.contains(&i) { 33 } else { 0 });
+        assert_eq!(query(runtime, "root").pending.len(), 33);
+    }
+    // The two distinct contents per root require two one-text model batches.
+    for _ in 0..ROOTS * 2 {
+        release_tx.send(()).unwrap();
+    }
+    for worker in workers {
+        assert!(matches!(worker.join().unwrap(), FillOutcome::Settled));
+    }
+    assert_eq!(peak.load(Ordering::SeqCst), INFLIGHT_FILL_LIMIT);
+    assert!(inflight.census().holders.is_empty());
+    assert!(lanes
+        .iter()
+        .all(|(_, _, runtime)| query(runtime, "root").complete()));
+}
+
+#[test]
+fn semantic_fill_chunk_gate_waiter_yields_cold_slot_to_returning_backend() {
+    let storage = tempfile::tempdir().unwrap();
+    let roots: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let cold = crate::cold_build_limiter::isolated_limiter(1);
+    let preparation = crate::cold_build_limiter::isolated_limiter(PREPARATION_LIMIT);
+    let inflight = crate::cold_build_limiter::isolated_limiter(2);
+    let (entered_tx, entered_rx) = crossbeam_channel::unbounded();
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let (done_tx, done_rx) = crossbeam_channel::unbounded();
+    let mut lanes = Vec::new();
+    for (i, root) in roots.iter().enumerate() {
+        for file in 0..33 {
+            write_tree(
+                root.path(),
+                &[(
+                    &format!("file_{file}.rs"),
+                    &format!("pub fn sibling_{i}() {{}}\n"),
+                )],
+            );
+        }
+        let slot = Arc::new(CheckoutSemanticSlot::default());
+        let (epoch, wake) = slot.begin();
+        let runtime = Arc::new(open(storage.path(), &format!("sibling-{i}"), root.path()));
+        assert!(slot.install(epoch, Arc::clone(&runtime)));
+        lanes.push((slot, epoch, wake, runtime));
+    }
+    let mut workers = Vec::new();
+    for (i, (slot, epoch, _, runtime)) in lanes.iter().enumerate() {
+        let weak = Arc::downgrade(slot);
+        let epoch = *epoch;
+        let runtime = Arc::clone(runtime);
+        let mut schedule = fast_schedule(roots[i].path());
+        schedule.limiter = Arc::clone(&cold);
+        let preparation = Arc::clone(&preparation);
+        let inflight = Arc::clone(&inflight);
+        let entered = entered_tx.clone();
+        let release = release_rx.clone();
+        let done = done_tx.clone();
+        workers.push(std::thread::spawn(move || {
+            let outcome = catch_up_with_limiters(
+                &weak,
+                epoch,
+                &runtime,
+                &schedule,
+                FillBudget::default(),
+                &mut |texts| {
+                    entered.send(i).unwrap();
+                    if i == 0 {
+                        release.recv().unwrap();
+                    }
+                    Model::default().embed(texts)
+                },
+                &preparation,
+                &inflight,
+            );
+            done.send(matches!(outcome, FillOutcome::Settled)).unwrap();
+        }));
+        if i == 0 {
+            assert_eq!(entered_rx.recv().unwrap(), 0);
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let yielded = loop {
+        if cold.admission_events().len() >= 2 && cold.census().holders.is_empty() {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    release_tx.send(()).unwrap();
+    let first_done = done_rx.recv_timeout(Duration::from_secs(10));
+    let second_done = done_rx.recv_timeout(Duration::from_secs(10));
+    if first_done.is_err() || second_done.is_err() {
+        for (slot, _, _, _) in &lanes {
+            slot.clear();
+        }
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert!(yielded, "chunk-gate waiter retained the only cold slot");
+    assert_eq!(first_done.unwrap(), true);
+    assert_eq!(second_done.unwrap(), true);
+    assert!(lanes
+        .iter()
+        .all(|(_, _, _, runtime)| query(runtime, "sibling").complete()));
 }
 
 #[test]
@@ -2599,8 +2805,8 @@ fn small_missing_vectors_wait_for_cold_slot_and_stay_pending() {
                 FillBudget::default(),
                 &mut |texts| {
                     assert!(
-                        !limiter.census().holders.is_empty(),
-                        "model ran without admission"
+                        limiter.census().holders.is_empty(),
+                        "model wait retained a cold slot after preparation admission"
                     );
                     model.embed(texts)
                 },
