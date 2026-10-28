@@ -208,6 +208,7 @@ fn basal_session_run(parent: &RouteIdentity, worker: bool) -> RouteIdentity {
         },
         run_id: run_id.into(),
         owner_route: parent.clone(),
+        owner_route_channel: route_key(41, 1),
         run_route: route_key(42, 1),
         run_principal: with_carrier(parent, "reserved:basal")
             .spawn_principal

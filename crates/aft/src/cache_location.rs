@@ -169,6 +169,20 @@ pub struct ProcessStorageLease {
 }
 static PROCESS_STORAGE_LEASES: OnceLock<Mutex<HashMap<Identity, Weak<ProcessStorageLease>>>> =
     OnceLock::new();
+
+#[derive(Debug)]
+pub(crate) struct SpeechServingLease {
+    _file: File,
+    _root: PinnedDir,
+    _storage_use: Arc<ProcessStorageLease>,
+    identity: Identity,
+}
+
+// Ordinary guard drop is not proof that detached speech work has stopped.
+// Managed runtimes explicitly remove their matching anchor after quiescence;
+// every other owner remains pinned until process exit.
+static SPEECH_SERVING_LEASES: OnceLock<Mutex<HashMap<Identity, Arc<SpeechServingLease>>>> =
+    OnceLock::new();
 impl CacheLease {
     pub(crate) fn same_root(&self, other: &Self) -> bool {
         self.root_identity == other.root_identity
@@ -2317,6 +2331,56 @@ pub fn acquire_daemon_storage_lease(storage: &Path) -> io::Result<Arc<ProcessSto
     crate::private_storage::open_root(storage)?;
     acquire_pinned_storage_lease(pin_storage_root(storage)?)
 }
+
+/// Exclude another speech forwarder until managed quiescence or process exit.
+pub(crate) fn acquire_speech_serving_lease(storage: &Path) -> io::Result<Arc<SpeechServingLease>> {
+    let storage_use = acquire_daemon_storage_lease(storage)?;
+    let root = pin_storage_root(storage)?;
+    let identity = pinned_identity(&root)?;
+    let mut leases = SPEECH_SERVING_LEASES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if leases.contains_key(&identity) {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "speech forwarding already has an owner",
+        ));
+    }
+    let retention = root.repair_descendant(Path::new("retention"), true)?;
+    let file = retention.repair_coordination_file(std::ffi::OsStr::new("speech-serving.lock"))?;
+    file.try_lock().map_err(storage_lock_error)?;
+    let lease = Arc::new(SpeechServingLease {
+        _file: file,
+        _root: root,
+        _storage_use: storage_use,
+        identity,
+    });
+    leases.insert(identity, Arc::clone(&lease));
+    Ok(lease)
+}
+
+/// Release only the anchor owned by the runtime that proved quiescence.
+pub(crate) fn release_quiescent_speech_serving_lease(lease: &Arc<SpeechServingLease>) -> bool {
+    let Some(leases) = SPEECH_SERVING_LEASES.get() else {
+        return false;
+    };
+    let Ok(mut leases) = leases.lock() else {
+        return false;
+    };
+    if !leases
+        .get(&lease.identity)
+        .is_some_and(|held| Arc::ptr_eq(held, lease))
+    {
+        return false;
+    }
+    leases.remove(&lease.identity);
+    true
+}
+
+#[cfg(test)]
+#[path = "gh_shim_speech/serving_tests.rs"]
+mod speech_serving_tests;
 
 fn acquire_pinned_storage_lease(root: PinnedDir) -> io::Result<Arc<ProcessStorageLease>> {
     let identity = pinned_identity(&root)?;

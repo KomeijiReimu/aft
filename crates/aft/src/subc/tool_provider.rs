@@ -6990,6 +6990,7 @@ pub(in crate::subc) mod route_tests {
                 worker_mode
             };
             let run = PlainToolRun {
+                speech_seed: None,
                 bare_name: "write".into(),
                 arguments: json!({"path": "pin.rs", "content": "pub fn edited() {}\n"}),
                 format_context: Default::default(),
@@ -7111,6 +7112,7 @@ pub(in crate::subc) mod route_tests {
         };
         let call = |content: &str, profile_reads: usize| -> Value {
             let run = PlainToolRun {
+                speech_seed: None,
                 bare_name: "write".into(),
                 arguments: json!({"path": "pin.rs", "content": content}),
                 format_context: Default::default(),
@@ -8543,6 +8545,7 @@ mod authorization_failure_tests {
             arguments: json!({"command":"printf must-not-run"}),
             format_context: crate::subc_format::FormatContext::default(),
             cancel: bash::BashWaitCancel {
+                speech_seed: None,
                 run_scope: None,
                 scope: None,
                 late_results: false,

@@ -1995,7 +1995,7 @@ impl PersistedTask {
         compressed: bool,
     ) -> Self {
         let call_key = Some(super::call_key_for_new_task(&task_id));
-        Self {
+        let metadata = Self {
             schema_version: SCHEMA_VERSION,
             harness: super::route_harness().map(|harness| harness.storage_segment()),
             task_id,
@@ -2048,7 +2048,9 @@ impl PersistedTask {
             stripped_env_names: Vec::new(),
             local_fallback_started: false,
             cancelled_call_unannounced: false,
-        }
+        };
+        crate::gh_shim_ticket::capture_spawn(&metadata);
+        metadata
     }
 
     pub fn is_terminal(&self) -> bool {
@@ -2076,6 +2078,7 @@ impl PersistedTask {
         self.child_pid = Some(child_pid);
         self.pgid = Some(pgid);
         self.child_start_time_ms = crate::root_cache::process_start_time_ms(child_pid);
+        crate::gh_shim_ticket::seal_spawn(self);
     }
 
     pub fn mark_terminal(
