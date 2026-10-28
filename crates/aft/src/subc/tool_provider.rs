@@ -1928,7 +1928,7 @@ impl LedgerEdge {
                 &identity.session,
                 admission_trusted(&identity, &call),
             )
-            .and_then(|()| super::rich_ui::admission::reject_non_carrier(&call.arguments))
+            .and_then(|_| super::rich_ui::admission::reject_non_carrier(&call.arguments))
         };
         if admitted.is_err() {
             return Err(decoded);
@@ -5859,6 +5859,13 @@ mod route_tests {
                     .await;
                     let body: Value = serde_json::from_slice(&reply.body).unwrap();
                     assert_eq!(reply.header.ty, FrameType::Response, "{name}: {body}");
+                    if role == RouteRole::ToolProviderV1 {
+                        assert_eq!(
+                            body,
+                            super::super::rich_ui::carrier::error_body("rich_ui_op_malformed")
+                        );
+                        continue;
+                    }
                     let rendered = body.to_string();
                     if own {
                         assert_eq!(body["isError"], false, "{name}: {body}");
@@ -5882,7 +5889,13 @@ mod route_tests {
             test_support::route_identity(root, session)
         };
         let data = Arc::get_mut(&mut identity.0).unwrap();
-        data.role = RouteRole::ToolProviderV1;
+        // Exercise the observation handlers through the legacy decoder while
+        // v1 carrier operation versions remain unpublished.
+        data.role = if carrier {
+            RouteRole::Legacy
+        } else {
+            RouteRole::ToolProviderV1
+        };
         data.scope = Some(stamp("worker"));
         data.session = session.into();
         if let AuthenticatedPrincipal::RouteBind { session_id, .. } = &mut data.spawn_principal {

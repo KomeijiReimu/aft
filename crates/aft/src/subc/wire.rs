@@ -1106,15 +1106,18 @@ pub(super) fn build_carrier_response_frame(
             super::rich_ui::carrier::error_body("result_schema_mismatch"),
         );
     }
-    Ok(WriterFrame::plain(Frame::build_with_version(
-        request.header.ver,
-        FrameType::Response,
-        request.header.flags,
-        request.header.channel,
-        request.header.epoch,
-        request.header.corr,
-        serde_json::to_vec(&body)?,
-    )?))
+    Ok(WriterFrame::plain(
+        Frame::build_with_version(
+            request.header.ver,
+            FrameType::Response,
+            request.header.flags,
+            request.header.channel,
+            request.header.epoch,
+            request.header.corr,
+            serde_json::to_vec(&body).map_err(SubcError::Json)?,
+        )
+        .map_err(SubcError::FrameBuild)?,
+    ))
 }
 
 pub(super) fn build_tool_response_frame_with_limit(

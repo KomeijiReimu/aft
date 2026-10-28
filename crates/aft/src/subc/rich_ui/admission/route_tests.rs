@@ -292,6 +292,10 @@ async fn operation_ledger_isolates_custodian_sessions_and_replays_exact_body() {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&first.body).unwrap()["structuredContent"],
+            json!({"running":true,"exitCode":null})
+        );
         carrier::validate_body(
             Some(&entry),
             &serde_json::from_slice::<Value>(&first.body).unwrap(),
