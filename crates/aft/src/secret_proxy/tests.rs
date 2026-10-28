@@ -1053,38 +1053,7 @@ async fn proxy_scope_stop_closes_listener_and_open_connections() {
         .await;
     proxy.stop_if_scope_ended(&scope("run"));
     assert!(proxy.state.stopped.load(Ordering::Acquire));
-    // stop() joins the serve thread, which drops the only listener fd, so
-    // the listener is closed before stop() returns and a fresh connect is
-    // normally refused. One can still succeed when the kernel completed
-    // the handshake before the close or the ephemeral port was recycled;
-    // such a socket must never be served: no success response, no vault.
-    if let Ok(mut stray) = TcpStream::connect(proxy.address()).await {
-        let url = proxy.proxy_url();
-        let token = url
-            .strip_prefix("http://")
-            .and_then(|rest| rest.split_once(":@"))
-            .map(|(token, _)| token.to_owned());
-        if let Some(token) = token {
-            let credentials = base64::engine::general_purpose::STANDARD.encode(format!("{token}:"));
-            let authority = server.address;
-            let _ = stray
-                .write_all(
-                    format!(
-                        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\
-                         Proxy-Authorization: Basic {credentials}\r\n\r\n"
-                    )
-                    .as_bytes(),
-                )
-                .await;
-        }
-        let mut reply = Vec::new();
-        let _ = tokio::time::timeout(Duration::from_secs(5), stray.read_to_end(&mut reply)).await;
-        assert!(
-            !reply.starts_with(b"HTTP/1.1 200"),
-            "post-stop connection was served: {}",
-            String::from_utf8_lossy(&reply)
-        );
-    }
+    assert_post_stop_connect_is_not_served(&proxy, server.address).await;
     // The held pre-stop connection is closed by the stop instead of being
     // served: the read ends (EOF or reset) rather than hanging, and the
     // vault saw nothing from it.
@@ -1214,7 +1183,7 @@ async fn proxy_process_tree_end_stops_listener_and_discards_matchers() {
     .await
     .unwrap();
     proxy.process_tree_ended();
-    assert!(TcpStream::connect(proxy.address()).await.is_err());
+    assert_post_stop_connect_is_not_served(&proxy, server.address).await;
     assert!(proxy.state.patterns.lock().is_empty());
 }
 
@@ -1318,7 +1287,7 @@ async fn proxy_expired_grant_refuses_without_material_and_tunnel_closes_on_stop(
         200
     );
     proxy.process_tree_ended();
-    assert!(TcpStream::connect(proxy.address()).await.is_err());
+    assert_post_stop_connect_is_not_served(&proxy, server.address).await;
     assert_eq!(client.request("/approved", json!({}), "")["error"], true);
 }
 
@@ -1448,4 +1417,41 @@ fn proxy_only_accepts_grants_for_the_exact_launch_scan() {
         SecretProxy::start_with_tls(cfg, tls).err(),
         Some(ProxyError::InvalidRules)
     );
+}
+
+/// A stopped proxy's listener is closed before `stop()` returns, so a fresh
+/// connect is normally refused. It can still succeed when the kernel finished
+/// the handshake before the close, or when another test has since bound the
+/// recycled port. Such a socket must never be served by this proxy: no
+/// success response for an authenticated CONNECT.
+async fn assert_post_stop_connect_is_not_served(
+    proxy: &SecretProxy,
+    authority: std::net::SocketAddr,
+) {
+    if let Ok(mut stray) = TcpStream::connect(proxy.address()).await {
+        let url = proxy.proxy_url();
+        let token = url
+            .strip_prefix("http://")
+            .and_then(|rest| rest.split_once(":@"))
+            .map(|(token, _)| token.to_owned());
+        if let Some(token) = token {
+            let credentials = base64::engine::general_purpose::STANDARD.encode(format!("{token}:"));
+            let _ = stray
+                .write_all(
+                    format!(
+                        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\
+                         Proxy-Authorization: Basic {credentials}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        }
+        let mut reply = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), stray.read_to_end(&mut reply)).await;
+        assert!(
+            !reply.starts_with(b"HTTP/1.1 200"),
+            "post-stop connection was served: {}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
 }
