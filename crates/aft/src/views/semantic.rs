@@ -1061,10 +1061,12 @@ impl SemanticPlane {
         generation: &ComposedGeneration,
     ) -> Result<Option<Box<dyn super::semantic_arena::RunSource>>, PlaneError> {
         if let super::contracts::StorageRoute::V3(route) = access.route(generation) {
-            return SemanticStore::v3_reader(&route)
+            let opened = std::sync::OnceLock::new();
+            return SemanticStore::v3_reader(&route, &opened)
                 .map(|reader| {
-                    reader
-                        .map(|reader| Box::new(reader) as Box<dyn super::semantic_arena::RunSource>)
+                    reader.map(|reader| {
+                        Box::new(reader.clone()) as Box<dyn super::semantic_arena::RunSource>
+                    })
                 })
                 .map_err(|error| plane_error(error.to_string()));
         }
