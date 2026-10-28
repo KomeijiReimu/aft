@@ -447,53 +447,31 @@ fn wait_until_process_exits(pid: i32) -> bool {
 #[test]
 fn bash_streams_progress_and_returns_final_response() {
     let mut aft = AftProcess::spawn();
-
-    let response = aft.send(r#"{"id":"bash-1","method":"bash","params":{"command":"echo hello"}}"#);
-    assert_eq!(response["id"], "bash-1");
+    let frames = aft.send_until(
+        r#"{"id":"bash-1","method":"bash","handles_progress":true,"params":{"command":"echo hello; sleep 1","foreground_orchestrate":true,"wait":true}}"#,
+        |frame| frame["id"] == "bash-1",
+    );
+    let response = frames.last().unwrap();
     assert_eq!(response["success"], true);
-    assert!(
-        matches!(
-            response["status"].as_str(),
-            Some("running" | "completed" | "failed" | "killed" | "timed_out" | "fate_unknown")
-        ),
-        "unexpected spawn status: {response:?}"
-    );
+    assert_eq!(response["output"].as_str().unwrap().replace("\r\n", "\n"), "hello\n");
+    assert_eq!(response["exit_code"], 0);
+    assert!(frames[..frames.len() - 1].iter().any(|frame| {
+        frame["type"] == "progress" && frame["request_id"] == "bash-1"
+            && frame["kind"] == "stdout" && frame["chunk"] == "hello\n"
+    }), "missing stdout progress before terminal reply: {frames:?}");
+    assert!(aft.shutdown().success());
+}
 
-    let task_id = response["task_id"].as_str().unwrap();
-    let started = std::time::Instant::now();
-    let status = loop {
-        let status = aft.send(
-            &serde_json::json!({
-                "id": "bash-1-status",
-                "method": "bash_status",
-                "params": { "task_id": task_id }
-            })
-            .to_string(),
-        );
-        if status["status"] == "completed" {
-            break status;
-        }
-        // This test checks what a finished task reports, not how fast the shell
-        // starts; a task that never finishes still fails here, with its last
-        // status.
-        assert!(
-            started.elapsed() < POSITIVE_COMPLETION_WAIT,
-            "task did not complete within {POSITIVE_COMPLETION_WAIT:?}; last status: {status:?}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    };
-    assert_eq!(
-        status["output_preview"]
-            .as_str()
-            .unwrap()
-            .replace("\r\n", "\n"),
-        "hello\n"
+#[test]
+fn bash_progress_requires_transport_opt_in() {
+    let mut aft = AftProcess::spawn();
+    let frames = aft.send_until(
+        r#"{"id":"bash-no-progress","method":"bash","params":{"command":"echo hello; sleep 1","foreground_orchestrate":true,"wait":true}}"#,
+        |frame| frame["id"] == "bash-no-progress",
     );
-    assert_eq!(status["exit_code"], 0);
-    assert!(status["duration_ms"].is_u64());
-
-    let status = aft.shutdown();
-    assert!(status.success());
+    assert_eq!(frames.last().unwrap()["success"], true);
+    assert!(frames.iter().all(|frame| frame["type"] != "progress"), "unexpected progress: {frames:?}");
+    assert!(aft.shutdown().success());
 }
 
 #[test]
