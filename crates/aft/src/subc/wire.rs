@@ -1092,6 +1092,31 @@ pub(super) fn build_tool_response_frame(
     )
 }
 
+/// Carrier bodies are already closed and validated. Keep them out of the
+/// ordinary serializer, which adds id, success and rendered text fields.
+pub(super) fn build_carrier_response_frame(
+    request: &Frame,
+    entry: Option<&Value>,
+    body: Value,
+) -> Result<WriterFrame, SubcError> {
+    if super::rich_ui::carrier::validate_body(entry, &body).is_err() {
+        return build_carrier_response_frame(
+            request,
+            None,
+            super::rich_ui::carrier::error_body("result_schema_mismatch"),
+        );
+    }
+    Ok(WriterFrame::plain(Frame::build_with_version(
+        request.header.ver,
+        FrameType::Response,
+        request.header.flags,
+        request.header.channel,
+        request.header.epoch,
+        request.header.corr,
+        serde_json::to_vec(&body)?,
+    )?))
+}
+
 pub(super) fn build_tool_response_frame_with_limit(
     ver: u8,
     route: RouteChannel,

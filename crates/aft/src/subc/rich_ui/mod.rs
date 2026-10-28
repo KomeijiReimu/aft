@@ -17,14 +17,18 @@
 //! - `chunks`: the `rich_ui.manifest_chunk` and `rich_ui.template_chunk`
 //!   provider reads that serve manifest and template bytes to Occipital.
 //!
-//! Apart from `chunks`, nothing here touches the daemon, the database or the
-//! wire. Until publication the other modules' only users are tests, so their
-//! dead-code allowances are module-local.
+//! Operation admission is live but fails closed without a published manifest.
+//! Query translation and result projection are staged for the policy-route and
+//! handler integrations; their dead-code allowances remain module-local.
 
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod admission;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod builder;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod canonical;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod carrier;
 pub(crate) mod chunks;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod jcs_number;

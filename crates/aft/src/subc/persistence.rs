@@ -118,6 +118,10 @@ impl DatabaseWaits {
         let Ok(body) = decoded.body() else {
             return Err(decoded);
         };
+        // A carrier-supplied preset must never restore worker launch authority.
+        if super::occipital_route(identity) && super::route_request_is_tool_call(body) {
+            return Err(decoded);
+        }
         let name = body.get("name").and_then(Value::as_str).unwrap_or("");
         if body.get("preset").and_then(Value::as_str) != Some("worker")
             || body
@@ -221,6 +225,20 @@ impl DatabaseWaits {
         let Ok(body) = decoded.body() else {
             return Err(decoded);
         };
+        // Structural carrier refusals precede all policy/database waits, for
+        // both the bare request and explicit tool.call forms.
+        if super::occipital_route(identity) && super::route_request_is_tool_call(body) {
+            let admitted = super::carrier_read_only::admit(identity, body).and_then(|()| {
+                super::carrier_read_only::admit_operation(
+                    identity,
+                    body["name"].as_str().unwrap_or(""),
+                    body.get("arguments").unwrap_or(&Value::Null),
+                )
+            });
+            if super::occipital_session_refusal(identity, body).is_some() || admitted.is_err() {
+                return Err(decoded);
+            }
+        }
         // A scoped worker's saved confinement lives in aft.db, and the bind
         // reply goes out while that database may still be opening. Its
         // catalog fetch and tool calls wait for the open rather than be
