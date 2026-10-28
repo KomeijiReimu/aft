@@ -464,7 +464,9 @@ fn bash_streams_progress_and_returns_final_response() {
             frame["type"] == "progress"
                 && frame["request_id"] == "bash-1"
                 && frame["kind"] == "stdout"
-                && frame["chunk"] == "hello\n"
+                && frame["chunk"]
+                    .as_str()
+                    .is_some_and(|chunk| chunk.replace("\r\n", "\n") == "hello\n")
         }),
         "missing stdout progress before terminal reply: {frames:?}"
     );
@@ -492,7 +494,7 @@ fn bash_progress_masks_environment_secrets() {
     let secret = "progress-secret-1052-very-sensitive-value";
     let frames = aft.send_until(&serde_json::json!({
         "id": "bash-mask-progress", "method": "bash", "handles_progress": true,
-        "params": { "command": "echo $PROGRESS_SECRET_TOKEN; sleep 1", "env": {"PROGRESS_SECRET_TOKEN": secret}, "foreground_orchestrate": true, "wait": true }
+        "params": { "command": format!("echo {secret}; sleep 1"), "env": {"PROGRESS_SECRET_TOKEN": secret}, "foreground_orchestrate": true, "wait": true }
     }).to_string(), |frame| frame["id"] == "bash-mask-progress");
     let progress = frames
         .iter()
