@@ -1077,7 +1077,7 @@ impl PinnedDir {
         let mut entries = self
             .repair_names(budget)?
             .into_iter()
-            .map(|name| Ok((name, true)));
+            .map(|name| Ok::<_, io::Error>((name, true)));
         loop {
             // Check before advancing the iterator, not after collecting a whole
             // directory. Also check while processing leaves, not just recursion.
