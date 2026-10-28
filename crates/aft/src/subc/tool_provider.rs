@@ -6973,6 +6973,7 @@ mod route_tests {
         };
         let call = |content: &str, profile_reads: usize| -> Value {
             let run = PlainToolRun {
+                speech_seed: None,
                 bare_name: "write".into(),
                 arguments: json!({"path": "pin.rs", "content": content}),
                 format_context: Default::default(),
