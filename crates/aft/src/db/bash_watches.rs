@@ -348,8 +348,8 @@ pub(crate) fn delivery_ack_version(
     session: &str,
     task: &str,
     watch: &str,
-) -> rusqlite::Result<Option<u64>> {
-    conn.query_row("SELECT version FROM bash_watch_delivery_acks WHERE harness=?1 AND session_id=?2 AND task_id=?3 AND watch_id=?4", params![harness, session, task, watch], |r| r.get::<_, i64>(0).map(|v| v.max(0) as u64)).optional()
+) -> rusqlite::Result<Option<(u64, String, u64)>> {
+    conn.query_row("SELECT version, eviction_epoch, evicted_through FROM bash_watch_delivery_acks WHERE harness=?1 AND session_id=?2 AND task_id=?3 AND watch_id=?4", params![harness, session, task, watch], |r| Ok((r.get::<_, i64>(0)?.max(0) as u64, r.get(1)?, r.get::<_, i64>(2)?.max(0) as u64))).optional()
 }
 
 pub(crate) fn acknowledge_delivery(
@@ -359,8 +359,13 @@ pub(crate) fn acknowledge_delivery(
     task: &str,
     watch: &str,
     version: u64,
+    gap: Option<&crate::bash_background::watch_lines::RetryGap>,
 ) -> rusqlite::Result<()> {
-    conn.execute("INSERT INTO bash_watch_delivery_acks(harness, session_id, task_id, watch_id, version, acknowledged_at) VALUES(?1,?2,?3,?4,?5,unixepoch()) ON CONFLICT(harness, session_id, task_id, watch_id) DO UPDATE SET version=MAX(version,excluded.version), acknowledged_at=excluded.acknowledged_at", params![harness, session, task, watch, version as i64])?;
+    let epoch = gap
+        .map(|gap| gap.eviction_epoch.as_str())
+        .unwrap_or_default();
+    let through = gap.map(|gap| gap.evicted_through).unwrap_or_default();
+    conn.execute("INSERT INTO bash_watch_delivery_acks(harness, session_id, task_id, watch_id, version, acknowledged_at, eviction_epoch, evicted_through) VALUES(?1,?2,?3,?4,?5,unixepoch(),?6,?7) ON CONFLICT(harness, session_id, task_id, watch_id) DO UPDATE SET version=MAX(version,excluded.version), acknowledged_at=excluded.acknowledged_at, eviction_epoch=CASE WHEN excluded.eviction_epoch != '' THEN excluded.eviction_epoch ELSE eviction_epoch END, evicted_through=CASE WHEN excluded.eviction_epoch != '' THEN excluded.evicted_through ELSE evicted_through END", params![harness, session, task, watch, version as i64, epoch, through as i64])?;
     // Retry queues are process-local. A month-old acknowledgement cannot still
     // have a transport copy waiting in the daemon that wrote it.
     conn.execute(
@@ -368,4 +373,15 @@ pub(crate) fn acknowledge_delivery(
         [],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn watch_gap_health_for_path(path: &std::path::Path) -> GapCensus {
+    WATCH_GAP_CENSUS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .get(&path.to_string_lossy().into_owned())
+        .copied()
+        .unwrap_or_default()
 }

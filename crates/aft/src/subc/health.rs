@@ -9569,3 +9569,77 @@ mod observability_retention_tests {
         assert!(events.keys().all(|key| key.session != "inactive"));
     }
 }
+
+#[cfg(test)]
+mod watch_gap_tests {
+    use super::*;
+
+    #[test]
+    fn retry_overflow_health_keeps_evictions_separate_and_clears_after_ack() {
+        use crate::bash_background::watch_lines::{LineBatch, RetryGap};
+        use crate::db::bash_watches::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let conn = crate::db::open(&path).unwrap();
+        let batch = LineBatch {
+            retry_gap: Some(RetryGap {
+                reason: "retry_overflow".into(),
+                dropped_notifications: 3,
+                known_missing_occurrences: 1,
+                ..Default::default()
+            }),
+            version: Some(5),
+            ..Default::default()
+        };
+        let mut row = BashPatternWatchRow {
+            harness: "opencode".into(),
+            session_id: "session".into(),
+            task_id: "task".into(),
+            watch_id: "watch".into(),
+            pattern_kind: "substring".into(),
+            pattern: "READY".into(),
+            once: false,
+            each_line: false,
+            match_batch: Some(serde_json::to_string(&batch).unwrap()),
+            created_at: 0,
+            stdout_offset: 0,
+            stderr_offset: 0,
+            pty_offset: 0,
+            scanning: true,
+            pending_match: true,
+            match_text: Some("watch delivery gap".into()),
+            match_offset: Some(5),
+            match_context: None,
+        };
+        upsert_bash_pattern_watch(&conn, &row).unwrap();
+        let (gaps, missing, uncertain) = watch_gap_health_for_path(&path);
+        assert_eq!((gaps, missing, uncertain), (1, 1, false));
+        let health = super::super::watch_delivery::health_from_census(gaps, missing, uncertain, 0);
+        assert_eq!(health["status"], "degraded");
+        assert_eq!(health["reason"], "retry_overflow");
+        assert_eq!(health["outstanding_watch_gaps"], 1);
+        assert_eq!(health["known_missing_occurrences"], 1);
+        assert!(health["evicted_transport_copies_total"].is_u64());
+        acknowledge_delivery(
+            &conn,
+            "opencode",
+            "session",
+            "task",
+            "watch",
+            5,
+            batch.retry_gap.as_ref(),
+        )
+        .unwrap();
+        row.pending_match = false;
+        upsert_bash_pattern_watch(&conn, &row).unwrap();
+        let (gaps, missing, uncertain) = watch_gap_health_for_path(&path);
+        let cleared = super::super::watch_delivery::health_from_census(gaps, missing, uncertain, 0);
+        assert_eq!(cleared["status"], "ok");
+        assert!(cleared["reason"].is_null());
+        assert_eq!(cleared["outstanding_watch_gaps"], 0);
+        assert_eq!(cleared["known_missing_occurrences"], 0);
+        let unconfirmed = super::super::watch_delivery::health_from_census(0, 0, true, 1);
+        assert_eq!(unconfirmed["status"], "degraded");
+        assert_eq!(unconfirmed["reason"], "watch_gap_persistence_unconfirmed");
+    }
+}

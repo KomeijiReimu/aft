@@ -508,7 +508,11 @@ export interface BashWatchLineBatch {
     first_offset?: number;
     last_offset?: number;
     stream?: string;
+    evicted_through?: number;
+    eviction_epoch?: string;
+    last_match_version?: number;
   };
+  acknowledged_version?: number;
   pending_id?: string;
   version?: number;
   terminal_summary?: boolean;

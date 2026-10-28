@@ -2941,3 +2941,95 @@ for (const route of ["in-turn", "wake"] as const) {
     });
   });
 }
+
+for (const route of ["in-turn", "wake"] as const) {
+  test(`admitted retry gap-only snapshots wake once per new version after a failed ack (${route})`, async () => {
+    const first = {
+      task_id: "task-batch",
+      session_id: "s1",
+      watch_id: "watch-batch",
+      match_offset: 0,
+      match_text: "matching lines",
+      context: "batch",
+      once: false,
+      reason: "pattern_match",
+      batch: {
+        pending_id: "pending-a",
+        version: 0,
+        snapshot: true,
+        lines: [],
+        retry_gap: {
+          reason: "retry_overflow" as const,
+          dropped_notifications: 2,
+          known_missing_occurrences: 1,
+          first_offset: 10,
+        },
+        dropped_lines: 0,
+        skipped_long_lines: 0,
+        first_dropped_offset: 20,
+        first_dropped_stream: "stdout",
+      },
+    };
+    let current = first;
+    let failAck = true;
+    const acknowledgements: Record<string, unknown>[] = [];
+    const { ctx } = harness((command, params) => {
+      if (command === "bash_drain_completions")
+        return { success: true, bg_completions: [], pending_matches: [current] };
+      if (command === "bash_ack_completions") {
+        acknowledgements.push(params);
+        if (failAck) {
+          failAck = false;
+          return { success: false, message: "ack response lost" };
+        }
+        return { success: true, acked_matches: params.matches ?? [] };
+      }
+      return { success: true };
+    });
+    const sent: string[] = [];
+    const client = makeClient(
+      mock(async (input: unknown) => {
+        sent.push((input as { body: { parts: { text: string }[] } }).body.parts[0].text);
+      }),
+    );
+    const context = { ctx, directory: "/tmp/project", sessionID: "s1", client };
+    const deliver = async () => {
+      if (route === "in-turn") {
+        const output = { output: "tool" };
+        await appendInTurnBgCompletions(context, output);
+        return output.output;
+      }
+      const wanted = sent.length + 1;
+      await handleSubcBgEventsNudge(context);
+      await waitUntil(() => sent.length === wanted && acknowledgements.length >= wanted);
+      return sent.at(-1)!;
+    };
+    const old = await deliver();
+    expect(old).toContain("a stalled connection dropped 2 watch notices; matches may be missing.");
+    expect(old).toContain("Known missing occurrences: 1.");
+    current = {
+      ...first,
+      match_offset: 1,
+      batch: {
+        ...first.batch,
+        version: 1,
+        lines: [],
+        retry_gap: {
+          ...first.batch.retry_gap,
+          dropped_notifications: 3,
+          known_missing_occurrences: 2,
+        },
+        dropped_lines: 0,
+        skipped_long_lines: 0,
+      },
+    };
+    const next = await deliver();
+    expect(next).toContain("a stalled connection dropped 1 watch notice; matches may be missing.");
+    expect(next).not.toContain("dropped 3 watch notices");
+    expect(next).toContain("Known missing occurrences: 1.");
+    expect(acknowledgements.at(-1)).toEqual({
+      session_id: "s1",
+      matches: [{ task_id: "task-batch", watch_id: "watch-batch", match_offset: 1 }],
+    });
+  });
+}

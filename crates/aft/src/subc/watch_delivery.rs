@@ -4,9 +4,14 @@ use crate::protocol::BashPatternMatchFrame;
 use std::sync::{Mutex, Weak};
 
 static PENDING_CHECKS: AtomicUsize = AtomicUsize::new(0);
+static NEXT_EVICTION: AtomicU64 = AtomicU64::new(1);
+static EVICTION_EPOCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 #[derive(Clone)]
 pub(crate) struct Candidate {
+    pub eviction_epoch: String,
+    pub last_eviction: u64,
+    pub fingerprint: Vec<u8>,
     pub frame: BashPatternMatchFrame,
     pub notifications: u64,
     pub first_version: u64,
@@ -15,34 +20,52 @@ pub(crate) struct Candidate {
     pub last_offset: Option<u64>,
     pub stream: Option<String>,
     pub same_generation: bool,
+    pub same_occurrence: bool,
 }
 
 impl Candidate {
     fn new(mut frame: BashPatternMatchFrame) -> Self {
-        let first_offset = frame
-            .batch
-            .as_ref()
-            .and_then(|b| b.lines.first())
-            .map(|l| l.offset)
-            .or(Some(frame.match_offset));
-        let last_offset = frame
-            .batch
-            .as_ref()
-            .and_then(|b| b.lines.last())
-            .map(|l| l.end_offset)
-            .or(first_offset);
-        let stream = frame
-            .batch
-            .as_ref()
-            .and_then(|b| b.lines.first())
-            .map(|l| l.stream.clone());
+        use sha2::Digest;
+        let fingerprint = sha2::Sha256::digest(frame.match_text.as_bytes()).to_vec();
+        let (first_offset, last_offset, stream) = if let Some(batch) = &frame.batch {
+            let stream = batch.lines.first().map(|line| line.stream.clone());
+            if batch
+                .lines
+                .iter()
+                .all(|line| Some(&line.stream) == stream.as_ref())
+            {
+                (
+                    batch
+                        .lines
+                        .first()
+                        .map(|line| line.offset)
+                        .or(batch.first_dropped_offset),
+                    batch.lines.last().map(|line| {
+                        line.offset.saturating_add(
+                            line.count
+                                .saturating_mul(line.end_offset.saturating_sub(line.offset)),
+                        )
+                    }),
+                    stream.or(batch.first_dropped_stream.clone()),
+                )
+            } else {
+                (None, None, None)
+            }
+        } else {
+            (Some(frame.match_offset), Some(frame.match_offset), None)
+        };
         let version = frame.match_offset;
-        frame.match_text.clear();
-        frame.context.clear();
+        frame.match_text = String::new();
+        frame.context = String::new();
         if let Some(batch) = &mut frame.batch {
-            batch.lines.clear();
+            batch.lines = Vec::new();
         }
         Self {
+            eviction_epoch: EVICTION_EPOCH
+                .get_or_init(|| uuid::Uuid::new_v4().to_string())
+                .clone(),
+            last_eviction: NEXT_EVICTION.fetch_add(1, Ordering::Relaxed),
+            fingerprint,
             frame,
             notifications: 1,
             first_version: version,
@@ -51,10 +74,15 @@ impl Candidate {
             last_offset,
             stream,
             same_generation: true,
+            same_occurrence: true,
         }
     }
 
     fn merge(&mut self, next: Self) {
+        self.same_occurrence &= next.same_occurrence
+            && self.fingerprint == next.fingerprint
+            && self.first_version == next.first_version;
+        self.last_eviction = self.last_eviction.max(next.last_eviction);
         self.notifications = self.notifications.saturating_add(next.notifications);
         self.first_version = self.first_version.min(next.first_version);
         self.last_version = self.last_version.max(next.last_version);
@@ -129,21 +157,7 @@ impl WatchDelivery {
             (0, 0, false)
         };
         let pending = PENDING_CHECKS.load(Ordering::Relaxed);
-        let reason = if gaps > 0 {
-            Some("retry_overflow")
-        } else if pending > 0 || uncertain {
-            Some("watch_gap_persistence_unconfirmed")
-        } else {
-            None
-        };
-        serde_json::json!({
-            "evicted_transport_copies_total": push::reliable_push_evictions(),
-            "outstanding_watch_gaps": gaps,
-            "known_missing_occurrences": missing,
-            "pending_gap_checks": pending,
-            "status": if reason.is_some() { "degraded" } else { "ok" },
-            "reason": reason,
-        })
+        health_from_census(gaps, missing, uncertain, pending)
     }
 
     pub(super) fn kick(self: &Arc<Self>) {
@@ -175,7 +189,10 @@ impl WatchDelivery {
                         .lock()
                         .unwrap()
                         .entry(key)
-                        .and_modify(|new| new.merge(candidate.clone()))
+                        .and_modify(|new| {
+                            new.merge(candidate.clone());
+                            PENDING_CHECKS.fetch_sub(1, Ordering::Relaxed);
+                        })
                         .or_insert(candidate);
                 } else {
                     PENDING_CHECKS.fetch_sub(1, Ordering::Relaxed);
@@ -191,6 +208,29 @@ impl WatchDelivery {
             }
         });
     }
+}
+
+pub(super) fn health_from_census(
+    gaps: u64,
+    missing: u64,
+    uncertain: bool,
+    pending: usize,
+) -> serde_json::Value {
+    let reason = if gaps > 0 {
+        Some("retry_overflow")
+    } else if pending > 0 || uncertain {
+        Some("watch_gap_persistence_unconfirmed")
+    } else {
+        None
+    };
+    serde_json::json!({
+        "evicted_transport_copies_total": push::reliable_push_evictions(),
+        "outstanding_watch_gaps": gaps,
+        "known_missing_occurrences": missing,
+        "pending_gap_checks": pending,
+        "status": if reason.is_some() { "degraded" } else { "ok" },
+        "reason": reason,
+    })
 }
 
 #[cfg(test)]
