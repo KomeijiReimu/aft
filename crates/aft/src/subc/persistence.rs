@@ -249,7 +249,10 @@ impl DatabaseWaits {
         if carrier_precheck_failed(identity, body) {
             return Err(decoded);
         }
-        if super::occipital_carrier_route(identity) && super::route_request_is_tool_call(body) {
+        if identity.role == tool_provider::RouteRole::ToolProviderV1
+            && super::occipital_carrier_route(identity)
+            && super::route_request_is_tool_call(body)
+        {
             // Worker role and confinement both depend on the policy route's
             // preset row. Do not let the carrier's disables or preset reject
             // the call before that row can be read.
@@ -395,9 +398,11 @@ impl DatabaseWaits {
         if carrier_precheck_failed(identity, body) {
             return Err(decoded);
         }
-        // Carrier policy is resolved on its executor job, including the saved
-        // confinement. A read here would use Occipital's bind principal instead.
-        if super::occipital_carrier_route(identity) {
+        // V1 carrier policy is resolved on its executor job, including saved
+        // confinement. Legacy calls still need the ordinary pre-admission read.
+        if identity.role == tool_provider::RouteRole::ToolProviderV1
+            && super::occipital_carrier_route(identity)
+        {
             return Err(decoded);
         }
         // Catalog fetches and the other provider operations run on the
