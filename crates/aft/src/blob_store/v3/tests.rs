@@ -188,23 +188,22 @@ fn changing_derived_database_reports_busy_then_measurement_recovers() {
     seed(root.path(), A);
     let derived_dir = view_dir(root.path(), A, "churning-view").unwrap();
     fs::create_dir_all(&derived_dir).unwrap();
-    let derived = IdentityConnection::open(
-        derived_dir.join("derived-generation.sqlite"),
-        "v3-measurement-churn",
-    )
-    .unwrap();
-    derived
-        .execute_batch("CREATE TABLE growing(payload BLOB)")
-        .unwrap();
     let lock = ReservationLock::acquire(root.path()).unwrap();
     let mut writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
     let writes = std::rc::Rc::new(std::cell::Cell::new(0));
     let count = writes.clone();
-    // A derived graph can commit outside the root reservation lock. Place one
-    // real SQLite commit between each inventory walk and its confirmation.
+    // A derived graph can commit outside the root reservation lock. Create a
+    // new generation between each inventory walk and its confirmation, so
+    // growth does not depend on the filesystem's allocation granularity.
     RECHECK_HOOK.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(move || {
-            derived.execute("INSERT INTO growing VALUES(zeroblob(16384))", [])?;
+            let derived = IdentityConnection::open(
+                derived_dir.join(format!("derived-{}.sqlite", count.get())),
+                "v3-measurement-churn",
+            )?;
+            derived.execute_batch(
+                "CREATE TABLE growing(payload BLOB); INSERT INTO growing VALUES(zeroblob(16384));",
+            )?;
             count.set(count.get() + 1);
             Ok(())
         }))
@@ -332,7 +331,7 @@ fn unreadable_peer_ledger_refuses_instead_of_ignoring_reserved_bytes() {
         "{detail}"
     );
     assert!(detail.contains("members.sqlite"), "{detail}");
-    assert!(detail.contains("file is not a database"), "{detail}");
+    assert!(detail.contains("schema_drift"), "{detail}");
     assert!(!db(root.path(), B).exists());
 }
 
