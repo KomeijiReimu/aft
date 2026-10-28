@@ -319,6 +319,40 @@ fn daemon_and_plexus_refusals_decode_with_their_stage() {
 }
 
 #[test]
+fn vendored_reply_contract_decodes_every_native_plexus_outcome() {
+    let vectors = super::super::plexus_contract_judge::load_reply_vectors();
+    assert_eq!(vectors.len(), 17);
+    for vector in vectors {
+        let name = vector["name"].as_str().unwrap();
+        let reply = &vector["reply"];
+        let result = &reply["result"];
+        let parsed = parse_reply(&ok_envelope(reply.clone()));
+        let generation = reply["repo_binding_generation"].as_u64();
+        let expected = match result["status"].as_str().unwrap() {
+            "refused" => Reply::Refused {
+                code: result["refusal_code"].as_str().unwrap().to_string(),
+                stage: PLEXUS_REPLY_STAGE.to_string(),
+                message: String::new(),
+                generation,
+            },
+            "completed" => Reply::Completed {
+                generation,
+                result: result["result"].clone(),
+            },
+            status => panic!("{name}: untested reply status {status}"),
+        };
+        assert_eq!(parsed, expected, "{name}");
+        if name == "resolve-thread-not-own" {
+            let code = result["refusal_code"].as_str().unwrap();
+            assert_eq!(result["transmission"], "not_sent");
+            assert_eq!(classify_code(code), CodeClass::Unknown);
+            assert_eq!(plexus_refusal_text(code, classify_code(code)),
+                "plexus refused the bot write with a code this shim does not know: review_thread_not_own; it was not retried");
+        }
+    }
+}
+
+#[test]
 fn bot_write_requires_scope_is_an_aft_refusal_with_the_governance_exit() {
     let refusal = json!({
         "op": BOT_REQUEST_OPERATION,
