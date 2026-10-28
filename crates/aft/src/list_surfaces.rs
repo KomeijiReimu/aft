@@ -355,6 +355,18 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "subc/rich_ui/bash_output.rs",
+        enclosing_item: "page, stream_items",
+        location_or_primitive: "limit, PAGE_BYTES, ITEM_BYTES",
+        reason: "Resumable cursor pages split output losslessly by byte limits instead of dropping result items.",
+    },
+    ExclusionEntry {
+        file: "bash_background/viewed_task.rs",
+        enclosing_item: "resolve",
+        location_or_primitive: "SQL LIMIT 2",
+        reason: "The LIMIT 2 uniqueness probe detects ambiguous task keys and never returns a list.",
+    },
+    ExclusionEntry {
         file: "commands/read.rs",
         enclosing_item: "fit_github_images, process_image_fitting",
         location_or_primitive: "remaining image byte budget, MAX_IMAGE_FIT_STEPS",
