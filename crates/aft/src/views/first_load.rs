@@ -6025,10 +6025,14 @@ impl CheckoutDriver {
                     .install_cut()
                     .and_then(|cut| cut.verification.as_ref())
                     .is_some_and(|guard| {
-                        !guard.steady_supported
+                        let stale = !guard.steady_supported
                             || guard.subscription.is_none()
                             || crate::watcher_backend::subscription::current(self.owner.root())
-                                != guard.subscription
+                                != guard.subscription;
+                        if stale {
+                            eprintln!("semantic subscription stale root={:?} steady_supported={} recorded={:?} current={:?}", self.owner.root(), guard.steady_supported, guard.subscription, crate::watcher_backend::subscription::status(self.owner.root()));
+                        }
+                        stale
                     })
         };
         if stale {
