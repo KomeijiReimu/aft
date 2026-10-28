@@ -273,6 +273,10 @@ const VIEW_DISK_LIMITS_OFF: u64 = u64::MAX;
 /// checkout's semantic index has finished loading.
 pub(crate) const VIEW_PUBLICATION_WAITING_FOR_SEMANTIC_INDEX: &str =
     "semantic view publication is waiting for the semantic index";
+/// Refusal of a content-addressed v1 view publication on a root whose views
+/// route every read through its v3 checkout views.
+pub(crate) const VIEW_PUBLICATION_STOPPED_ON_ROUTED_ROOT: &str =
+    "v1 view publication is stopped: this root's views read its v3 checkout views";
 /// The publication phase that takes the query pin for a newly assembled
 /// generation. Before it, publication walks source paths, assembles the
 /// generation, and opens the view to load its manifest.
@@ -309,6 +313,12 @@ thread_local! {
 
 thread_local! {
     static CHECKOUT_QUERY_OUTCOMES: std::cell::RefCell<Vec<(usize, Option<crate::views::contracts::WaitOutcome>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static LEXICAL_QUERY_SNAPSHOTS: std::cell::RefCell<Vec<(usize, Result<crate::search_index::SearchIndexSnapshot, String>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The call-graph reader each pinned request acquired from its checkout
+    /// view, so every graph read in one request answers from one generation.
+    static CALLGRAPH_QUERY_READERS: std::cell::RefCell<Vec<(usize, Result<Arc<ReadonlyCallGraphStore>, crate::views::callgraph::CallgraphViewError>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -400,6 +410,10 @@ pub struct ConfigPinGuard {
 impl Drop for ConfigPinGuard {
     fn drop(&mut self) {
         if let Some(key) = self.key {
+            LEXICAL_QUERY_SNAPSHOTS
+                .with(|snapshots| snapshots.borrow_mut().retain(|(id, _)| *id != key));
+            CALLGRAPH_QUERY_READERS
+                .with(|readers| readers.borrow_mut().retain(|(id, _)| *id != key));
             CHECKOUT_QUERY_OUTCOMES.with(|outcomes| {
                 outcomes
                     .borrow_mut()
@@ -4565,6 +4579,13 @@ pub struct AppContext {
     #[cfg(test)]
     view_publication_attempt_starts: parking_lot::Mutex<Vec<Instant>>,
     checkout_driver: crate::views::first_load::InstalledDriver,
+    lexical_view: parking_lot::Mutex<Option<Arc<crate::views::trigram::LexicalView>>>,
+    lexical_routes: [AtomicU64; 3],
+    callgraph_view: parking_lot::Mutex<Option<Arc<crate::views::callgraph::CallgraphView>>>,
+    callgraph_view_routes: AtomicU64,
+    /// Files whose symbols a views-routed root's prewarm reused from, or
+    /// stored into, the family's v3 symbol plane.
+    symbol_view_routes: Arc<AtomicU64>,
     /// The views-on semantic lane of this root (see `views::semantic_runtime`).
     checkout_semantic: Arc<crate::views::semantic_runtime::CheckoutSemanticSlot>,
     /// Wall-clock milliseconds at which the completion drain should next
@@ -4622,6 +4643,8 @@ pub struct AppContext {
     // probe again after repeated load disconnects.
     search_index_disconnect_reschedule: parking_lot::Mutex<(u64, u32, Option<Instant>)>,
     search_persist_epoch: crate::root_cache::ArtifactPublishEpoch,
+    legacy_search_publication:
+        parking_lot::Mutex<Arc<crate::search_index::LegacySearchPublicationGate>>,
     pub(crate) search_corpus_refresh_lane: Arc<crate::runtime_drain::SearchCorpusRefreshLane>,
     pending_search_index_paths: parking_lot::Mutex<BTreeSet<PathBuf>>,
     symbol_cache: SharedSymbolCache,
@@ -5419,6 +5442,11 @@ impl AppContext {
             #[cfg(test)]
             view_publication_attempt_starts: parking_lot::Mutex::new(Vec::new()),
             checkout_driver: crate::views::first_load::InstalledDriver::default(),
+            lexical_view: parking_lot::Mutex::new(None),
+            lexical_routes: Default::default(),
+            callgraph_view: parking_lot::Mutex::new(None),
+            callgraph_view_routes: AtomicU64::new(0),
+            symbol_view_routes: Arc::default(),
             checkout_semantic: Arc::default(),
             view_disk_limits_next_ms,
             checkout_query_runtime: RwLock::new(None),
@@ -5453,6 +5481,7 @@ impl AppContext {
             search_pending_install: Arc::default(),
             search_index_disconnect_reschedule: parking_lot::Mutex::new((0, 0, None)),
             search_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
+            legacy_search_publication: Default::default(),
             search_corpus_refresh_lane: Arc::default(),
             pending_search_index_paths: parking_lot::Mutex::new(BTreeSet::new()),
             symbol_cache,
@@ -8987,6 +9016,11 @@ impl AppContext {
                 return None;
             };
             let mut next = next;
+            if next.views.enabled {
+                self.legacy_search_publication.lock().revoke();
+            } else if guard.views.enabled {
+                *self.legacy_search_publication.lock() = Arc::default();
+            }
             next.aft_search_registered = next.tool_registered("aft_search");
             #[cfg(test)]
             let next = self.app.isolate_test_config(next);
@@ -9015,6 +9049,10 @@ impl AppContext {
         });
         self.reconcile_rerank_backend(&next);
         self.arm_view_disk_limits(next.views.enabled);
+        if !next.views.enabled || project_root_changed {
+            self.lexical_view.lock().take();
+            self.callgraph_view.lock().take();
+        }
         if project_root_changed {
             self.path_restriction_root_memo.lock().take();
             *self
@@ -9622,17 +9660,6 @@ impl AppContext {
         self.view_publication_attempts.load(Ordering::Acquire)
     }
 
-    #[cfg(test)]
-    pub(crate) fn view_publication_attempt_started_for_test(
-        &self,
-        attempt: usize,
-    ) -> Option<Instant> {
-        self.view_publication_attempt_starts
-            .lock()
-            .get(attempt)
-            .copied()
-    }
-
     pub(crate) fn clear_view_runtime(&self) {
         self.release_view_publication_cache();
         if let Some(root) = self.canonical_cache_root_opt() {
@@ -9645,6 +9672,18 @@ impl AppContext {
             .checkout_query_runtime
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let retired = self
+            .view_runtime
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        drop(retired);
+    }
+
+    /// Drops this root's content-addressed v1 view runtime and nothing else:
+    /// the checkout drivers and the semantic lane keep running.
+    pub(crate) fn drop_v1_view_runtime(&self) {
+        self.release_view_publication_cache();
         let retired = self
             .view_runtime
             .write()
@@ -9892,6 +9931,9 @@ impl AppContext {
         }
         let content_generation = self.configure_content_generation();
         phase("manifest").map_err(|error| error.to_string())?;
+        if self.views_route_root() {
+            return Err(VIEW_PUBLICATION_STOPPED_ON_ROUTED_ROOT.to_owned());
+        }
         if self.retire_deleted_view_root() {
             return Err("view publication root was deleted".to_owned());
         }
@@ -10558,6 +10600,12 @@ impl AppContext {
 
     pub(crate) fn record_checkout_watcher_change(&self, path: &Path) {
         self.reset_view_publication_retry();
+        if let Some(view) = self.lexical_view.lock().as_ref() {
+            view.record_change(path);
+        }
+        if let Some(view) = self.callgraph_view.lock().as_ref() {
+            view.record_change(path);
+        }
         if let Some(driver) = self.checkout_driver.get() {
             driver.record_absolute_change(path);
         }
@@ -10568,6 +10616,12 @@ impl AppContext {
 
     pub(crate) fn record_checkout_watcher_overflow(&self) {
         self.reset_view_publication_retry();
+        if let Some(view) = self.lexical_view.lock().as_ref() {
+            view.record_overflow();
+        }
+        if let Some(view) = self.callgraph_view.lock().as_ref() {
+            view.record_overflow();
+        }
         if let Some(driver) = self.checkout_driver.get() {
             driver.record_watcher_overflow();
         }
@@ -10576,6 +10630,12 @@ impl AppContext {
 
     pub(crate) fn record_checkout_watcher_cookie(&self, path: &Path) {
         self.record_checkout_pending_watcher_gap();
+        if let Some(view) = self.lexical_view.lock().as_ref() {
+            view.record_cookie(path);
+        }
+        if let Some(view) = self.callgraph_view.lock().as_ref() {
+            view.record_cookie(path);
+        }
         if let Some(driver) = self.checkout_driver.get() {
             driver.record_watcher_cookie(path);
         }
@@ -10825,11 +10885,6 @@ impl AppContext {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn lazy_callgraph_builds_scheduled_for_test(&self) -> usize {
-        self.lazy_callgraph.builds_scheduled.load(Ordering::Acquire)
-    }
-
     /// A root actor or the standalone scope now publishes for this context.
     pub(crate) fn note_publication_scope(&self) {
         self.lazy_callgraph
@@ -10946,6 +11001,36 @@ impl AppContext {
                     CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(error.reason))
                 }
                 Err(_) => CallgraphStoreAccess::Building,
+            };
+        }
+        if self.callgraph_views_enabled() {
+            // Warming runs on the transport loop and must not bind a view
+            // there; only a use of the graph acquires it.
+            if !demand {
+                return CallgraphStoreAccess::Building;
+            }
+            return match self.callgraph_view_reader() {
+                Some(Ok(store)) => CallgraphStoreAccess::Ready(store),
+                // A lock held on the view's database says nothing about the
+                // graph: report SQLite's busy error, which callers present as
+                // building, retry shortly.
+                Some(Err(error)) if error.busy => CallgraphStoreAccess::Error(
+                    CallGraphStoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                        Some(error.reason),
+                    )),
+                ),
+                Some(Err(error))
+                    if error
+                        .reason
+                        .contains(crate::views::read::CALLGRAPH_DISABLED) =>
+                {
+                    CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(error.reason))
+                }
+                Some(Err(error)) => CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(
+                    format!("callgraph view unavailable: {error}"),
+                )),
+                None => CallgraphStoreAccess::Unavailable,
             };
         }
         if self.config().views.enabled && self.config().indexes.callgraph {
@@ -11967,6 +12052,246 @@ impl AppContext {
         &self.search_index
     }
 
+    pub(crate) fn legacy_search_publication_gate(
+        &self,
+    ) -> Arc<crate::search_index::LegacySearchPublicationGate> {
+        self.legacy_search_publication.lock().clone()
+    }
+
+    pub(crate) fn lexical_views_enabled(&self) -> bool {
+        let config = self.config();
+        config.views.enabled
+            && config.indexes.trigram
+            && config.project_root.is_some()
+            && self.heavy_root_work_allowed()
+            && self.cache_unavailable_reason().is_none()
+    }
+
+    pub(crate) fn lexical_view_is_ready(&self) -> bool {
+        self.lexical_view
+            .lock()
+            .as_ref()
+            .is_some_and(|view| view.is_ready())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lexical_source_for_test(
+        &self,
+    ) -> Arc<dyn crate::views::trigram::LexicalSnapshotSource> {
+        self.lexical_view.lock().as_ref().unwrap().source_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_lexical_source_for_test(
+        &self,
+        source: Arc<dyn crate::views::trigram::LexicalSnapshotSource>,
+    ) {
+        let root = self.canonical_cache_root();
+        let family = self.memoized_artifact_cache_key(&root);
+        *self.lexical_view.lock() =
+            Some(Arc::new(crate::views::trigram::LexicalView::with_source(
+                root,
+                self.storage_paths(),
+                family,
+                crate::blob_store::v2::TrigramPolicy {
+                    max_file_size: self.config().search_index_max_file_size,
+                },
+                source,
+            )));
+    }
+
+    /// With views enabled, lexical queries use the checkout-local view rather
+    /// than the legacy SearchIndex cache. The separate lexical driver keeps
+    /// lexical service independent of semantic models.
+    pub(crate) fn lexical_view_snapshot(
+        &self,
+        tool: &str,
+    ) -> Option<Result<crate::search_index::SearchIndexSnapshot, String>> {
+        if !self.lexical_views_enabled() {
+            return None;
+        }
+        if let Some(snapshot) = LEXICAL_QUERY_SNAPSHOTS.with(|snapshots| {
+            snapshots
+                .borrow()
+                .iter()
+                .find(|(id, _)| *id == self.config_pin_key())
+                .map(|(_, snapshot)| snapshot.clone())
+        }) {
+            return Some(snapshot);
+        }
+        let config = self.config();
+        let root = self.canonical_cache_root();
+        let storage = self.storage_paths();
+        let policy = crate::blob_store::v2::TrigramPolicy {
+            max_file_size: config.search_index_max_file_size,
+        };
+        let family = self.memoized_artifact_cache_key(&root);
+        // Building the view, recording a watcher gap and binding the checkout
+        // can take long on a cold or loaded machine, and other queries may
+        // wait behind them. None of it is this request's read, so it does not
+        // spend the request's filesystem deadline.
+        let acquired = crate::bounded_io::excluding_wait(|| {
+            let view = {
+                let mut slot = self.lexical_view.lock();
+                if !slot
+                    .as_ref()
+                    .is_some_and(|view| view.matches(&root, &storage, &family, policy))
+                {
+                    match crate::views::trigram::LexicalView::new(root, storage, family, policy) {
+                        Ok(view) => *slot = Some(Arc::new(view)),
+                        Err(error) => return Err(error),
+                    }
+                }
+                slot.as_ref().unwrap().clone()
+            };
+            self.record_checkout_pending_watcher_gap();
+            Ok(view.snapshot())
+        });
+        let result = match acquired {
+            Ok(result) => result,
+            Err(error) => return Some(Err(error)),
+        };
+        if pinned_config_for(self.config_pin_key()).is_some() {
+            LEXICAL_QUERY_SNAPSHOTS.with(|snapshots| {
+                snapshots
+                    .borrow_mut()
+                    .push((self.config_pin_key(), result.clone()))
+            });
+        }
+        if result.is_ok() && tool != "bind" {
+            let index = match tool {
+                "grep" => 0,
+                "glob" => 1,
+                _ => 2,
+            };
+            self.lexical_routes[index].fetch_add(1, Ordering::Relaxed);
+        }
+        Some(result)
+    }
+
+    /// Executed v3 lexical acquisitions, ordered as grep, glob, aft_search.
+    pub fn lexical_view_route_counts(&self) -> [u64; 3] {
+        std::array::from_fn(|index| self.lexical_routes[index].load(Ordering::Relaxed))
+    }
+
+    /// With views enabled, call-graph reads (navigation, zoom, inspect) use
+    /// the checkout's v3 view rather than the legacy store or a v1 view. An
+    /// explicitly installed checkout query runtime keeps precedence.
+    pub(crate) fn callgraph_views_enabled(&self) -> bool {
+        self.views_route_root() && self.config().indexes.callgraph
+    }
+
+    /// True when views serve this root through its own v3 checkout views
+    /// (lexical, call graph and semantic) rather than the content-addressed
+    /// v1 view or the legacy stores. Such a root runs none of the legacy
+    /// views-on writers: no v1 view publication or import, no v1 blob puts
+    /// and no legacy semantic import. An explicitly installed checkout query
+    /// runtime keeps the older route.
+    pub(crate) fn views_route_root(&self) -> bool {
+        let config = self.config();
+        config.views.enabled
+            && config.project_root.is_some()
+            && self.heavy_root_work_allowed()
+            && self.cache_unavailable_reason().is_none()
+            && !self.checkout_query_runtime_active()
+    }
+
+    pub(crate) fn callgraph_view_is_ready(&self) -> bool {
+        self.callgraph_view
+            .lock()
+            .as_ref()
+            .is_some_and(|view| view.is_ready())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_callgraph_source_for_test(
+        &self,
+        source: Arc<dyn crate::views::callgraph::CallgraphReaderSource>,
+    ) {
+        let root = self.canonical_cache_root();
+        let family = self.memoized_artifact_cache_key(&root);
+        *self.callgraph_view.lock() = Some(Arc::new(
+            crate::views::callgraph::CallgraphView::with_source(
+                root,
+                self.storage_paths(),
+                family,
+                crate::blob_store::v2::TrigramPolicy {
+                    max_file_size: self.config().search_index_max_file_size,
+                },
+                source,
+            ),
+        ));
+    }
+
+    /// The call-graph reader of this checkout's view, acquired once per
+    /// pinned request. `None` means views do not route call-graph reads; an
+    /// acquisition error is final and never answered from another store.
+    pub(crate) fn callgraph_view_reader(
+        &self,
+    ) -> Option<Result<Arc<ReadonlyCallGraphStore>, crate::views::callgraph::CallgraphViewError>>
+    {
+        if !self.callgraph_views_enabled() {
+            return None;
+        }
+        if let Some(reader) = CALLGRAPH_QUERY_READERS.with(|readers| {
+            readers
+                .borrow()
+                .iter()
+                .find(|(id, _)| *id == self.config_pin_key())
+                .map(|(_, reader)| reader.clone())
+        }) {
+            return Some(reader);
+        }
+        let config = self.config();
+        let root = self.canonical_cache_root();
+        let storage = self.storage_paths();
+        let policy = crate::blob_store::v2::TrigramPolicy {
+            max_file_size: config.search_index_max_file_size,
+        };
+        let family = self.memoized_artifact_cache_key(&root);
+        let view = {
+            let mut slot = self.callgraph_view.lock();
+            if !slot
+                .as_ref()
+                .is_some_and(|view| view.matches(&root, &storage, &family, policy))
+            {
+                match crate::views::callgraph::CallgraphView::new(root, storage, family, policy) {
+                    Ok(view) => *slot = Some(Arc::new(view)),
+                    Err(error) => return Some(Err(error.into())),
+                }
+            }
+            slot.as_ref().unwrap().clone()
+        };
+        self.record_checkout_pending_watcher_gap();
+        let result = view.reader();
+        if pinned_config_for(self.config_pin_key()).is_some() {
+            CALLGRAPH_QUERY_READERS.with(|readers| {
+                readers
+                    .borrow_mut()
+                    .push((self.config_pin_key(), result.clone()))
+            });
+        }
+        if result.is_ok() {
+            self.callgraph_view_routes.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(result)
+    }
+
+    /// Executed v3 call-graph acquisitions (one per pinned request).
+    pub fn callgraph_view_route_count(&self) -> u64 {
+        self.callgraph_view_routes.load(Ordering::Relaxed)
+    }
+
+    /// Files a views-routed symbol prewarm served from or stored into the
+    /// v3 symbol plane.
+    pub fn symbol_view_route_count(&self) -> u64 {
+        self.symbol_view_routes.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn symbol_view_route_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.symbol_view_routes)
+    }
+
     pub(crate) fn search_exact_memo(
         &self,
     ) -> Arc<crate::commands::semantic_search::memo::ExactMemoStore> {
@@ -12424,6 +12749,10 @@ impl AppContext {
     }
 
     fn search_index_shutdown_outcome(&self) -> SearchIndexShutdownOutcome {
+        if self.config().views.enabled {
+            return SearchIndexShutdownOutcome::Skipped;
+        }
+        let _publication = self.legacy_search_publication_gate().install();
         use SearchIndexShutdownOutcome::{Failed, Flushed, Skipped};
         if self.cache_unavailable_reason().is_some() {
             return Failed("cache root is unavailable");
@@ -13993,6 +14322,12 @@ impl AppContext {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        // A views-routed root's lexical and call-graph views hold their
+        // installed snapshots and the call graph's open reader. The next query
+        // binds a fresh view, which verifies the checkout from its published
+        // generation.
+        self.lexical_view.lock().take();
+        self.callgraph_view.lock().take();
         self.borrowed_index_cache.lock().clear();
         self.clear_semantic_refresh_worker();
         *self.semantic_embedding_model.lock() = None;
@@ -18171,7 +18506,6 @@ mod callgraph_store_for_ops_tests {
     use crate::parser::TreeSitterProvider;
     use crate::protocol::RawRequest;
     use serde_json::json;
-    use std::collections::HashSet;
     use std::path::Path;
     use std::sync::Barrier;
     use tempfile::TempDir;
@@ -20136,20 +20470,6 @@ mod callgraph_store_for_ops_tests {
             assert!(status.success(), "git {args:?} failed with {status}");
         }
 
-        fn publish(&self) {
-            let report = self
-                .ctx
-                .publish_view_paths(BTreeSet::new(), true)
-                .expect("view publication");
-            assert!(report.published, "first view generation must publish");
-            assert_eq!(
-                self.ctx
-                    .view_runtime_snapshot()
-                    .and_then(|view| view.generation),
-                report.generation
-            );
-        }
-
         fn callers(&self) -> crate::protocol::Response {
             crate::commands::callers::handle_callers(
                 &RawRequest {
@@ -20208,96 +20528,6 @@ mod callgraph_store_for_ops_tests {
                 "watcher HEAD metadata event must schedule publication"
             );
         }
-    }
-
-    #[test]
-    fn worktree_view_publishes_dirty_source_after_a_watcher_event() {
-        let fixture = ViewsCallgraphFixture::new();
-        fixture.ctx.set_cache_role(true, None);
-        fixture
-            .ctx
-            .update_config(|config| config.worktree.ram_overlay = false);
-        fixture.publish();
-        let edited = "pub fn dirty_caller() { target(); }\npub fn target() {}\n";
-        std::fs::write(&fixture.source, edited).unwrap();
-        fixture
-            .watcher_tx
-            .send(crate::watcher_filter::WatcherDispatchEvent::Paths(vec![
-                fixture.source.clone(),
-            ]))
-            .unwrap();
-        // Drain to completion before forcing the quiet window to expire: a
-        // slice that exhausts its time budget parks in its apply phase with
-        // the publication still due, and a publication requested from that
-        // phase returns early without clearing the due mark.
-        let outcome = crate::runtime_drain::drain_watcher_to_completion_for_test(&fixture.ctx, 1);
-        assert_eq!(outcome.processed, 1);
-        let mut state = fixture.ctx.watcher_drain_slice().lock().take().unwrap();
-        assert!(state.view_publication_due.is_some());
-        state.view_publication_due = Some(Instant::now());
-        crate::runtime_drain::publish_view_if_quiet(&fixture.ctx, &mut state);
-        assert!(state.view_publication_due.is_none());
-        *fixture.ctx.watcher_drain_slice().lock() = Some(state);
-
-        let response = fixture.callers();
-        assert!(response.success, "{response:?}");
-        assert_eq!(response.data["total_callers"], 1);
-        assert!(
-            response.data.to_string().contains("dirty_caller"),
-            "{response:?}"
-        );
-        assert!(fixture.ctx.shared_artifacts_read_only());
-        assert!(!fixture.ctx.callgraph_writer());
-        assert!(!fixture.ctx.ram_overlay_active());
-        assert!(
-            crate::callgraph_store::CallGraphRead::node_for(
-                fixture.legacy.as_ref(),
-                Path::new("lib.rs"),
-                "dirty_caller"
-            )
-            .is_err(),
-            "watcher must not update the legacy graph"
-        );
-    }
-
-    #[test]
-    fn worktree_view_publishes_callgraph_without_importing_legacy_semantics() {
-        let fixture = ViewsCallgraphFixture::new();
-        fixture.ctx.set_cache_role(true, None);
-        fixture.commit_source(
-            "pub fn local_caller() { target(); }\npub fn target() {}\n",
-            "local source",
-        );
-        fixture
-            .ctx
-            .update_config(|config| config.indexes.semantic = true);
-        assert!(!fixture.ctx.checkout_semantic.active());
-        assert!(fixture.ctx.semantic_index().read().unwrap().is_none());
-
-        let report = fixture
-            .ctx
-            .publish_view_paths(BTreeSet::new(), true)
-            .unwrap();
-        assert!(
-            report.published,
-            "callgraph must not wait for a borrowed legacy semantic index"
-        );
-        assert_eq!(
-            report.pending_inputs[b"lib.rs".as_slice()].plane,
-            "semantic"
-        );
-        assert_eq!(
-            fixture.ctx.view_runtime_snapshot().unwrap().pending_inputs[b"lib.rs".as_slice()].plane,
-            "semantic"
-        );
-        let response = fixture.callers();
-        assert!(response.success, "{response:?}");
-        assert!(
-            response.data.to_string().contains("local_caller"),
-            "{response:?}"
-        );
-        assert!(fixture.ctx.shared_artifacts_read_only());
-        assert!(fixture.ctx.semantic_index().read().unwrap().is_none());
     }
 
     #[test]
@@ -20362,10 +20592,15 @@ mod callgraph_store_for_ops_tests {
         assert!(!message.contains("retry shortly"), "{message}");
     }
 
+    /// With views on, a commit that changes the graph is answered from the
+    /// checkout as it now is: the stale legacy store, which still holds the
+    /// removed call, never answers.
     #[test]
-    fn views_pending_head_callers_reports_building_instead_of_serving_legacy() {
+    fn views_changed_head_callers_answer_the_current_tree_not_the_stale_legacy_store() {
         let fixture = ViewsCallgraphFixture::new();
-        fixture.publish();
+        let before = fixture.callers();
+        assert!(before.success, "{:#}", before.data);
+        assert_eq!(before.data["total_callers"], 1, "{:#}", before.data);
         fixture.commit_source(
             "pub fn caller() {}\npub fn target() {}\n",
             "remove stale call",
@@ -20382,68 +20617,43 @@ mod callgraph_store_for_ops_tests {
 
         let response = fixture.callers();
 
-        assert!(!response.success, "pending HEAD must not serve stale rows");
-        assert_eq!(response.data["code"], "callgraph_building");
+        assert!(response.success, "{:#}", response.data);
         assert_eq!(
-            response.data["message"],
-            "callers: callgraph store is building in the background; retry shortly"
+            response.data["total_callers"], 0,
+            "the changed HEAD must not serve stale rows: {:#}",
+            response.data
         );
     }
 
     impl ViewsCallgraphFixture {
-        /// Publish the current HEAD as a generation without call graph data,
-        /// as a session with the call graph off does, and pin it as this
-        /// context's view, as configure does when it loads that generation.
-        fn publish_without_callgraph(&self) -> String {
-            let view = self.ctx.view_runtime_snapshot().expect("view runtime");
-            let head = crate::alias::head_tree_entries(&self.root).expect("HEAD entries");
-            let desired_head = crate::views::assembly::head_tree_fingerprint(&head);
-            let report = crate::views::assembly::publish_checkout(
-                &crate::views::assembly::AssemblyRequest {
-                    storage: view.storage.clone(),
-                    project_root: self.root.clone(),
-                    family: view.family.clone(),
-                    scope: view.scope.clone(),
-                    desired_head: desired_head.clone(),
-                    changed_paths: Default::default(),
-                    semantic_keys: Default::default(),
-                    require_semantic: false,
-                    allow_blob_put: true,
-                    callgraph: false,
-                },
+        /// Hold this checkout's v3 call-graph view database busy the way a
+        /// writer does mid-maintenance: an exclusive lock that a reader cannot
+        /// get past. Binds the view first (one answered query), then drops
+        /// this context's view (turning views off and on again) so the next
+        /// query must open the database, and waits for the deferred checkpoint
+        /// so only the returned connection holds the file.
+        fn hold_checkout_view_derived_busy(&self) -> rusqlite::Connection {
+            let bound = self.callers();
+            assert!(bound.success, "{:#}", bound.data);
+            self.ctx
+                .update_config(|config| config.views.enabled = false);
+            self.ctx.update_config(|config| config.views.enabled = true);
+            let storage = self.ctx.storage_paths().artifacts;
+            let family = self.ctx.memoized_artifact_cache_key(&self.root);
+            let member = crate::blob_store::v3::view_dir(
+                &storage,
+                &family,
+                &crate::views::callgraph::view_scope(&self.root),
             )
-            .expect("keyless view publication");
-            assert!(report.published, "keyless generation must publish");
-            let manifest = report.manifest.expect("published manifest");
-            assert!(crate::views::assembly::manifest_lacks_callgraph(&manifest));
-            let generation = report.generation.expect("published generation");
-            let pin =
-                crate::pins::QueryPin::acquire(&view.view_dir, &generation).expect("query pin");
-            self.ctx.install_view_runtime(
-                ViewRuntimeSnapshot {
-                    generation: Some(generation.clone()),
-                    manifest: Some(manifest),
-                    head_fingerprint: desired_head,
-                    pending_paths: BTreeSet::new(),
-                    pending_inputs: BTreeMap::new(),
-                    ..view
-                },
-                Some(pin),
-            );
-            generation
-        }
-
-        /// Hold the derived database of the pinned generation busy the way a
-        /// writer does mid-maintenance: an exclusive lock that a zero-wait
-        /// reader cannot get past. Waits for the publication's own deferred
-        /// checkpoint first so only this connection holds the file. The lock
-        /// lasts as long as the returned connection.
-        fn hold_pinned_derived_busy(&self) -> rusqlite::Connection {
-            let view = self.ctx.pinned_view_runtime().expect("pinned view runtime");
-            crate::views::wait_for_derived_checkpoint_for_test(&view.view_dir);
-            let generation = view.generation.expect("pinned generation");
-            let path = crate::views::resolve_derived_path(&view.view_dir, &generation)
-                .expect("derived path");
+            .expect("v3 member directory");
+            crate::views::wait_for_derived_checkpoint_for_test(&member);
+            let generation = crate::views::ViewStore::open_dir(member.clone())
+                .expect("v3 member view")
+                .current_generation()
+                .expect("v3 pointer")
+                .expect("published v3 generation");
+            let path =
+                crate::views::resolve_derived_path(&member, &generation).expect("derived path");
             assert!(
                 path.is_file(),
                 "derived database {} missing",
@@ -20457,43 +20667,46 @@ mod callgraph_store_for_ops_tests {
         }
     }
 
-    /// Whether a generation carries a call graph is a property of its
-    /// manifest alone. A generation published with the call graph off must
-    /// answer "disabled" even while its derived database is busy; answering
-    /// "building, retry" would send the agent into a retry loop for a graph
-    /// that will never be built from this generation.
+    /// A call graph turned off is never built and never answered: with views
+    /// on and `indexes.callgraph=false` the call-graph tools report the index
+    /// off without binding a checkout view.
     #[test]
-    fn views_keyless_generation_answers_disabled_while_derived_store_is_busy() {
+    fn views_callgraph_index_off_answers_off_without_binding_a_view() {
         let fixture = ViewsCallgraphFixture::new();
-        fixture.publish_without_callgraph();
-        let _busy = fixture.hold_pinned_derived_busy();
+        fixture
+            .ctx
+            .update_config(|config| config.indexes.callgraph = false);
 
         let response = fixture.callers();
 
         assert!(!response.success, "{:#}", response.data);
         assert_eq!(
-            response.data["code"], "callgraph_unavailable",
+            response.data["code"], "callgraph_off",
             "{:#}",
             response.data
         );
-        assert!(
-            response.data["message"]
-                .as_str()
-                .is_some_and(|message| message.contains(crate::views::read::CALLGRAPH_DISABLED)),
-            "{:#}",
-            response.data
-        );
+        assert!(matches!(
+            fixture.ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Off
+        ));
+        assert_eq!(fixture.ctx.callgraph_view_route_count(), 0);
+        let member = crate::blob_store::v3::view_dir(
+            &fixture.ctx.storage_paths().artifacts,
+            &fixture.ctx.memoized_artifact_cache_key(&fixture.root),
+            &crate::views::callgraph::view_scope(&fixture.root),
+        )
+        .unwrap();
+        assert!(!member.exists());
     }
 
-    /// The counterpart: a generation that does carry a call graph, read while
+    /// A generation that does carry a call graph, read while
     /// its derived database is busy, is temporarily unreadable and says so as
     /// a retryable `callgraph_building`. This also proves the busy hold above
     /// really blocks a reader that opens the store.
     #[test]
     fn views_keyed_generation_answers_building_while_derived_store_is_busy() {
         let fixture = ViewsCallgraphFixture::new();
-        fixture.publish();
-        let _busy = fixture.hold_pinned_derived_busy();
+        let busy = fixture.hold_checkout_view_derived_busy();
 
         let response = fixture.callers();
 
@@ -20507,13 +20720,15 @@ mod callgraph_store_for_ops_tests {
             response.data["message"],
             "callers: persisted callgraph store is busy; retry shortly"
         );
+        drop(busy);
+        let response = fixture.callers();
+        assert!(response.success, "{:#}", response.data);
     }
 
     #[test]
     fn views_keyed_generation_inspect_reports_pending_while_derived_store_is_busy() {
         let fixture = ViewsCallgraphFixture::new();
         fixture.ctx.set_harness(crate::harness::Harness::Runner);
-        fixture.publish();
         let inspect = || {
             crate::commands::inspect::handle_inspect(
                 &RawRequest {
@@ -20529,7 +20744,7 @@ mod callgraph_store_for_ops_tests {
                 &fixture.ctx,
             )
         };
-        let busy = fixture.hold_pinned_derived_busy();
+        let busy = fixture.hold_checkout_view_derived_busy();
 
         let response = inspect();
 
@@ -20585,88 +20800,6 @@ mod callgraph_store_for_ops_tests {
         );
     }
 
-    /// An automatic dead-code refresh that finds the published graph's
-    /// database locked has nothing else to wake it: the lock clearing is not a
-    /// view publication and not a source edit. It must keep a timed retry, so
-    /// on a quiet checkout dead code refreshes by itself once the lock clears.
-    #[test]
-    fn views_busy_dead_code_refresh_retries_after_lock_clears_without_edit() {
-        use crate::inspect::{InspectCategory, InspectSnapshot, JobScope, Tier2TriggerReason};
-        let fixture = ViewsCallgraphFixture::new();
-        fixture.ctx.set_harness(crate::harness::Harness::Opencode);
-        fixture.publish();
-        let manager = fixture.ctx.inspect_manager();
-        let config = fixture.ctx.config();
-        let wait_idle = |what: &str| {
-            let deadline = Instant::now() + Duration::from_secs(60);
-            while manager.tier2_any_in_flight() {
-                assert!(Instant::now() < deadline, "{what} did not finish");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            manager.drain_completions();
-        };
-
-        let busy = fixture.hold_pinned_derived_busy();
-        fixture.ctx.reset_tier2_refresh_scheduler_at(Instant::now());
-        assert!(fixture.ctx.request_tier2_refresh_pull());
-        let dispatched_at = Instant::now();
-        assert_eq!(
-            fixture
-                .ctx
-                .tick_tier2_refresh_scheduler_at(Instant::now(), 0),
-            Some(Tier2TriggerReason::Pull)
-        );
-        wait_idle("refresh against the locked view");
-        let retry_at = manager
-            .try_tier2_resource_retry_at(&config)
-            .flatten()
-            .expect("a refresh that found the view locked must keep a timed retry");
-        assert!(
-            retry_at
-                <= dispatched_at
-                    + crate::inspect::tier2_scheduler::TIER2_CACHE_WRITER_RETRY_BACKOFF
-                    + Duration::from_secs(60),
-            "the retry must fall within the resource retry bound"
-        );
-        let detail = manager.tier2_builder_state_detail(InspectCategory::DeadCode);
-        assert!(detail.contains("call graph view"), "{detail}");
-
-        drop(busy);
-        assert!(!fixture.ctx.tier2_pull_demand_pending());
-        manager.expire_tier2_resource_waits_for_test();
-        assert!(
-            fixture.ctx.tier2_refresh_dispatch_due(),
-            "a quiet checkout must come due for the retry without an edit"
-        );
-        assert_eq!(
-            fixture
-                .ctx
-                .tick_tier2_refresh_scheduler_at(Instant::now(), 0),
-            Some(Tier2TriggerReason::ResourceRetry)
-        );
-        wait_idle("retry after the lock cleared");
-        let outcome = manager.tier2_read_cached_readonly(
-            InspectSnapshot {
-                project_root: fixture.root.clone(),
-                inspect_dir: fixture.ctx.inspect_dir(),
-                config: config.clone(),
-                symbol_cache: fixture.ctx.symbol_cache(),
-                inspect_writer: true,
-                callgraph_writer: true,
-            },
-            InspectCategory::DeadCode,
-            JobScope::for_project(fixture.root.clone()),
-        );
-        let payload = outcome.payload().expect("dead-code result after the retry");
-        assert_eq!(payload["callgraph_available"], true, "{payload:#}");
-        assert!(payload["count"].as_u64().is_some(), "{payload:#}");
-        assert_eq!(
-            manager.try_tier2_resource_retry_at(&config),
-            Some(None),
-            "a successful retry must not leave another one armed"
-        );
-    }
-
     /// Zoom's call graph field reads the same store as `callers` and must give
     /// the same verdict for a busy database: building, retry shortly. A busy
     /// open says nothing about whether the graph exists, so reporting it as
@@ -20675,7 +20808,6 @@ mod callgraph_store_for_ops_tests {
     #[test]
     fn views_keyed_generation_zoom_reports_building_while_derived_store_is_busy() {
         let fixture = ViewsCallgraphFixture::new();
-        fixture.publish();
         let zoom = || {
             crate::commands::zoom::handle_zoom(
                 &RawRequest {
@@ -20692,7 +20824,7 @@ mod callgraph_store_for_ops_tests {
                 &fixture.ctx,
             )
         };
-        let busy = fixture.hold_pinned_derived_busy();
+        let busy = fixture.hold_checkout_view_derived_busy();
 
         let response = zoom();
 
@@ -20715,134 +20847,6 @@ mod callgraph_store_for_ops_tests {
             response.data.get("callgraph").is_none(),
             "{:#}",
             response.data
-        );
-    }
-
-    #[test]
-    fn views_published_navigation_uses_cached_head_without_git_spawns() {
-        let fixture = ViewsCallgraphFixture::new();
-        fixture.publish();
-        crate::alias::reset_head_tree_entry_calls_for_test();
-
-        for _ in 0..20 {
-            let response = fixture.callers();
-            assert!(response.success, "{response:?}");
-            assert_eq!(response.data["total_callers"], 1);
-        }
-
-        assert_eq!(
-            crate::alias::head_tree_entry_calls_for_test(),
-            0,
-            "navigation must not rebuild the HEAD manifest on its read path"
-        );
-    }
-
-    #[test]
-    fn views_legacy_refresh_ignores_busy_process_worker() {
-        // Only the process-worker control needs this lock: refresh-worker tests
-        // shut that worker down or hold its queue while exercising exit paths.
-        let _guard = crate::callgraph_store::REFRESH_WORKER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Other roots may legitimately be waiting for a store or writer lease.
-        // The gate proves this fixture's batch started without flushing that work.
-        let (_busy_dirs, busy_ctx) = cold_build_context();
-        let busy_root = std::fs::canonicalize(busy_ctx.config().project_root.as_ref().unwrap())
-            .expect("canonical busy root");
-        let family = crate::search_index::artifact_cache_key(&busy_root);
-        crate::root_cache::configure_artifact_access(&busy_root, &family, false);
-        busy_ctx.set_canonical_cache_root(busy_root.clone());
-        busy_ctx
-            .ensure_callgraph_store()
-            .expect("busy root callgraph build")
-            .expect("busy root callgraph reader");
-        let (held, release) =
-            crate::callgraph_store::install_callgraph_refresh_worker_test_gate(busy_root.clone());
-        assert!(busy_ctx.enqueue_callgraph_store_refresh([busy_root.join("src/lib.rs")]));
-        held.recv_timeout(Duration::from_secs(12))
-            .expect("process worker must be held on the unrelated root");
-
-        // Exercise the entire migration window while another root cannot finish
-        // its refresh. A views fixture must not inherit that queue's backlog.
-        views_first_publication_retires_legacy_after_migration_window();
-
-        release.send(()).expect("release busy process worker");
-        assert!(
-            crate::callgraph_store::wait_for_process_callgraph_refresh_for_test(
-                &busy_root,
-                Duration::from_secs(12)
-            )
-        );
-    }
-
-    #[test]
-    fn views_first_publication_retires_legacy_after_migration_window() {
-        let fixture = ViewsCallgraphFixture::new();
-        // Process-worker tests hold unrelated roots and shut down the shared
-        // queue. Keep this root's migration refreshes on a fixture-owned worker.
-        let worker = crate::callgraph_store::isolated_callgraph_refresh_worker_for_test(
-            fixture.root.clone(),
-        );
-        crate::runtime_drain::reset_legacy_watcher_refreshes_for_test();
-        crate::runtime_drain::refresh_callgraph_store_for_watcher(
-            &fixture.ctx,
-            &HashSet::from([fixture.source.clone()]),
-        );
-        assert_eq!(
-            crate::runtime_drain::legacy_watcher_refreshes_for_test(),
-            1,
-            "legacy refresh must remain active before the first publication"
-        );
-        assert!(
-            worker.wait(Duration::from_secs(12)),
-            "legacy refresh worker hung"
-        );
-        let legacy_response = fixture.callers();
-        assert!(legacy_response.success, "{legacy_response:?}");
-        assert_eq!(legacy_response.data["total_callers"], 1);
-
-        fixture.publish();
-        assert!(matches!(
-            fixture.ctx.callgraph_store_for_ops(),
-            CallgraphStoreAccess::Ready(store) if store.reader_kind() == "view"
-        ));
-        crate::runtime_drain::reset_legacy_watcher_refreshes_for_test();
-        crate::runtime_drain::refresh_callgraph_store_for_watcher(
-            &fixture.ctx,
-            &HashSet::from([fixture.source.clone()]),
-        );
-        assert_eq!(
-            crate::runtime_drain::legacy_watcher_refreshes_for_test(),
-            0,
-            "the first publication must retire watcher writes to legacy"
-        );
-
-        std::fs::write(
-            &fixture.source,
-            "pub fn caller() { target(); }\npub fn resumed() { target(); }\npub fn target() {}\n",
-        )
-        .expect("views-off source update");
-        fixture
-            .ctx
-            .update_config(|config| config.views.enabled = false);
-        crate::runtime_drain::refresh_callgraph_store_for_watcher(
-            &fixture.ctx,
-            &HashSet::from([fixture.source.clone()]),
-        );
-        assert_eq!(
-            crate::runtime_drain::legacy_watcher_refreshes_for_test(),
-            1,
-            "disabling views must enqueue legacy refresh again"
-        );
-        assert!(
-            worker.wait(Duration::from_secs(12)),
-            "views-off legacy refresh worker hung"
-        );
-        let response = fixture.callers();
-        assert!(response.success, "{response:?}");
-        assert_eq!(
-            response.data["total_callers"], 2,
-            "views-off legacy refresh did not converge: {response:?}"
         );
     }
 

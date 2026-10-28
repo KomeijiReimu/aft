@@ -3188,6 +3188,173 @@ fn delay_symbol_prewarm_for_debug() {
     thread::sleep(Duration::from_millis(delay_ms));
 }
 
+/// What one views-routed symbol prewarm did with the files it was given.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SymbolViewPrewarm {
+    /// Already in the symbol cache for the file's current modification time.
+    cached: u64,
+    /// Served from rows the family's v3 symbol plane already held.
+    reused: u64,
+    /// Parsed here and stored into the v3 symbol plane.
+    stored: u64,
+    /// Left for an ordinary on-demand parse: unreadable, changed since the
+    /// lexical view verified it, or not parseable.
+    skipped: u64,
+}
+
+/// Pre-warms the symbol cache of a views-routed root from the files its
+/// lexical v3 view verified, on a background thread. Symbols come from the
+/// family's v3 symbol plane, keyed by content, so a file another checkout of
+/// the family already parsed is not parsed again; only misses are parsed and
+/// then stored for every checkout. The legacy symbol cache file is neither
+/// read nor written.
+fn spawn_symbol_view_prewarm(
+    ctx: &AppContext,
+    snapshot: &crate::search_index::SearchIndexSnapshot,
+) {
+    let files = snapshot.file_entries().to_vec();
+    let symbol_cache = ctx.symbol_cache();
+    let generation = symbol_cache
+        .read()
+        .map(|cache| cache.generation())
+        .unwrap_or_default();
+    let storage = ctx.storage_paths().artifacts;
+    let root = ctx.canonical_cache_root();
+    let family = ctx.memoized_artifact_cache_key(&root);
+    let routes = ctx.symbol_view_route_counter();
+    let session_id = log_ctx::current_session();
+    let spawned = thread::Builder::new()
+        .name("aft-symbol-view-prewarm".to_owned())
+        .spawn(move || {
+            log_ctx::with_session(session_id, || {
+                #[cfg(debug_assertions)]
+                delay_symbol_prewarm_for_debug();
+                let report = prewarm_symbol_cache_from_view(
+                    &storage,
+                    &family,
+                    &symbol_cache,
+                    generation,
+                    &files,
+                );
+                routes.fetch_add(report.reused + report.stored, Ordering::Relaxed);
+                slog_info!(
+                    "pre-warmed symbol cache from the v3 symbol plane: {} reused, {} stored, {} cached, {} skipped root={}",
+                    report.reused,
+                    report.stored,
+                    report.cached,
+                    report.skipped,
+                    root.display()
+                );
+            });
+        });
+    if let Err(error) = spawned {
+        slog_warn!("symbol view prewarm thread failed to start: {}", error);
+    }
+}
+
+fn prewarm_symbol_cache_from_view(
+    storage: &Path,
+    family: &str,
+    symbol_cache: &SharedSymbolCache,
+    generation: u64,
+    files: &[crate::search_index::FileEntry],
+) -> SymbolViewPrewarm {
+    use crate::views::symbol_store;
+    let mut report = SymbolViewPrewarm::default();
+    let producer = symbol_store::SymbolProducer::current();
+    let mut rows = Vec::new();
+    // False once a newer configure reset the cache; that configure runs its
+    // own prewarm.
+    let insert = |file: &crate::search_index::FileEntry, symbols: Vec<crate::symbols::Symbol>| {
+        let Ok(mut cache) = symbol_cache.write() else {
+            return false;
+        };
+        if cache.generation() != generation {
+            return false;
+        }
+        cache.insert_for_generation(
+            generation,
+            file.path.clone(),
+            file.modified,
+            file.size,
+            file.content_hash,
+            symbols,
+        );
+        true
+    };
+    for file in files {
+        if symbol_cache
+            .read()
+            .is_ok_and(|cache| cache.contains_path_with_mtime(&file.path, file.modified))
+        {
+            report.cached += 1;
+            continue;
+        }
+        let Some(lang) = crate::parser::detect_language(&file.path) else {
+            continue;
+        };
+        let content = crate::blob_store::v2::ContentHash::from_bytes(*file.content_hash.as_bytes());
+        match symbol_store::lookup(storage, family, content, &file.path) {
+            Ok(Some(symbols)) => {
+                if !insert(file, symbols.as_ref().clone()) {
+                    break;
+                }
+                report.reused += 1;
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                slog_debug!(
+                    "v3 symbol lookup failed path={}: {}",
+                    file.path.display(),
+                    error
+                );
+            }
+        }
+        // Only the bytes the lexical view verified may be stored under its
+        // content hash; a file that moved on is left for an on-demand parse.
+        let source = match crate::parser::read_source(&file.path) {
+            Ok(source) if blake3::hash(source.as_bytes()) == file.content_hash => source,
+            _ => {
+                report.skipped += 1;
+                continue;
+            }
+        };
+        let symbols = crate::parser::parse_source_with_cached_parser(&file.path, &source, lang)
+            .and_then(|tree| crate::parser::extract_symbols_from_tree(&source, &tree, lang));
+        let Ok(symbols) = symbols else {
+            report.skipped += 1;
+            continue;
+        };
+        let language = symbol_store::language_id(lang);
+        let key = symbol_store::SymbolKey {
+            content,
+            language: language.clone(),
+            producer,
+        }
+        .family_key();
+        rows.push((
+            key,
+            symbol_store::encode_payload(&producer, &language, &symbols),
+        ));
+        if !insert(file, symbols) {
+            break;
+        }
+        report.stored += 1;
+    }
+    if !rows.is_empty() {
+        if let Err(error) = symbol_store::put(storage, family, &rows) {
+            slog_warn!(
+                "storing prewarmed symbols in the v3 symbol plane failed: {}",
+                error
+            );
+            report.skipped += report.stored;
+            report.stored = 0;
+        }
+    }
+    report
+}
+
 fn walk_semantic_project_files_bounded(
     root: &Path,
     max_files: usize,
@@ -5024,7 +5191,7 @@ fn handle_configure_inner(
             &canonical_cache_root,
         ));
     ctx.begin_configure_ack_phase("index_loading_state");
-    let search_index = ctx.config().indexes.trigram;
+    let search_index = ctx.config().indexes.trigram && !ctx.config().views.enabled;
     let semantic_search = ctx.config().indexes.semantic;
     let mut search_index_cache_reused = false;
 
@@ -5435,7 +5602,7 @@ fn semantic_status_is_not_opened(ctx: &AppContext) -> bool {
 
 fn missing_artifact_loads(ctx: &AppContext) -> ArtifactLoadNeeds {
     let config = ctx.config();
-    let search_enabled = config.indexes.trigram;
+    let search_enabled = config.indexes.trigram && !config.views.enabled;
     let semantic_enabled = config.indexes.semantic;
     drop(config);
     let semantic_admitted = semantic_enabled && semantic_work_admitted(ctx);
@@ -5571,6 +5738,9 @@ fn start_artifact_loads(starts: ArtifactLoadStarts) -> bool {
 /// dropped. Without the overlay, a read-only root serves the shared snapshot
 /// as-is.
 pub(crate) fn trigger_search_index_reload_if_evicted(ctx: &AppContext) -> bool {
+    if ctx.config().views.enabled {
+        return false;
+    }
     if ctx.canonical_cache_root_opt().is_none() || !ctx.search_index_query_reload_allowed() {
         return false;
     }
@@ -5823,6 +5993,9 @@ fn schedule_artifact_loads_admitted(
     load_semantic: bool,
     semantic_view_work_allowed: bool,
 ) -> ArtifactLoadStarts {
+    // With views enabled, skip both loading another checkout's SearchIndex
+    // cache and building a new legacy search cache.
+    let load_search = load_search && !ctx.config().views.enabled;
     if let Some(reason) = ctx.cache_unavailable_reason() {
         let code = crate::root_cache::cache_status_code(&reason);
         *ctx.semantic_index_status()
@@ -5916,6 +6089,7 @@ fn schedule_artifact_loads_admitted(
         let search_rx_terminal_guard = ctx.search_index_rx_terminal_guard(search_rx_epoch);
         let search_pending_install = ctx.search_pending_install();
         let search_persist_epoch_flag = ctx.search_persist_epoch_flag();
+        let search_publication_gate = ctx.legacy_search_publication_gate();
         let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
         search_artifact_load_start = Some(start_tx);
 
@@ -5923,6 +6097,7 @@ fn schedule_artifact_loads_admitted(
         mark_search_rebuild_spawn_for_debug();
         thread::spawn(move || {
             let _terminal_guard = search_rx_terminal_guard;
+            let _publication = search_publication_gate.install();
             if start_rx.recv().is_err() {
                 #[cfg(test)]
                 note_configure_artifact_load_cancellation_for_test();
@@ -6157,14 +6332,14 @@ fn schedule_artifact_loads_admitted(
                     if search_persist_epoch_flag.current() != search_persist_epoch {
                         return;
                     }
-                    let index = SearchIndex::rebuild_or_refresh_with_strategy(
+                    let Some(index) = SearchIndex::build_with_limit_to_cache_dir_cancellable(
                         &root_for_search,
                         search_index_max_file_size,
-                        current_head,
-                        None,
-                        Some(&cache_dir),
-                        VerifyStrategy::StatFirst,
-                    );
+                        &cache_dir,
+                        &|| search_publication_gate.allowed(),
+                    ) else {
+                        return;
+                    };
                     delay_search_rebuild_publish_for_debug();
                     index
                 };
@@ -8756,10 +8931,29 @@ fn run_configure_maintenance_unit_inner(
                 && ctx.config().views.enabled
                 && !job.root_too_broad
             {
-                finish_configure_view_load(
-                    ctx,
-                    prepare_configure_view(&ConfigureViewInput::capture(ctx, job), job),
-                );
+                if ctx.views_route_root() {
+                    // Every read of this root goes through its v3 checkout
+                    // views; the v1 view is neither opened, imported into
+                    // nor published.
+                    ctx.drop_v1_view_runtime();
+                } else if ctx.config().indexes.semantic || ctx.config().indexes.callgraph {
+                    finish_configure_view_load(
+                        ctx,
+                        prepare_configure_view(&ConfigureViewInput::capture(ctx, job), job),
+                    );
+                } else {
+                    ctx.clear_view_runtime();
+                }
+                match ctx.lexical_view_snapshot("bind") {
+                    Some(Err(error)) => {
+                        slog_warn!("lexical checkout view unavailable: {}", error);
+                    }
+                    // The symbol prewarm follows the files the view verified.
+                    Some(Ok(snapshot)) if ctx.views_route_root() => {
+                        spawn_symbol_view_prewarm(ctx, &snapshot);
+                    }
+                    _ => {}
+                }
             } else {
                 ctx.clear_view_runtime();
             }
@@ -11299,36 +11493,6 @@ mod tests {
             .success());
     }
 
-    fn write_legacy_semantic_fixture(path: &Path, fingerprint: &str, source: &[u8]) {
-        fn put_field(bytes: &mut Vec<u8>, value: &[u8]) {
-            bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
-            bytes.extend_from_slice(value);
-        }
-        let mut bytes = vec![7];
-        bytes.extend_from_slice(&2_u32.to_le_bytes());
-        bytes.extend_from_slice(&1_u32.to_le_bytes());
-        put_field(&mut bytes, fingerprint.as_bytes());
-        bytes.extend_from_slice(&1_u32.to_le_bytes());
-        put_field(&mut bytes, b"tracked.rs");
-        bytes.extend_from_slice(&0_u64.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&(source.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(blake3::hash(source).as_bytes());
-        put_field(&mut bytes, b"tracked.rs");
-        put_field(&mut bytes, b"tracked");
-        put_field(&mut bytes, b"");
-        bytes.push(0);
-        bytes.extend_from_slice(&1_u32.to_le_bytes());
-        bytes.extend_from_slice(&1_u32.to_le_bytes());
-        bytes.push(0);
-        put_field(&mut bytes, b"fn tracked() {}");
-        put_field(&mut bytes, b"tracked function");
-        bytes.extend_from_slice(&1.0_f32.to_le_bytes());
-        bytes.extend_from_slice(&0.0_f32.to_le_bytes());
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, bytes).unwrap();
-    }
-
     #[test]
     fn views_gate_off_does_not_create_view_storage() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -11716,353 +11880,6 @@ mod tests {
         assert!(!ctx.configure_tail_has_work());
     }
 
-    #[test]
-    fn busy_readiness_defers_revalidation_without_a_cold_rebuild() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        init_git_fixture(project.path());
-        let ctx = test_context();
-        let params = json!({
-            "project_root": project.path(), "storage_dir": storage.path(), "harness": "opencode",
-            "config": [user_tier(json!({ "views": { "enabled": true },
-                "indexes": { "trigram": false, "semantic": false, "callgraph": true } }))]
-        });
-        let root = project.path().canonicalize().unwrap();
-        let scope = crate::path_identity::project_scope_key(&root);
-        crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
-            storage: storage.path().to_owned(),
-            family: crate::search_index::artifact_cache_key(&root),
-            scope: scope.clone(),
-            desired_head: crate::views::assembly::head_tree_fingerprint(
-                &crate::alias::head_tree_entries(&root).unwrap(),
-            ),
-            project_root: root.clone(),
-            changed_paths: BTreeSet::new(),
-            semantic_keys: Default::default(),
-            require_semantic: false,
-            allow_blob_put: true,
-            callgraph: true,
-        })
-        .unwrap();
-        let view = crate::views::ViewStore::open(storage.path(), &scope).unwrap();
-        let initial = view.current_generation().unwrap();
-        let derived = view.derived_path(initial.as_deref().unwrap()).unwrap();
-        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
-        let writer = crate::db::file_identity::IdentityConnection::open(
-            &derived,
-            "busy_configure_readiness_test",
-        )
-        .unwrap();
-        writer
-            .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
-            .unwrap();
-
-        assert!(
-            handle_configure_for_test(
-                &configure_request_with_session(params.clone(), "while-locked"),
-                &ctx
-            )
-            .success
-        );
-        super::drain_deferred_configure_maintenance(&ctx);
-        let pending = ctx.view_runtime_snapshot().unwrap();
-        assert!(!pending.pending_paths.is_empty());
-        assert!(pending
-            .pending_inputs
-            .values()
-            .any(|input| { input.reason == crate::views::read::CALLGRAPH_READINESS_BUSY }));
-        assert!(matches!(
-            ctx.callgraph_store_for_ops(),
-            CallgraphStoreAccess::Building
-        ));
-        let health = ctx.view_health_snapshot().unwrap();
-        assert_eq!(
-            health.callgraph_readiness_deferred,
-            Some(crate::views::read::CALLGRAPH_READINESS_BUSY)
-        );
-        let failure = health.publication_failure.expect("publication will retry");
-        assert_eq!(failure.reason, "publication_failed");
-        assert!(failure.next_retry_ms.is_some(), "{failure:?}");
-        assert_eq!(view.current_generation().unwrap(), initial);
-        assert_eq!(
-            crate::views::assembly::cold_build_counts(view.view_dir()),
-            Default::default()
-        );
-        writer.execute_batch("ROLLBACK").unwrap();
-        drop(writer);
-
-        // Drive the retry without waiting for its one-second backoff. The
-        // invariant here is reuse of the healthy graph, not timer scheduling.
-        ctx.view_publication_retry().lock().reset(&root);
-        crate::executor::view_publication::schedule(&ctx, BTreeSet::new(), true).unwrap();
-
-        assert!(
-            handle_configure_for_test(
-                &configure_request_with_session(params, "after-unlock"),
-                &ctx
-            )
-            .success
-        );
-        super::drain_deferred_configure_maintenance(&ctx);
-        assert_eq!(view.current_generation().unwrap(), initial);
-        assert!(matches!(
-            ctx.callgraph_store_for_ops(),
-            CallgraphStoreAccess::Ready(_)
-        ));
-    }
-
-    #[test]
-    fn views_owner_rebuilds_stale_callgraph_with_multiple_sessions_and_linked_worktrees() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let temp = tempfile::tempdir().unwrap();
-        let main = temp.path().join("main");
-        let storage = temp.path().join("storage");
-        init_git_fixture(&main);
-        let main = main.canonicalize().unwrap();
-        for name in ["linked-one", "linked-two"] {
-            assert!(git_command(&main)
-                .args(["worktree", "add", "--detach", "--quiet"])
-                .arg(temp.path().join(name))
-                .arg("HEAD")
-                .status()
-                .unwrap()
-                .success());
-        }
-        let family = crate::search_index::artifact_cache_key(&main);
-        let scope = crate::path_identity::project_scope_key(&main);
-        let head = crate::views::assembly::head_tree_fingerprint(
-            &crate::alias::head_tree_entries(&main).unwrap(),
-        );
-        let seeded =
-            crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
-                storage: storage.clone(),
-                project_root: main.clone(),
-                family: family.clone(),
-                scope: scope.clone(),
-                desired_head: head,
-                changed_paths: BTreeSet::new(),
-                semantic_keys: Default::default(),
-                require_semantic: false,
-                allow_blob_put: true,
-                callgraph: true,
-            })
-            .unwrap();
-        let generation = seeded.generation.unwrap();
-        let view = crate::views::ViewStore::open(&storage, &scope).unwrap();
-        let derived = view.derived_path(&generation).unwrap();
-        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
-        // An older binary published the same HEAD with callgraph keys, but its
-        // extraction producer and derived build output are no longer readable.
-        let source = fs::read_to_string(main.join("tracked.rs")).unwrap();
-        let old_producer = "ruled-callgraph-v2";
-        let old_key =
-            crate::blob_store::CallgraphKey::from_bytes(source.as_bytes(), "rust", old_producer)
-                .full_key();
-        let old_blob =
-            crate::callgraph_store::join::CallgraphBlob::extract(&source, "rust", old_producer)
-                .unwrap();
-        let mut blobs = crate::blob_store::BlobStore::open(
-            &storage,
-            &family,
-            crate::blob_store::BlobPlane::Callgraph,
-        )
-        .unwrap();
-        blobs.put(&old_key, &old_blob.to_bytes().unwrap()).unwrap();
-        // Leave only old-producer payloads: the owner must extract current
-        // blobs before a read-only worktree can assemble its own graph.
-        let connection = rusqlite::Connection::open(blobs.path()).unwrap();
-        connection
-            .execute(
-                "DELETE FROM blob_payloads WHERE full_key != ?1",
-                [old_key.as_bytes().as_slice()],
-            )
-            .unwrap();
-        drop(connection);
-        let old_manifest =
-            crate::views::Manifest::new(view.load_manifest(&generation).unwrap().entries().map(
-                |(path, entry)| {
-                    let mut entry = entry.clone();
-                    if let crate::views::ManifestEntry::Regular { planes, .. } = &mut entry {
-                        planes.callgraph = Some(old_key.to_hex());
-                    }
-                    (path.clone(), entry)
-                },
-            ))
-            .unwrap();
-        fs::write(
-            view.manifest_path(&generation).unwrap(),
-            old_manifest.to_json_bytes().unwrap(),
-        )
-        .unwrap();
-        let connection = rusqlite::Connection::open(&derived).unwrap();
-        connection.execute("UPDATE meta SET v = '9e904a6dac7809c1250e41cc0eb9c1811afc33f707da25d3938c095b6e3bca2c' WHERE k = 'fingerprint'", []).unwrap();
-        drop(connection);
-
-        let params = |root: &Path| {
-            json!({
-                "project_root": root, "storage_dir": storage, "harness": "opencode",
-                "config": [user_tier(json!({ "views": { "enabled": true },
-                    "indexes": { "trigram": false, "semantic": false, "callgraph": true } }))]
-            })
-        };
-        let owner = test_context();
-        for session in ["owner-one", "owner-two", "owner-three"] {
-            let response = handle_configure_for_test(
-                &configure_request_with_session(params(&main), session),
-                &owner,
-            );
-            assert!(response.success, "{}", response.data);
-            assert_eq!(response.data["artifact_owner"]["mode"], "owner");
-        }
-        assert!(owner.callgraph_writer());
-        super::drain_deferred_configure_maintenance(&owner);
-        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
-        match owner.callgraph_store_for_ops() {
-            CallgraphStoreAccess::Ready(store) => {
-                assert_eq!(store.reader_kind(), "view");
-                assert!(crate::callgraph_store::CallGraphRead::node_for(
-                    &store,
-                    Path::new("tracked.rs"),
-                    "tracked"
-                )
-                .is_ok());
-            }
-            CallgraphStoreAccess::Error(error) => {
-                panic!("bound owner did not rebuild its stale view: {error}")
-            }
-            _ => panic!("bound owner did not rebuild its stale view"),
-        }
-        assert_ne!(
-            view.current_generation().unwrap().as_deref(),
-            Some(generation.as_str())
-        );
-        // Rebinding a ready owner must not manufacture redundant generations.
-        let ready_generation = view.current_generation().unwrap();
-        assert!(
-            handle_configure_for_test(
-                &configure_request_with_session(params(&main), "owner-four"),
-                &owner
-            )
-            .success
-        );
-        super::drain_deferred_configure_maintenance(&owner);
-        assert_eq!(view.current_generation().unwrap(), ready_generation);
-        for name in ["linked-one", "linked-two"] {
-            let linked = temp.path().join(name);
-            let borrower = test_context();
-            let response = handle_configure_for_test(
-                &configure_request_with_session(params(&linked), name),
-                &borrower,
-            );
-            assert!(response.success, "{}", response.data);
-            assert_eq!(response.data["artifact_owner"]["mode"], "read_only");
-            assert!(!borrower.callgraph_writer());
-            super::drain_deferred_configure_maintenance(&borrower);
-            crate::views::wait_for_derived_checkpoint_for_test(&lazy_view_dir(&storage, &linked));
-            match borrower.callgraph_store_for_ops() {
-                CallgraphStoreAccess::Ready(store) => {
-                    assert_eq!(store.reader_kind(), "view");
-                    assert!(crate::callgraph_store::CallGraphRead::node_for(
-                        &store,
-                        Path::new("tracked.rs"),
-                        "tracked"
-                    )
-                    .is_ok());
-                }
-                CallgraphStoreAccess::Error(error) => {
-                    panic!("linked worktree could not read the rebuilt graph: {error}")
-                }
-                _ => panic!("linked worktree could not read the rebuilt graph"),
-            }
-            let request = RawRequest {
-                id: "linked-callers".into(),
-                command: "callers".into(),
-                session_id: Some(name.into()),
-                lsp_hints: None,
-                params: json!({ "file": linked.join("tracked.rs"), "symbol": "tracked" }),
-            };
-            let answer = crate::commands::callers::handle_callers(&request, &borrower);
-            assert!(answer.success, "{}", answer.data);
-        }
-    }
-
-    #[test]
-    fn s4_upgrade_same_head_configure_recovers_old_view_identities() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let temp = tempfile::tempdir().unwrap();
-        let main = temp.path().join("main");
-        let storage = temp.path().join("storage");
-        init_git_fixture(&main);
-        fs::write(main.join("tracked.rs"), "pub struct C; impl C { pub fn unique(&self) {} }\npub fn tracked(x: &C) { x.unique(); }\n").unwrap();
-        let main = main.canonicalize().unwrap();
-        let family = crate::search_index::artifact_cache_key(&main);
-        let scope = crate::path_identity::project_scope_key(&main);
-        let head = crate::views::assembly::head_tree_fingerprint(
-            &crate::alias::head_tree_entries(&main).unwrap(),
-        );
-        let request = crate::views::assembly::AssemblyRequest {
-            storage: storage.clone(),
-            project_root: main.clone(),
-            family: family.clone(),
-            scope: scope.clone(),
-            desired_head: head.clone(),
-            changed_paths: BTreeSet::new(),
-            semantic_keys: Default::default(),
-            require_semantic: false,
-            allow_blob_put: true,
-            callgraph: true,
-        };
-        let seeded = crate::callgraph_store::position_identity_tests::with_pre_s4_output(|| {
-            crate::views::assembly::publish_checkout(&request)
-        })
-        .unwrap();
-        let view = crate::views::ViewStore::open(&storage, &scope).unwrap();
-        let old = view
-            .derived_path(seeded.generation.as_deref().unwrap())
-            .unwrap();
-        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
-        {
-            let conn = rusqlite::Connection::open(&old).unwrap();
-            crate::callgraph_store::position_identity_tests::seed_old_dispatch_hint(&conn);
-            crate::callgraph_store::position_identity_tests::stamp_pre_s4(&conn, true);
-        }
-        let owner = test_context();
-        let params = json!({"project_root":main,"storage_dir":storage,"harness":"opencode","config":[user_tier(json!({"views":{"enabled":true},"indexes":{"trigram":false,"semantic":false,"callgraph":true}}))]});
-        let response =
-            handle_configure_for_test(&configure_request_with_session(params, "s4-owner"), &owner);
-        assert!(response.success, "{}", response.data);
-        super::drain_deferred_configure_maintenance(&owner);
-        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
-        match owner.callgraph_store_for_ops() {
-            CallgraphStoreAccess::Ready(store) => assert!(
-                !crate::callgraph_store::CallGraphRead::edge_snapshot(&store)
-                    .unwrap()
-                    .is_empty()
-            ),
-            _ => panic!("same-HEAD configure must recover a ready view"),
-        }
-        assert_eq!(
-            head,
-            crate::views::assembly::head_tree_fingerprint(
-                &crate::alias::head_tree_entries(&main).unwrap()
-            )
-        );
-        let current = view.current_generation().unwrap().unwrap();
-        assert_ne!(Some(current.as_str()), seeded.generation.as_deref());
-        let database = view.derived_path(&current).unwrap();
-        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
-        crate::callgraph_store::position_identity_tests::assert_current_graph(
-            &rusqlite::Connection::open(&database).unwrap(),
-        );
-    }
-
     /// `lib.rs` of the on-demand call-graph fixtures: one caller, one callee
     /// and one function nothing calls, so callers, impact and dead code all
     /// have something to report.
@@ -12073,8 +11890,9 @@ mod tests {
         main: PathBuf,
         linked: PathBuf,
         storage: PathBuf,
-        /// `None` when the main checkout was never bound in this process.
-        owner: Option<Arc<AppContext>>,
+        /// The main checkout's context, kept alive for the fixture's
+        /// lifetime; `None` when it was never bound in this process.
+        _owner: Option<Arc<AppContext>>,
         borrower: Arc<AppContext>,
     }
 
@@ -12147,7 +11965,7 @@ mod tests {
             main,
             linked,
             storage,
-            owner,
+            _owner: owner,
             borrower,
         }
     }
@@ -12202,17 +12020,6 @@ mod tests {
         storage
             .join("views")
             .join(crate::path_identity::project_scope_key(root))
-    }
-
-    /// Derived call-graph files of a view: databases and ownership references.
-    fn lazy_derived_files(view_dir: &Path) -> Vec<String> {
-        let mut names = fs::read_dir(view_dir)
-            .unwrap()
-            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-            .filter(|name| name.starts_with("derived-"))
-            .collect::<Vec<_>>();
-        names.sort();
-        names
     }
 
     fn lazy_ready(
@@ -12313,31 +12120,6 @@ mod tests {
         assert_eq!(projected, dead_code(cold));
     }
 
-    /// Wait for the publication that builds the worktree's own graph.
-    fn lazy_wait_for_own_graph(ctx: &AppContext) {
-        let deadline = Instant::now() + Duration::from_secs(180);
-        loop {
-            let built = ctx
-                .view_runtime_snapshot()
-                .and_then(|view| {
-                    let generation = view.generation?;
-                    Some(crate::views::read::derived_built(
-                        &view.view_dir,
-                        &generation,
-                    ))
-                })
-                .unwrap_or(false);
-            if built && !crate::executor::view_publication::running_for(ctx) {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the on-demand call-graph build did not finish"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
     /// Edit `lib.rs` in the worktree and deliver the change through the
     /// watcher drain, without publishing it yet.
     fn lazy_edit_through_watcher(fixture: &LazyWorktree, contents: &str) {
@@ -12351,429 +12133,6 @@ mod tests {
         .unwrap();
         let outcome = crate::runtime_drain::drain_watcher_events_bounded(&fixture.borrower, 1);
         assert_eq!(outcome.processed, 1);
-    }
-
-    /// A views-on checkout whose call graph an operator removes while the
-    /// daemon is stopped: `blobs/<family>/callgraph.sqlite` and its `-wal` and
-    /// `-shm` files are deleted, while `oid-alias.sqlite` and
-    /// `semantic.sqlite` beside them are kept.
-    struct BlobRemovalFixture {
-        _temp: tempfile::TempDir,
-        root: PathBuf,
-        storage: PathBuf,
-        family: String,
-        /// `callers` of `target` and `call_tree` of `caller`, Debug-formatted,
-        /// as the daemon answered before the store was removed.
-        callers_before: String,
-        call_tree_before: String,
-        generation_before: String,
-    }
-
-    const BLOB_REMOVAL_EDITED_LIB: &str =
-        "pub fn caller() { target(); }\npub fn second() { target(); }\npub fn target() {}\nfn unused() {}\n";
-
-    fn blob_removal_callgraph_db(storage: &Path, family: &str) -> PathBuf {
-        storage.join("blobs").join(family).join("callgraph.sqlite")
-    }
-
-    fn blob_removal_payload_rows(storage: &Path, family: &str) -> u64 {
-        let connection =
-            rusqlite::Connection::open(blob_removal_callgraph_db(storage, family)).unwrap();
-        connection
-            .query_row("SELECT COUNT(*) FROM blob_payloads", [], |row| row.get(0))
-            .unwrap()
-    }
-
-    fn blob_removal_answers(ctx: &AppContext) -> (String, String) {
-        let view = ctx.view_runtime_snapshot().expect("published fixture view");
-        // Wait for the detached checkpoint to finish before reading: it can
-        // still lock the database after publication. A live query can instead
-        // return the retryable callgraph_building response.
-        crate::views::wait_for_derived_checkpoint_for_test(&view.view_dir);
-        let store = lazy_ready(ctx.callgraph_store_for_ops());
-        let lib = Path::new("lib.rs");
-        (
-            format!("{:?}", store.callers_of(lib, "target", 3).unwrap()),
-            format!("{:?}", store.call_tree(lib, "caller", 3).unwrap()),
-        )
-    }
-
-    fn blob_removal_generation(storage: &Path, root: &Path) -> Option<String> {
-        crate::views::ViewStore::open(storage, &crate::path_identity::project_scope_key(root))
-            .unwrap()
-            .current_generation()
-            .unwrap()
-    }
-
-    #[test]
-    fn configure_busy_callgraph_readiness_revalidates_after_unlock() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("main");
-        let storage = temp.path().join("storage");
-        init_git_fixture(&root);
-        lazy_commit(&root, LAZY_LIB, "lib");
-        let root = root.canonicalize().unwrap();
-        let first = lazy_bind(&root, &storage, "before-lock");
-        let view_dir = lazy_view_dir(&storage, &root);
-        crate::views::wait_for_derived_checkpoint_for_test(&view_dir);
-        let generation = blob_removal_generation(&storage, &root).unwrap();
-        drop(first);
-        let database = crate::views::resolve_derived_path(&view_dir, &generation).unwrap();
-        let writer = crate::db::file_identity::IdentityConnection::open(
-            &database,
-            "busy configure readiness fixture",
-        )
-        .unwrap();
-        writer
-            .execute(
-                "UPDATE meta SET v = 'stale-build-output' WHERE k = 'fingerprint'",
-                [],
-            )
-            .unwrap();
-        let journal: String = writer
-            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(journal, "delete");
-        writer.execute_batch("BEGIN EXCLUSIVE;").unwrap();
-        let probe = crate::callgraph_store::manifest_view_database_ready(
-            &view_dir,
-            &generation,
-            Instant::now() + crate::db::TOOL_RETRY_BUSY_WAIT,
-        )
-        .unwrap_err();
-        assert!(probe.is_transient_lock_contention(), "{probe}");
-
-        let owner = test_context();
-        let params = json!({
-            "project_root": root, "storage_dir": storage, "harness": "opencode",
-            "config": [user_tier(json!({"views":{"enabled":true},
-                "indexes":{"trigram":false,"semantic":false,"callgraph":true}}))]
-        });
-        assert!(
-            handle_configure_for_test(
-                &configure_request_with_session(params, "after-lock"),
-                &owner,
-            )
-            .success
-        );
-        let (gate, probe_done, release) =
-            super::gate_configure_tail_stage_for_test(root.clone(), "view_payload_check");
-        std::thread::scope(|scope| {
-            let tail = scope.spawn(|| super::drain_deferred_configure_maintenance(&owner));
-            probe_done.recv_timeout(Duration::from_secs(30)).unwrap();
-            writer
-                .execute_batch("ROLLBACK; PRAGMA journal_mode=WAL;")
-                .unwrap();
-            drop(writer);
-            drop(gate);
-            release.send(()).unwrap();
-            tail.join().unwrap();
-        });
-        crate::views::wait_for_derived_checkpoint_for_test(&view_dir);
-        let store = lazy_ready(owner.callgraph_store_for_ops());
-        assert_eq!(store.reader_kind(), "view");
-        assert_ne!(
-            blob_removal_generation(&storage, &root).as_deref(),
-            Some(generation.as_str())
-        );
-        assert!(owner
-            .view_runtime_snapshot()
-            .unwrap()
-            .pending_paths
-            .is_empty());
-        assert!(format!(
-            "{:?}",
-            store.callers_of(Path::new("lib.rs"), "target", 3).unwrap()
-        )
-        .contains("caller"));
-    }
-
-    /// Models a stopped daemon before the store is removed: once this returns,
-    /// no tracked database connection under `storage` is open in this process.
-    /// Deleting a file that a connection still holds would leave that
-    /// connection reading the unlinked file on Unix, which would hide the effect
-    /// being tested, and fails on Windows.
-    ///
-    /// Dropping the last context closes the connections it owns. The view
-    /// publication, however, handed its keeper connection on the new
-    /// `derived-*.sqlite` to the detached `aft-view-checkpoint` worker (see
-    /// `views::generation::schedule_derived_checkpoint`). The context does not
-    /// own that worker; it waits at least 250 ms, attempts a checkpoint unless
-    /// a later publication superseded it, then closes the connection either
-    /// way. Wait for it here. A real daemon stop ends the process, which closes
-    /// that handle as well.
-    fn blob_removal_stop(ctx: Arc<AppContext>, storage: &Path, root: &Path) {
-        let Ok(ctx) = Arc::try_unwrap(ctx) else {
-            panic!("another owner kept the context alive past the stop");
-        };
-        drop(ctx);
-        crate::views::wait_for_derived_checkpoint_for_test(&lazy_view_dir(storage, root));
-        let held = crate::db::file_identity::open_connections_under_for_test(storage);
-        assert!(
-            held.is_empty(),
-            "connections outlived the stopped context: {held:#?}"
-        );
-    }
-
-    /// Removes the family's call-graph blob store and asserts that the alias and
-    /// semantic stores beside it are left in place.
-    fn blob_removal_delete_store(storage: &Path, family: &str) {
-        let database = blob_removal_callgraph_db(storage, family);
-        assert!(database.is_file());
-        for suffix in ["", "-wal", "-shm"] {
-            let path = PathBuf::from(format!("{}{suffix}", database.display()));
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => panic!("removing {}: {error}", path.display()),
-            }
-        }
-        let family_dir = storage.join("blobs").join(family);
-        assert!(!database.exists());
-        assert!(family_dir.join("oid-alias.sqlite").is_file());
-        assert!(family_dir.join("semantic.sqlite").is_file());
-    }
-
-    /// Binds a committed checkout with views and the call graph on, records the
-    /// answers the daemon gives, stops it and removes the call-graph blob store.
-    fn blob_removal_fixture() -> BlobRemovalFixture {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("main");
-        init_git_fixture(&root);
-        lazy_commit(&root, LAZY_LIB, "lib");
-        let root = root.canonicalize().unwrap();
-        let storage = temp.path().join("storage");
-        let family = crate::search_index::artifact_cache_key(&root);
-
-        let ctx = lazy_bind(&root, &storage, "before-removal");
-        let (callers_before, call_tree_before) = blob_removal_answers(&ctx);
-        assert!(callers_before.contains("caller"), "{callers_before}");
-        assert!(call_tree_before.contains("target"), "{call_tree_before}");
-        let generation_before = blob_removal_generation(&storage, &root).unwrap();
-        assert!(crate::views::read::derived_built(
-            &lazy_view_dir(&storage, &root),
-            &generation_before
-        ));
-        // lib.rs and tracked.rs each have one extracted payload.
-        assert_eq!(blob_removal_payload_rows(&storage, &family), 2);
-
-        blob_removal_stop(ctx, &storage, &root);
-        blob_removal_delete_store(&storage, &family);
-        BlobRemovalFixture {
-            _temp: temp,
-            root,
-            storage,
-            family,
-            callers_before,
-            call_tree_before,
-            generation_before,
-        }
-    }
-
-    /// Removing only the blob store used to freeze the view: nothing extracted
-    /// the deleted payloads again, the first edit's closure check found the
-    /// unchanged file's payload missing, and every retry failed the same way.
-    /// A missing payload is now extracted again from the working tree, so the
-    /// restarted daemon keeps answering and the next edit publishes.
-    #[test]
-    fn views_removed_callgraph_blob_store_heals_and_the_next_edit_publishes() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let fixture = blob_removal_fixture();
-        let (root, storage, family) = (&fixture.root, &fixture.storage, &fixture.family);
-
-        let ctx = lazy_bind(root, storage, "after-removal");
-        assert_eq!(
-            blob_removal_answers(&ctx),
-            (
-                fixture.callers_before.clone(),
-                fixture.call_tree_before.clone()
-            ),
-            "the restarted daemon answers from the surviving derived database"
-        );
-
-        fs::write(root.join("lib.rs"), BLOB_REMOVAL_EDITED_LIB).unwrap();
-        let report = ctx
-            .publish_view_paths(BTreeSet::from([b"lib.rs".to_vec()]), false)
-            .expect("the edit publishes although the blob store was removed");
-        assert!(report.published, "{report:?}");
-        assert!(report.pending_paths.is_empty(), "{report:?}");
-        assert_ne!(
-            blob_removal_generation(storage, root).as_deref(),
-            Some(fixture.generation_before.as_str()),
-            "the edit's generation is current"
-        );
-        let (callers_after_edit, _) = blob_removal_answers(&ctx);
-        assert!(
-            callers_after_edit.contains("second"),
-            "the edit's new caller is served: {callers_after_edit}"
-        );
-        // The unchanged file's payload was extracted again, beside the edit's.
-        assert!(blob_removal_has_payload(
-            storage,
-            family,
-            &blob_removal_key(&root.join("tracked.rs"))
-        ));
-        assert!(blob_removal_has_payload(
-            storage,
-            family,
-            &blob_removal_key(&root.join("lib.rs"))
-        ));
-    }
-
-    /// The callgraph key of a file's current bytes, as assembly computes it.
-    fn blob_removal_key(path: &Path) -> String {
-        crate::blob_store::CallgraphKey::from_bytes(
-            &fs::read(path).unwrap(),
-            "rust",
-            crate::views::callgraph::PRODUCER,
-        )
-        .full_key()
-        .to_hex()
-    }
-
-    fn blob_removal_has_payload(storage: &Path, family: &str, key: &str) -> bool {
-        let connection =
-            rusqlite::Connection::open(blob_removal_callgraph_db(storage, family)).unwrap();
-        let key = crate::blob_store::v2::parse_hex32(key).unwrap();
-        connection
-            .query_row(
-                "SELECT COUNT(*) FROM blob_payloads WHERE full_key = ?1",
-                [key.as_slice()],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap()
-            == 1
-    }
-
-    /// Deletes every payload row of the family's call-graph store, keeping the
-    /// file, as a lost or truncated store would leave it.
-    fn blob_removal_clear_rows(storage: &Path, family: &str) {
-        let connection =
-            rusqlite::Connection::open(blob_removal_callgraph_db(storage, family)).unwrap();
-        connection
-            .execute_batch("DELETE FROM blob_payloads")
-            .unwrap();
-        drop(connection);
-        assert_eq!(blob_removal_payload_rows(storage, family), 0);
-    }
-
-    fn blob_removal_manifest_key(storage: &Path, root: &Path, path: &str) -> Option<String> {
-        let view =
-            crate::views::ViewStore::open(storage, &crate::path_identity::project_scope_key(root))
-                .unwrap();
-        let generation = view.current_generation().unwrap().unwrap();
-        let manifest = view.load_manifest(&generation).unwrap();
-        match manifest.get(&crate::views::RelPath::new(path.as_bytes().to_vec()).unwrap())? {
-            crate::views::ManifestEntry::Regular { planes, .. } => planes.callgraph.clone(),
-            _ => None,
-        }
-    }
-
-    /// A bound checkout whose call-graph store loses its rows while the daemon
-    /// runs. Returns the live context.
-    fn blob_heal_running_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, String, Arc<AppContext>)
-    {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("main");
-        init_git_fixture(&root);
-        lazy_commit(&root, LAZY_LIB, "lib");
-        let root = root.canonicalize().unwrap();
-        let storage = temp.path().join("storage");
-        let family = crate::search_index::artifact_cache_key(&root);
-        let ctx = lazy_bind(&root, &storage, "running-heal");
-        assert_eq!(blob_removal_payload_rows(&storage, &family), 2);
-        blob_removal_clear_rows(&storage, &family);
-        (temp, root, storage, family, ctx)
-    }
-
-    /// A store SQLite cannot read is moved aside and recreated empty when it
-    /// is opened. The view keeps naming the old payloads; they are extracted
-    /// again, and the next edit publishes.
-    #[test]
-    fn views_corrupt_callgraph_blob_store_is_moved_aside_and_heals() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let fixture = blob_removal_fixture();
-        let (root, storage, family) = (&fixture.root, &fixture.storage, &fixture.family);
-        let database = blob_removal_callgraph_db(storage, family);
-        fs::write(&database, b"this is not a SQLite database\n".repeat(256)).unwrap();
-
-        let ctx = lazy_bind(root, storage, "after-corruption");
-        let family_dir = storage.join("blobs").join(family);
-        let moved_aside = fs::read_dir(&family_dir)
-            .unwrap()
-            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-            .filter(|name| name.starts_with("callgraph.sqlite.corrupt-"))
-            .count();
-        assert_eq!(moved_aside, 1, "the corrupt store was moved aside");
-        assert_eq!(
-            blob_removal_answers(&ctx),
-            (
-                fixture.callers_before.clone(),
-                fixture.call_tree_before.clone()
-            ),
-        );
-
-        fs::write(root.join("lib.rs"), BLOB_REMOVAL_EDITED_LIB).unwrap();
-        let report = ctx
-            .publish_view_paths(BTreeSet::from([b"lib.rs".to_vec()]), false)
-            .expect("the edit publishes after the corrupt store was replaced");
-        assert!(report.published, "{report:?}");
-        let (callers_after_edit, _) = blob_removal_answers(&ctx);
-        assert!(
-            callers_after_edit.contains("second"),
-            "{callers_after_edit}"
-        );
-        assert!(blob_removal_has_payload(
-            storage,
-            family,
-            &blob_removal_key(&root.join("tracked.rs"))
-        ));
-    }
-
-    /// Bind finds the current generation's missing payloads before any edit
-    /// and schedules the publication that extracts them again.
-    #[test]
-    fn views_emptied_callgraph_blob_store_is_healed_at_bind() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let fixture = blob_removal_fixture();
-        let (root, storage, family) = (&fixture.root, &fixture.storage, &fixture.family);
-
-        let ctx = lazy_bind(root, storage, "after-emptying");
-        assert_eq!(
-            blob_removal_payload_rows(storage, family),
-            2,
-            "bind extracted both payloads again without an edit"
-        );
-        assert_eq!(
-            blob_removal_generation(storage, root).as_deref(),
-            Some(fixture.generation_before.as_str()),
-            "the repair changed no content, so the generation is unchanged"
-        );
-        assert!(ctx
-            .view_runtime_snapshot()
-            .is_some_and(|view| view.pending_paths.is_empty()));
-        assert_eq!(
-            blob_removal_answers(&ctx),
-            (
-                fixture.callers_before.clone(),
-                fixture.call_tree_before.clone()
-            ),
-        );
-        let (_cold_storage, cold) = lazy_cold_store(root);
-        let store = lazy_ready(ctx.callgraph_store_for_ops());
-        assert_eq!(
-            store.edge_snapshot().unwrap(),
-            cold.edge_snapshot().unwrap()
-        );
     }
 
     /// Measures, on a checkout of about AFT's size with both payload planes
@@ -12972,366 +12331,8 @@ mod tests {
         }
     }
 
-    /// A missing payload whose file changed since the view was published is
-    /// extracted from the file's current content, under its new key.
     #[test]
-    fn views_missing_payload_of_a_changed_file_is_extracted_under_its_new_key() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let (_temp, root, storage, family, ctx) = blob_heal_running_fixture();
-        let old_tracked_key = blob_removal_key(&root.join("tracked.rs"));
-        assert_eq!(
-            blob_removal_manifest_key(&storage, &root, "tracked.rs").as_deref(),
-            Some(old_tracked_key.as_str())
-        );
-        // Nothing reports this change: only lib.rs is published below.
-        fs::write(
-            root.join("tracked.rs"),
-            "fn tracked() { crate::target(); }\n",
-        )
-        .unwrap();
-        let new_tracked_key = blob_removal_key(&root.join("tracked.rs"));
-
-        fs::write(root.join("lib.rs"), BLOB_REMOVAL_EDITED_LIB).unwrap();
-        let report = ctx
-            .publish_view_paths(BTreeSet::from([b"lib.rs".to_vec()]), false)
-            .expect("the edit publishes");
-        assert!(report.published, "{report:?}");
-        assert_eq!(
-            blob_removal_manifest_key(&storage, &root, "tracked.rs").as_deref(),
-            Some(new_tracked_key.as_str()),
-            "the changed file is published under its current content's key"
-        );
-        assert!(blob_removal_has_payload(
-            &storage,
-            &family,
-            &new_tracked_key
-        ));
-        assert!(!blob_removal_has_payload(
-            &storage,
-            &family,
-            &old_tracked_key
-        ));
-        let (callers_after_edit, _) = blob_removal_answers(&ctx);
-        assert!(
-            callers_after_edit.contains("second"),
-            "{callers_after_edit}"
-        );
-    }
-
-    /// The bind check reads keys, not payloads, and an exhausted budget is
-    /// reported as incomplete rather than as a store with nothing missing.
-    #[test]
-    fn views_payload_check_names_missing_paths_and_reports_an_exhausted_budget() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let (_temp, root, storage, family, _ctx) = blob_heal_running_fixture();
-        let view = crate::views::ViewStore::open(
-            &storage,
-            &crate::path_identity::project_scope_key(&root),
-        )
-        .unwrap();
-        let manifest = view
-            .load_manifest(&view.current_generation().unwrap().unwrap())
-            .unwrap();
-        let callgraph = crate::blob_store::BlobStore::open(
-            &storage,
-            family.clone(),
-            crate::blob_store::BlobPlane::Callgraph,
-        )
-        .unwrap();
-        let semantic = crate::blob_store::BlobStore::open(
-            &storage,
-            family.clone(),
-            crate::blob_store::BlobPlane::Semantic,
-        )
-        .unwrap();
-
-        let check = super::view_payload_check(
-            &manifest,
-            &callgraph,
-            &semantic,
-            Instant::now() + Duration::from_secs(60),
-        )
-        .unwrap();
-        assert!(check.complete());
-        assert_eq!(
-            check.missing.keys().cloned().collect::<Vec<_>>(),
-            vec![b"lib.rs".to_vec(), b"tracked.rs".to_vec()]
-        );
-        assert!(check
-            .missing
-            .values()
-            .all(|input| input.plane == "callgraph"));
-
-        let exhausted = super::view_payload_check(
-            &manifest,
-            &callgraph,
-            &semantic,
-            Instant::now()
-                .checked_sub(Duration::from_millis(1))
-                .unwrap_or_else(Instant::now),
-        )
-        .unwrap();
-        assert!(!exhausted.complete());
-        assert!(exhausted.missing.is_empty());
-    }
-
-    /// A missing payload whose file cannot be read leaves that path out of the
-    /// generation with a failed status; the rest of the publication lands.
-    #[test]
-    fn views_missing_payload_of_an_unreadable_file_fails_only_that_path() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let (_temp, root, storage, _family, ctx) = blob_heal_running_fixture();
-        // A directory where the tracked file was: the path still exists, but
-        // reading it as a file fails.
-        fs::remove_file(root.join("tracked.rs")).unwrap();
-        fs::create_dir(root.join("tracked.rs")).unwrap();
-
-        fs::write(root.join("lib.rs"), BLOB_REMOVAL_EDITED_LIB).unwrap();
-        let report = ctx
-            .publish_view_paths(BTreeSet::from([b"lib.rs".to_vec()]), false)
-            .expect("one unreadable path does not fail the publication");
-        assert!(report.published, "{report:?}");
-        assert!(
-            blob_removal_manifest_key(&storage, &root, "tracked.rs").is_none(),
-            "the unreadable path is not published with a missing payload"
-        );
-        let status = crate::path_status::PathStatusStore::open(&lazy_view_dir(&storage, &root))
-            .unwrap()
-            .status_for(b"tracked.rs")
-            .unwrap()
-            .expect("the unreadable path has a status");
-        assert_eq!(status.state, crate::path_status::PathState::Failed);
-        assert_eq!(
-            status.reason,
-            crate::views::assembly::MISSING_PAYLOAD_SOURCE_UNREADABLE
-        );
-        let (callers_after_edit, _) = blob_removal_answers(&ctx);
-        assert!(
-            callers_after_edit.contains("second"),
-            "{callers_after_edit}"
-        );
-    }
-
-    /// Removing the checkout's view directory together with the blob store
-    /// makes the next bind publish from scratch: every file is extracted
-    /// again, and the rebuilt graph answers as before and takes later edits.
-    #[test]
-    fn views_removed_callgraph_blob_store_and_view_rebuild_on_restart() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let fixture = blob_removal_fixture();
-        let (root, storage, family) = (&fixture.root, &fixture.storage, &fixture.family);
-        let view_dir = lazy_view_dir(storage, root);
-        fs::remove_dir_all(&view_dir).unwrap();
-
-        let ctx = lazy_bind(root, storage, "after-removal");
-        let generation = blob_removal_generation(storage, root).expect("republished at bind");
-        assert!(crate::views::read::derived_built(&view_dir, &generation));
-        assert!(ctx
-            .view_runtime_snapshot()
-            .is_some_and(|view| view.pending_paths.is_empty()));
-        assert_eq!(
-            blob_removal_payload_rows(storage, family),
-            2,
-            "both files were extracted again"
-        );
-
-        // Rebuilding from scratch flushes its database before bind returns, so
-        // there is no background checkpoint to pause. Publish an edit below and
-        // pause that generation's checkpoint with a real SQLite writer.
-        // An exclusive rollback-journal transaction makes short-lived lock
-        // contention observable without racing the scheduler.
-        enum CheckpointObservation {
-            Waiting,
-            Answer(std::thread::Result<(String, String)>),
-        }
-        let (begin_tx, begin_rx) = std::sync::mpsc::channel();
-        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let (observation_tx, observation_rx) = std::sync::mpsc::channel();
-        let waiting_tx = observation_tx.clone();
-        crate::views::checkpoint_test_hooks()
-            .lock()
-            .unwrap()
-            .insert(
-                view_dir.clone(),
-                crate::views::CheckpointTestHooks {
-                    before_settled: Some(Box::new(move |path| {
-                        begin_rx.recv_timeout(Duration::from_secs(60)).unwrap();
-                        let connection = crate::db::file_identity::IdentityConnection::open(
-                            path,
-                            "checkpoint contention fixture",
-                        )
-                        .unwrap();
-                        let journal: String = connection
-                            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
-                            .unwrap();
-                        assert_eq!(journal, "delete");
-                        connection.execute_batch("BEGIN EXCLUSIVE;").unwrap();
-                        locked_tx.send(path.to_path_buf()).unwrap();
-                        let _ = release_rx.recv_timeout(Duration::from_secs(60));
-                        connection
-                            .execute_batch("ROLLBACK; PRAGMA journal_mode=WAL;")
-                            .unwrap();
-                    })),
-                    before_wait: Some(Box::new(move || {
-                        waiting_tx.send(CheckpointObservation::Waiting).unwrap();
-                    })),
-                },
-            );
-        let source = fs::read_to_string(root.join("lib.rs")).unwrap();
-        fs::write(
-            root.join("lib.rs"),
-            format!("{source}\n// checkpoint synchronization fixture\n"),
-        )
-        .unwrap();
-        let checkpoint_publication = ctx
-            .publish_view_paths(BTreeSet::from([b"lib.rs".to_vec()]), false)
-            .unwrap();
-        assert!(
-            checkpoint_publication.published,
-            "{checkpoint_publication:?}"
-        );
-        let generation = checkpoint_publication
-            .generation
-            .expect("incremental checkpoint generation");
-        begin_tx.send(()).unwrap();
-        let locked_path = locked_rx.recv_timeout(Duration::from_secs(60)).unwrap();
-        assert_eq!(
-            locked_path,
-            crate::views::resolve_derived_path(&view_dir, &generation).unwrap()
-        );
-        let request: RawRequest = serde_json::from_value(serde_json::json!({
-            "id": "checkpoint-busy", "command": "callers", "session_id": "after-removal",
-            "file": "lib.rs", "symbol": "target"
-        }))
-        .unwrap();
-        let busy = crate::commands::callers::handle_callers(&request, &ctx);
-        assert!(!busy.success, "{busy:?}");
-        assert_eq!(busy.data["code"], "callgraph_building", "{busy:?}");
-        let reader_ctx = Arc::clone(&ctx);
-        let reader = std::thread::spawn(move || {
-            let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                blob_removal_answers(&reader_ctx)
-            }));
-            observation_tx
-                .send(CheckpointObservation::Answer(answer))
-                .unwrap();
-        });
-        assert!(
-            matches!(
-                observation_rx
-                    .recv_timeout(Duration::from_secs(60))
-                    .unwrap(),
-                CheckpointObservation::Waiting
-            ),
-            "the fixture read before the checkpoint completion event"
-        );
-        release_tx.send(()).unwrap();
-        let CheckpointObservation::Answer(answer) = observation_rx
-            .recv_timeout(Duration::from_secs(60))
-            .unwrap()
-        else {
-            panic!("checkpoint waiter did not answer");
-        };
-        reader.join().unwrap();
-        crate::views::checkpoint_test_hooks()
-            .lock()
-            .unwrap()
-            .remove(&view_dir);
-        assert_eq!(
-            answer.unwrap(),
-            (
-                fixture.callers_before.clone(),
-                fixture.call_tree_before.clone()
-            ),
-        );
-        let (_cold_storage, cold) = lazy_cold_store(root);
-        let store = lazy_ready(ctx.callgraph_store_for_ops());
-        assert_eq!(
-            store.edge_snapshot().unwrap(),
-            cold.edge_snapshot().unwrap()
-        );
-        drop(store);
-
-        fs::write(root.join("lib.rs"), BLOB_REMOVAL_EDITED_LIB).unwrap();
-        let report = ctx
-            .publish_view_paths(BTreeSet::from([b"lib.rs".to_vec()]), false)
-            .unwrap();
-        assert!(report.published, "{report:?}");
-        assert!(report.pending_paths.is_empty(), "{report:?}");
-        let (callers_after_edit, _) = blob_removal_answers(&ctx);
-        assert!(
-            callers_after_edit.contains("second"),
-            "{callers_after_edit}"
-        );
-    }
-
-    #[test]
-    fn linked_worktree_answers_from_main_graph_without_building_its_own() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let fixture = lazy_worktree(true);
-        let view_dir = lazy_view_dir(&fixture.storage, &fixture.linked);
-        let view = crate::views::ViewStore::open(
-            &fixture.storage,
-            &crate::path_identity::project_scope_key(&fixture.linked),
-        )
-        .unwrap();
-        assert!(
-            view.current_generation().unwrap().is_some(),
-            "the worktree's view is still published at bind"
-        );
-        assert_eq!(lazy_derived_files(&view_dir), Vec::<String>::new());
-
-        let store = lazy_ready(fixture.borrower.callgraph_store_for_ops());
-        assert!(
-            store
-                .sqlite_path()
-                .starts_with(lazy_view_dir(&fixture.storage, &fixture.main)),
-            "answered from {:?}, not the main checkout's graph",
-            store.sqlite_path()
-        );
-        let (_cold_storage, cold) = lazy_cold_store(&fixture.linked);
-        lazy_assert_same_graph(&store, &cold);
-        // Inspect's Tier-2 categories, such as dead code, also read the main
-        // checkout's graph for this worktree.
-        let (inspect_store, _) = crate::inspect::current_view_projection_store_for_test(
-            &fixture.linked,
-            &fixture.borrower.config(),
-        )
-        .expect("inspect reads the main checkout's graph for the worktree");
-        lazy_assert_same_graph(&inspect_store, &cold);
-        let answer = crate::commands::callers::handle_callers(
-            &RawRequest {
-                id: "lazy-callers".into(),
-                command: "callers".into(),
-                session_id: Some("lazy-linked".into()),
-                lsp_hints: None,
-                params: json!({ "file": fixture.linked.join("lib.rs"), "symbol": "target" }),
-            },
-            &fixture.borrower,
-        );
-        assert!(answer.success, "{}", answer.data);
-        assert_eq!(answer.data["total_callers"], 1, "{}", answer.data);
-
-        assert_eq!(lazy_derived_files(&view_dir), Vec::<String>::new());
-        assert_eq!(
-            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
-            0
-        );
-    }
-
-    #[test]
-    fn linked_worktree_edit_reports_building_then_answers_from_its_own_graph() {
+    fn linked_worktree_edit_answers_from_its_own_view_at_once() {
         let _artifact_guard = artifact_owner_test_lock();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
@@ -13341,26 +12342,8 @@ mod tests {
             "pub fn caller() { target(); }\npub fn edited_caller() { target(); }\npub fn target() {}\nfn unused() {}\n",
         );
 
-        // The edit is not published yet, but main's graph no longer answers.
-        let access = {
-            let _scope = crate::executor::install_standalone_scope(Arc::clone(&fixture.borrower));
-            fixture.borrower.callgraph_store_for_ops()
-        };
-        assert!(matches!(access, CallgraphStoreAccess::Building));
-        assert_eq!(
-            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
-            1
-        );
-        lazy_wait_for_own_graph(&fixture.borrower);
-
-        let store = lazy_ready(fixture.borrower.callgraph_store_for_ops());
-        assert!(
-            store
-                .sqlite_path()
-                .starts_with(lazy_view_dir(&fixture.storage, &fixture.linked)),
-            "answered from {:?}, not the worktree's own graph",
-            store.sqlite_path()
-        );
+        // The edit is not published yet; the worktree's own view answers with it.
+        let store = lazy_query_builds_own_graph(&fixture);
         let (_cold_storage, cold) = lazy_cold_store(&fixture.linked);
         lazy_assert_same_graph(&store, &cold);
         assert!(crate::callgraph_store::CallGraphRead::node_for(
@@ -13369,96 +12352,6 @@ mod tests {
             "edited_caller"
         )
         .is_ok());
-        assert_eq!(
-            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
-            1
-        );
-    }
-
-    #[test]
-    fn linked_worktree_that_never_queries_never_builds_a_call_graph() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let fixture = lazy_worktree(true);
-        let view_dir = lazy_view_dir(&fixture.storage, &fixture.linked);
-        let view = crate::views::ViewStore::open(
-            &fixture.storage,
-            &crate::path_identity::project_scope_key(&fixture.linked),
-        )
-        .unwrap();
-        let first = view.current_generation().unwrap();
-        lazy_edit_through_watcher(
-            &fixture,
-            "pub fn caller() { target(); }\npub fn target() {}\nfn unused() { caller(); }\n",
-        );
-        let mut state = fixture
-            .borrower
-            .watcher_drain_slice()
-            .lock()
-            .take()
-            .unwrap();
-        state.view_publication_due = Some(Instant::now());
-        crate::runtime_drain::publish_view_if_quiet(&fixture.borrower, &mut state);
-        assert!(state.view_publication_due.is_none());
-        let edited = view.current_generation().unwrap();
-        assert!(edited.is_some() && edited != first, "the edit is published");
-        // Rebinding the unchanged worktree neither rebuilds nor republishes.
-        let rebound = handle_configure_for_test(
-            &configure_request_with_session(
-                json!({
-                    "project_root": fixture.linked, "storage_dir": fixture.storage,
-                    "harness": "opencode",
-                    "config": [user_tier(json!({ "views": { "enabled": true },
-                        "indexes": { "trigram": false, "semantic": false, "callgraph": true } }))]
-                }),
-                "lazy-linked-again",
-            ),
-            &fixture.borrower,
-        );
-        assert!(rebound.success, "{}", rebound.data);
-        super::drain_deferred_configure_maintenance(&fixture.borrower);
-        assert_eq!(view.current_generation().unwrap(), edited);
-
-        assert_eq!(lazy_derived_files(&view_dir), Vec::<String>::new());
-        assert_eq!(
-            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
-            0
-        );
-        // Sweeping removes the superseded generation's manifest even though
-        // this worktree has no derived call-graph files to delete.
-        view.sweep_generations().unwrap();
-        assert!(!view
-            .manifest_path(first.as_deref().unwrap())
-            .unwrap()
-            .exists());
-        assert_eq!(lazy_derived_files(&view_dir), Vec::<String>::new());
-    }
-
-    #[test]
-    fn main_checkout_still_builds_its_call_graph_at_bind() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let fixture = lazy_worktree(false);
-        let view_dir = lazy_view_dir(&fixture.storage, &fixture.main);
-        let generation = crate::views::ViewStore::open(
-            &fixture.storage,
-            &crate::path_identity::project_scope_key(&fixture.main),
-        )
-        .unwrap()
-        .current_generation()
-        .unwrap()
-        .unwrap();
-        assert!(
-            crate::views::read::derived_built(&view_dir, &generation),
-            "the main checkout's graph is built at bind, before any query: {:?}",
-            lazy_derived_files(&view_dir)
-        );
-        let owner = fixture.owner.as_ref().unwrap();
-        assert_eq!(owner.lazy_callgraph_builds_scheduled_for_test(), 0);
-        let store = lazy_ready(owner.callgraph_store_for_ops());
-        assert!(store.sqlite_path().starts_with(&view_dir));
     }
 
     #[test]
@@ -13467,8 +12360,8 @@ mod tests {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         let fixture = lazy_worktree(true);
-        // A change the watcher saw means main's graph cannot answer.
-        fixture.borrower.note_checkout_changed_for_callgraph();
+        // Concurrent first queries are serialized on the checkout view: both
+        // answer, and the shared base graph is built and sealed only once.
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let queries = (0..2)
             .map(|_| {
@@ -13479,32 +12372,28 @@ mod tests {
                     barrier.wait();
                     matches!(
                         ctx.callgraph_store_for_ops(),
-                        CallgraphStoreAccess::Building
+                        CallgraphStoreAccess::Ready(_)
                     )
                 })
             })
             .collect::<Vec<_>>();
         for query in queries {
-            assert!(query.join().unwrap(), "a first query must report building");
+            assert!(query.join().unwrap(), "a first query must answer");
         }
-        assert_eq!(
-            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
-            1
-        );
-        lazy_wait_for_own_graph(&fixture.borrower);
-        assert_eq!(
-            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
-            1
-        );
+        let sealed = crate::views::donor::events_under(&fixture.storage)
+            .into_iter()
+            .filter(|event| *event == crate::views::donor::DonorEvent::Sealed)
+            .count();
+        assert_eq!(sealed, 1, "one base graph build for both queries");
         let store = lazy_ready(fixture.borrower.callgraph_store_for_ops());
-        assert!(store
-            .sqlite_path()
-            .starts_with(lazy_view_dir(&fixture.storage, &fixture.linked)));
+        assert_eq!(store.reader_kind(), "view");
+        let (_cold_storage, cold) = lazy_cold_store(&fixture.linked);
+        lazy_assert_same_graph(&store, &cold);
     }
 
     /// Query the worktree's call graph under a publication scope, as a daemon
-    /// request does: it must report building, never main's rows. Then wait for
-    /// the build and return the worktree's own graph.
+    /// request does. With views on it answers at once from the worktree's own
+    /// checkout view (its own v3 member), never from main's graph.
     fn lazy_query_builds_own_graph(
         fixture: &LazyWorktree,
     ) -> Arc<crate::callgraph_store::ReadonlyCallGraphStore> {
@@ -13512,20 +12401,14 @@ mod tests {
             let _scope = crate::executor::install_standalone_scope(Arc::clone(&fixture.borrower));
             fixture.borrower.callgraph_store_for_ops()
         };
-        if let CallgraphStoreAccess::Ready(store) = &access {
-            panic!(
-                "the first query answered before any build, from {:?}",
-                store.sqlite_path()
-            );
-        }
-        assert!(matches!(access, CallgraphStoreAccess::Building));
-        lazy_wait_for_own_graph(&fixture.borrower);
-        let store = lazy_ready(fixture.borrower.callgraph_store_for_ops());
+        let store = lazy_ready(access);
+        assert_eq!(store.reader_kind(), "view");
+        assert_eq!(store.project_root(), fixture.linked);
         assert!(
-            store
+            !store
                 .sqlite_path()
-                .starts_with(lazy_view_dir(&fixture.storage, &fixture.linked)),
-            "answered from {:?}, not the worktree's own graph",
+                .starts_with(lazy_view_dir(&fixture.storage, &fixture.main)),
+            "answered from main's graph {:?}",
             store.sqlite_path()
         );
         store
@@ -13554,14 +12437,6 @@ mod tests {
             "branch_caller"
         )
         .is_ok());
-        // aft_inspect's dead-code check must also read the worktree's own view, not main's graph.
-        assert!(crate::inspect::current_view_projection_store_for_test(
-            &fixture.linked,
-            &fixture.borrower.config(),
-        )
-        .is_some_and(|(store, _)| store
-            .sqlite_path()
-            .starts_with(lazy_view_dir(&fixture.storage, &fixture.linked))));
     }
 
     #[test]
@@ -13570,13 +12445,8 @@ mod tests {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         let fixture = lazy_worktree(true);
-        // The worktree matches main's generation, so main answers and that
-        // verdict is cached.
-        let store = lazy_ready(fixture.borrower.callgraph_store_for_ops());
-        assert!(store
-            .sqlite_path()
-            .starts_with(lazy_view_dir(&fixture.storage, &fixture.main)));
-        drop(store);
+        // The worktree matches main's generation and answers from its own view.
+        drop(lazy_query_builds_own_graph(&fixture));
         // Main moves on: a new commit removes the caller and main publishes a
         // generation with different inputs.
         lazy_commit(
@@ -13595,142 +12465,6 @@ mod tests {
             "caller"
         )
         .is_ok());
-    }
-
-    /// The current generation of `root`'s view and whether it has a derived
-    /// call-graph database.
-    fn lazy_current_generation(storage: &Path, root: &Path) -> (String, bool) {
-        let view_dir = lazy_view_dir(storage, root);
-        let generation =
-            crate::views::ViewStore::open(storage, &crate::path_identity::project_scope_key(root))
-                .unwrap()
-                .current_generation()
-                .unwrap()
-                .expect("published view");
-        let built = crate::views::read::derived_built(&view_dir, &generation);
-        (generation, built)
-    }
-
-    #[test]
-    fn linked_worktree_with_a_graph_from_an_earlier_process_defers_its_next_publication() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        // An earlier daemon built this worktree's graph (the eager behaviour
-        // before graphs were built on first use, or a process that queried it).
-        // Then the worker committed, so this bind has a publication to make.
-        let mut earlier = None;
-        let fixture = lazy_worktree_with(true, true, |linked, storage| {
-            lazy_publish(linked, storage);
-            earlier = Some(lazy_current_generation(storage, linked));
-            lazy_commit(
-                linked,
-                "pub fn caller() { target(); }\npub fn branch_caller() { target(); }\npub fn target() {}\nfn unused() {}\n",
-                "branch caller",
-            );
-        });
-        let (earlier, earlier_built) = earlier.unwrap();
-        assert!(earlier_built, "the earlier process built a derived graph");
-        let (current, built) = lazy_current_generation(&fixture.storage, &fixture.linked);
-        assert_ne!(current, earlier, "the bind published the new commit");
-        assert!(
-            !built,
-            "no query needed the graph in this process, so the publication must not patch or rebuild it: {:?}",
-            lazy_derived_files(&lazy_view_dir(&fixture.storage, &fixture.linked))
-        );
-        assert_eq!(
-            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
-            0
-        );
-        // The first query builds it, and the result equals a cold build.
-        let store = lazy_query_builds_own_graph(&fixture);
-        let (_cold_storage, cold) = lazy_cold_store(&fixture.linked);
-        lazy_assert_same_graph(&store, &cold);
-    }
-
-    #[test]
-    fn linked_worktree_defers_and_builds_on_first_query_when_main_is_not_bound() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        // Main is neither bound in this process nor published, so its graph
-        // cannot answer; the worktree still defers until a query needs it.
-        let fixture = lazy_worktree_with(false, false, |_, _| {});
-        assert!(fixture.owner.is_none());
-        let (_, built) = lazy_current_generation(&fixture.storage, &fixture.linked);
-        assert!(!built);
-        assert_eq!(
-            lazy_derived_files(&lazy_view_dir(&fixture.storage, &fixture.linked)),
-            Vec::<String>::new()
-        );
-        let store = lazy_query_builds_own_graph(&fixture);
-        let (_cold_storage, cold) = lazy_cold_store(&fixture.linked);
-        lazy_assert_same_graph(&store, &cold);
-    }
-
-    /// Hold an exclusive write transaction on `root`'s current derived
-    /// call-graph database, so a reader without a busy wait gets
-    /// "database is locked" until the returned connection rolls back.
-    fn lazy_lock_derived(
-        storage: &Path,
-        root: &Path,
-    ) -> crate::db::file_identity::IdentityConnection {
-        let (generation, built) = lazy_current_generation(storage, root);
-        assert!(built, "{root:?} has a derived call graph to lock");
-        let view =
-            crate::views::ViewStore::open(storage, &crate::path_identity::project_scope_key(root))
-                .unwrap();
-        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
-        let writer = crate::db::file_identity::IdentityConnection::open(
-            &view.derived_path(&generation).unwrap(),
-            "lazy_callgraph_lock_test",
-        )
-        .unwrap();
-        // In WAL mode a writer never blocks readers; the rollback journal makes
-        // the exclusive lock visible to them, as a checkpoint resetting the WAL
-        // or the last connection closing it is.
-        writer
-            .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
-            .unwrap();
-        writer
-    }
-
-    #[test]
-    fn linked_worktree_waits_for_a_locked_main_graph_instead_of_building() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let fixture = lazy_worktree(true);
-        // Main's publication holds its derived database while the worktree,
-        // whose files match main's, asks for callers.
-        let writer = lazy_lock_derived(&fixture.storage, &fixture.main);
-        match fixture.borrower.callgraph_store_for_ops() {
-            CallgraphStoreAccess::Building => {}
-            CallgraphStoreAccess::Ready(store) => panic!(
-                "a locked main graph must report building, not answer from {:?}",
-                store.sqlite_path()
-            ),
-            CallgraphStoreAccess::Error(error) => {
-                panic!("a locked main graph failed the query: {error}")
-            }
-            _ => panic!("a locked main graph must report building"),
-        }
-        // A lock is no verdict: no build started, and main answers once free.
-        assert!(fixture.borrower.defer_callgraph_build());
-        assert_eq!(
-            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
-            0
-        );
-        assert_eq!(
-            lazy_derived_files(&lazy_view_dir(&fixture.storage, &fixture.linked)),
-            Vec::<String>::new()
-        );
-        writer.execute_batch("ROLLBACK").unwrap();
-        drop(writer);
-        let store = lazy_ready(fixture.borrower.callgraph_store_for_ops());
-        assert!(store
-            .sqlite_path()
-            .starts_with(lazy_view_dir(&fixture.storage, &fixture.main)));
     }
 
     #[test]
@@ -13837,7 +12571,7 @@ mod tests {
     }
 
     #[test]
-    fn views_restart_dirty_source_reports_working_tree_refresh_until_publication() {
+    fn views_restart_dirty_source_answers_the_working_tree_at_once() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         let project = tempfile::tempdir().unwrap();
@@ -13897,88 +12631,10 @@ mod tests {
             params: json!({"file": root.join("tracked.rs"), "symbol": "dirty"}),
         };
         let response = crate::commands::callers::handle_callers(&request, &ctx);
-        assert_eq!(response.data["code"], "callgraph_building", "{response:?}");
-        assert_eq!(response.data["progress"]["phase"], "working_tree_refresh");
-        assert_eq!(response.data["progress"]["pending_paths"], 1);
-        assert!(response.data["progress"]["waiting_on"]
-            .to_string()
-            .contains("view publication"));
-        assert!(
-            ctx.publish_view_paths(BTreeSet::new(), true)
-                .unwrap()
-                .published
-        );
-        let response = crate::commands::callers::handle_callers(&request, &ctx);
+        // The checkout view verifies the working tree for the query itself, so
+        // the dirty source answers at once, without waiting for publication.
         assert!(response.success, "{response:?}");
         assert_eq!(response.data["total_callers"], 1);
-    }
-
-    #[test]
-    fn views_clean_thousand_file_configure_hashes_zero_source_files() {
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        init_git_fixture(project.path());
-        for index in 0..999 {
-            std::fs::write(
-                project.path().join(format!("file_{index:04}.rs")),
-                "pub fn clean() {}\n",
-            )
-            .unwrap();
-        }
-        assert!(git_command(project.path())
-            .args(["add", "."])
-            .status()
-            .unwrap()
-            .success());
-        assert!(git_command(project.path())
-            .args([
-                "-c",
-                "user.name=AFT Tests",
-                "-c",
-                "user.email=aft-tests@example.com",
-                "commit",
-                "--quiet",
-                "-m",
-                "thousand files"
-            ])
-            .status()
-            .unwrap()
-            .success());
-        let root = std::fs::canonicalize(project.path()).unwrap();
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
-        let configure = configure_request_with_params(json!({
-            "project_root": root, "storage_dir": storage.path(), "harness": "opencode",
-            "config": [user_tier(json!({
-                "views": {"enabled": true},
-                "indexes": {"trigram": false, "semantic": false, "callgraph": true}
-            }))]
-        }));
-        assert!(handle_configure_for_test(&configure, &ctx).success);
-        super::drain_deferred_configure_maintenance(&ctx);
-        assert_eq!(
-            ctx.view_runtime_snapshot()
-                .unwrap()
-                .manifest
-                .unwrap()
-                .entries()
-                .count(),
-            1000
-        );
-        drop(ctx);
-
-        let restarted = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
-        assert!(handle_configure_for_test(&configure, &restarted).success);
-        let mut state = super::ConfigureMaintenanceState::default();
-        state.absorb_enqueued(&restarted);
-        let job = &state.jobs.front().unwrap().job;
-        let input = super::ConfigureViewInput::capture(&restarted, job);
-        super::VIEW_WORKING_TREE_HASHES.with(|count| count.set(0));
-        let prepared = super::open_view_runtime_for_configure(&input, job).unwrap();
-        assert!(prepared.snapshot.pending_paths.is_empty());
-        super::VIEW_WORKING_TREE_HASHES
-            .with(|count| assert_eq!(count.get(), 0, "clean configure must not hash source files"));
     }
 
     #[test]
@@ -14143,230 +12799,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn views_gate_on_opens_family_stores_after_ack_and_schedules_fresh_head() {
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        init_git_fixture(project.path());
-        let canonical_root = std::fs::canonicalize(project.path()).unwrap();
-        let family = crate::search_index::artifact_cache_key(&canonical_root);
-        let scope = crate::path_identity::project_scope_key(&canonical_root);
-        let ctx = AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                storage_dir: Some(storage.path().to_path_buf()),
-                ..Config::default()
-            },
-        );
-        let response = handle_configure_for_test(
-            &configure_request_with_params(json!({
-                "project_root": canonical_root,
-                "storage_dir": storage.path(),
-                "harness": "opencode",
-                "config": [user_tier(json!({
-                    "views": { "enabled": true },
-                    "indexes": { "trigram": false, "semantic": false, "callgraph": true }
-                }))]
-            })),
-            &ctx,
-        );
-        assert!(response.success, "{}", response.data);
-        assert!(!storage.path().join("views").exists());
-
-        super::drain_deferred_configure_maintenance(&ctx);
-
-        let view = ctx.view_runtime_snapshot().expect("view runtime");
-        assert_eq!(view.family, family);
-        assert_eq!(view.scope, scope);
-        assert!(view
-            .generation
-            .as_deref()
-            .is_some_and(|generation| generation.starts_with("1-")));
-        assert!(view.pending_paths.is_empty());
-        assert!(view.manifest.is_some());
-        assert!(storage
-            .path()
-            .join("blobs")
-            .join(&family)
-            .join("semantic.sqlite")
-            .is_file());
-        assert!(storage
-            .path()
-            .join("blobs")
-            .join(&family)
-            .join("callgraph.sqlite")
-            .is_file());
-        assert!(storage.path().join("views").join(scope).is_dir());
-        let health = ctx.view_health_snapshot().expect("view health");
-        assert_eq!(health.generation, 1);
-        assert!(health.pinned);
-        let digest_request: RawRequest = serde_json::from_value(json!({
-            "id": "digest-1",
-            "command": "health.digest"
-        }))
-        .unwrap();
-        let digest = crate::commands::health_digest::handle_health_digest(&digest_request, &ctx);
-        let digest = serde_json::to_value(digest).unwrap();
-        assert_eq!(digest["views"]["ticket"]["generation"], json!(1));
-
-        match ctx.callgraph_store_for_ops() {
-            CallgraphStoreAccess::Ready(store) => {
-                assert_eq!(store.reader_kind(), "view");
-                assert!(crate::callgraph_store::CallGraphRead::node_for(
-                    &store,
-                    Path::new("tracked.rs"),
-                    "tracked",
-                )
-                .is_ok());
-            }
-            _ => panic!("expected view callgraph reader"),
-        }
-
-        fs::write(project.path().join("next.rs"), "pub fn next() {}\n").unwrap();
-        assert!(git_command(project.path())
-            .args(["add", "next.rs"])
-            .status()
-            .unwrap()
-            .success());
-        // The hermetic git env has no identity of its own; a CI runner has none
-        // either, so the commit must carry it the way the fixture's first one does.
-        assert!(git_command(project.path())
-            .args([
-                "-c",
-                "user.name=AFT Tests",
-                "-c",
-                "user.email=aft-tests@example.com",
-                "commit",
-                "--quiet",
-                "-m",
-                "next",
-            ])
-            .status()
-            .unwrap()
-            .success());
-        ctx.publish_view_paths(BTreeSet::from([b"next.rs".to_vec()]), true)
-            .unwrap();
-        let digest_request: RawRequest = serde_json::from_value(json!({
-            "id": "digest-2",
-            "command": "health.digest"
-        }))
-        .unwrap();
-        let digest = crate::commands::health_digest::handle_health_digest(&digest_request, &ctx);
-        let digest = serde_json::to_value(digest).unwrap();
-        assert_eq!(digest["views"]["ticket"]["generation"], json!(2));
-    }
-
-    /// Every HEAD path a first views-on configure schedules must leave the
-    /// pending ledger once the publication finishes, including paths the
-    /// publication does not make view members: tracked files deleted from the
-    /// checkout (binary assets here, as a copy of a tree can leave them out),
-    /// tracked files the project content rules exclude, and tracked symlinks
-    /// deleted from the checkout. A path left pending here is never revisited,
-    /// so status would report it pending for the life of the view.
-    #[test]
-    fn views_first_publication_leaves_no_path_pending_for_non_member_head_paths() {
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let root = project.path();
-        // Binary content present in the checkout: an ordinary member.
-        std::fs::create_dir_all(root.join("assets")).unwrap();
-        std::fs::write(root.join("assets/present.png"), [0x89, b'P', 0xff, 0xfe, 0]).unwrap();
-        // Binary content committed and then removed from the checkout.
-        std::fs::write(root.join("assets/banner.jpeg"), [0xff, 0xd8, 0xff, 0xe0, 0]).unwrap();
-        std::fs::create_dir_all(root.join("fixtures")).unwrap();
-        std::fs::write(root.join("fixtures/binary.bin"), [0, 0xff, 0xfe, 1]).unwrap();
-        // A tracked database file, which project content rules always exclude.
-        std::fs::write(root.join("fixtures/model.db"), b"SQLite format 3\0").unwrap();
-        #[cfg(unix)]
-        {
-            // A dangling symlink present in the checkout is still a member;
-            // one deleted from the checkout is not.
-            std::os::unix::fs::symlink("missing.rs", root.join("dangling.rs")).unwrap();
-            std::os::unix::fs::symlink("tracked.rs", root.join("removed_link.rs")).unwrap();
-        }
-        init_git_fixture(root);
-        std::fs::remove_file(root.join("assets/banner.jpeg")).unwrap();
-        std::fs::remove_file(root.join("fixtures/binary.bin")).unwrap();
-        #[cfg(unix)]
-        std::fs::remove_file(root.join("removed_link.rs")).unwrap();
-        let canonical_root = std::fs::canonicalize(root).unwrap();
-        let ctx = AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                storage_dir: Some(storage.path().to_path_buf()),
-                ..Config::default()
-            },
-        );
-        let response = handle_configure_for_test(
-            &configure_request_with_params(json!({
-                "project_root": canonical_root,
-                "storage_dir": storage.path(),
-                "harness": "opencode",
-                "config": [user_tier(json!({
-                    "views": { "enabled": true },
-                    "indexes": { "trigram": false, "semantic": false, "callgraph": true }
-                }))]
-            })),
-            &ctx,
-        );
-        assert!(response.success, "{}", response.data);
-
-        super::drain_deferred_configure_maintenance(&ctx);
-
-        let view = ctx.view_runtime_snapshot().expect("view runtime");
-        let manifest = view.manifest.as_ref().expect("published manifest");
-        let members = manifest
-            .entries()
-            .map(|(path, _)| String::from_utf8_lossy(path.as_bytes()).into_owned())
-            .collect::<BTreeSet<_>>();
-        assert!(members.contains("assets/present.png"), "{members:?}");
-        assert!(!members.contains("assets/banner.jpeg"), "{members:?}");
-        assert!(!members.contains("fixtures/binary.bin"), "{members:?}");
-        assert!(!members.contains("fixtures/model.db"), "{members:?}");
-        #[cfg(unix)]
-        {
-            assert!(members.contains("dangling.rs"), "{members:?}");
-            assert!(!members.contains("removed_link.rs"), "{members:?}");
-        }
-
-        let ledger = crate::path_status::PathStatusStore::open(&view.view_dir)
-            .unwrap()
-            .summary()
-            .unwrap();
-        let annotated = ledger
-            .paths
-            .iter()
-            .map(|status| {
-                format!(
-                    "{} {} ({})",
-                    String::from_utf8_lossy(&status.rel_path),
-                    status.state.as_str(),
-                    status.reason
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            (ledger.pending_count, ledger.failed_count),
-            (0, 0),
-            "paths left annotated after a complete publication: {annotated:?}"
-        );
-        let health = ctx.view_health_snapshot().expect("view health");
-        assert_eq!(health.generation, 1);
-        assert!(health.pinned);
-        assert_eq!((health.pending_paths, health.failed_paths), (0, 0));
-    }
-
     /// A tracked source in a call-graph language that is not valid UTF-8 can
-    /// never be parsed. It must not fail the publication (which would leave
-    /// every HEAD path pending forever): it joins the generation with an
-    /// empty call graph and is reported as skipped, apart from pending and
-    /// failed, while every other file keeps its call graph.
+    /// never be parsed. It must not fail the root's call-graph view: it joins
+    /// with an empty call graph while every other file keeps its call graph,
+    /// and once it decodes, its symbols join too.
     #[test]
-    fn views_publication_skips_a_non_utf8_callgraph_source_and_completes() {
+    fn views_callgraph_view_skips_a_non_utf8_callgraph_source_and_answers() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         let project = tempfile::tempdir().unwrap();
@@ -14399,56 +12837,29 @@ mod tests {
         assert!(response.success, "{}", response.data);
 
         super::drain_deferred_configure_maintenance(&ctx);
-
-        let health = ctx.view_health_snapshot().expect("view health");
-        assert_eq!(health.generation, 1, "{health:?}");
-        assert!(health.pinned, "{health:?}");
-        assert_eq!((health.pending_paths, health.failed_paths), (0, 0));
-        assert_eq!(
-            health.skipped_paths,
-            std::collections::BTreeMap::from([("non_utf8_source".to_string(), 1)])
-        );
-        let status = serde_json::to_value(&health).unwrap();
-        assert_eq!(status["skipped_paths"]["non_utf8_source"], json!(1));
-        assert_eq!(
-            status["skipped_path_sample"],
-            json!([{ "path": "latin1.py", "reason": "non_utf8_source" }])
-        );
-        let view = ctx.view_runtime_snapshot().expect("view runtime");
-        let manifest = view.manifest.as_ref().expect("published manifest");
-        assert!(manifest
-            .entries()
-            .any(|(path, _)| path.as_bytes() == b"latin1.py"));
-        match ctx.callgraph_store_for_ops() {
+        assert!(ctx.views_route_root());
+        let graph_has = |file: &str, symbol: &str| match ctx.callgraph_store_for_ops() {
             CallgraphStoreAccess::Ready(store) => {
-                assert_eq!(store.reader_kind(), "view");
-                for (file, symbol) in [("tracked.rs", "tracked"), ("util.py", "helper")] {
-                    assert!(
-                        crate::callgraph_store::CallGraphRead::node_for(
-                            &store,
-                            Path::new(file),
-                            symbol,
-                        )
-                        .is_ok(),
-                        "{file}:{symbol} left the call graph"
-                    );
-                }
+                crate::callgraph_store::CallGraphRead::node_for(&store, Path::new(file), symbol)
+                    .is_ok()
             }
-            _ => panic!("expected view callgraph reader"),
+            CallgraphStoreAccess::Error(error) => panic!("call-graph view refused: {error}"),
+            _ => panic!("expected the call-graph view reader"),
+        };
+        for (file, symbol) in [("tracked.rs", "tracked"), ("util.py", "helper")] {
+            assert!(
+                graph_has(file, symbol),
+                "{file}:{symbol} left the call graph"
+            );
         }
+        assert!(!graph_has("latin1.py", "caf\u{e9}"));
 
-        // Once the file decodes, its skip is cleared by the next publication.
+        // Once the file decodes, the next read of the view includes it.
         std::fs::write(root.join("latin1.py"), "def cafe():\n    pass\n").unwrap();
-        ctx.publish_view_paths(BTreeSet::from([b"latin1.py".to_vec()]), true)
-            .unwrap();
-        // Read the ledger directly: status caches its summary between reads.
-        let ledger = crate::path_status::PathStatusStore::open(&view.view_dir)
-            .unwrap()
-            .summary()
-            .unwrap();
-        assert!(ledger.skipped_by_reason.is_empty(), "{ledger:?}");
-        assert!(ledger.skipped_sample.is_empty(), "{ledger:?}");
-        assert_eq!((ledger.pending_count, ledger.failed_count), (0, 0));
+        ctx.record_checkout_watcher_change(&canonical_root.join("latin1.py"));
+        assert!(graph_has("latin1.py", "cafe"));
+        assert!(graph_has("util.py", "helper"));
+        assert!(ctx.view_runtime_snapshot().is_none());
     }
 
     /// While a views-on root is unbound past the grace window its semantic
@@ -14710,189 +13121,6 @@ mod tests {
             server.non_probe_input_count(),
             embedded,
             "the restarted lane embedded stored content again"
-        );
-    }
-
-    /// Callgraph view publication never waits on semantic embedding. With
-    /// views enabled, semantic vectors belong to the root's per-checkout
-    /// semantic view, so the older view publishes callgraph data with no
-    /// semantic plane at all, even while the semantic view's first fill is
-    /// stuck at the embedding server.
-    #[test]
-    fn callgraph_view_publishes_while_semantic_view_fill_is_held() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let _quiet_window = EnvVarGuard::set("AFT_SEMANTIC_QUIET_WINDOW_MS", "50");
-        let server = CountingEmbeddingServer::start();
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        init_git_fixture(project.path());
-        let canonical_root = project.path().canonicalize().unwrap();
-        let source = canonical_root.join("tracked.rs");
-        let ctx = AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                storage_dir: Some(storage.path().to_path_buf()),
-                ..Config::default()
-            },
-        );
-        let request = configure_semantic_views_with_timeout(
-            &canonical_root,
-            storage.path(),
-            &server.base_url,
-            30_000,
-        );
-        assert!(handle_configure_for_test(&request, &ctx).success);
-        super::drain_deferred_configure_maintenance(&ctx);
-        // The non-probe request proves the fill reached the server's response
-        // gate. Draining maintenance only releases the worker: model startup,
-        // view loading and cold-build admission can still be queued. Allow a
-        // 60-second hang guard rather than imposing a startup latency budget.
-        assert!(
-            server.wait_for_non_probe_request_count(1, Duration::from_secs(60)),
-            "the semantic view's first fill did not reach the embedding server: {}",
-            ctx.checkout_semantic().describe()
-        );
-        assert!(
-            ctx.semantic_index()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_none(),
-            "a views-on root must not build the legacy semantic index"
-        );
-
-        let second_source =
-            "pub fn newly_visible() {}\npub fn invokes_new() { newly_visible(); }\n";
-        fs::write(&source, second_source).unwrap();
-        assert!(git_command(project.path())
-            .args(["add", "tracked.rs"])
-            .status()
-            .unwrap()
-            .success());
-        assert!(git_command(project.path())
-            .args([
-                "-c",
-                "user.name=AFT Tests",
-                "-c",
-                "user.email=aft-tests@example.com",
-                "commit",
-                "--quiet",
-                "-m",
-                "callgraph change while semantic is held",
-            ])
-            .status()
-            .unwrap()
-            .success());
-        ctx.update_config(|config| config.indexes.callgraph = true);
-        let callgraph_report = ctx
-            .publish_view_paths(BTreeSet::from([b"tracked.rs".to_vec()]), true)
-            .unwrap();
-        assert!(callgraph_report.published);
-        assert!(
-            callgraph_report.pending_paths.is_empty(),
-            "the older view must not wait for semantic vectors it no longer carries"
-        );
-        match ctx.callgraph_store_for_ops() {
-            CallgraphStoreAccess::Ready(store) => {
-                assert_eq!(store.reader_kind(), "view");
-                assert!(crate::callgraph_store::CallGraphRead::node_for(
-                    &store,
-                    Path::new("tracked.rs"),
-                    "newly_visible",
-                )
-                .is_ok());
-            }
-            _ => panic!("callgraph plane was not readable while embedding was held"),
-        }
-
-        server.release_responses();
-        // A fill event describes one worker round, not query readiness. Wait for
-        // the semantic view to cover the edited source after releasing the server.
-        ctx.checkout_semantic().wake();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let complete = ctx.checkout_semantic_runtime().map(|runtime| {
-                runtime
-                    .search(&[1.0, 0.0, 0.0], 10, &|_| true)
-                    .map(|answer| answer.complete())
-            });
-            if matches!(complete, Some(Ok(true))) {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "semantic view did not become complete after response release; \
-                 lane={}; search={complete:?}",
-                ctx.checkout_semantic().describe()
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    #[test]
-    fn legacy_semantic_import_runs_once_and_records_its_outcome() {
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        init_git_fixture(project.path());
-        let canonical_root = std::fs::canonicalize(project.path()).unwrap();
-        let family = crate::search_index::artifact_cache_key(&canonical_root);
-        let scope = crate::path_identity::project_scope_key(&canonical_root);
-        let fingerprint =
-            SemanticIndexFingerprint::for_config_dimension(&Config::default().semantic, 2)
-                .as_string();
-        let semantic_path = storage
-            .path()
-            .join("semantic")
-            .join(&family)
-            .join("semantic.bin");
-        let source = fs::read(canonical_root.join("tracked.rs")).unwrap();
-        write_legacy_semantic_fixture(&semantic_path, &fingerprint, &source);
-        let ctx = AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                storage_dir: Some(storage.path().to_path_buf()),
-                ..Config::default()
-            },
-        );
-        let params = json!({
-            "project_root": canonical_root,
-            "storage_dir": storage.path(),
-            "harness": "opencode",
-            "config": [user_tier(json!({
-                "views": { "enabled": true },
-                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
-            }))]
-        });
-
-        let response =
-            handle_configure_for_test(&configure_request_with_params(params.clone()), &ctx);
-        assert!(response.success, "{}", response.data);
-        super::drain_deferred_configure_maintenance(&ctx);
-        let status =
-            crate::path_status::PathStatusStore::open(&storage.path().join("views").join(&scope))
-                .unwrap();
-        let first = status
-            .maintenance_outcome("legacy_semantic_import")
-            .unwrap()
-            .expect("import outcome");
-        assert!(first.0.contains("Imported"));
-        fs::write(&semantic_path, [99]).unwrap();
-
-        let response = handle_configure_for_test(&configure_request_with_params(params), &ctx);
-        assert!(response.success, "{}", response.data);
-        super::drain_deferred_configure_maintenance(&ctx);
-        let status =
-            crate::path_status::PathStatusStore::open(&storage.path().join("views").join(&scope))
-                .unwrap();
-        assert_eq!(
-            status
-                .maintenance_outcome("legacy_semantic_import")
-                .unwrap()
-                .expect("persisted import outcome"),
-            first
         );
     }
 
@@ -15591,21 +13819,30 @@ mod tests {
         assert!(ctx.cache_unavailable_reason().is_none());
         assert!(ctx.cache_dir().ends_with("offline-volume/aft"));
         let _ = ctx.flush_search_index_on_graceful_shutdown();
-        assert!(ctx
-            .search_index()
-            .read()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|index| index.ready));
+        // With views on, the legacy search index is never built or written:
+        // the checkout's lexical view is the trigram cache, and it must be
+        // usable and persisted under the recovered cache directory.
+        let lexical = ctx.lexical_view_snapshot("grep");
+        assert!(
+            matches!(lexical, Some(Ok(_))),
+            "{:?}",
+            lexical.map(|result| result.err())
+        );
         let key = ctx.memoized_artifact_cache_key(&ctx.canonical_cache_root());
         assert!(
             ctx.cache_dir()
-                .join("index")
-                .join(key)
-                .join("cache.bin")
+                .join("blobs/v3")
+                .join(&key)
+                .join("trigram.sqlite")
                 .is_file(),
             "normal cold initialization must persist the recovered trigram cache"
         );
+        assert!(!ctx
+            .cache_dir()
+            .join("index")
+            .join(key)
+            .join("cache.bin")
+            .exists());
         assert_eq!(
             ctx.try_health_snapshot(&project).cache_unavailable_reason,
             None
@@ -15666,6 +13903,1075 @@ mod tests {
             "storage_dir": storage,
             "config": [user_tier(json!({ "indexes": { "trigram": true, "semantic": false } }))],
         }))
+    }
+
+    fn configure_lexical_views(root: &Path, storage: &Path) -> RawRequest {
+        configure_request_with_params(json!({
+            "project_root": root, "harness": "opencode", "storage_dir": storage,
+            "config": [user_tier(json!({
+                "views": { "enabled": true },
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false }
+            }))]
+        }))
+    }
+
+    fn lexical_views_oracle(root: &Path) -> TestContext {
+        let oracle = test_context();
+        oracle.update_config(|config| {
+            config.project_root = Some(root.to_path_buf());
+            config.views.enabled = false;
+            config.indexes.trigram = true;
+            config.indexes.semantic = false;
+            config.indexes.callgraph = false;
+        });
+        oracle.set_canonical_cache_root(root.to_path_buf());
+        *oracle.search_index().write().unwrap() = Some(SearchIndex::build_with_limit_serial(
+            root,
+            oracle.config().search_index_max_file_size,
+        ));
+        oracle
+    }
+
+    fn lexical_views_assert_public_parity(ctx: &AppContext, root: &Path) {
+        let oracle = lexical_views_oracle(root);
+        for (command, params, field) in [
+            (
+                "grep",
+                json!({"pattern": "TOKEN|needle", "include": "**/*.ts"}),
+                "matches",
+            ),
+            ("glob", json!({"pattern": "**/*.ts"}), "files"),
+            (
+                "semantic_search",
+                json!({"query": "OLDER_COMMIT_TOKEN"}),
+                "results",
+            ),
+            (
+                "semantic_search",
+                json!({"query": "needle alpha"}),
+                "results",
+            ),
+            (
+                "semantic_search",
+                json!({"query": "unfindable_token"}),
+                "results",
+            ),
+            (
+                "semantic_search",
+                json!({"pattern": "TOKEN|needle"}),
+                "results",
+            ),
+            (
+                "semantic_search",
+                json!({"query": "needle", "pattern": "TOKEN|needle"}),
+                "results",
+            ),
+        ] {
+            let request = RawRequest {
+                id: format!("lexical-views-{command}"),
+                command: command.into(),
+                lsp_hints: None,
+                session_id: None,
+                params,
+            };
+            let run = |ctx: &AppContext| match command {
+                "grep" => crate::commands::grep::handle_grep(&request, ctx),
+                "glob" => crate::commands::glob::handle_glob(&request, ctx),
+                _ => crate::commands::semantic_search::handle_semantic_search(&request, ctx),
+            };
+            let expected = run(&oracle);
+            let actual = run(ctx);
+            assert!(expected.success, "oracle {command}: {:?}", expected.data);
+            assert!(actual.success, "view {command}: {:?}", actual.data);
+            assert!(
+                expected.data[field].is_array(),
+                "{command}: {:?}",
+                expected.data
+            );
+            assert_eq!(
+                actual.data[field], expected.data[field],
+                "{command} {field}"
+            );
+            assert_eq!(actual.data["text"], expected.data["text"], "{command} text");
+        }
+        assert!(ctx
+            .lexical_view_route_counts()
+            .iter()
+            .all(|count| *count > 0));
+        assert_eq!(oracle.lexical_view_route_counts(), [0; 3]);
+    }
+
+    fn lexical_views_public_checkout(kind: OlderCheckoutKind) {
+        // Holds the process environment lock for the whole test. These views
+        // resolve their storage root and verify the Git conversion policy on
+        // every query, and both read process state other tests change while
+        // holding this lock: AFT_STORAGE_DIR overrides every configured
+        // storage root, and HOME decides the path `git var GIT_ATTR_GLOBAL`
+        // reports.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let (owner, root, storage) = older_checkout_beside_live_owner(temp.path(), kind);
+        let root = std::fs::canonicalize(root).unwrap();
+        let cache = crate::search_index::resolve_cache_dir_with_key(
+            &owner.memoized_artifact_cache_key(&owner.canonical_cache_root()),
+            Some(&storage),
+        );
+        let owner_cache = std::fs::read(cache.join("cache.bin")).unwrap();
+        let builds = crate::write_ledger::register(
+            crate::write_ledger::Domain::SearchIndexBuild,
+            root.display().to_string(),
+        );
+        let deltas = crate::write_ledger::register(
+            crate::write_ledger::Domain::SearchIndexDelta,
+            root.display().to_string(),
+        );
+        let before = (
+            builds.physical_total_for_test(),
+            deltas.physical_total_for_test(),
+        );
+        let ctx = test_context();
+        let bound = handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx);
+        assert!(bound.success, "{:?}", bound.data);
+        assert!(ctx.search_index().read().unwrap().is_none());
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+        lexical_views_assert_public_parity(&ctx, &root);
+
+        std::fs::write(
+            root.join("shared.ts"),
+            "export const OLDER_COMMIT_TOKEN = 4;\nneedle alpha\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("new.ts"), "needle alpha beta\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "new.ts\n").unwrap();
+        ctx.record_checkout_watcher_change(&root.join("shared.ts"));
+        lexical_views_assert_public_parity(&ctx, &root);
+        let stamp = filetime::FileTime::from_last_modification_time(
+            &std::fs::metadata(root.join("shared.ts")).unwrap(),
+        );
+        std::fs::write(
+            root.join("shared.ts"),
+            "export const OLDER_COMMIT_TOKEN = 5;\nneedle alpha\n",
+        )
+        .unwrap();
+        filetime::set_file_mtime(root.join("shared.ts"), stamp).unwrap();
+        lexical_views_assert_public_parity(&ctx, &root);
+        std::fs::remove_file(root.join("shared.ts")).unwrap();
+        std::fs::write(root.join(".gitignore"), "").unwrap();
+        lexical_views_assert_public_parity(&ctx, &root);
+        std::fs::rename(root.join("new.ts"), root.join("moved.ts")).unwrap();
+        lexical_views_assert_public_parity(&ctx, &root);
+        ctx.record_checkout_watcher_overflow();
+        std::fs::write(root.join("moved.ts"), "needle alpha after overflow\n").unwrap();
+        lexical_views_assert_public_parity(&ctx, &root);
+
+        crate::runtime_drain::spawn_search_corpus_refresh(&ctx, root.clone(), ctx.config());
+        crate::runtime_drain::refresh_search_index_after_write(&ctx, &root.join("moved.ts"));
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+        ctx.flush_search_index_on_graceful_shutdown();
+        assert_eq!(
+            (
+                builds.physical_total_for_test(),
+                deltas.physical_total_for_test()
+            ),
+            before
+        );
+        // The owner fixture already wrote a cache. A routed checkout must not
+        // replace it with its own content, even after refresh and shutdown.
+        assert_eq!(std::fs::read(cache.join("cache.bin")).unwrap(), owner_cache);
+        assert!(!storage.join("blobs/v2").exists());
+        ctx.mark_subc_unbound();
+        ctx.cancel_unbound_artifact_work();
+        drop(ctx);
+        let restarted = test_context();
+        assert!(
+            handle_configure_for_test(&configure_lexical_views(&root, &storage), &restarted)
+                .success
+        );
+        lexical_views_assert_public_parity(&restarted, &root);
+        assert_eq!(std::fs::read(cache.join("cache.bin")).unwrap(), owner_cache);
+    }
+
+    #[test]
+    fn lexical_views_public_linked_worktree_parity_edits_restart_and_writer_stop() {
+        lexical_views_public_checkout(OlderCheckoutKind::LinkedWorktree);
+    }
+
+    #[test]
+    fn lexical_views_public_plain_clone_parity_edits_restart_and_writer_stop() {
+        lexical_views_public_checkout(OlderCheckoutKind::PlainClone);
+    }
+
+    #[test]
+    fn lexical_views_public_empty_generation_and_live_only_addition_match_legacy() {
+        // Holds the process environment lock for the whole test. These views
+        // resolve their storage root and verify the Git conversion policy on
+        // every query, and both read process state other tests change while
+        // holding this lock: AFT_STORAGE_DIR overrides every configured
+        // storage root, and HOME decides the path `git var GIT_ATTR_GLOBAL`
+        // reports.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = test_context();
+        assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
+        lexical_views_assert_public_parity(&ctx, &root);
+        std::fs::write(
+            root.join("new.ts"),
+            "export const OLDER_COMMIT_TOKEN = 1;\nneedle alpha\n",
+        )
+        .unwrap();
+        lexical_views_assert_public_parity(&ctx, &root);
+        assert!(!storage.join("blobs/v2").exists());
+    }
+
+    #[test]
+    fn lexical_views_public_late_legacy_completion_and_views_off_boundary() {
+        // Holds the process environment lock for the whole test. These views
+        // resolve their storage root and verify the Git conversion policy on
+        // every query, and both read process state other tests change while
+        // holding this lock: AFT_STORAGE_DIR overrides every configured
+        // storage root, and HOME decides the path `git var GIT_ATTR_GLOBAL`
+        // reports.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        assert!(handle_configure_for_test(&configure_with_storage(&root, &storage), &ctx).success);
+        wait_for_search_index_ready(&ctx, Duration::from_secs(10));
+        assert_eq!(ctx.lexical_view_route_counts(), [0; 3]);
+        let floor = std::fs::read(storage.join("reader-floor.json")).ok();
+        assert!(crate::commands::grep::handle_grep(&grep_request("needle"), &ctx).success);
+        let off_glob: RawRequest = serde_json::from_value(json!({
+            "id": "lexical-off-glob", "command": "glob", "pattern": "**/*"
+        }))
+        .unwrap();
+        assert!(crate::commands::glob::handle_glob(&off_glob, &ctx).success);
+        assert!(
+            crate::commands::semantic_search::handle_semantic_search(
+                &semantic_search_request("needle"),
+                &ctx
+            )
+            .success
+        );
+        assert_eq!(std::fs::read(storage.join("reader-floor.json")).ok(), floor);
+        assert_eq!(ctx.lexical_view_route_counts(), [0; 3]);
+        assert!(!storage.join("blobs/v3").exists());
+        let stale =
+            SearchIndex::build_with_limit_serial(&root, ctx.config().search_index_max_file_size);
+        std::fs::write(
+            root.join("shared.ts"),
+            "export const OLDER_COMMIT_TOKEN = 7;\nneedle alpha\n",
+        )
+        .unwrap();
+        assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        ctx.install_search_index_rx(rx, ctx.configure_generation());
+        tx.send(stale).unwrap();
+        crate::runtime_drain::drain_search_index_events(&ctx);
+        assert!(ctx.search_index().read().unwrap().is_none());
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+        lexical_views_assert_public_parity(&ctx, &root);
+        assert!(!storage.join("blobs/v2").exists());
+    }
+
+    #[test]
+    fn lexical_views_public_acquisition_failure_never_uses_legacy_index() {
+        // Holds the process environment lock for the whole test. These views
+        // resolve their storage root and verify the Git conversion policy on
+        // every query, and both read process state other tests change while
+        // holding this lock: AFT_STORAGE_DIR overrides every configured
+        // storage root, and HOME decides the path `git var GIT_ATTR_GLOBAL`
+        // reports.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        struct Refused;
+        impl crate::views::trigram::LexicalSnapshotSource for Refused {
+            fn acquire(&self) -> Result<crate::views::snapshot::Snapshot, String> {
+                Err("lexical source deliberately refused".into())
+            }
+            fn record_change(&self, _: &Path) {}
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(root.join("visible.ts"), "needle\n").unwrap();
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(
+                &configure_lexical_views(&root, &temp.path().join("storage")),
+                &ctx
+            )
+            .success
+        );
+        ctx.install_lexical_source_for_test(Arc::new(Refused));
+        *ctx.search_index().write().unwrap() = Some(SearchIndex::empty_ready_for_root(&root));
+        let grep = crate::commands::grep::handle_grep(&grep_request("needle"), &ctx);
+        assert!(
+            !grep.success && grep.data.to_string().contains("deliberately refused"),
+            "{:?}",
+            grep.data
+        );
+        let search = crate::commands::semantic_search::handle_semantic_search(
+            &semantic_search_request("needle"),
+            &ctx,
+        );
+        assert!(
+            !search.success && search.data.to_string().contains("deliberately refused"),
+            "{:?}",
+            search.data
+        );
+        let glob = crate::commands::glob::handle_glob(
+            &RawRequest {
+                id: "lexical-refused-glob".into(),
+                command: "glob".into(),
+                lsp_hints: None,
+                session_id: None,
+                params: json!({"pattern":"**/*.ts"}),
+            },
+            &ctx,
+        );
+        assert!(
+            glob.success && glob.data["text"].as_str().unwrap().contains("visible.ts"),
+            "{:?}",
+            glob.data
+        );
+        assert_eq!(glob.data["fallback"], "filesystem");
+        assert_eq!(ctx.lexical_view_route_counts(), [0; 3]);
+    }
+
+    #[test]
+    fn lexical_views_public_search_pins_one_snapshot_for_all_lexical_lanes() {
+        // Holds the process environment lock for the whole test. These views
+        // resolve their storage root and verify the Git conversion policy on
+        // every query, and both read process state other tests change while
+        // holding this lock: AFT_STORAGE_DIR overrides every configured
+        // storage root, and HOME decides the path `git var GIT_ATTR_GLOBAL`
+        // reports.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        struct Counted {
+            source: Arc<dyn crate::views::trigram::LexicalSnapshotSource>,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl crate::views::trigram::LexicalSnapshotSource for Counted {
+            fn acquire(&self) -> Result<crate::views::snapshot::Snapshot, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                crate::views::trigram::LexicalSnapshotSource::acquire(self.source.as_ref())
+            }
+            fn record_change(&self, path: &Path) {
+                crate::views::trigram::LexicalSnapshotSource::record_change(
+                    self.source.as_ref(),
+                    path,
+                );
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("shared.ts"),
+            "export const OLDER_COMMIT_TOKEN = 1;\n",
+        )
+        .unwrap();
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(
+                &configure_lexical_views(&root, &temp.path().join("storage")),
+                &ctx
+            )
+            .success
+        );
+        let initialized = ctx.lexical_view_snapshot("bind").unwrap();
+        assert!(initialized.is_ok(), "{:?}", initialized.err());
+        let source = ctx.lexical_source_for_test();
+        let counted = Arc::new(Counted {
+            source,
+            calls: Default::default(),
+        });
+        ctx.install_lexical_source_for_test(counted.clone());
+        let response = crate::commands::semantic_search::handle_semantic_search(
+            &semantic_search_request("OLDER_COMMIT_TOKEN"),
+            &ctx,
+        );
+        assert!(response.success, "{:?}", response.data);
+        assert!(!response.data["results"].as_array().unwrap().is_empty());
+        assert_eq!(counted.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ctx.lexical_view_route_counts(), [0, 0, 1]);
+    }
+
+    /// A grep whose lexical view takes longer to bind than the request's whole
+    /// filesystem deadline still reads and answers: the bind is shared view
+    /// work, not the request's read. On a loaded Windows runner the first grep
+    /// after configure spent its deadline waiting for the bind and was refused
+    /// with `read_deadline_exceeded` before reading anything.
+    #[test]
+    fn lexical_views_grep_after_a_bind_longer_than_its_deadline_still_reads() {
+        // Holds the process environment lock for the whole test, as the other
+        // lexical views tests do.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        struct Slow {
+            source: Arc<dyn crate::views::trigram::LexicalSnapshotSource>,
+            delay: Duration,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl crate::views::trigram::LexicalSnapshotSource for Slow {
+            fn acquire(&self) -> Result<crate::views::snapshot::Snapshot, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(self.delay);
+                crate::views::trigram::LexicalSnapshotSource::acquire(self.source.as_ref())
+            }
+            fn record_change(&self, path: &Path) {
+                crate::views::trigram::LexicalSnapshotSource::record_change(
+                    self.source.as_ref(),
+                    path,
+                );
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("shared.ts"),
+            "export const OLDER_COMMIT_TOKEN = 1;\nneedle alpha\n",
+        )
+        .unwrap();
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(
+                &configure_lexical_views(&root, &temp.path().join("storage")),
+                &ctx
+            )
+            .success
+        );
+        let initialized = ctx.lexical_view_snapshot("bind").unwrap();
+        assert!(initialized.is_ok(), "{:?}", initialized.err());
+        let request = RawRequest {
+            id: "lexical-views-slow-bind".into(),
+            command: "grep".into(),
+            lsp_hints: None,
+            session_id: None,
+            params: json!({"pattern": "TOKEN|needle", "include": "**/*.ts"}),
+        };
+        let expected = crate::commands::grep::handle_grep(&request, &ctx);
+        assert!(expected.success, "{:?}", expected.data);
+        assert!(!expected.data["matches"].as_array().unwrap().is_empty());
+        let slow = Arc::new(Slow {
+            source: ctx.lexical_source_for_test(),
+            delay: Duration::from_millis(1500),
+            calls: Default::default(),
+        });
+        ctx.install_lexical_source_for_test(slow.clone());
+        // The request's filesystem deadline (1 s) is shorter than the bind.
+        let actual = crate::bounded_io::with_budget(
+            Some(crate::bounded_io::Budget::after(Duration::from_secs(1))),
+            || crate::commands::grep::handle_grep(&request, &ctx),
+        );
+        assert_eq!(slow.calls.load(Ordering::SeqCst), 1);
+        assert!(actual.success, "{:?}", actual.data);
+        assert_eq!(actual.data["matches"], expected.data["matches"]);
+        assert_eq!(actual.data["text"], expected.data["text"]);
+    }
+
+    #[test]
+    fn lexical_views_public_kill_child() {
+        // Holds the process environment lock for the whole test. These views
+        // resolve their storage root and verify the Git conversion policy on
+        // every query, and both read process state other tests change while
+        // holding this lock: AFT_STORAGE_DIR overrides every configured
+        // storage root, and HOME decides the path `git var GIT_ATTR_GLOBAL`
+        // reports.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let Some(root) = std::env::var_os("AFT_LEXICAL_KILL_ROOT") else {
+            return;
+        };
+        let storage = PathBuf::from(std::env::var_os("AFT_LEXICAL_KILL_STORAGE").unwrap());
+        let root = PathBuf::from(root);
+        let ctx = test_context();
+        assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
+        lexical_views_assert_public_parity(&ctx, &root);
+        println!("LEXICAL_VIEW_PUBLISHED");
+        use std::io::{Read, Write};
+        std::io::stdout().flush().unwrap();
+        let _ = std::io::stdin().read(&mut [0u8; 1]);
+    }
+
+    #[test]
+    fn lexical_views_public_forced_kill_reopens_current_tree() {
+        // Holds the process environment lock for the whole test. These views
+        // resolve their storage root and verify the Git conversion policy on
+        // every query, and both read process state other tests change while
+        // holding this lock: AFT_STORAGE_DIR overrides every configured
+        // storage root, and HOME decides the path `git var GIT_ATTR_GLOBAL`
+        // reports.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        use std::io::BufRead;
+        use std::process::Stdio;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("shared.ts"),
+            "export const OLDER_COMMIT_TOKEN = 1;\nneedle alpha\n",
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::configure::tests::lexical_views_public_kill_child",
+                "--nocapture",
+            ])
+            .env("AFT_LEXICAL_KILL_ROOT", &root)
+            .env("AFT_LEXICAL_KILL_STORAGE", &storage)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = child.stdout.take().unwrap();
+        let mut published = false;
+        for line in std::io::BufReader::new(output).lines() {
+            if line.unwrap().contains("LEXICAL_VIEW_PUBLISHED") {
+                published = true;
+                break;
+            }
+        }
+        if !published {
+            let status = child.wait().unwrap();
+            panic!("child exited before publication handshake: {status}");
+        }
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+        std::fs::write(
+            root.join("shared.ts"),
+            "export const OLDER_COMMIT_TOKEN = 2;\nneedle alpha changed\n",
+        )
+        .unwrap();
+        let ctx = test_context();
+        assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
+        lexical_views_assert_public_parity(&ctx, &root);
+    }
+
+    fn configure_callgraph_views(root: &Path, storage: &Path, views: bool) -> RawRequest {
+        configure_request_with_params(json!({
+            "project_root": root, "harness": "opencode", "storage_dir": storage,
+            "config": [user_tier(json!({
+                "views": { "enabled": views },
+                "indexes": { "trigram": true, "semantic": false, "callgraph": true }
+            }))]
+        }))
+    }
+
+    /// The navigation answers whose output the views route must reproduce.
+    fn callgraph_views_answers(ctx: &AppContext, root: &Path) -> Vec<(String, Response)> {
+        let requests = [
+            ("callers", "a.ts", "target", 2),
+            ("impact", "a.ts", "target", 3),
+            ("call_tree", "c.ts", "top", 3),
+            ("trace_to", "a.ts", "target", 5),
+            ("callers", "b.ts", "caller", 1),
+        ];
+        requests
+            .into_iter()
+            .map(|(command, file, symbol, depth)| {
+                let request = RawRequest {
+                    id: format!("callgraph-views-{command}"),
+                    command: command.into(),
+                    lsp_hints: None,
+                    session_id: None,
+                    params: json!({"file": root.join(file), "symbol": symbol, "depth": depth}),
+                };
+                let response = match command {
+                    "callers" => crate::commands::callers::handle_callers(&request, ctx),
+                    "impact" => crate::commands::impact::handle_impact(&request, ctx),
+                    "call_tree" => crate::commands::call_tree::handle_call_tree(&request, ctx),
+                    _ => crate::commands::trace_to::handle_trace_to(&request, ctx),
+                };
+                (format!("{command} {file} {symbol}"), response)
+            })
+            .collect()
+    }
+
+    /// Compares the views route with the legacy store over the same files,
+    /// built cold by a views-off context in separate storage. The legacy
+    /// store serves no linked worktree, so it reads a plain copy of the
+    /// checkout's files, and both sides render their root as `<root>`.
+    fn callgraph_views_assert_parity(ctx: &AppContext, root: &Path) {
+        let storage = tempfile::tempdir().unwrap();
+        let copy = tempfile::tempdir().unwrap();
+        let copy_root = std::fs::canonicalize(copy.path()).unwrap();
+        for entry in std::fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() && entry.file_name() != ".git" {
+                std::fs::copy(entry.path(), copy_root.join(entry.file_name())).unwrap();
+            }
+        }
+        let oracle = test_context();
+        assert!(
+            handle_configure_for_test(
+                &configure_callgraph_views(&copy_root, storage.path(), false),
+                &oracle
+            )
+            .success
+        );
+        {
+            let _wait = crate::context::override_callgraph_build_wait_ms_for_test(&oracle, 60_000);
+            let legacy = lazy_ready(oracle.callgraph_store_for_ops());
+            assert_eq!(legacy.reader_kind(), "legacy");
+        }
+        let normalized = |data: &serde_json::Value, root: &Path| {
+            data.to_string()
+                .replace(&root.display().to_string(), "<root>")
+        };
+        let before = ctx.callgraph_view_route_count();
+        let expected = callgraph_views_answers(&oracle, &copy_root);
+        let actual = callgraph_views_answers(ctx, root);
+        for ((label, expected), (_, actual)) in expected.iter().zip(&actual) {
+            assert!(expected.success, "legacy {label}: {:?}", expected.data);
+            assert!(actual.success, "view {label}: {:?}", actual.data);
+            assert_eq!(
+                normalized(&actual.data, root),
+                normalized(&expected.data, &copy_root),
+                "{label}"
+            );
+        }
+        assert!(ctx.callgraph_view_route_count() > before);
+        assert_eq!(oracle.callgraph_view_route_count(), 0);
+        assert!(ctx.callgraph_store().read().unwrap().is_none());
+    }
+
+    fn callgraph_views_checkout(kind: OlderCheckoutKind) {
+        // Holds the process environment lock for the whole test. These views
+        // resolve their storage root and verify the Git conversion policy on
+        // every query, and both read process state other tests change while
+        // holding this lock: AFT_STORAGE_DIR overrides every configured
+        // storage root, and HOME decides the path `git var GIT_ATTR_GLOBAL`
+        // reports.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let live = temp.path().join("live");
+        init_git_fixture(&live);
+        for (name, text) in [
+            ("a.ts", "export function target() { return 1; }\n"),
+            (
+                "b.ts",
+                "import { target } from './a';\nexport function caller() { return target(); }\n",
+            ),
+            (
+                "c.ts",
+                "import { caller } from './b';\nexport function top() { return caller(); }\n",
+            ),
+        ] {
+            std::fs::write(live.join(name), text).unwrap();
+        }
+        git_commit_all(&live, "graph");
+        let scratch = temp.path().join("scratch");
+        match kind {
+            OlderCheckoutKind::LinkedWorktree => git_ok(
+                &live,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "--detach",
+                    scratch.to_str().unwrap(),
+                    "HEAD",
+                ],
+            ),
+            _ => git_ok(temp.path(), &["clone", "--quiet", "live", "scratch"]),
+        }
+        let root = std::fs::canonicalize(&scratch).unwrap();
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        callgraph_views_assert_parity(&ctx, &root);
+
+        // Edits: a new caller, a changed callee file and a deletion.
+        std::fs::write(
+            root.join("d.ts"),
+            "import { target } from './a';\nexport function second() { return target(); }\n",
+        )
+        .unwrap();
+        ctx.record_checkout_watcher_change(&root.join("d.ts"));
+        callgraph_views_assert_parity(&ctx, &root);
+        std::fs::write(
+            root.join("b.ts"),
+            "import { target } from './a';\nexport function caller() { return target() + target(); }\n",
+        )
+        .unwrap();
+        ctx.record_checkout_watcher_change(&root.join("b.ts"));
+        callgraph_views_assert_parity(&ctx, &root);
+        std::fs::remove_file(root.join("d.ts")).unwrap();
+        ctx.record_checkout_watcher_overflow();
+        callgraph_views_assert_parity(&ctx, &root);
+        assert!(!storage.join("blobs/v2").exists());
+
+        // Restart: a new context reopens the published view.
+        ctx.mark_subc_unbound();
+        ctx.cancel_unbound_artifact_work();
+        drop(ctx);
+        let restarted = test_context();
+        assert!(
+            handle_configure_for_test(
+                &configure_callgraph_views(&root, &storage, true),
+                &restarted
+            )
+            .success
+        );
+        callgraph_views_assert_parity(&restarted, &root);
+    }
+
+    #[test]
+    fn callgraph_views_public_linked_worktree_parity_across_edits_and_restart() {
+        callgraph_views_checkout(OlderCheckoutKind::LinkedWorktree);
+    }
+
+    #[test]
+    fn callgraph_views_public_plain_clone_parity_across_edits_and_restart() {
+        callgraph_views_checkout(OlderCheckoutKind::PlainClone);
+    }
+
+    #[test]
+    fn callgraph_views_acquisition_failure_never_uses_the_legacy_store() {
+        // Holds the process environment lock for the whole test. These views
+        // resolve their storage root and verify the Git conversion policy on
+        // every query, and both read process state other tests change while
+        // holding this lock: AFT_STORAGE_DIR overrides every configured
+        // storage root, and HOME decides the path `git var GIT_ATTR_GLOBAL`
+        // reports.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        struct Refused(std::sync::atomic::AtomicUsize);
+        impl crate::views::callgraph::CallgraphReaderSource for Refused {
+            fn acquire(
+                &self,
+            ) -> Result<
+                Arc<crate::callgraph_store::ReadonlyCallGraphStore>,
+                crate::views::callgraph::CallgraphViewError,
+            > {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err("callgraph source deliberately refused".into())
+            }
+            fn record_change(&self, _: &Path) {}
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("a.ts"),
+            "export function target() { return 1; }\nexport function caller() { return target(); }\n",
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        // A legacy store built for this very root must not answer either.
+        let legacy = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, false), &legacy)
+                .success
+        );
+        let legacy_store = {
+            let _wait = crate::context::override_callgraph_build_wait_ms_for_test(&legacy, 60_000);
+            lazy_ready(legacy.callgraph_store_for_ops())
+        };
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        *ctx.callgraph_store().write().unwrap() = Some(legacy_store);
+        let refused = Arc::new(Refused(Default::default()));
+        ctx.install_callgraph_source_for_test(refused.clone());
+        let _pin = ctx.pin_config();
+        let answers = callgraph_views_answers(&ctx, &root);
+        for (label, answer) in &answers {
+            assert!(!answer.success, "{label}: {:?}", answer.data);
+            assert!(
+                answer.data.to_string().contains("deliberately refused"),
+                "{label}: {:?}",
+                answer.data
+            );
+        }
+        // One pinned request acquires once and keeps its refusal.
+        let inspect_access = ctx.callgraph_store_for_query_without_wait();
+        assert!(matches!(
+            inspect_access,
+            CallgraphStoreAccess::Error(ref error) if error.to_string().contains("deliberately refused")
+        ));
+        assert_eq!(refused.0.load(Ordering::SeqCst), 1);
+        assert_eq!(ctx.callgraph_view_route_count(), 0);
+        // Views off keeps the legacy store exactly as before.
+        assert_eq!(legacy.callgraph_view_route_count(), 0);
+        let legacy_answers = callgraph_views_answers(&legacy, &root);
+        assert!(
+            legacy_answers[0].1.success,
+            "{:?}",
+            legacy_answers[0].1.data
+        );
+    }
+
+    /// What a root's storage holds outside the v3 namespace: content-addressed
+    /// v1 views and v1/v2 blob stores, plus the legacy symbol cache file.
+    fn legacy_views_on_writes(storage: &Path) -> Vec<String> {
+        let mut found = Vec::new();
+        for (dir, keep) in [("blobs", Some("v3")), ("views", None), ("symbols", None)] {
+            if let Ok(entries) = std::fs::read_dir(storage.join(dir)) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if keep != Some(name.as_str()) {
+                        found.push(format!("{dir}/{name}"));
+                    }
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn views_routed_root_publishes_no_v1_view_and_puts_no_legacy_blobs() {
+        // Holds the process environment lock for the whole test. These views
+        // resolve their storage root and verify the Git conversion policy on
+        // every query, and both read process state other tests change while
+        // holding this lock: AFT_STORAGE_DIR overrides every configured
+        // storage root, and HOME decides the path `git var GIT_ATTR_GLOBAL`
+        // reports.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        for (name, text) in [
+            ("a.ts", "export function target() { return 1; }\n"),
+            (
+                "b.ts",
+                "import { target } from './a';\nexport function caller() { return target(); }\n",
+            ),
+        ] {
+            std::fs::write(root.join(name), text).unwrap();
+        }
+        git_commit_all(&root, "graph");
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        assert!(ctx.views_route_root());
+        // The view load stage runs here; a routed root opens no v1 view.
+        super::drain_deferred_configure_maintenance(&ctx);
+        let callers = |ctx: &AppContext| {
+            crate::commands::callers::handle_callers(
+                &RawRequest {
+                    id: "routed-callers".into(),
+                    command: "callers".into(),
+                    lsp_hints: None,
+                    session_id: None,
+                    params: json!({"file": root.join("a.ts"), "symbol": "target", "depth": 1}),
+                },
+                ctx,
+            )
+        };
+        let answer = callers(&ctx);
+        assert!(answer.success, "{:?}", answer.data);
+        assert!(ctx.callgraph_view_route_count() > 0);
+
+        // An edit, a watcher overflow and every publication trigger (a queued
+        // path publication and a full one) leave the v1 view and the legacy
+        // blob stores untouched.
+        std::fs::write(
+            root.join("b.ts"),
+            "import { target } from './a';\nexport function caller() { return target() + target(); }\n",
+        )
+        .unwrap();
+        ctx.record_checkout_watcher_change(&root.join("b.ts"));
+        ctx.record_checkout_watcher_overflow();
+        let _ = crate::executor::view_publication::schedule(
+            &ctx,
+            BTreeSet::from([b"b.ts".to_vec()]),
+            true,
+        );
+        let _ = crate::executor::view_publication::schedule(&ctx, BTreeSet::new(), true);
+        let answer = callers(&ctx);
+        assert!(answer.success, "{:?}", answer.data);
+        assert_eq!(legacy_views_on_writes(&storage), Vec::<String>::new());
+        assert_eq!(ctx.view_publication_attempts_for_test(), 0);
+        assert!(ctx.view_runtime_snapshot().is_none());
+        let direct = ctx.publish_view_paths(BTreeSet::new(), true);
+        assert!(
+            direct.as_ref().is_err_and(|error| error
+                .to_string()
+                .contains(crate::context::VIEW_PUBLICATION_STOPPED_ON_ROUTED_ROOT)),
+            "{direct:?}"
+        );
+        assert_eq!(legacy_views_on_writes(&storage), Vec::<String>::new());
+        assert!(crate::blob_store::v3::family_dir(
+            &storage,
+            &ctx.memoized_artifact_cache_key(&root)
+        )
+        .unwrap()
+        .is_dir());
+
+        // Views off is not a routed root.
+        let off = test_context();
+        assert!(
+            handle_configure_for_test(
+                &configure_callgraph_views(&root, &temp.path().join("off-storage"), false),
+                &off
+            )
+            .success
+        );
+        assert!(!off.views_route_root());
+    }
+
+    /// Idle eviction releases a routed root's lexical and call-graph views,
+    /// and the next query binds them again and answers.
+    #[test]
+    fn views_routed_idle_eviction_releases_views_and_the_next_query_rebinds() {
+        // Holds the process environment lock: these views resolve storage and
+        // the Git conversion policy through the process environment.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("a.ts"),
+            "export function target() { return 1; }\nexport function caller() { return target(); }\n",
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        let grep = || crate::commands::grep::handle_grep(&grep_request("target"), &ctx);
+        let callers = || {
+            crate::commands::callers::handle_callers(
+                &RawRequest {
+                    id: "evicted-callers".into(),
+                    command: "callers".into(),
+                    lsp_hints: None,
+                    session_id: None,
+                    params: json!({"file": root.join("a.ts"), "symbol": "target", "depth": 1}),
+                },
+                &ctx,
+            )
+        };
+        assert!(grep().success);
+        assert!(callers().success);
+        assert!(ctx.lexical_view_is_ready() && ctx.callgraph_view_is_ready());
+
+        assert!(ctx.evict_idle_artifacts());
+        assert!(!ctx.lexical_view_is_ready() && !ctx.callgraph_view_is_ready());
+        let before = (
+            ctx.lexical_view_route_counts()[0],
+            ctx.callgraph_view_route_count(),
+        );
+        let answer = grep();
+        assert!(answer.success, "{:?}", answer.data);
+        assert_eq!(answer.data["index_status"], "Ready", "{:?}", answer.data);
+        let answer = callers();
+        assert!(answer.success, "{:?}", answer.data);
+        assert_eq!(
+            (
+                ctx.lexical_view_route_counts()[0],
+                ctx.callgraph_view_route_count()
+            ),
+            (before.0 + 1, before.1 + 1)
+        );
+        assert!(ctx.lexical_view_is_ready() && ctx.callgraph_view_is_ready());
+    }
+
+    #[test]
+    fn views_routed_symbol_prewarm_stores_then_reuses_v3_symbol_rows() {
+        // Holds the process environment lock for the whole test. These views
+        // resolve their storage root and verify the Git conversion policy on
+        // every query, and both read process state other tests change while
+        // holding this lock: AFT_STORAGE_DIR overrides every configured
+        // storage root, and HOME decides the path `git var GIT_ATTR_GLOBAL`
+        // reports.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("lib.rs"),
+            "pub fn alpha() -> u32 { 1 }\npub struct Beta;\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("notes.md"), "# notes\n").unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        super::drain_deferred_configure_maintenance(&ctx);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while ctx.symbol_view_route_count() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the routed symbol prewarm never ran"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let family = ctx.memoized_artifact_cache_key(&root);
+        let lib = root.join("lib.rs");
+        let bytes = std::fs::read(&lib).unwrap();
+        let stored = crate::views::symbol_store::lookup(
+            &storage,
+            &family,
+            crate::blob_store::v2::ContentHash::of(&bytes),
+            &lib,
+        )
+        .unwrap()
+        .expect("the prewarm stored lib.rs's symbols in the v3 symbol plane");
+        let names: Vec<_> = stored.iter().map(|symbol| symbol.name.clone()).collect();
+        assert!(names.contains(&"alpha".to_owned()), "{names:?}");
+        let modified = std::fs::metadata(&lib).unwrap().modified().unwrap();
+        assert!(ctx
+            .symbol_cache()
+            .read()
+            .unwrap()
+            .contains_path_with_mtime(&lib, modified));
+        assert_eq!(legacy_views_on_writes(&storage), Vec::<String>::new());
+
+        // A fresh cache over the same files reuses the stored rows: nothing
+        // is parsed or stored again.
+        let snapshot = ctx.lexical_view_snapshot("bind").unwrap().unwrap();
+        let fresh: crate::parser::SharedSymbolCache =
+            Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new()));
+        let report = super::prewarm_symbol_cache_from_view(
+            &storage,
+            &family,
+            &fresh,
+            0,
+            snapshot.file_entries(),
+        );
+        let parsed_files = snapshot
+            .file_entries()
+            .iter()
+            .filter(|file| crate::parser::detect_language(&file.path).is_some())
+            .count() as u64;
+        assert!(parsed_files >= 1);
+        assert_eq!(
+            report,
+            super::SymbolViewPrewarm {
+                reused: parsed_files,
+                ..Default::default()
+            }
+        );
+        assert!(fresh
+            .read()
+            .unwrap()
+            .contains_path_with_mtime(&lib, modified));
     }
 
     fn configure_search_with_max_file_size(
@@ -24501,11 +23807,16 @@ mod tests {
         assert!(ctx.config().indexes.semantic);
         assert!(ctx.config().indexes.callgraph);
         assert!(ctx.config().views.enabled);
-        assert!(ctx.search_index_rx().read().unwrap().is_some());
+        // With views on, the checkout's lexical view replaces the legacy
+        // search loader, so trigram work for this root is the lexical view.
+        assert!(ctx.lexical_views_enabled());
         assert!(ctx.semantic_index_rx().lock().is_some());
         super::drain_deferred_configure_maintenance(&ctx);
         assert!(ctx.watcher_runtime_active());
-        assert!(ctx.view_runtime_snapshot().is_some());
+        // The root's reads go through its v3 checkout views, so no v1 view
+        // runtime is opened for it.
+        assert!(ctx.views_route_root());
+        assert!(ctx.view_runtime_snapshot().is_none());
         assert!(ctx.callgraph_writer());
         ctx.stop_watcher_runtime();
     }

@@ -53,7 +53,7 @@ pub(crate) fn admit_principal(principal_id: Option<&str>) -> Result<(), ErrorBod
 /// production builder does not publish a manifest yet, so this is `None`
 /// outside tests; tests inject the golden manifest through
 /// [`set_test_manifest_for_test`].
-fn running_manifest() -> Option<(String, Vec<u8>)> {
+pub(super) fn running_manifest() -> Option<(String, Vec<u8>)> {
     #[cfg(test)]
     {
         if let Some(manifest) = TEST_MANIFEST

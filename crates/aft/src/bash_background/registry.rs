@@ -1276,6 +1276,10 @@ struct ProjectReplayDiskBatch {
 }
 
 pub(crate) struct RegistryInner {
+    #[cfg(unix)]
+    secret_proxies: Mutex<HashMap<String, super::secrets::SharedRuntime>>,
+    #[cfg(unix)]
+    revoked_secret_authorizations: Mutex<HashSet<(String, String, u64)>>,
     memory_monitors: Mutex<HashMap<String, super::memory_limit::Monitor>>,
     #[cfg(unix)]
     db_hint_jobs:
@@ -1911,6 +1915,10 @@ impl BgTaskRegistry {
         Self {
             inner: Arc::new(RegistryInner {
                 memory_monitors: Mutex::new(HashMap::new()),
+                #[cfg(unix)]
+                secret_proxies: Mutex::new(HashMap::new()),
+                #[cfg(unix)]
+                revoked_secret_authorizations: Mutex::new(HashSet::new()),
                 #[cfg(unix)]
                 db_hint_jobs: Mutex::new(HashMap::new()),
                 #[cfg(unix)]
@@ -2987,6 +2995,8 @@ impl BgTaskRegistry {
     }
 
     fn post_terminal_transition(&self, task: &Arc<BgTask>, emit_frame: bool) -> Result<(), String> {
+        #[cfg(unix)]
+        self.stop_secret_proxy(&task.task_id);
         self.settle_memory_accounting(task)?;
         #[cfg(test)]
         {
@@ -4925,6 +4935,11 @@ impl BgTaskRegistry {
         };
 
         let child_pid = child.id();
+        if let Err(error) = self.arm_secret_proxy(&spawn_plan, &task_id, child_pid) {
+            super::process::terminate_pgid(child_pid as i32, None);
+            let _ = child.wait();
+            return Err(error.into());
+        }
         if let Some(mut monitor) = memory_monitor.take() {
             if let Err(error) = monitor.attach(child_pid) {
                 super::process::terminate_pgid(child_pid as i32, None);
@@ -5306,6 +5321,7 @@ impl BgTaskRegistry {
                     .map_err(|error| error.to_string())
             };
             spawn_pty_for_command(
+                self,
                 &spawn_plan,
                 &task_id,
                 &session_id,
@@ -10776,6 +10792,19 @@ impl BgTaskRegistry {
 
     pub fn detach(&self) {
         self.inner.shutdown.store(true, Ordering::SeqCst);
+        #[cfg(unix)]
+        {
+            let proxies = std::mem::take(
+                &mut *self
+                    .inner
+                    .secret_proxies
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()),
+            );
+            for runtime in proxies.into_values() {
+                runtime.lock().unwrap_or_else(|p| p.into_inner()).stop();
+            }
+        }
         if let Ok(mut tasks) = self.inner.tasks.lock() {
             for task in tasks.values() {
                 if let Ok(mut state) = task.lock_state() {
@@ -11279,12 +11308,38 @@ impl BgTaskRegistry {
     /// Find live shell tasks with a persisted daemon scope identity. Keep
     /// this off the subc frame loop: locks and process sampling may block.
     pub(crate) fn live_scope_stamps(&self) -> Vec<subc_protocol::scope::ScopeStamp> {
-        self.running_tasks()
+        // Only unix extends the task scopes with secret proxy authorizations.
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut scopes: Vec<_> = self
+            .running_tasks()
             .into_iter()
             .filter_map(|task| {
                 let scope = task.lock_state().ok()?.metadata.scope.clone()?;
                 self.has_live_task_processes(&task.task_id, &task.session_id)
                     .then_some(scope)
+            })
+            .collect();
+        #[cfg(unix)]
+        scopes.extend(self.secret_authorization_scope_stamps());
+        scopes
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn secret_authorization_scope_stamps(
+        &self,
+    ) -> Vec<subc_protocol::scope::ScopeStamp> {
+        self.inner
+            .secret_proxies
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .map(|runtime| {
+                runtime
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .authorization
+                    .stamp()
+                    .clone()
             })
             .collect()
     }
@@ -11301,11 +11356,148 @@ impl BgTaskRegistry {
                 scope.scope_ref.clone(),
                 scope.scope_epoch,
             ));
+        #[cfg(unix)]
+        {
+            let mut proxies = self
+                .inner
+                .secret_proxies
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let mut stopped = Vec::new();
+            proxies.retain(|_, runtime| {
+                let proxy = runtime.lock().unwrap_or_else(|p| p.into_inner());
+                if [proxy.lifetime.stamp(), proxy.authorization.stamp()]
+                    .iter()
+                    .any(|stamp| {
+                        stamp.owner == scope.owner
+                            && stamp.scope_ref == scope.scope_ref
+                            && stamp.scope_epoch == scope.scope_epoch
+                    })
+                {
+                    stopped.push(runtime.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            drop(proxies);
+            for runtime in stopped {
+                runtime.lock().unwrap_or_else(|p| p.into_inner()).stop();
+            }
+        }
         if let Err(error) = self.stop_scope_tasks(scope, false, None, None) {
             log::warn!("scope revocation kill failed: {error}");
         }
         // Finished commands of the ended scope keep no scratch for later reads.
         self.release_scope_scratch(scope);
+    }
+
+    /// An authorization rebind invalidates secret use, not the command's own
+    /// lifetime. This secret-authorization revocation marker never kills
+    /// ordinary shell tasks.
+    #[cfg(unix)]
+    pub(crate) fn revoke_secret_authorization(&self, scope: &subc_protocol::scope::ScopeStamp) {
+        self.inner
+            .revoked_secret_authorizations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert((
+                serde_json::to_string(&scope.owner).expect("principal is JSON"),
+                scope.scope_ref.clone(),
+                scope.scope_epoch,
+            ));
+        let mut proxies = self
+            .inner
+            .secret_proxies
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut stopped = Vec::new();
+        proxies.retain(|_, runtime| {
+            let proxy = runtime.lock().unwrap_or_else(|p| p.into_inner());
+            let auth = proxy.authorization.stamp();
+            if auth.owner == scope.owner
+                && auth.scope_ref == scope.scope_ref
+                && auth.scope_epoch == scope.scope_epoch
+            {
+                stopped.push(runtime.clone());
+                false
+            } else {
+                true
+            }
+        });
+        drop(proxies);
+        for runtime in stopped {
+            runtime.lock().unwrap_or_else(|p| p.into_inner()).stop();
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn arm_secret_proxy(
+        &self,
+        plan: &SpawnPlan,
+        task_id: &str,
+        pid: u32,
+    ) -> Result<(), String> {
+        let Some(runtime) = plan.prepared_task().and_then(|task| task.secret_runtime()) else {
+            return Ok(());
+        };
+        let mut proxies = self
+            .inner
+            .secret_proxies
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        {
+            let mut proxy = runtime.lock().unwrap_or_else(|p| p.into_inner());
+            if self.inner.shutdown.load(Ordering::SeqCst)
+                || self.scope_revoked(proxy.lifetime.stamp())
+                || self.scope_revoked(proxy.authorization.stamp())
+                || self
+                    .inner
+                    .revoked_secret_authorizations
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains(&(
+                        serde_json::to_string(&proxy.authorization.stamp().owner)
+                            .expect("principal is JSON"),
+                        proxy.authorization.stamp().scope_ref.clone(),
+                        proxy.authorization.stamp().scope_epoch,
+                    ))
+            {
+                #[cfg(test)]
+                eprintln!("secret proxy authorization revoked before arming");
+                proxy.stop();
+                return Err(super::secrets::PROXY_UNAVAILABLE.to_owned());
+            }
+            proxy.arm(pid)?;
+        }
+        proxies.insert(task_id.to_owned(), runtime);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn stop_secret_proxy(&self, task_id: &str) {
+        let runtime = self
+            .inner
+            .secret_proxies
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(task_id);
+        if let Some(runtime) = runtime {
+            runtime.lock().unwrap_or_else(|p| p.into_inner()).stop();
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn secret_proxy_address_for_test(
+        &self,
+        task_id: &str,
+    ) -> Option<std::net::SocketAddr> {
+        self.inner
+            .secret_proxies
+            .lock()
+            .unwrap()
+            .get(task_id)
+            .map(|runtime| runtime.lock().unwrap().address())
     }
 
     /// Cancel this scope's current tasks without ending its authority to spawn.
@@ -12442,6 +12634,8 @@ impl BgTaskRegistry {
         let task = self
             .task_for_session(task_id, session_id)
             .ok_or_else(|| RegistryError::TaskNotFound(task_id.into()))?;
+        #[cfg(unix)]
+        self.stop_secret_proxy(task_id);
         let pending_memory_reason = task
             .lock_state()
             .ok()
@@ -17156,6 +17350,7 @@ mod tests {
     fn launcher_plans_disable_pipeline_status_capture() {
         let launcher = SpawnPlan::launcher_for_test(
             crate::sandbox_profile::SandboxProfile {
+                secret_proxy: false,
                 data_policy: Default::default(),
                 v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
                 mode: crate::config::SandboxMode::Strict,
@@ -27281,6 +27476,40 @@ mod tests {
             .unwrap();
     }
 
+    /// Scan until a replayed watch delivers its pending match.
+    ///
+    /// Right after a replay a scan can return without emitting and without
+    /// advancing the cursors (its early returns never persist a cursor), and
+    /// production's watchdog then rescans the same bytes on its next pass. A
+    /// test that scans exactly once turns that delay into a false negative.
+    /// Retry briefly: a watch that never delivers still fails, with the scan
+    /// state attached.
+    fn scan_until_new_match(
+        live: &BgTaskRegistry,
+        live_task: &Arc<BgTask>,
+        live_frames: &Mutex<Vec<PushFrame>>,
+    ) -> BashPatternMatchFrame {
+        let seen = pattern_match_frames(live_frames).len();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            live.scan_task_watch_output(live_task);
+            let mut current = pattern_match_frames(live_frames);
+            if current.len() > seen {
+                return current.pop().unwrap();
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "replayed watch delivered no match: active={} running={} cursors={:?} frames={}",
+                    live.active_watch_count(&live_task.task_id),
+                    live_task.is_running(),
+                    live.watch_stream_cursors(&live_task.task_id),
+                    pattern_match_frames(live_frames).len(),
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
     #[test]
     fn each_line_once_warning_stays_armed_through_ack_and_restart() {
         for restart in [false, true] {
@@ -27350,8 +27579,7 @@ mod tests {
                 let _reap_live = KillTasksOnDrop(live.clone());
                 append_each_line_output(&task.paths.stdout, b"READY after warning\n");
                 let live_task = live.task_for_session(&task.task_id, "session").unwrap();
-                live.scan_task_watch_output(&live_task);
-                let matched = pattern_match_frames(&live_frames).pop().unwrap();
+                let matched = scan_until_new_match(&live, &live_task, &live_frames);
                 assert_eq!(
                     matched.batch.as_ref().unwrap().lines[0].text,
                     "READY after warning"
@@ -27564,8 +27792,7 @@ mod tests {
             }
             let replayed_task = replayed.task_for_session(&task.task_id, "session").unwrap();
             append_each_line_output(&task.paths.stderr, b"READY b\n");
-            replayed.scan_task_watch_output(&replayed_task);
-            let newest = pattern_match_frames(&replay_frames).pop().unwrap();
+            let newest = scan_until_new_match(&replayed, &replayed_task, &replay_frames);
             assert!(
                 newest.match_offset > first.match_offset,
                 "acknowledged first: {acknowledge_first}"

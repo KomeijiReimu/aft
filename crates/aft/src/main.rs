@@ -1591,6 +1591,7 @@ fn dispatch_command(req: RawRequest, ctx: &AppContext) -> Response {
         "remove_import" => aft::commands::remove_import::handle_remove_import(&req, ctx),
         "organize_imports" => aft::commands::organize_imports::handle_organize_imports(&req, ctx),
         "configure" => aft::commands::configure::handle_configure(&req, ctx),
+        "view_token" => aft::commands::view_token::handle_view_token(&req, ctx),
         "glob" => aft::commands::glob::handle_glob(&req, ctx),
         "grep" => aft::commands::grep::handle_grep(&req, ctx),
         "semantic_search" => {
@@ -3183,6 +3184,32 @@ mod deferred_semantic_search_tests {
             session_id: Some("standalone-search-test".to_string()),
             params,
         }
+    }
+
+    #[test]
+    fn view_token_management_dispatch_reaches_the_default_off_guard() {
+        let storage = tempfile::tempdir().unwrap();
+        let context = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.path().to_owned()),
+                ..Default::default()
+            },
+        );
+        let response = super::dispatch_command(
+            request(
+                "token",
+                "view_token",
+                serde_json::json!({
+                    "root": storage.path().join("future"), "expected_tree": "a".repeat(40),
+                }),
+            ),
+            &context,
+        );
+        let wire = serde_json::to_value(response).unwrap();
+        assert_eq!(wire["success"], false);
+        assert_eq!(wire["code"], "VIEW_TOKEN");
+        assert!(!storage.path().join("blobs").exists());
     }
 
     fn slow_search_request(id: &str) -> RawRequest {

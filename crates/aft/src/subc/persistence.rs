@@ -8,6 +8,22 @@ pub(super) const WAIT_BUDGET: Duration = Duration::from_secs(10);
 const MAX_WAITERS: usize = 256;
 const MAX_CONFINEMENT_READS: usize = 8;
 
+fn carrier_precheck_failed(identity: &RouteIdentity, body: &Value) -> bool {
+    identity.role == tool_provider::RouteRole::ToolProviderV1
+        && super::occipital_route(identity)
+        && super::route_request_is_tool_call(body)
+        && (super::occipital_session_refusal(identity, body).is_some()
+            || super::carrier_read_only::admit(identity, body)
+                .and_then(|()| {
+                    super::carrier_read_only::admit_operation(
+                        identity,
+                        body["name"].as_str().unwrap_or(""),
+                        body.get("arguments").unwrap_or(&Value::Null),
+                    )
+                })
+                .is_err())
+}
+
 pub(super) struct DatabaseWaits {
     tasks: tokio::task::JoinSet<DecodedFrame>,
     pending: HashMap<(RouteChannel, u64), (tokio::task::AbortHandle, AdmissionWait)>,
@@ -118,6 +134,13 @@ impl DatabaseWaits {
         let Ok(body) = decoded.body() else {
             return Err(decoded);
         };
+        // A carrier-supplied preset must never restore worker launch authority.
+        if identity.role == tool_provider::RouteRole::ToolProviderV1
+            && super::occipital_route(identity)
+            && super::route_request_is_tool_call(body)
+        {
+            return Err(decoded);
+        }
         let name = body.get("name").and_then(Value::as_str).unwrap_or("");
         if body.get("preset").and_then(Value::as_str) != Some("worker")
             || body
@@ -221,6 +244,11 @@ impl DatabaseWaits {
         let Ok(body) = decoded.body() else {
             return Err(decoded);
         };
+        // Structural carrier refusals precede all policy/database waits, for
+        // both the bare request and explicit tool.call forms.
+        if carrier_precheck_failed(identity, body) {
+            return Err(decoded);
+        }
         // A scoped worker's saved confinement lives in aft.db, and the bind
         // reply goes out while that database may still be opening. Its
         // catalog fetch and tool calls wait for the open rather than be
@@ -349,6 +377,9 @@ impl DatabaseWaits {
         let Ok(body) = decoded.body() else {
             return Err(decoded);
         };
+        if carrier_precheck_failed(identity, body) {
+            return Err(decoded);
+        }
         // Catalog fetches and the other provider operations run on the
         // executor and read the policy there; only tool calls are checked
         // against it on the frame loop.

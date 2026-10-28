@@ -7,11 +7,6 @@ thread_local! {
     static PRECHECK_PATH_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
-pub(super) fn precheck_path_builds_for_test() -> usize {
-    PRECHECK_PATH_BUILDS.with(std::cell::Cell::get)
-}
-
 #[inline]
 fn record_path_comparison() {
     #[cfg(test)]

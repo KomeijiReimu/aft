@@ -400,16 +400,20 @@ impl IdentityConnection {
 
     pub(crate) fn open(path: impl AsRef<Path>, seam: &'static str) -> rusqlite::Result<Self> {
         super::lifecycle::production_write_gate(path.as_ref())?;
+        crate::views::donor::refuse_sealed_write(path.as_ref())?;
         let _guard = filesystem_guard();
         crate::private_storage::prepare_sqlite(path.as_ref(), rusqlite::OpenFlags::default())?;
+        // Long view-store paths (and their `-journal`/`-wal` sidecars) pass
+        // Windows' MAX_PATH; `sqlite_open_path` spells those in `\\?\` form.
+        let sqlite_path = super::lifecycle::sqlite_open_path(path.as_ref());
         #[cfg(test)]
         let connection = crate::views::materialization::open_probe_connection(
-            path.as_ref(),
+            &sqlite_path,
             rusqlite::OpenFlags::default(),
         )?;
         #[cfg(not(test))]
         let connection = crate::views::write_accounting::open_connection(
-            path.as_ref(),
+            &sqlite_path,
             rusqlite::OpenFlags::default(),
         )?;
         Ok(Self::new(connection, seam))
@@ -422,14 +426,24 @@ impl IdentityConnection {
     ) -> rusqlite::Result<Self> {
         if !flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
             super::lifecycle::production_write_gate(path.as_ref())?;
+            crate::views::donor::refuse_sealed_write(path.as_ref())?;
         }
         let _guard = filesystem_guard();
         crate::private_storage::prepare_sqlite(path.as_ref(), flags)?;
+        // A `file:` URI is SQLite syntax, not a filesystem path, so it is
+        // passed through; plain paths go through `sqlite_open_path`, which
+        // adds the Windows long-path spelling when a path needs it.
+        let sqlite_path = if flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_URI)
+            && path.as_ref().to_string_lossy().starts_with("file:")
+        {
+            std::borrow::Cow::Borrowed(path.as_ref())
+        } else {
+            super::lifecycle::sqlite_open_path(path.as_ref())
+        };
         #[cfg(test)]
-        let connection =
-            crate::views::materialization::open_probe_connection(path.as_ref(), flags)?;
+        let connection = crate::views::materialization::open_probe_connection(&sqlite_path, flags)?;
         #[cfg(not(test))]
-        let connection = crate::views::write_accounting::open_connection(path.as_ref(), flags)?;
+        let connection = crate::views::write_accounting::open_connection(&sqlite_path, flags)?;
         Ok(Self::new(connection, seam))
     }
 
@@ -745,26 +759,6 @@ pub(crate) fn has_open_connections_under(path: &Path) -> bool {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
         .any(|(path, database)| path.starts_with(&key) && !database.openers.is_empty())
-}
-
-/// Describe every registered connection to a database under `path`, naming
-/// the database, the opener's store label and the thread that opened it.
-/// Tests use it to show what still holds files they are about to delete.
-#[cfg(test)]
-pub(crate) fn open_connections_under_for_test(path: &Path) -> Vec<String> {
-    let key = registry_key(path);
-    open_databases()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .filter(|(path, _)| path.starts_with(&key))
-        .flat_map(|(path, database)| {
-            database
-                .openers
-                .iter()
-                .map(move |opener| format!("{} held by {}", path.display(), opener.describe()))
-        })
-        .collect()
 }
 
 /// Report `action` if it is about to delete, rename, or replace the database

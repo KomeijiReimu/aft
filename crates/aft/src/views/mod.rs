@@ -11,12 +11,13 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rusqlite::{params, Connection, TransactionBehavior};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 pub mod assembly;
+pub mod base_builder;
+pub mod base_refs;
+pub mod base_sweep;
+pub(crate) mod donor;
 mod generation;
 #[cfg(test)]
-pub(crate) use generation::{
-    checkpoint_test_hooks, clone_derived_for_test, wait_for_derived_checkpoint_for_test,
-    CheckpointTestHooks,
-};
+pub(crate) use generation::wait_for_derived_checkpoint_for_test;
 pub(crate) mod io;
 #[cfg(aft_views_lazy_benchmark)]
 pub mod lazy_read_benchmark;
@@ -46,6 +47,7 @@ pub mod readiness;
 pub mod registry;
 pub mod segment_store;
 pub mod snapshot;
+pub mod symbol_store;
 
 // Plane and runtime modules of the per-checkout views. Each starts as a
 // documented empty module that its plane fills in.
@@ -59,12 +61,16 @@ pub mod query_wait;
 pub mod semantic;
 pub mod semantic_arena;
 pub mod semantic_runtime;
+mod tree_base;
 pub mod trigram;
+mod verification;
 
 #[cfg(test)]
 mod dispatch_parity_probe;
 #[cfg(test)]
 mod per_checkout_core_tests;
+#[cfg(test)]
+mod v3_plane_tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;

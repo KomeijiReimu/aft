@@ -55,6 +55,8 @@ impl Producers {
             FamilyPlane::Trigram => Some(&self.trigram),
             FamilyPlane::Semantic => self.semantic.as_deref(),
             FamilyPlane::Callgraph => Some(&self.callgraph),
+            // Symbols are not a manifest plane: no producer is recorded here.
+            FamilyPlane::Symbol => None,
         }
     }
 }
@@ -118,6 +120,7 @@ impl EntryPlanes {
             FamilyPlane::Trigram => self.trigram.as_ref(),
             FamilyPlane::Semantic => self.semantic.as_ref(),
             FamilyPlane::Callgraph => self.callgraph.as_ref(),
+            FamilyPlane::Symbol => None,
         }
     }
 
@@ -126,6 +129,12 @@ impl EntryPlanes {
             FamilyPlane::Trigram => &mut self.trigram,
             FamilyPlane::Semantic => &mut self.semantic,
             FamilyPlane::Callgraph => &mut self.callgraph,
+            // Unreachable while FamilyPlane::ALL excludes Symbol (pinned by
+            // `blob_store::v2` test `symbol_is_not_a_manifest_plane`). A write
+            // here could not be persisted, so it fails loudly instead.
+            FamilyPlane::Symbol => {
+                panic!("symbol readiness is not a manifest plane; EntryPlanes has no symbol state")
+            }
         }
     }
 }
@@ -231,6 +240,17 @@ impl ManifestV2 {
 
     pub fn base_header(&self) -> Option<&BaseHeader> {
         self.base.as_ref()
+    }
+    /// Rebinds a v3 worker delta to `header`. The worker publisher calls this
+    /// with the header of the base it authenticated, never a caller's string.
+    pub fn set_base_header(&mut self, header: BaseHeader) -> Result<()> {
+        if !self.v3 || self.base.is_none() {
+            return Err(ViewError::InvalidManifest(
+                "only a v3 worker delta can be rebound to a base".into(),
+            ));
+        }
+        self.base = Some(header);
+        Ok(())
     }
     pub fn published(&self) -> Option<&PublishedFrontier> {
         self.published.as_ref()

@@ -187,6 +187,8 @@ pub mod sandbox_spawn;
 pub mod scoped_key;
 pub mod search_b2;
 pub mod search_index;
+pub mod secret;
+pub mod secret_proxy;
 pub mod semantic_admission;
 pub mod semantic_index;
 pub mod setup_plan;

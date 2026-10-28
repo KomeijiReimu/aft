@@ -1568,6 +1568,50 @@ describe("bash tool adapter", () => {
     ).rejects.toThrow("bash.memory_limit_mib");
   });
 
+  test("secret placeholders refuse host fallback before confirmation", async () => {
+    for (const [command, effective] of [
+      ["printf '{{ck-secret:test}}'", undefined],
+      ["printf '{{ck-secret:unfinished'", undefined],
+      ["printf clean", "printf '{{ck-secret:test}}'"],
+      ["printf '{{ck-secret:test}}'", "printf clean"],
+    ] as const) {
+      const tools = new Map<string, MockToolDef>();
+      let confirmations = 0;
+      const bridge = {
+        send: async () => {
+          throw new BridgeTransportUnavailableError("offline");
+        },
+      } as unknown as BinaryBridge;
+      const api =
+        effective === undefined
+          ? makeMockApi(tools)
+          : ({
+              registerTool: (tool: MockToolDef) => tools.set(tool.name, tool),
+              getHook: (name: string) =>
+                name === "bashSpawn" ? async () => ({ command: effective }) : undefined,
+            } as unknown as ExtensionAPI);
+      registerBashTool(
+        api,
+        makeMockContext(bridge, { bash: { host_fallback: true } } as PluginContext["config"]),
+      );
+      await expect(
+        tools.get("bash")!.execute("call", { command }, undefined, undefined, {
+          cwd: projectRoot,
+          hasUI: true,
+          ui: {
+            confirm: async () => {
+              confirmations++;
+              return false;
+            },
+          },
+        }),
+      ).rejects.toThrow(
+        "Secret placeholder commands need AFT's shell; Pi's built-in shell cannot run them.",
+      );
+      expect(confirmations).toBe(0);
+    }
+  });
+
   test("a bash call that timed out at the bridge names the task AFT started (issue #577)", async () => {
     const tools = new Map<string, MockToolDef>();
     const confirmations: unknown[] = [];

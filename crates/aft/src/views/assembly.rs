@@ -41,11 +41,6 @@ pub(crate) fn full_verification_due(view_dir: &Path) -> bool {
     manifest_incremental::full_verification_due(view_dir)
 }
 
-#[cfg(test)]
-pub(crate) fn precheck_path_builds_for_test() -> usize {
-    manifest_incremental::precheck_path_builds_for_test()
-}
-
 /// Avoid build admission for notifications outside committed membership. This
 /// does not replace rescans, semantic handoffs, artifact repair or graph builds.
 pub(crate) fn can_skip_irrelevant_paths(request: &AssemblyRequest, defer_derived: bool) -> bool {
@@ -84,16 +79,6 @@ pub(crate) fn can_skip_irrelevant_paths(request: &AssemblyRequest, defer_derived
         })
     };
     check().unwrap_or(false)
-}
-
-#[cfg(test)]
-pub(crate) fn expire_verification_for_test(view_dir: &Path) {
-    manifest_incremental::expire_verification_for_test(view_dir);
-}
-
-#[cfg(test)]
-pub(crate) fn cache_contains_for_test(view_dir: &Path) -> bool {
-    manifest_incremental::cache_contains_for_test(view_dir)
 }
 
 #[derive(Clone, Debug)]
@@ -429,19 +414,6 @@ static BEFORE_INDEX_WRITE: std::sync::LazyLock<
 static INDEX_WRITES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<IndexWrite>>>,
 > = std::sync::LazyLock::new(Default::default);
-
-/// Runs `hook` each time a derived-index row for `view_dir` is about to be
-/// written, before the served generation is checked.
-#[cfg(test)]
-pub(crate) fn before_index_write_for_test(
-    view_dir: &Path,
-    hook: impl Fn() + Send + Sync + 'static,
-) {
-    BEFORE_INDEX_WRITE
-        .lock()
-        .unwrap()
-        .insert(view_dir.to_path_buf(), std::sync::Arc::new(hook));
-}
 
 /// The outcomes of every derived-index write for `view_dir` so far.
 #[cfg(test)]
@@ -1882,29 +1854,6 @@ static PUBLICATION_OUTCOMES: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<PathBuf, Vec<(&'static str, String)>>>,
 > = std::sync::LazyLock::new(Default::default);
 
-#[cfg(test)]
-pub(crate) fn publication_outcomes_for_test(root: &Path) -> Vec<&'static str> {
-    PUBLICATION_OUTCOMES
-        .lock()
-        .get(root)
-        .map(|profiles| profiles.iter().map(|(outcome, _)| *outcome).collect())
-        .unwrap_or_default()
-}
-
-#[cfg(test)]
-pub(crate) fn publication_scheduling_for_test(root: &Path) -> Vec<String> {
-    PUBLICATION_OUTCOMES
-        .lock()
-        .get(root)
-        .map(|profiles| {
-            profiles
-                .iter()
-                .map(|(_, scheduling)| scheduling.clone())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn log_publication_profile(profile: &PublicationProfile) {
     crate::slog_info!(
         "{} {} {}",
@@ -2221,7 +2170,7 @@ fn manifest_entry_callgraph_key(entry: &ManifestEntry) -> Option<&str> {
     }
 }
 
-pub(super) fn is_resolution_input(path: &[u8]) -> bool {
+pub(crate) fn is_resolution_input(path: &[u8]) -> bool {
     let name = path.rsplit(|byte| *byte == b'/').next().unwrap_or(path);
     name == b"package.json"
         || name == b"Cargo.toml"

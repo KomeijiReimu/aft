@@ -553,6 +553,10 @@ pub(super) mod tests {
                 callgraph: false,
             },
             semantic_config: Default::default(),
+            trigram_policy: crate::blob_store::v2::TrigramPolicy {
+                max_file_size: crate::config::Config::default().search_index_max_file_size,
+            },
+            view_routes: Default::default(),
             discovery: RwLock::new(None),
             children: RwLock::new(Vec::new()),
             semantic: RwLock::new(Plane::Loading),

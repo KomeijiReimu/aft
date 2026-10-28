@@ -221,6 +221,8 @@ mod consent;
 pub(crate) use consent::directory_scope;
 #[cfg(all(test, unix))]
 mod deleted_root_reclaim_tests;
+// The secret vault seam and its consent adapter. They read ragged route
+// fields, so they live under `subc` rather than the public `secret` types.
 mod drain;
 mod flow_read;
 mod health;
@@ -229,6 +231,14 @@ mod idle_reap_frame_loop_tests;
 #[cfg(test)]
 mod idle_root_retention_tests;
 mod perf_sweep;
+mod secret_consent;
+#[cfg(all(test, unix))]
+pub(crate) use secret_consent::with_secret_bound_identity_for_test;
+#[cfg(test)]
+pub(crate) use secret_consent::with_secret_identity_for_test;
+pub(crate) use secret_consent::{
+    current_call_scopes, current_secret_audit_scope, resolve_current_secret_label, LaunchDecision,
+};
 mod standalone;
 #[doc(hidden)]
 pub use self::health::SubcTestHealthRollupProbe;
@@ -251,6 +261,8 @@ mod rich_ui;
 mod rich_ui_chunk_route_tests;
 mod run_scope;
 mod scope_describe;
+#[cfg(all(test, unix))]
+pub(crate) use scope_describe::confirm_secret_rebind_for_test;
 #[cfg(test)]
 mod scope_workdir_tests;
 mod stall_watchdog;
@@ -3537,6 +3549,9 @@ async fn handle_bash_elicitation_reply(
 
     if frame.header.ty == FrameType::Response && bash_elicitation_reply_is_allow(&frame.body) {
         if routes.contains_key(&key.route) {
+            let _secret_identity = secret_consent::SecretIdentityGuard::install_optional(
+                routes.get(&key.route).cloned(),
+            );
             let _grant_scope = crate::access_policy::scope_guard(
                 routes.get(&key.route).map(access_grants::policy_scope_key),
             );
@@ -9578,10 +9593,11 @@ fn occipital_route(identity: &RouteIdentity) -> bool {
 /// scoped, and its stamp's owner is not Occipital itself. Only such a route
 /// may take session calls.
 fn occipital_carrier_route(identity: &RouteIdentity) -> bool {
-    identity.scope.as_ref().is_some_and(|scope| {
-        principal_id(&Some(scope.owner.clone())).as_deref()
-            != Some(rich_ui::chunks::OCCIPITAL_PRINCIPAL)
-    })
+    occipital_route(identity)
+        && identity.scope.as_ref().is_some_and(|scope| {
+            principal_id(&Some(scope.owner.clone())).as_deref()
+                != Some(rich_ui::chunks::OCCIPITAL_PRINCIPAL)
+        })
 }
 
 /// Whether a route request is a tool call: either `op: "tool.call"`, or the
@@ -10486,6 +10502,34 @@ async fn handle_tool_call(
                 .await
             }
         };
+        match carrier_read_only::admit_operation(&identity, &call.name, &call.arguments) {
+            Err(error) => {
+                let response = wire::build_carrier_response_frame(
+                    frame,
+                    None,
+                    rich_ui::carrier::error_body(&error.code),
+                )?;
+                return send_reliable_writer_frame(
+                    tx,
+                    metrics,
+                    response,
+                    "carrier admission refusal",
+                )
+                .await;
+            }
+            Ok(Some(_operation)) => {
+                // A published operation alone grants no access to a session.
+                // Refuse rather than dispatch without a proven session policy.
+                return send_provider_error(
+                    tx,
+                    metrics,
+                    frame,
+                    rich_ui::chunks::refusal("session_not_bound"),
+                )
+                .await;
+            }
+            Ok(None) => {}
+        }
         if let Some(error) = tool_provider::shell_capability_refusal(
             &call.name,
             tool_provider::admission_trusted(&identity, &call),
@@ -10501,6 +10545,9 @@ async fn handle_tool_call(
             return send_provider_error(tx, metrics, frame, error).await;
         }
         if let Err(error) = tool_provider::admit_call_mode(&call.name, &identity.call_mode) {
+            return send_provider_error(tx, metrics, frame, error).await;
+        }
+        if let Err(error) = rich_ui::admission::reject_non_carrier(&call.arguments) {
             return send_provider_error(tx, metrics, frame, error).await;
         }
         // Plugin approvals are host transport metadata, not model-facing tool
@@ -11096,6 +11143,7 @@ async fn handle_tool_call(
 
         let _grant_scope =
             crate::access_policy::scope_guard(Some(access_grants::policy_scope_key(&identity)));
+        let _secret_identity = secret_consent::SecretIdentityGuard::install(identity.clone());
         let _ask_route = crate::access_policy::ask_route_guard(Some(
             access_grants::ask_route_for_call(&identity, &bare_name, &arguments),
         ));
@@ -11218,9 +11266,17 @@ async fn handle_tool_call(
             .map(|run| run.io_budget.clone())
             .unwrap_or_else(|| crate::bounded_io::Budget::after(Duration::from_secs(25)));
         phase_trace.mark_executor_submitted();
+        // The vault scopes are read once per submitted call, outside the job,
+        // from the same identity the job runs with. A launch inside the job
+        // reads them through `SecretScopeGuard`, so a background command keeps
+        // them for its whole life.
+        let secret_scopes = Some(secret_consent::call_scopes(&identity_for_run));
         let job: crate::executor::ExecutorJob = Box::new(move |ctx| {
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
             let _deferred_wake_scope = completion_wake.install();
+            let _secret_scope = secret_consent::SecretScopeGuard::install(secret_scopes.clone());
+            let _secret_identity =
+                secret_consent::SecretIdentityGuard::install(identity_for_run.clone());
             let _grant_scope = crate::access_policy::scope_guard(Some(
                 access_grants::policy_scope_key(&identity_for_run),
             ));
@@ -18194,401 +18250,6 @@ mod tests {
         assert!(!deferred);
     }
 
-    /// Edit the fixture `edit_count` times, then check that the view
-    /// publication starts once, on a Watcher drain, after the quiet window.
-    ///
-    /// Other threads take the language-server manager lock at moments these
-    /// edits do not control: each watcher batch starts a background
-    /// applicability walk that locks the manager to store its result, and
-    /// status pushes read it. A scheduler probe that finds the manager busy
-    /// counts it as pending Lsp work, and a watcher drain that finds it busy
-    /// keeps its diagnostics step and is due again at once. Both are
-    /// legitimate, so the checks below count Watcher drains only (only they
-    /// publish views) and let a retried drain finish before checking that a
-    /// future quiet deadline alone wakes nothing. With `lsp_manager_busy` the
-    /// helper holds the manager during every probe, and during each edit's
-    /// drains until one of them has reached the diagnostics step, so both
-    /// cases happen on every run. `first_drain_runs_out_of_budget` makes the
-    /// first edit's drain spend its whole time slice before that step.
-    async fn assert_quiet_view_publication_wake(
-        edit_count: usize,
-        lsp_manager_busy: bool,
-        first_drain_runs_out_of_budget: bool,
-    ) {
-        assert!(
-            lsp_manager_busy || !first_drain_runs_out_of_budget,
-            "first_drain_runs_out_of_budget relies on lsp_manager_busy to follow the drain to its diagnostics step"
-        );
-        use crate::context::ViewRuntimeSnapshot;
-        use crate::watcher_filter::WatcherDispatchEvent;
-        use std::collections::BTreeSet;
-
-        let (_dir, root) = test_root("maintenance-view-deadline");
-        let root_path = std::fs::canonicalize(root.as_path()).unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        for args in [
-            vec!["init", "--quiet"],
-            vec!["config", "user.name", "Publication test"],
-            vec!["config", "user.email", "publication@example.invalid"],
-        ] {
-            assert!(std::process::Command::new("git")
-                .args(args)
-                .current_dir(&root_path)
-                .status()
-                .unwrap()
-                .success());
-        }
-        for name in ["first.rs", "second.rs"] {
-            std::fs::write(root_path.join(name), "pub fn original() {}\n").unwrap();
-        }
-        for args in [
-            vec!["add", "."],
-            vec![
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "--quiet",
-                "-m",
-                "fixture",
-            ],
-        ] {
-            assert!(std::process::Command::new("git")
-                .args(args)
-                .current_dir(&root_path)
-                .status()
-                .unwrap()
-                .success());
-        }
-        let ctx = test_ctx();
-        ctx.update_config(|config| {
-            config.project_root = Some(root_path.clone());
-            config.storage_dir = Some(storage.path().to_owned());
-            config.views.enabled = true;
-            config.indexes.trigram = false;
-            config.indexes.semantic = false;
-            config.indexes.callgraph = true;
-        });
-        ctx.set_canonical_cache_root(root_path.clone());
-        let scope = crate::path_identity::project_scope_key(&root_path);
-        let view = crate::views::ViewStore::open(storage.path(), &scope).unwrap();
-        ctx.install_view_runtime(
-            ViewRuntimeSnapshot {
-                query_pin: None,
-                storage: storage.path().to_owned(),
-                family: "maintenance-view-fixture".to_owned(),
-                scope,
-                view_dir: view.view_dir().to_owned(),
-                generation: None,
-                manifest: None,
-                head_fingerprint: String::new(),
-                head_metadata: crate::alias::capture_git_head_metadata(&root_path, None).unwrap(),
-                pending_paths: BTreeSet::new(),
-                pending_inputs: Default::default(),
-            },
-            None,
-        );
-        let initial = ctx
-            .publish_view_paths(BTreeSet::new(), true)
-            .unwrap()
-            .generation;
-        runtime_drain::drain_build_completions(&ctx);
-        runtime_drain::drain_inspect_events(&ctx);
-        let publications = crate::executor::view_publication::Completions::new(root_path.clone());
-        let (tx, rx) = crossbeam_channel::unbounded();
-        *ctx.watcher_rx().lock() = Some(rx);
-        let executor = Arc::new(Executor::new());
-        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-        let metrics = Arc::new(DispatchPathMetrics::new());
-        let (completion_tx, mut completion_rx) = mpsc::channel(8);
-        let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
-        let lsp_drains_run = std::cell::Cell::new(0usize);
-        // Probe once and run every due job to completion, as the frame loop
-        // would. `hold_through_drains` keeps a busy manager held while the
-        // jobs run, not just while the scheduler probes.
-        let mut jobs = async |hold_through_drains: bool| {
-            let mut held_lsp = lsp_manager_busy.then(|| ctx.lsp());
-            let (jobs, deferred) = due_maintenance_jobs(
-                &mut live_roots,
-                Some(&executor),
-                &BgSubsBySession::new(),
-                &BgWakePending::new(),
-                MAINTENANCE_SUBMIT_BUDGET,
-                &HashSet::new(),
-            );
-            if !hold_through_drains {
-                held_lsp = None;
-            }
-            assert!(!deferred);
-            for (job_root, _) in &jobs {
-                assert_eq!(job_root, &root);
-            }
-            for (job_root, kind) in &jobs {
-                if *kind == MaintenanceDrainKind::Lsp {
-                    lsp_drains_run.set(lsp_drains_run.get() + 1);
-                }
-                submit_maintenance_job(
-                    &executor,
-                    job_root.clone(),
-                    *kind,
-                    Vec::new(),
-                    &completion_tx,
-                    &metrics,
-                );
-                let completion = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
-                    .await
-                    .unwrap_or_else(|_| panic!("{kind:?} maintenance must finish"))
-                    .unwrap();
-                assert!(completion.response.success);
-                note_maintenance_completion(
-                    live_roots.get_mut(job_root).unwrap(),
-                    completion.requeue_kind,
-                    false,
-                    false,
-                );
-            }
-            drop(held_lsp);
-            jobs.iter()
-                .filter(|(_, kind)| *kind == MaintenanceDrainKind::Watcher)
-                .count()
-        };
-        assert_eq!(
-            jobs(false).await,
-            0,
-            "no watcher drain is due before the first edit"
-        );
-        let baseline = ctx.view_publication_attempts_for_test();
-        let mut changed = BTreeSet::new();
-        let mut previous_due = None;
-        let mut last_edit = Instant::now();
-        for edit in 0..edit_count {
-            let path = root_path.join(if edit % 2 == 0 {
-                "first.rs"
-            } else {
-                "second.rs"
-            });
-            last_edit = Instant::now();
-            std::fs::write(&path, format!("pub fn changed_{edit}() {{}}\n")).unwrap();
-            changed.insert(path.clone());
-            tx.send(WatcherDispatchEvent::Paths(vec![path])).unwrap();
-            let slow_slice = (first_drain_runs_out_of_budget && edit == 0).then(|| {
-                // The drain calls the language-server applicability refresh
-                // after its slice clock has started and before its symbol
-                // cache step. Holding the symbol cache from before the drain
-                // until a full budget after that refresh began therefore
-                // makes the drain spend its whole slice, whatever the
-                // scheduling, and park before the diagnostics step.
-                assert!(
-                    !ctx.project_applicability_walk_running(),
-                    "no applicability walk runs before the first edit"
-                );
-                let holder_ctx = Arc::clone(&ctx);
-                let (held_tx, held_rx) = std::sync::mpsc::channel();
-                let holder = std::thread::spawn(move || {
-                    let cache = holder_ctx.symbol_cache();
-                    let _read = cache.read().unwrap();
-                    held_tx.send(()).unwrap();
-                    let deadline = Instant::now() + Duration::from_secs(10);
-                    while !holder_ctx.project_applicability_walk_running() {
-                        assert!(
-                            Instant::now() < deadline,
-                            "the drain's applicability walk was not seen running within 10 s"
-                        );
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    std::thread::sleep(
-                        runtime_drain::WATCHER_DRAIN_SLICE_BUDGET + Duration::from_millis(50),
-                    );
-                });
-                held_rx.recv().unwrap();
-                holder
-            });
-            assert_eq!(jobs(lsp_manager_busy).await, 1, "each batch gets one drain");
-            if let Some(holder) = slow_slice {
-                holder.join().expect("symbol cache holder");
-                let slice = ctx.watcher_drain_slice().lock();
-                assert!(
-                    matches!(
-                        &slice.as_ref().unwrap().phase,
-                        crate::context::WatcherDrainPhase::Apply { stage, .. }
-                            if !matches!(
-                                stage,
-                                crate::context::WatcherDrainApplyPhase::LspDiagnostics
-                                    | crate::context::WatcherDrainApplyPhase::Complete
-                            )
-                    ),
-                    "the first drain runs out of its slice before the diagnostics step"
-                );
-            }
-            if lsp_manager_busy {
-                // Keep the manager held across drains until one reaches the
-                // diagnostics step: a slow drain may spend its slice on
-                // earlier steps first. Six steps come before it and a drain
-                // parks only after a 250 ms slice, so 10 s fails only if the
-                // drain stops making progress.
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while !ctx.watcher_lsp_diagnostics_retry_pending_for_test() {
-                    assert!(
-                        Instant::now() < deadline,
-                        "a drain that finds the manager busy keeps its diagnostics step"
-                    );
-                    jobs(true).await;
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            }
-            // Finish drains that stopped early: a busy manager (above) or an
-            // exhausted time slice leaves path work that is due at once. 100
-            // retries is far more than a manager held for a moment needs.
-            let mut retries = 0;
-            while ctx
-                .watcher_drain_slice()
-                .lock()
-                .as_ref()
-                .is_some_and(|state| state.has_pending_work())
-            {
-                retries += 1;
-                assert!(retries <= 100, "an interrupted watcher drain must finish");
-                jobs(false).await;
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            let slice = ctx.watcher_drain_slice().lock();
-            let state = slice.as_ref().unwrap();
-            assert_eq!(state.view_publication_paths, changed);
-            let due = state.view_publication_due.unwrap();
-            assert!(due > last_edit);
-            if let Some(previous) = previous_due {
-                assert!(due > previous, "each batch extends the quiet window");
-            }
-            previous_due = Some(due);
-            drop(slice);
-            assert!(
-                ctx.view_publication_attempts_for_test() == baseline,
-                "the debounce must not publish early"
-            );
-            assert_eq!(
-                jobs(false).await,
-                0,
-                "a future deadline must not spin the dispatcher"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        let due = previous_due.unwrap();
-        let deadline = last_edit + Duration::from_secs(2);
-        while ctx.view_publication_attempts_for_test() == baseline && Instant::now() < deadline {
-            assert!(
-                !ctx.tier2_refresh_dispatch_due(),
-                "no Tier-2 rescue wake is due"
-            );
-            jobs(false).await;
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let start_diagnostics = |observer: Instant| {
-            let producer = ctx.view_publication_attempt_started_for_test(baseline);
-            let relative = |stamp: Option<Instant>, origin: Instant| match stamp {
-                Some(stamp) if stamp >= origin => format!("+{:?}", stamp.duration_since(origin)),
-                Some(stamp) => format!("-{:?}", origin.duration_since(stamp)),
-                None => "not recorded".to_owned(),
-            };
-            format!(
-                "root={} producer_since_edit={} producer_after_due={} observer_since_edit={} observer_after_due={}",
-                root_path.display(),
-                relative(producer, last_edit),
-                relative(producer, due),
-                relative(Some(observer), last_edit),
-                relative(Some(observer), due),
-            )
-        };
-        assert_eq!(
-            ctx.view_publication_attempts_for_test() - baseline,
-            1,
-            "view publication did not start within 2s of the edit without other maintenance due; {}",
-            start_diagnostics(Instant::now())
-        );
-        let started = Instant::now();
-        assert!(
-            started >= due,
-            "publication must respect the quiet window; {}",
-            start_diagnostics(started)
-        );
-        assert!(
-            started <= due + Duration::from_secs(1),
-            "publication start exceeded the quiet deadline + 1s; {}",
-            start_diagnostics(started)
-        );
-        // Building a generation can take longer under CPU or I/O contention.
-        // Wait for this root's terminal event before checking its installation.
-        let publication = tokio::task::spawn_blocking(move || publications.next_event())
-            .await
-            .expect("publication-settled observer must not panic");
-        assert_eq!(publication.root, root_path);
-        assert_eq!(
-            publication.outcome,
-            crate::executor::view_publication::CompletionOutcome::Published,
-            "publication did not succeed: {:?}",
-            publication.outcome
-        );
-        assert_ne!(
-            ctx.view_runtime_snapshot().unwrap().generation,
-            initial,
-            "a successful publication completion must follow generation installation"
-        );
-        runtime_drain::drain_build_completions(&ctx);
-        runtime_drain::drain_inspect_events(&ctx);
-        let slice = ctx.watcher_drain_slice().lock();
-        assert!(slice.as_ref().unwrap().view_publication_due.is_none());
-        assert!(slice.as_ref().unwrap().view_publication_paths.is_empty());
-        drop(slice);
-        for _ in 0..10 {
-            assert_eq!(
-                jobs(false).await,
-                0,
-                "an unchanged root must return to idle"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(
-            ctx.view_publication_attempts_for_test() - baseline,
-            1,
-            "a burst publishes exactly once"
-        );
-        if lsp_manager_busy {
-            assert!(
-                lsp_drains_run.get() > 0,
-                "a probe that finds the manager busy schedules an Lsp drain"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn view_publication_quiet_root_wakes_without_other_maintenance() {
-        assert_quiet_view_publication_wake(1, false, false).await;
-    }
-
-    #[tokio::test]
-    async fn view_publication_burst_coalesces_and_returns_idle() {
-        assert_quiet_view_publication_wake(3, false, false).await;
-    }
-
-    /// Every watcher batch with a project root starts the language-server
-    /// applicability walk on a background thread, and that walk takes the
-    /// manager lock to store its result. A probe in that window counts the
-    /// busy manager as pending Lsp work, so an Lsp drain may be due beside
-    /// the publication, and a drain in that window is due again to finish its
-    /// diagnostics step. The publication must still start once, on the
-    /// Watcher wake after the quiet window.
-    #[tokio::test]
-    async fn view_publication_wakes_while_the_language_server_manager_is_busy() {
-        assert_quiet_view_publication_wake(3, true, false).await;
-    }
-
-    /// A slow or descheduled drain can spend its whole time slice on the
-    /// steps before the diagnostics step and save the rest of the batch for
-    /// the next drain. The busy-manager checks must wait for the drain that
-    /// actually reaches that step instead of assuming the first one does.
-    #[tokio::test]
-    async fn view_publication_wakes_when_the_first_drain_runs_out_of_budget() {
-        assert_quiet_view_publication_wake(3, true, true).await;
-    }
-
     /// The maintenance probes run on the frame loop, which also answers
     /// health checks and routes requests. A probe that waits for its source's
     /// lock parks the whole module for as long as another thread holds it,
@@ -22053,101 +21714,6 @@ mod tests {
                 self._gate.join_storage_sweep_worker();
             }
         }
-    }
-
-    /// The bind-time check that a view's payloads are still stored runs in the
-    /// configure tail, after the bind is answered: a bind never waits on it.
-    /// Held inside the check, the tail leaves the first bind already answered
-    /// and still lets another session's bind of the root be answered.
-    #[test]
-    fn route_binds_are_answered_while_the_view_payload_check_is_held() {
-        const ACK_BOUND: Duration = Duration::from_secs(2);
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let executor = Arc::new(Executor::new());
-        let configured = ConfiguredRoot::unconfigured(&executor);
-        let root = configured.canonical_root.clone();
-        // A published generation with call-graph keys gives the check work.
-        let report =
-            crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
-                storage: configured.storage.path().to_path_buf(),
-                project_root: root.clone(),
-                family: crate::search_index::artifact_cache_key(&root),
-                scope: crate::path_identity::project_scope_key(&root),
-                desired_head: crate::views::assembly::head_tree_fingerprint(
-                    &crate::alias::head_tree_entries(&root).unwrap(),
-                ),
-                changed_paths: std::collections::BTreeSet::new(),
-                semantic_keys: Default::default(),
-                require_semantic: false,
-                allow_blob_put: true,
-                callgraph: true,
-            })
-            .unwrap();
-        assert!(report.published, "{report:?}");
-        let (_gate, check_held, release) =
-            crate::commands::configure::gate_configure_tail_stage_for_test(
-                root.clone(),
-                "view_payload_check",
-            );
-        let views_bind = |index: usize| {
-            let mut request = configured.bind_request(index, "opencode");
-            request.params["config"] = json!([{
-                "tier": "user",
-                "source": "/u/aft.jsonc",
-                "doc": json!({
-                    "views": { "enabled": true },
-                    "indexes": { "semantic": false, "trigram": false, "callgraph": true },
-                })
-                .to_string(),
-            }]);
-            request
-        };
-
-        let started = Instant::now();
-        let first = configured
-            .submit_bind(&executor, views_bind(0))
-            .blocking_recv()
-            .expect("first bind completes");
-        let first_ack = started.elapsed();
-        assert!(first.success, "{}", first.data);
-        assert!(
-            check_held.try_recv().is_err(),
-            "the payload check ran before the bind was answered"
-        );
-        let tail = executor.submit_maintenance_async(
-            configured.root.clone(),
-            Lane::MaintenanceCommit,
-            format!("subc-maintenance-drain-configure-tail-{}", root.display()),
-            Box::new(|ctx| {
-                let requeue = runtime_drain::drain_deferred_configure_maintenance_yielding(ctx);
-                Response::success("tail", json!({ "requeue": requeue }))
-            }),
-        );
-        check_held
-            .recv_timeout(Duration::from_secs(30))
-            .expect("the configure tail reaches the payload check");
-
-        let second_started = Instant::now();
-        let mut second = configured.submit_bind(&executor, views_bind(1));
-        let mut second_ack = None;
-        while second_started.elapsed() < ACK_BOUND {
-            if let Ok(response) = second.try_recv() {
-                assert!(response.success, "{}", response.data);
-                second_ack = Some(second_started.elapsed());
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        let _ = release.send(());
-        assert!(tail.blocking_recv().expect("tail completion").success);
-        crate::commands::configure::drain_deferred_configure_maintenance(&configured.ctx);
-        eprintln!(
-            "bind acks with the payload check held: first={first_ack:?} second={second_ack:?}"
-        );
-        assert!(
-            second_ack.is_some(),
-            "a bind was not answered within {ACK_BOUND:?} while the payload check was held"
-        );
     }
 
     /// After a daemon restart every session of a root rebinds at once, while

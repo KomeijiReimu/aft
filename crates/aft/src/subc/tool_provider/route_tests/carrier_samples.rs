@@ -217,14 +217,23 @@ fn normalized_frame(frame: &Frame, temporary_root: &Path, tool: &str) -> Value {
     json!({"header_hex":header_hex,"body_utf8":body})
 }
 
-async fn run_case(case: &Case) -> Value {
+async fn run_case(case: &Case, role: RouteRole) -> Value {
     let (dir, root, ctx) = fixture();
-    let mut identity = occipital_identity(&root, RouteRole::ToolProviderV1);
+    let mut identity = occipital_identity(&root, role);
     Arc::get_mut(&mut identity.0).unwrap().tool_result_body = true;
+    let mut body = json!({"name":case.tool,"preset":"worker","arguments":case.arguments});
+    if role == RouteRole::ToolProviderV1 {
+        body["op"] = json!("tool.call");
+    }
     let request = Frame::build(
-        FrameType::Request, control_flags(), 41, 1, 7,
-        serde_json::to_vec(&json!({"op":"tool.call","name":case.tool,"preset":"worker","arguments":case.arguments})).unwrap(),
-    ).unwrap();
+        FrameType::Request,
+        control_flags(),
+        41,
+        1,
+        7,
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .unwrap();
     let reply = exchange_frame_with_actor(
         request.clone(),
         identity,
@@ -233,7 +242,26 @@ async fn run_case(case: &Case) -> Value {
         dispatch,
     )
     .await;
-    if let Some(code) = case.error {
+    if role == RouteRole::ToolProviderV1 && case.error != Some("carrier_read_only") {
+        assert_eq!(
+            reply.header.ty,
+            FrameType::Response,
+            "{}: {:?}",
+            case.name,
+            String::from_utf8_lossy(&reply.body)
+        );
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(
+            body,
+            rich_ui::carrier::error_body("rich_ui_op_malformed"),
+            "{}",
+            case.name
+        );
+        rich_ui::carrier::validate_body(None, &body).unwrap();
+    } else if let Some(code) = case
+        .error
+        .filter(|code| !(role == RouteRole::Legacy && *code == "invalid_request"))
+    {
         assert_eq!(reply.header.ty, FrameType::Error, "{}", case.name);
         let error: subc_protocol::ErrorBody = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(error.code, code, "{}: {error:?}", case.name);
@@ -276,7 +304,7 @@ fn carrier_sample_normalization_is_narrow() {
 async fn capture_carrier_samples() {
     std::fs::create_dir_all(sample_dir()).unwrap();
     for case in cases() {
-        let sample = run_case(&case).await;
+        let sample = run_case(&case, RouteRole::ToolProviderV1).await;
         let common = sample_dir().join(format!("{}.json", case.name));
         let path = if cfg!(windows) {
             let baseline: Value = serde_json::from_slice(&std::fs::read(&common).unwrap()).unwrap();
@@ -291,6 +319,23 @@ async fn capture_carrier_samples() {
         };
         let json = format!("{}\n", serde_json::to_string_pretty(&sample).unwrap());
         std::fs::write(&path, &json).unwrap();
+        // Closed admission refusals have no platform-dependent handler output.
+        // Retire old overrides when a formerly successful sample becomes one.
+        if !cfg!(windows)
+            && sample["reply_frame"]["body_utf8"]
+                .as_str()
+                .is_some_and(|body| {
+                    serde_json::from_str::<Value>(body).is_ok_and(|body| {
+                        body["structuredContent"]["code"] == "rich_ui_op_malformed"
+                    })
+                })
+        {
+            let windows = sample_dir().join(format!("{}.windows.json", case.name));
+            if windows.exists() {
+                std::fs::remove_file(windows).unwrap();
+                println!("CARRIER_SAMPLE_REMOVED {}.windows", case.name);
+            }
+        }
         println!(
             "CARRIER_SAMPLE {} {sample}",
             path.file_stem().unwrap().to_str().unwrap()
@@ -311,10 +356,12 @@ async fn carrier_samples_match_wire() {
             }))
             .unwrap();
         assert_eq!(
-            run_case(&case).await,
+            run_case(&case, RouteRole::ToolProviderV1).await,
             expected,
             "carrier sample {}",
             case.name
         );
+        // Legacy-route cases retain the original gate and handler coverage.
+        run_case(&case, RouteRole::Legacy).await;
     }
 }

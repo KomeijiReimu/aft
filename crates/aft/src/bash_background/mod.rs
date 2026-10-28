@@ -1061,7 +1061,7 @@ impl TaskSlot {
 /// background feature and takes a background slot. A foreground command
 /// (`false`, and not a PTY) always starts; see [`TaskSlot::Foreground`].
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn(
+pub(crate) fn spawn_with_secrets(
     request_id: &str,
     session_id: &str,
     command: &str,
@@ -1081,6 +1081,7 @@ pub(crate) fn spawn(
     scanner_requires_approval: bool,
     host_escalation: Option<HostEscalationAttempt>,
     remote: Option<RemoteLaunch>,
+    #[cfg(unix)] mut secret_launch: Option<secrets::Launch>,
 ) -> Response {
     if require_background_flag && !ctx.config().experimental_bash_background {
         return Response::error(
@@ -1167,11 +1168,16 @@ pub(crate) fn spawn(
     };
     let session_dir = persistence::session_tasks_dir(&storage_dir, session_id);
     #[cfg(unix)]
-    let (spawn_plan, unregistered_task) = if native_sandbox_enforced(ctx, &principal)
-        && host_escalation.is_none()
+    let (spawn_plan, unregistered_task) = if secret_launch.is_some()
+        || (native_sandbox_enforced(ctx, &principal) && host_escalation.is_none())
     {
         enter_bash_startup_step(BashStartupStep::TaskDirectory);
-        let task = match persistence::allocate_task_layout(&storage_dir, session_id) {
+        let task = match secret_launch
+            .as_mut()
+            .and_then(|launch| launch.preflight.task.take())
+            .map(Ok)
+            .unwrap_or_else(|| persistence::allocate_task_layout(&storage_dir, session_id))
+        {
             Ok(task) => task,
             Err(error) => {
                 return Response::error(
@@ -1184,14 +1190,19 @@ pub(crate) fn spawn(
             }
         };
         enter_bash_startup_step(BashStartupStep::Profile);
-        let plan = resolve_sandbox_spawn(
-            ctx,
-            &principal,
-            requested_tier,
-            task_kind,
-            &task.paths.io_dir,
-            None,
-        );
+        let plan = secret_launch
+            .as_ref()
+            .map(|launch| launch.preflight.plan.clone())
+            .unwrap_or_else(|| {
+                resolve_sandbox_spawn(
+                    ctx,
+                    &principal,
+                    requested_tier,
+                    task_kind,
+                    &task.paths.io_dir,
+                    None,
+                )
+            });
         if plan.refusal_code().is_some() {
             (plan, Some(task))
         } else {
@@ -1218,7 +1229,12 @@ pub(crate) fn spawn(
                 &shell_path,
                 &environment,
             ) {
-                Ok(prepared) => (plan.with_prepared_task(prepared), Some(task)),
+                Ok(prepared) => {
+                    if let Some(launch) = secret_launch.as_ref() {
+                        prepared.set_secret_runtime(launch.runtime.clone());
+                    }
+                    (plan.with_prepared_task(prepared), Some(task))
+                }
                 Err(error) => {
                     let _ = persistence::delete_resolved_task(&task);
                     return Response::error(
@@ -1364,6 +1380,17 @@ pub(crate) fn spawn(
             project_root,
         )
     };
+    #[cfg(unix)]
+    if spawn_result.is_ok() {
+        if let Some(launch) = secret_launch.as_mut() {
+            launch.spawned();
+        }
+    } else {
+        if let Some(task) = cleanup_plan.prepared_task() {
+            ctx.bash_background()
+                .stop_secret_proxy(&task.resolved_task().paths.task_id);
+        }
+    }
 
     match spawn_result {
         Ok(task_id) => {
@@ -1412,6 +1439,54 @@ pub(crate) fn spawn(
             }
         }
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn(
+    request_id: &str,
+    session_id: &str,
+    command: &str,
+    shell: BashShell,
+    shell_path: PathBuf,
+    workdir: Option<PathBuf>,
+    env: Option<HashMap<String, String>>,
+    hard_kill: HardKill,
+    ctx: &AppContext,
+    require_background_flag: bool,
+    notify_on_completion: bool,
+    compressed: bool,
+    pty: bool,
+    pty_rows: u16,
+    pty_cols: u16,
+    scanner_report: Vec<PermissionAsk>,
+    scanner_requires_approval: bool,
+    host_escalation: Option<HostEscalationAttempt>,
+    remote: Option<RemoteLaunch>,
+) -> Response {
+    spawn_with_secrets(
+        request_id,
+        session_id,
+        command,
+        shell,
+        shell_path,
+        workdir,
+        env,
+        hard_kill,
+        ctx,
+        require_background_flag,
+        notify_on_completion,
+        compressed,
+        pty,
+        pty_rows,
+        pty_cols,
+        scanner_report,
+        scanner_requires_approval,
+        host_escalation,
+        remote,
+        #[cfg(unix)]
+        None,
+    )
 }
 
 /// Decide, in one place, whether a jailed worker's shell receives the host-local
@@ -2423,3 +2498,4 @@ mod legacy_root_task_repair_tests {
 
 #[cfg(all(test, unix))]
 pub(crate) use registry::push_projection_fixture;
+pub(crate) mod secrets;

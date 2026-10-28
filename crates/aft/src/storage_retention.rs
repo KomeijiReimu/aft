@@ -40,7 +40,7 @@ const INTERVAL: Duration = Duration::from_secs(10 * 60);
 const STARTUP_GRACE: Duration = Duration::from_secs(5 * 60);
 const PASS_BUDGET: Duration = Duration::from_secs(5);
 const PASS_ENTRIES: usize = 64;
-const TREE_ENTRIES: usize = 4096;
+pub(crate) const TREE_ENTRIES: usize = 4096;
 const TRASH_SCAN_HANDLES: usize = 64;
 const HISTORY_ENTRIES: usize = 8192;
 static REPORTED_BINDING_READ_ERRORS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
@@ -1621,7 +1621,7 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
     serde_json::from_slice(&fs::read(path)?).map_err(io::Error::other)
 }
 
-fn bounded_dirs(directory: &Path, cap: usize) -> io::Result<Vec<fs::DirEntry>> {
+pub(crate) fn bounded_dirs(directory: &Path, cap: usize) -> io::Result<Vec<fs::DirEntry>> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -2284,6 +2284,144 @@ fn protected(cache: &Path) -> io::Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// Whether a due legacy cache must stay because a v3 import is reading it.
+///
+/// The v3 importer reads `index/<key>`, `semantic/<key>` and `symbols/<key>`
+/// while it holds a claim in the family's import ledger
+/// (`migration::v3_ledger`). Retiring such a set would pull the source out
+/// from under that import, so a live claim protects it, and a ledger that
+/// cannot be read is uncertainty and protects it too. A finished, abandoned
+/// or absent import leaves the binding-age rules alone.
+fn legacy_import_source_pinned(storage: &StoragePaths, cache: &Path, key: &str) -> bool {
+    let domain = cache
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str());
+    if !matches!(domain, Some("index" | "semantic" | "symbols")) {
+        return false;
+    }
+    match crate::migration::v3_ledger::legacy_key_status(&storage.artifacts, key) {
+        Ok(Some(status)) => status.live_claim,
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
+/// One kind of legacy (pre-v3) data that stays on disk for an offline
+/// rollback to the previous binary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum RetainedKind {
+    /// `symbols/<key>`: a parsed-symbol cache, a source of the v3 symbol import.
+    SymbolCache,
+    /// `views/<scope>`: a v1 view, whose generations name v1 blob rows.
+    V1View,
+    /// `blobs/<family>`: v1 blob stores, the copy-on-first-use donors of v3.
+    V1BlobFamily,
+    /// `blobs/v2/<family>`: v2 family stores, also copy-on-first-use donors.
+    V2FamilyStore,
+}
+
+impl RetainedKind {
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::SymbolCache => "symbol cache",
+            Self::V1View => "v1 view",
+            Self::V1BlobFamily => "v1 blob family",
+            Self::V2FamilyStore => "v2 family store",
+        }
+    }
+}
+
+/// One retained legacy item.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetainedItem {
+    pub kind: RetainedKind,
+    pub path: PathBuf,
+    pub bytes: u64,
+    /// The v3 family of the same name exists, so rows of this item may have
+    /// been copied into v3 (a copy never removes or changes its source).
+    pub copied_into_v3: bool,
+    /// Why the item is protected right now (a live import claim, live pins
+    /// or readers), or `None`. A protected item is never retired.
+    pub pinned: Option<String>,
+}
+
+/// Upper bound on items listed per retained kind.
+const RETAINED_ITEMS_PER_KIND: usize = 10_000;
+
+/// Lists the legacy data this build keeps but never writes: symbol caches,
+/// v1 views and blob families, and v2 family stores, with whether v3 holds
+/// a family of the same name and whether something protects them now. It
+/// reads directory listings, sizes, ledgers and pin files only; it writes
+/// nothing under the storage root.
+pub fn retained_legacy_inventory(storage: &Path) -> io::Result<Vec<RetainedItem>> {
+    let paths = StoragePaths::same(storage);
+    let v3_family = |name: &str| storage.join("blobs/v3").join(name).is_dir();
+    let mut items = Vec::new();
+    for (kind, parent) in [
+        (RetainedKind::SymbolCache, storage.join("symbols")),
+        (RetainedKind::V1View, storage.join("views")),
+        (RetainedKind::V1BlobFamily, storage.join("blobs")),
+        (RetainedKind::V2FamilyStore, storage.join("blobs/v2")),
+    ] {
+        let entries = match fs::read_dir(&parent) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let mut names = Vec::new();
+        for entry in entries.take(RETAINED_ITEMS_PER_KIND) {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let listed = match kind {
+                RetainedKind::SymbolCache => {
+                    crate::migration::per_checkout::validate_legacy_key(&name).is_ok()
+                }
+                RetainedKind::V1View | RetainedKind::V1BlobFamily => key_valid(&name),
+                RetainedKind::V2FamilyStore => {
+                    crate::blob_store::v2::validate_family(&name).is_ok()
+                }
+            };
+            if listed {
+                names.push(name);
+            }
+        }
+        names.sort();
+        for name in names {
+            let path = parent.join(&name);
+            let bytes = crate::migration::prune_legacy::tree_size(&path, TREE_ENTRIES)
+                .map(|(bytes, _, _)| bytes)
+                .unwrap_or(0);
+            let pinned = match kind {
+                RetainedKind::SymbolCache => legacy_import_source_pinned(&paths, &path, &name)
+                    .then(|| "a v3 import is reading it".to_owned()),
+                RetainedKind::V1View => match protected(&path) {
+                    Ok(true) => Some("live pins or readers".to_owned()),
+                    Ok(false) => None,
+                    Err(error) => Some(format!("pins unreadable: {error}")),
+                },
+                // Their rows are protected one by one: a copier pins each
+                // source row before reading it, and the v1/v2 sweeps honour
+                // those pins. Nothing protects the store as a whole.
+                RetainedKind::V1BlobFamily | RetainedKind::V2FamilyStore => None,
+            };
+            items.push(RetainedItem {
+                kind,
+                copied_into_v3: v3_family(&name),
+                path,
+                bytes,
+                pinned,
+            });
+        }
+    }
+    Ok(items)
 }
 
 fn owner_has_residency_marker(
@@ -3712,6 +3850,7 @@ impl PreparedDue {
             || crate::root_cache::live_scope_keys_for_storage(&storage.durable).contains(key)
             || owners.protect(storage, key, current.contains_key(key))?
             || protected(&cache)?
+            || legacy_import_source_pinned(storage, &cache, key)
         {
             report.skipped_protected += 1;
             return Ok(());
@@ -4200,6 +4339,7 @@ fn candidate_inner(
         report,
     )? || crate::root_cache::live_scope_keys_for_storage(&storage.durable).contains(key)
         || protected(&cache)?
+        || legacy_import_source_pinned(storage, &cache, key)
     {
         report.skipped_protected += 1;
         return Ok(());
@@ -4877,7 +5017,7 @@ enum V3Step {
 /// way, so they never keep a member. `Err` is uncertainty (an unreadable pin,
 /// or a `pins/` or `readers/` listing longer than the bound) and keeps the
 /// member without resetting its count, as the v2 family sweep does.
-fn v3_member_protected(
+pub(crate) fn v3_member_protected(
     tx: &rusqlite::Transaction<'_>,
     scope: &str,
     view_dir: &Path,
@@ -5104,10 +5244,16 @@ fn v3_finish_eviction(
     crate::views::registry::remove_view_dir(view_dir)?;
     registry
         .with_barrier(|tx| {
-            tx.execute(
+            let removed = tx.execute(
                 "DELETE FROM members WHERE scope=?1 AND state=?2",
                 rusqlite::params![scope, crate::views::registry::STATE_EVICTING],
             )?;
+            // A deregistered worker's referrer and strict-rebuild rows go in
+            // the same transaction as its member row, after its directory.
+            if removed > 0 && crate::views::base_refs::has_base_refs(tx)? {
+                tx.execute("DELETE FROM base_refs WHERE worker_scope=?1", [scope])?;
+                tx.execute("DELETE FROM strict_rebuild WHERE worker_scope=?1", [scope])?;
+            }
             Ok(())
         })
         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -5419,6 +5565,44 @@ fn collect_v3_family(
                 last_scope: Some(last_scope),
             },
         )?;
+    }
+    // The base-reference sweep: referrer reconciliation, the two-sweep base
+    // reclaim and the plane-row sweep. It needs the registry's base-reference
+    // tables and runs under the reservation lock this visit already holds.
+    if !cancelled()
+        && Instant::now() < deadline
+        && registry.registry_version().map_err(v3)?
+            >= crate::blob_store::v3::REGISTRY_BASE_REFS_VERSION
+    {
+        let plane_cursor = cursor_root(paths)?
+            .join("v3-plane-rows")
+            .join(format!("{family}.json"));
+        let bounds = crate::views::base_sweep::SweepBounds {
+            deadline: Some(deadline),
+            ..Default::default()
+        };
+        match crate::views::base_sweep::sweep_family_locked(
+            storage,
+            family,
+            &lock,
+            None,
+            bounds,
+            Some(&plane_cursor),
+        ) {
+            Ok(swept) => {
+                report.removed_roots += swept.reclaimed_bases.len();
+                report.removed_blobs += swept.plane_rows_deleted as usize;
+                report.examined_blobs += swept.plane_rows_examined as usize;
+                report.stopped_early |= !swept.plane_rows_complete && swept.skipped.is_none();
+            }
+            Err(error) => {
+                if report.errors.len() < 16 {
+                    report
+                        .errors
+                        .push(format!("v3 base sweep of family {family}: {error}"));
+                }
+            }
+        }
     }
     // Every collector pass ends with a covering measurement, so committed
     // usage also reflects files removed by anything else since the last one.
@@ -5954,6 +6138,7 @@ mod storage_retention_tests {
                 pid: 4242,
                 hostname: "other-host".into(),
                 created_at_ms: 1_761_300_000_000,
+                nonce: None,
             })
             .unwrap(),
         )
@@ -9731,6 +9916,93 @@ mod storage_retention_tests {
     }
 
     #[test]
+    fn retention_due_legacy_cache_keeps_a_live_v3_import_source() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let (temp, root, scope) = fixture();
+        fs::remove_dir(&root).unwrap();
+        let path = cache(temp.path(), "index", &scope);
+        // The v3 importer of this key's family holds a live claim: it may be
+        // reading `index/<scope>` right now.
+        let held = crate::migration::v3_ledger::hold_claim_for_test(temp.path(), &scope, &scope);
+        let report = run_pass(temp.path(), &|| false);
+        assert_eq!(report.removed_roots, 0, "{report:?}");
+        assert!(path.join("payload.bin").exists());
+        assert!(report.skipped_protected > 0, "{report:?}");
+        // Once the import is gone the binding-age rule applies again.
+        drop(held);
+        let report = run_pass(temp.path(), &|| false);
+        assert_eq!(report.removed_roots, 1, "{report:?}");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn retained_legacy_inventory_lists_every_kind_without_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path();
+        for (path, bytes) in [
+            ("symbols/0123456789abcdef/symbols.bin", &b"symbols"[..]),
+            ("views/0123456789abcdef/manifest.json", b"view"),
+            ("views/v2/scope/manifest.json", b"v2 view"),
+            ("blobs/fedcba9876543210/semantic.sqlite", b"v1 blobs"),
+            ("blobs/v2/family/semantic.sqlite", b"v2 blobs"),
+            ("blobs/v3/family/members.sqlite", b"v3 registry"),
+        ] {
+            let path = storage.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+        let pins = storage.join("views/0123456789abcdef/pins");
+        fs::create_dir_all(&pins).unwrap();
+        let _pin =
+            crate::pins::QueryPin::acquire(&storage.join("views/0123456789abcdef"), "g").unwrap();
+        let snapshot = crate::migration::v3_import::tests::snapshot_tree;
+        let before = snapshot(storage);
+        let items = retained_legacy_inventory(storage).unwrap();
+        let summary = items
+            .iter()
+            .map(|item| {
+                (
+                    item.kind,
+                    item.path.strip_prefix(storage).unwrap().to_path_buf(),
+                    item.copied_into_v3,
+                    item.pinned.is_some(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    RetainedKind::SymbolCache,
+                    PathBuf::from("symbols/0123456789abcdef"),
+                    false,
+                    false
+                ),
+                (
+                    RetainedKind::V1View,
+                    PathBuf::from("views/0123456789abcdef"),
+                    false,
+                    true
+                ),
+                (
+                    RetainedKind::V1BlobFamily,
+                    PathBuf::from("blobs/fedcba9876543210"),
+                    false,
+                    false
+                ),
+                (
+                    RetainedKind::V2FamilyStore,
+                    PathBuf::from("blobs/v2/family"),
+                    true,
+                    false
+                ),
+            ]
+        );
+        assert!(items.iter().all(|item| item.bytes > 0));
+        assert_eq!(snapshot(storage), before);
+    }
+
+    #[test]
     fn retention_due_root_keeps_writer_lock() {
         let (temp, _, _, path) = due_cache_fixture();
         let _writer =
@@ -13359,5 +13631,79 @@ mod v3_collector_tests {
             .exists());
         assert!(!storage.join("blobs/v3/reservations.lock").exists());
         assert!(member.join("data.bin").exists());
+    }
+}
+
+#[cfg(test)]
+mod v3_base_reference_collector_tests {
+    use super::*;
+    use crate::views::base_refs::tests::{
+        bind, plane_has, publish_test_base, published, put_rows, refs, worker_delta, FAMILY,
+    };
+    use crate::views::base_refs::with_base_barrier;
+
+    fn pass(storage: &Path) -> SweepReport {
+        let mut report = SweepReport::default();
+        collect_one_v3_family(
+            &StoragePaths::same(storage),
+            &|| false,
+            &mut report,
+            V3Bounds::PASS,
+        )
+        .unwrap();
+        assert!(report.errors.is_empty(), "{report:?}");
+        report
+    }
+
+    fn registered(storage: &Path, scope: &str) -> bool {
+        crate::blob_store::v3::LedgerReader::open_existing(storage, FAMILY)
+            .unwrap()
+            .member(scope)
+            .unwrap()
+            .is_some()
+    }
+
+    #[test]
+    fn the_collector_keeps_a_referenced_base_and_reclaims_it_two_passes_after_its_worker_goes() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let storage = tempfile::tempdir().unwrap();
+        let (identity, generation) = publish_test_base(storage.path(), &[("src/a.rs", b"alpha")]);
+        put_rows(storage.path(), &[b"new"]);
+        let (_, composed) = published(
+            bind(
+                storage.path(),
+                "worker-a",
+                &identity,
+                &generation,
+                worker_delta(&identity, &generation, b"new"),
+                None,
+            )
+            .unwrap(),
+        );
+        drop(composed);
+        for _ in 0..3 {
+            pass(storage.path());
+            assert!(registered(storage.path(), &identity.scope));
+            assert!(plane_has(storage.path(), b"alpha"));
+        }
+        // The worker is deregistered: its rows go with its member row.
+        with_base_barrier(storage.path(), FAMILY, |tx| {
+            tx.execute(
+                "UPDATE members SET state='evicting' WHERE scope='worker-a'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        pass(storage.path());
+        assert!(!registered(storage.path(), "worker-a"));
+        assert!(refs(storage.path()).is_empty());
+        // That same pass counted the base once; the next one reclaims it.
+        assert!(registered(storage.path(), &identity.scope));
+        pass(storage.path());
+        assert!(!registered(storage.path(), &identity.scope));
+        pass(storage.path());
+        assert!(!plane_has(storage.path(), b"alpha"));
+        assert!(!storage.path().join("views/v3").exists());
     }
 }

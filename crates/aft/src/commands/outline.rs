@@ -61,6 +61,7 @@ pub struct OutlineEntry {
 ///
 /// Output is capped at 30KB; if exceeded, truncates with a narrowing hint.
 pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
+    let _fetch_temp = super::url_resolution::FetchTempScope::enter();
     ctx.with_read_policy_snapshot(&req.id, || handle_outline_with_snapshot(req, ctx))
 }
 

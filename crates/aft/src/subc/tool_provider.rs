@@ -1832,8 +1832,27 @@ impl LedgerEdge {
             .run_owner
             .as_ref()
             .map_or(&identity.spawn_principal, |owner| &owner.run_principal);
+        let carrier = if super::occipital_route(identity) {
+            identity
+                .scope
+                .as_ref()
+                .map(|scope| {
+                    format!(
+                        "reserved:occipital#{}",
+                        serde_json::to_string(&json!([
+                            super::principal_id(&Some(scope.owner.clone())).unwrap(),
+                            scope.scope_ref,
+                            scope.scope_epoch.to_string()
+                        ]))
+                        .expect("scope tuple serializes")
+                    )
+                })
+                .unwrap_or_else(|| ledger_carrier(principal))
+        } else {
+            ledger_carrier(principal)
+        };
         crate::db::call_ledger::Key {
-            carrier: ledger_carrier(principal),
+            carrier,
             call_key: call_key.into(),
         }
     }
@@ -1892,16 +1911,26 @@ impl LedgerEdge {
         let Some(call_key) = call.call_key.as_deref() else {
             return Err(decoded);
         };
-        if admit(
-            &call,
-            identity.scope.is_some(),
-            &identity.disabled_tools,
-            crate::bash_background::powershell_available(),
-            &identity.session,
-            admission_trusted(&identity, &call),
-        )
-        .is_err()
-        {
+        let carrier = super::occipital_carrier_route(&identity);
+        let admitted = if carrier {
+            super::carrier_read_only::admit(&identity, body).and_then(|()| {
+                super::carrier_read_only::admit_operation(&identity, &call.name, &call.arguments)
+                    .map(|_| ())
+            })
+        } else if super::occipital_route(&identity) {
+            return Err(decoded);
+        } else {
+            admit(
+                &call,
+                identity.scope.is_some(),
+                &identity.disabled_tools,
+                crate::bash_background::powershell_available(),
+                &identity.session,
+                admission_trusted(&identity, &call),
+            )
+            .and_then(|_| super::rich_ui::admission::reject_non_carrier(&call.arguments))
+        };
+        if admitted.is_err() {
             return Err(decoded);
         };
         let held = matches!(identity.trust, BindTrust::Untrusted)
@@ -1932,21 +1961,38 @@ impl LedgerEdge {
             let metrics = metrics.clone();
             tokio::spawn(async move {
                 let result = ledger_refusal_result(&call, response, &identity.project_root);
-                if let Ok(frame) = build_tool_response_frame(
-                    decoded.frame.header.ver,
-                    route,
-                    decoded.frame.header.corr,
-                    decoded.frame.header.flags,
-                    &result,
-                    identity.reply_policy(),
-                ) {
+                let outgoing = if carrier {
+                    super::wire::build_carrier_response_frame(
+                        &decoded.frame,
+                        None,
+                        super::rich_ui::carrier::error_body(
+                            result.response.data["code"].as_str().unwrap_or("unknown"),
+                        ),
+                    )
+                } else {
+                    build_tool_response_frame(
+                        decoded.frame.header.ver,
+                        route,
+                        decoded.frame.header.corr,
+                        decoded.frame.header.flags,
+                        &result,
+                        identity.reply_policy(),
+                    )
+                };
+                if let Ok(frame) = outgoing {
                     let _ = send_reliable_writer_frame(&writer, &metrics, frame, "ledger refusal")
                         .await;
                 }
             });
             return Ok(());
         }
-        let scope = identity.scope.as_ref().map(ledger_scope);
+        // Carrier observations must not enter the scope owner's ack sequence,
+        // late-results feed or retention accounting.
+        let scope = if super::occipital_route(&identity) {
+            None
+        } else {
+            identity.scope.as_ref().map(ledger_scope)
+        };
         // composition_digest is the role crate's SHA-256 over JCS, without
         // schema-description projection. Hash before server shell injections.
         let digest = composition_digest(
@@ -1959,7 +2005,7 @@ impl LedgerEdge {
         let metrics = metrics.clone();
         let root = identity.root.clone();
         let request_id = format!("ledger-{}-{}", route.channel, decoded.frame.header.corr);
-        let include_tool_result_body = identity.tool_result_body;
+        let include_tool_result_body = identity.tool_result_body && !carrier;
         let response_key = key.clone();
         let cancel = PersistentCancelSignal::new();
         let terminal_claim = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2147,12 +2193,16 @@ impl LedgerEdge {
                                     let _ = send_reliable_writer_frame(
                                         &writer,
                                         &metrics,
-                                        WriterFrame::retained_tool_response_with_source(
-                                            frame,
-                                            identity.reply_policy(),
-                                            call.arguments.get("path").and_then(Value::as_str),
-                                            row.tool_result_source,
-                                        ),
+                                        if carrier {
+                                            WriterFrame::plain(frame)
+                                        } else {
+                                            WriterFrame::retained_tool_response_with_source(
+                                                frame,
+                                                identity.reply_policy(),
+                                                call.arguments.get("path").and_then(Value::as_str),
+                                                row.tool_result_source,
+                                            )
+                                        },
                                         "attached ledger result",
                                     )
                                     .await;
@@ -2195,12 +2245,16 @@ impl LedgerEdge {
                         let _ = send_reliable_writer_frame(
                             &writer,
                             &metrics,
-                            WriterFrame::retained_tool_response_with_source(
-                                frame,
-                                identity.reply_policy(),
-                                call.arguments.get("path").and_then(Value::as_str),
-                                row.tool_result_source,
-                            ),
+                            if carrier {
+                                WriterFrame::plain(frame)
+                            } else {
+                                WriterFrame::retained_tool_response_with_source(
+                                    frame,
+                                    identity.reply_policy(),
+                                    call.arguments.get("path").and_then(Value::as_str),
+                                    row.tool_result_source,
+                                )
+                            },
                             "ledger replay",
                         )
                         .await;
@@ -2229,14 +2283,25 @@ impl LedgerEdge {
                         return;
                     }
                     let result = ledger_refusal_result(&call, response, &identity.project_root);
-                    if let Ok(mut frame) = build_tool_response_frame(
-                        decoded.frame.header.ver,
-                        route,
-                        decoded.frame.header.corr,
-                        decoded.frame.header.flags,
-                        &result,
-                        identity.reply_policy(),
-                    ) {
+                    let outgoing = if carrier {
+                        super::wire::build_carrier_response_frame(
+                            &decoded.frame,
+                            None,
+                            super::rich_ui::carrier::error_body(
+                                result.response.data["code"].as_str().unwrap_or("unknown"),
+                            ),
+                        )
+                    } else {
+                        build_tool_response_frame(
+                            decoded.frame.header.ver,
+                            route,
+                            decoded.frame.header.corr,
+                            decoded.frame.header.flags,
+                            &result,
+                            identity.reply_policy(),
+                        )
+                    };
+                    if let Ok(mut frame) = outgoing {
                         if edge.finish_waiting(&decoded.frame) {
                             frame = Self::cancelled_frame(&decoded.frame).unwrap().into();
                         }
@@ -3036,30 +3101,48 @@ fn admit_as(
     trusted: bool,
     role: CallerRole,
 ) -> Result<(), ErrorBody> {
+    admit_role_name(
+        &call.name,
+        disabled,
+        powershell_available,
+        session,
+        trusted,
+        role,
+    )?;
+    admit_arguments(call, role, true)
+}
+
+/// Role admission is separate from served-argument validation because carrier
+/// bindings and operation arguments are translated only after task ownership.
+pub(super) fn admit_role_name(
+    name: &str,
+    disabled: &[String],
+    powershell_available: bool,
+    session: &str,
+    trusted: bool,
+    role: CallerRole,
+) -> Result<(), ErrorBody> {
     if !METADATA
         .iter()
         .chain(PRESET_ONLY_METADATA)
-        .any(|(name, _, _)| *name == call.name)
+        .any(|(tool, _, _)| *tool == name)
     {
-        return Err(errors::unknown_tool(&call.name));
+        return Err(errors::unknown_tool(name));
     }
-    if role == CallerRole::Reader && !READER_TOOLS.contains(&call.name.as_str()) {
+    if role == CallerRole::Reader && !READER_TOOLS.contains(&name) {
         return Err(ErrorBody::new(
             errors::UNKNOWN_TOOL,
-            format!(
-                "tool {:?} is not served by the \"reader\" preset",
-                call.name
-            ),
+            format!("tool {:?} is not served by the \"reader\" preset", name),
         )
-        .with_detail(json!({"tool": call.name, "preset": CatalogPreset::Reader.name()})));
+        .with_detail(json!({"tool": name, "preset": CatalogPreset::Reader.name()})));
     }
-    if crate::tool_gate::refusal_by_name("v1-admission", &call.name, disabled).is_some() {
-        return Err(errors::tool_disabled(&call.name));
+    if crate::tool_gate::refusal_by_name("v1-admission", name, disabled).is_some() {
+        return Err(errors::tool_disabled(name));
     }
-    if call.name == "powershell" && !powershell_available {
+    if name == "powershell" && !powershell_available {
         return Err(
             ErrorBody::new(errors::TOOL_UNAVAILABLE, "PowerShell is not available")
-                .with_detail(json!({"tool": call.name, "reason": "under_review"})),
+                .with_detail(json!({"tool": name, "reason": "under_review"})),
         );
     }
     if session.is_empty() {
@@ -3068,9 +3151,17 @@ fn admit_as(
             "v1 execution requires a bound session",
         ));
     }
-    if let Some(error) = shell_capability_refusal(&call.name, trusted) {
+    if let Some(error) = shell_capability_refusal(name, trusted) {
         return Err(error);
     }
+    Ok(())
+}
+
+pub(super) fn admit_arguments(
+    call: &cortexkit_role_tool_provider::call::ToolCallRequest,
+    role: CallerRole,
+    check_pin: bool,
+) -> Result<(), ErrorBody> {
     // The worker preset serves every head tool plus the preset-only ones, so
     // its catalog holds the served schema of every admitted name.
     let served = served_tools(CatalogPreset::Worker)
@@ -3097,7 +3188,7 @@ fn admit_as(
             .find(|entry| entry.catalog.name == call.name)
             .map_or(tool.semantics, |entry| entry.catalog.semantics)
     };
-    if let Some(encoded) = &call.schema_pin {
+    if let Some(encoded) = call.schema_pin.as_ref().filter(|_| check_pin) {
         let pin = SchemaPin::parse(encoded)
             .map_err(|error| errors::invalid_request("schema_pin", error.to_string()))?;
         if pin.schema_digest != tool.schema_digest
@@ -4962,6 +5053,8 @@ mod tests {
 #[cfg(test)]
 mod route_tests {
     mod carrier_samples;
+    #[path = "../../rich_ui/admission/route_tests.rs"]
+    mod operation_admission;
 
     use super::super::*;
     use super::*;
@@ -5269,7 +5362,7 @@ mod route_tests {
     }
 
     #[tokio::test]
-    async fn occipital_allowed_reads_keep_session_authority() {
+    async fn occipital_allowed_reads_require_versioned_operations_on_v1() {
         let _guard = EXCHANGE_LOCK.lock().await;
         let (_dir, root) = test_support::test_root("occipital-allowed");
         for role in [RouteRole::ToolProviderV1, RouteRole::Legacy] {
@@ -5311,6 +5404,14 @@ mod route_tests {
                 .await;
                 let body: Value = serde_json::from_slice(&reply.body).unwrap();
                 assert_eq!(reply.header.ty, FrameType::Response, "{name}: {body}");
+                if role == RouteRole::ToolProviderV1 {
+                    assert_eq!(
+                        body,
+                        super::super::rich_ui::carrier::error_body("rich_ui_op_malformed")
+                    );
+                    assert_eq!(*LAST_DISPATCH.lock().unwrap(), None);
+                    continue;
+                }
                 assert_eq!(body["isError"], false, "{name}: {body}");
                 assert_eq!(
                     *LAST_DISPATCH.lock().unwrap(),
@@ -5362,23 +5463,26 @@ mod route_tests {
     }
 
     #[tokio::test]
-    async fn occipital_allowed_read_preserves_negotiated_tool_result_body() {
+    async fn occipital_unpublished_read_uses_closed_carrier_body() {
+        let _manifest = super::super::rich_ui::chunks::set_test_manifest_for_test(None);
         let (_dir, root) = test_support::test_root("occipital-tool-result");
         let mut identity = occipital_identity(&root, RouteRole::ToolProviderV1);
         Arc::get_mut(&mut identity.0).unwrap().tool_result_body = true;
         let reply = exchange_with_actor(
-            json!({"name":"read","preset":"worker","arguments":{"path":"local.txt"}}),
+            json!({"name":"read","preset":"worker","arguments":{"path":"local.txt","rich_ui_op":"read@1"}}),
             identity,
             test_support::test_ctx(),
             &Arc::new(DispatchPathMetrics::new()),
-            |request, _| Response::success(request.id, json!({"content":"read-marker"})),
+            |_, _| panic!("unpublished operations must not dispatch"),
         )
         .await;
         assert_eq!(reply.header.ty, FrameType::Response);
-        let body: cortexkit_role_tool_provider::result::ToolResult =
-            serde_json::from_slice(&reply.body).unwrap();
-        cortexkit_role_tool_provider::result::validate(&body).unwrap();
-        assert!(body.error_code.is_none(), "{body:?}");
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(
+            body,
+            super::super::rich_ui::carrier::error_body("operation_version_unsupported")
+        );
+        super::super::rich_ui::carrier::validate_body(None, &body).unwrap();
     }
 
     #[tokio::test]
@@ -5755,6 +5859,13 @@ mod route_tests {
                     .await;
                     let body: Value = serde_json::from_slice(&reply.body).unwrap();
                     assert_eq!(reply.header.ty, FrameType::Response, "{name}: {body}");
+                    if role == RouteRole::ToolProviderV1 {
+                        assert_eq!(
+                            body,
+                            super::super::rich_ui::carrier::error_body("rich_ui_op_malformed")
+                        );
+                        continue;
+                    }
                     let rendered = body.to_string();
                     if own {
                         assert_eq!(body["isError"], false, "{name}: {body}");
@@ -5778,7 +5889,13 @@ mod route_tests {
             test_support::route_identity(root, session)
         };
         let data = Arc::get_mut(&mut identity.0).unwrap();
-        data.role = RouteRole::ToolProviderV1;
+        // Exercise the observation handlers through the legacy decoder while
+        // v1 carrier operation versions remain unpublished.
+        data.role = if carrier {
+            RouteRole::Legacy
+        } else {
+            RouteRole::ToolProviderV1
+        };
         data.scope = Some(stamp("worker"));
         data.session = session.into();
         if let AuthenticatedPrincipal::RouteBind { session_id, .. } = &mut data.spawn_principal {

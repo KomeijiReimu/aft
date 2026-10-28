@@ -691,6 +691,12 @@ pub(crate) fn schedule_with_reason(
     if ctx.retire_deleted_view_root() {
         return Ok(());
     }
+    // A root whose reads all go through its v3 checkout views has no reader
+    // of the content-addressed v1 view, so nothing is assembled, put into
+    // the v1 blob store or published for it.
+    if ctx.views_route_root() {
+        return Ok(());
+    }
     let target = CURRENT.with(|slot| slot.borrow().clone());
     let Some(target) = target.filter(|target| std::ptr::eq(ctx, target.ctx.as_ref())) else {
         if ctx
@@ -972,9 +978,6 @@ pub(crate) fn schedule_with_reason(
 mod tests;
 
 #[cfg(test)]
-pub(crate) use tests::{CompletionOutcome, Completions};
-
-#[cfg(test)]
 thread_local! {
     static IN_COMMIT_BARRIER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -997,12 +1000,6 @@ impl Drop for CommitBarrierMark {
     fn drop(&mut self) {
         IN_COMMIT_BARRIER.set(false);
     }
-}
-
-/// Whether this thread is inside a publication's commit barrier.
-#[cfg(test)]
-pub(crate) fn in_commit_barrier_for_test() -> bool {
-    IN_COMMIT_BARRIER.get()
 }
 
 #[cfg(test)]

@@ -74,6 +74,20 @@ pub(super) fn admit(identity: &RouteIdentity, envelope: &Value) -> Result<(), Er
     Ok(())
 }
 
+/// Extend `admit` with versioned operation admission without changing the
+/// gate's allowlist, target checks or refusal frames. Call only after `admit`.
+pub(super) fn admit_operation(
+    identity: &RouteIdentity,
+    name: &str,
+    arguments: &Value,
+) -> Result<Option<super::rich_ui::admission::Operation>, ErrorBody> {
+    if super::occipital_carrier_route(identity) {
+        super::rich_ui::admission::prepare(name, arguments).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 /// Check target arguments at admission, before even a cached remote document
 /// can be returned. Reading a URL or GitHub item may fetch live network data.
 fn blocked_target_kind(name: &str, arguments: &Value) -> Option<&'static str> {

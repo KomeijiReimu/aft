@@ -754,9 +754,7 @@ pub struct CheckoutSemanticMemory {
 /// before its vectors can be brought up to date. The initial snapshot (before
 /// any generation was published) always needs one.
 fn needs_reload(snapshot: &Snapshot) -> bool {
-    snapshot.generation().name() == "empty"
-        || snapshot.pending_intent().next().is_some()
-        || snapshot.live_entries().next().is_some()
+    snapshot.needs_reconcile()
 }
 
 /// Whether reconciling `snapshot` needs a cold-build slot. A reconcile walks
@@ -776,6 +774,11 @@ fn needs_reload(snapshot: &Snapshot) -> bool {
 /// regular file counts as large. A changed path that no longer exists counts
 /// as zero bytes, because the reconcile has nothing of it to read.
 fn needs_cold_reconcile(snapshot: &Snapshot, root: &Path) -> bool {
+    // Reconciled bytes may still have pending planes. Their fill admission
+    // does not require probing source files for another reconciliation.
+    if !needs_reload(snapshot) {
+        return false;
+    }
     if snapshot.generation().name() == "empty" {
         return true;
     }
