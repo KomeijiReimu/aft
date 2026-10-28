@@ -64,6 +64,131 @@ pub(super) fn restart_watch_notice(output_file: Option<&std::path::Path>) -> Str
     }
     notice
 }
+
+/// `masked`, the masked form of the output line `raw`, with every occurrence of
+/// `needle` (a substring watch's own pattern) visible. Masking can swallow the
+/// pattern into a placeholder when it is part of a credential, or is one; the
+/// agent supplied it, so showing it reveals nothing the agent does not have.
+///
+/// The result is built only from `masked`'s own text, its placeholders and
+/// parts of `needle`, so no other raw byte can reach it. Each placeholder is
+/// matched to the raw bytes it replaced by aligning the visible text around
+/// it; where a placeholder hid part of the pattern, that part of the pattern
+/// is shown once and the rest of the hidden bytes stay behind placeholders. If
+/// the alignment fails, `masked` is returned unchanged.
+pub(super) fn keep_pattern_visible(raw: &str, masked: &str, needle: &str) -> String {
+    use crate::log_redact::{SECRET_PLACEHOLDER, URL_CREDENTIAL_PLACEHOLDER};
+    if needle.is_empty() || masked.matches(needle).count() >= raw.matches(needle).count() {
+        return masked.to_string();
+    }
+    // Split `masked` into visible text and placeholders, in order.
+    let mut tokens: Vec<(bool, &str)> = Vec::new();
+    let mut rest = masked;
+    while !rest.is_empty() {
+        let next = [SECRET_PLACEHOLDER, URL_CREDENTIAL_PLACEHOLDER]
+            .iter()
+            .filter_map(|placeholder| rest.find(placeholder).map(|at| (at, *placeholder)))
+            .min_by_key(|(at, placeholder)| (*at, std::cmp::Reverse(placeholder.len())));
+        match next {
+            Some((at, placeholder)) => {
+                if at > 0 {
+                    tokens.push((false, &rest[..at]));
+                }
+                tokens.push((true, placeholder));
+                rest = &rest[at + placeholder.len()..];
+            }
+            None => {
+                tokens.push((false, rest));
+                rest = "";
+            }
+        }
+    }
+    // The raw byte range each token stands for. A placeholder replaced at
+    // least one byte and ends where the next visible text resumes.
+    let mut spans = Vec::with_capacity(tokens.len());
+    let mut position = 0;
+    let mut pending: Option<usize> = None;
+    for (index, (placeholder, text)) in tokens.iter().enumerate() {
+        if *placeholder {
+            if pending.is_some() {
+                // Two adjacent placeholders cannot be told apart.
+                return masked.to_string();
+            }
+            pending = Some(spans.len());
+            spans.push(position..position);
+            continue;
+        }
+        let found = match pending.take() {
+            None => raw[position..].starts_with(text).then_some(position),
+            Some(slot) => {
+                // The placeholder replaced at least one whole character.
+                let Some(earliest) = raw[position..]
+                    .chars()
+                    .next()
+                    .map(|first| position + first.len_utf8())
+                else {
+                    return masked.to_string();
+                };
+                let found = if index + 1 == tokens.len() {
+                    raw.ends_with(text)
+                        .then(|| raw.len() - text.len())
+                        .filter(|at| *at >= earliest)
+                } else {
+                    raw.get(earliest..)
+                        .and_then(|tail| tail.find(text))
+                        .map(|at| earliest + at)
+                };
+                if let Some(at) = found {
+                    spans[slot] = position..at;
+                }
+                found
+            }
+        };
+        let Some(at) = found else {
+            return masked.to_string();
+        };
+        spans.push(at..at + text.len());
+        position = at + text.len();
+    }
+    if let Some(slot) = pending {
+        if position >= raw.len() {
+            return masked.to_string();
+        }
+        spans[slot] = position..raw.len();
+    } else if position != raw.len() {
+        return masked.to_string();
+    }
+    let occurrences: Vec<std::ops::Range<usize>> = raw
+        .match_indices(needle)
+        .map(|(at, _)| at..at + needle.len())
+        .collect();
+    let mut out = String::with_capacity(masked.len() + needle.len());
+    for ((placeholder, text), span) in tokens.iter().zip(spans) {
+        if !*placeholder {
+            out.push_str(text);
+            continue;
+        }
+        // Show at most one occurrence per placeholder. Repeating a short
+        // pattern across a credential would spell out its structure.
+        let mut cursor = span.start;
+        if let Some(occurrence) = occurrences
+            .iter()
+            .find(|occurrence| occurrence.start < span.end && occurrence.end > span.start)
+        {
+            let from = occurrence.start.max(span.start);
+            let to = occurrence.end.min(span.end);
+            if from > cursor {
+                out.push_str(text);
+            }
+            out.push_str(&needle[from - occurrence.start..to - occurrence.start]);
+            cursor = to;
+        }
+        if cursor < span.end {
+            out.push_str(text);
+        }
+    }
+    out
+}
 /// Bytes read beyond the largest maskable region on each side, so a JSON field
 /// or private-key block that crosses a line break into the region can be seen
 /// whole and the region widened to include it.
@@ -758,6 +883,59 @@ mod ticket_preview_tests {
                 .unwrap(),
             fragment
         );
+    }
+}
+
+#[cfg(test)]
+mod keep_pattern_tests {
+    use super::keep_pattern_visible;
+    use crate::log_redact::SECRET_PLACEHOLDER as HIDDEN;
+
+    #[test]
+    fn a_pattern_masked_as_part_of_a_credential_stays_visible() {
+        let token = format!("ghp_{}", "A".repeat(36));
+        let raw = format!("token {token} done");
+        let masked = format!("token {HIDDEN} done");
+        // The rest of the credential stays hidden behind a placeholder.
+        assert_eq!(
+            keep_pattern_visible(&raw, &masked, "ghp_"),
+            format!("token ghp_{HIDDEN} done")
+        );
+        // A pattern that is the whole credential is shown as given.
+        assert_eq!(keep_pattern_visible(&raw, &masked, &token), raw);
+        // Only the hidden part of a pattern that starts in visible text is
+        // restored, so the visible part is not repeated.
+        assert_eq!(
+            keep_pattern_visible(&raw, &masked, "n ghp_AA"),
+            format!("token ghp_AA{HIDDEN} done")
+        );
+        // A pattern in the middle of a credential keeps both sides hidden.
+        assert_eq!(
+            keep_pattern_visible(&raw, &masked, "AAAA"),
+            format!("token {HIDDEN}AAAA{HIDDEN} done")
+        );
+    }
+
+    #[test]
+    fn every_hidden_occurrence_and_trailing_credential_is_handled() {
+        let raw = "a=SECRETVALUE b=SECRETVALUE";
+        let masked = format!("a={HIDDEN} b={HIDDEN}");
+        assert_eq!(keep_pattern_visible(raw, &masked, "SECRETVALUE"), raw);
+        assert_eq!(
+            keep_pattern_visible(raw, &masked, "SECRET"),
+            format!("a=SECRET{HIDDEN} b=SECRET{HIDDEN}")
+        );
+    }
+
+    #[test]
+    fn visible_patterns_and_unalignable_text_are_left_as_masked() {
+        let raw = "READY token ghp_x";
+        let masked = format!("READY token {HIDDEN}");
+        assert_eq!(keep_pattern_visible(raw, &masked, "READY"), masked);
+        // Masked text that does not line up with the raw line is never
+        // patched with guessed raw bytes.
+        let unrelated = format!("other {HIDDEN}");
+        assert_eq!(keep_pattern_visible(raw, &unrelated, "ghp_"), unrelated);
     }
 }
 
