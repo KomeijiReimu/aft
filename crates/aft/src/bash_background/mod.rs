@@ -2498,4 +2498,5 @@ mod legacy_root_task_repair_tests {
 
 #[cfg(all(test, unix))]
 pub(crate) use registry::push_projection_fixture;
+pub(crate) mod progress;
 pub(crate) mod secrets;

@@ -2359,6 +2359,13 @@ impl BgTaskRegistry {
         Some(queued)
     }
 
+    pub(crate) fn uses_db_pool(&self, conn: &Arc<Mutex<TrackedConnection>>) -> bool {
+        self.inner
+            .db_pool
+            .read()
+            .is_ok_and(|slot| slot.as_ref().is_some_and(|pool| Arc::ptr_eq(pool, conn)))
+    }
+
     pub fn set_db_pool(&self, conn: Arc<Mutex<TrackedConnection>>) {
         let path = conn
             .lock()

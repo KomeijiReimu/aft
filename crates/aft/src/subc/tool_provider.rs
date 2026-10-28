@@ -8508,6 +8508,7 @@ mod authorization_failure_tests {
         let identity =
             test_support::route_identity_with_trust(root, "authorization", BindTrust::Untrusted);
         PendingBashAsk {
+            handles_progress: false,
             route: route_key(42, 3),
             tool_corr: 78,
             tool_flags: control_flags(),

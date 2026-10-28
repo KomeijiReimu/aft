@@ -34,6 +34,7 @@ import { resolveIsSubagent, resolveSubagentStatus } from "../shared/subagent-det
 import type { PluginContext } from "../types.js";
 import { trackV2BackgroundTask, v2StopEpoch } from "../v2-session-lifecycle.js";
 import { callBashBridge, coerceOptionalInt, optionalInt, projectRootFor } from "./_shared.js";
+import { metadataUpdater } from "./metadata.js";
 import { withHostPermissionGrants } from "./outside-permissions.js";
 import { runAsk } from "./permissions.js";
 
@@ -552,7 +553,7 @@ export function createBashTool(
       const aftSearchRegistered = aftSearchRegisteredOverride ?? ctxAftSearchRegistered;
       let accumulatedOutput = "";
       const description = args.description as string | undefined;
-      const metadata = (context as { metadata?: (data: Record<string, unknown>) => void }).metadata;
+      const metadata = metadataUpdater(context);
       const rawCommand = args.command as string;
       const command = rawCommand;
       const cwd = (args.workdir as string | undefined) ?? context.directory;
@@ -693,7 +694,7 @@ export function createBashTool(
             ),
             onProgress: ({ text }) => {
               accumulatedOutput = preview(accumulatedOutput + text);
-              metadata?.({ output: accumulatedOutput, description });
+              void metadata({ output: accumulatedOutput, description });
             },
           },
         );
@@ -775,7 +776,7 @@ export function createBashTool(
           rendered += workerBackgroundTaskNote(taskId);
         }
         const metadataPayload = { description, output: rendered, status: "running", taskId };
-        metadata?.(metadataPayload);
+        await metadata(metadataPayload);
         return { output: rendered, title: uiTitle, metadata: metadataPayload };
       }
 
@@ -784,7 +785,7 @@ export function createBashTool(
         ? output
         : maybeAppendGrepSearchHint(output, command, aftSearchRegistered, projectRootFor(context));
       const metadataPayload = foregroundMetadata(description, data, rendered);
-      metadata?.(metadataPayload);
+      await metadata(metadataPayload);
       return {
         output: rendered,
         title: uiTitle,
