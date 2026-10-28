@@ -39,15 +39,19 @@ impl SecretVault for Vault {
     fn resolve(&self, scope: &crate::secret::SecretScope, label: &str) -> Resolution {
         #[cfg(unix)]
         {
-            let mut core: libc::rlimit = unsafe { std::mem::zeroed() };
-            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut core) }, 0);
-            assert_eq!(
-                (core.rlim_cur, core.rlim_max),
-                (0, 0),
+            assert!(
+                crate::secret_proxy::test_hardening::hardened_on_this_thread(),
                 "hardening must precede vault resolution"
             );
-            #[cfg(target_os = "linux")]
-            assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE) }, 0);
+            // The real limits change only in the audit tests' isolated child
+            // processes; a shared test process keeps its limits.
+            if std::env::var_os(crate::secret_proxy::test_hardening::REAL_ENV).is_some() {
+                let mut core: libc::rlimit = unsafe { std::mem::zeroed() };
+                assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut core) }, 0);
+                assert_eq!((core.rlim_cur, core.rlim_max), (0, 0));
+                #[cfg(target_os = "linux")]
+                assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE) }, 0);
+            }
         }
         assert_eq!(scope.reference(), "secret-bash");
         assert_eq!(scope.owner(), "reserved:prefrontal-core");

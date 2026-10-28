@@ -120,6 +120,17 @@ pub enum ProxyError {
 /// adapters can transiently receive material, so every proxy owner must prevent
 /// core dumps before starting a secret runtime.
 pub(crate) fn protect_secret_process() -> Result<(), ProxyError> {
+    // Test builds harden for real only inside the isolated child processes the
+    // audit tests spawn. In a shared test process the change would outlive the
+    // test that made it: on Linux a non-dumpable process can no longer read its
+    // own /proc/self/io, which breaks unrelated tests that run afterwards.
+    #[cfg(test)]
+    {
+        test_hardening::mark();
+        if std::env::var_os(test_hardening::REAL_ENV).is_none() {
+            return Ok(());
+        }
+    }
     #[cfg(unix)]
     {
         let limit = libc::rlimit {
@@ -135,6 +146,32 @@ pub(crate) fn protect_secret_process() -> Result<(), ProxyError> {
         }
     }
     Ok(())
+}
+
+/// Test-build record of `protect_secret_process` calls, so fakes can check that
+/// hardening ran before resolution without hardening the shared test process.
+#[cfg(test)]
+pub(crate) mod test_hardening {
+    use std::cell::Cell;
+
+    /// Set by the audit tests' isolated child processes; only there does
+    /// `protect_secret_process` change the real process limits.
+    pub(crate) const REAL_ENV: &str = "AFT_S4_AUDIT_CHILD";
+
+    thread_local! {
+        static HARDENED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn mark() {
+        HARDENED.with(|hardened| hardened.set(true));
+    }
+
+    /// Whether `protect_secret_process` ran on this thread. Each test runs on
+    /// its own thread, so one test's call never satisfies another's check.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn hardened_on_this_thread() -> bool {
+        HARDENED.with(Cell::get)
+    }
 }
 
 pub(crate) struct State {
