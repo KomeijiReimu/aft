@@ -1541,7 +1541,9 @@ mod tests {
         .unwrap();
         assert!(crate::reader_floor::prepare(dir.path()).is_empty());
         let conn = open(&path).unwrap();
-        assert_eq!(schema_version(&conn), 21);
+        // Opening migrates through every later version too, so the result is
+        // the current schema; the v21 columns below must still be present.
+        assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION);
         let columns = conn
             .prepare("PRAGMA table_info(bash_pattern_watches)")
             .unwrap()
@@ -1568,7 +1570,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .get(crate::persisted_format::PersistedStore::AftDb),
-            Some(21)
+            Some(u64::from(CURRENT_SCHEMA_VERSION))
         );
     }
 
