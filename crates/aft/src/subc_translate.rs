@@ -5273,7 +5273,7 @@ mod outline_target_validation_tests {
         assert_eq!(translated.command, "outline");
         assert_eq!(
             translated.args["files"],
-            serde_json::json!([first, root.path().join("src/lib.rs"), second])
+            serde_json::json!([first, root.path().join("src").join("lib.rs"), second])
         );
     }
 
