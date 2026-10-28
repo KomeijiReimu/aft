@@ -2457,6 +2457,9 @@ async fn published_sdk_reservation_old_connection_cleanup_cannot_close_a_replace
         )
         .await
         .unwrap();
+    // Keep the old socket alive so its GOODBYE proves lease cleanup rather
+    // than disappearing with the last consumer when the reservation drops.
+    let _old_consumer = relay.transport.consumer.lock().await.clone().unwrap();
     let replacement = daemon.transport().await;
     let consumer = replacement.consumer.lock().await.clone().unwrap();
     *relay.transport.consumer.lock().await = Some(consumer);
