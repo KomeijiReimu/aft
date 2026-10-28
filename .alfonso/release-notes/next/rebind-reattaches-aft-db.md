@@ -1,0 +1,1 @@
+- Returning to an idle project restores database persistence for bash tasks, compression events, and undo backups without restarting AFT.
