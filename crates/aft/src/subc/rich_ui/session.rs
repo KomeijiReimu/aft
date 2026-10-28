@@ -71,9 +71,15 @@ pub(super) fn resolve(
         ScopeKind::Worker => {
             // Even a reads-only Worker needs a route with a saved worker preset:
             // its confinement cannot safely come from the carrier's bind.
+            let mut candidates = candidates
+                .filter(|route| principal(route) != owner.as_deref())
+                .peekable();
+            if candidates.peek().is_none() {
+                return Err(refusal("session_not_bound"));
+            }
             let db = ctx.db().ok_or_else(|| refusal("database_unavailable"))?;
             let conn = db.lock().map_err(|_| refusal("database_unavailable"))?;
-            for route in candidates.filter(|route| principal(route) != owner.as_deref()) {
+            for route in candidates {
                 let key = remote_policy::session_preset_key(route, "worker")
                     .ok_or_else(|| refusal("session_not_bound"))?;
                 let presets = crate::db::rich_ui::session_presets(&conn, &key)
@@ -245,6 +251,7 @@ pub(in crate::subc) async fn submit(
         .expect("validated target")
         .to_owned();
     let entry = operation.entry.clone();
+    let reply_entry = entry.clone();
     let io_budget = crate::bounded_io::Budget::after(plain_run_io_budget(frame.header.corr));
     let ledger_key = serde_json::from_slice::<Value>(&frame.body)
         .ok()
@@ -373,7 +380,7 @@ pub(in crate::subc) async fn submit(
         }
         let reply = wire::build_carrier_response_frame(
             &request,
-            None,
+            Some(&reply_entry),
             response
                 .data
                 .get("body")

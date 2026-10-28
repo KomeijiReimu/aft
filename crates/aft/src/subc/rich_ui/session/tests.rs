@@ -602,6 +602,13 @@ fn worker_two_presets_and_unavailable_database_fail_before_role() {
     assert_eq!(f.code(&[f.policy.clone()]), "database_unavailable");
 }
 
+#[test]
+fn worker_without_candidate_is_unbound_even_without_database() {
+    let f = Fixture::new("worker");
+    f.ctx.clear_db();
+    assert_eq!(f.code(&[f.carrier.clone()]), "session_not_bound");
+}
+
 const MANIFEST: &[u8] = include_bytes!("../../../../tests/fixtures/rich_ui/manifest.jcs.json");
 
 async fn exchange(f: &Fixture, name: &str, args: Value, preset: &str) -> Frame {
