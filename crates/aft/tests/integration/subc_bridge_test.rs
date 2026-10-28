@@ -3658,6 +3658,10 @@ fn subc_bridge_bash_hand_off_text_follows_the_worker_role() {
     );
 }
 
+// Startup admission ends at the earlier of 15 seconds and the worker wait
+// limit. Do not shrink that startup budget on loaded Windows CI runners.
+const WORKER_BASH_WAIT_LIMIT_MS: u64 = if cfg!(windows) { 30_000 } else { 1_500 };
+
 /// A delegated worker's blocking bash call over subc (`wait: true`, and a
 /// `block_to_completion` call) returns at the worker wait limit with the
 /// command still running in the background, as on the standalone path.
@@ -3665,8 +3669,13 @@ fn subc_bridge_bash_hand_off_text_follows_the_worker_role() {
 fn subc_bridge_worker_blocking_bash_detaches_at_the_worker_wait_limit() {
     run_subc_bridge_test_with_env(
         "subc_bridge_worker_blocking_bash_detaches_at_the_worker_wait_limit",
-        Duration::from_secs(60),
-        || vec![set_test_env("AFT_TEST_WORKER_WAIT_MAX_MS", "1500")],
+        Duration::from_millis(2 * WORKER_BASH_WAIT_LIMIT_MS) + Duration::from_secs(60),
+        || {
+            vec![set_test_env(
+                "AFT_TEST_WORKER_WAIT_MAX_MS",
+                &WORKER_BASH_WAIT_LIMIT_MS.to_string(),
+            )]
+        },
         drive_bash_worker_wait_limit_daemon,
         |_, _, _| {},
     );
@@ -5569,6 +5578,12 @@ async fn drive_bash_worker_wait_limit_daemon(input: FakeDaemonInput) {
         mut stream, root1, ..
     } = open_fake_daemon_session(input).await;
     bind_route1(&mut stream, &root1).await;
+    let wait_limit = Duration::from_millis(WORKER_BASH_WAIT_LIMIT_MS);
+    let reply_budget = if cfg!(windows) {
+        wait_limit + Duration::from_secs(30)
+    } else {
+        Duration::from_secs(15)
+    };
     for (corr, mode) in [(140_u64, "wait"), (141_u64, "block_to_completion")] {
         let marker = root1.join(format!("worker-{mode}-started"));
         let release = root1.join(format!("worker-{mode}-release"));
@@ -5594,17 +5609,22 @@ async fn drive_bash_worker_wait_limit_daemon(input: FakeDaemonInput) {
             .expect("worker limit tool call frame"),
         )
         .await;
-        let frame = read_frame_timeout(&mut stream, "worker limit bash").await;
+        let frame = read_frame_within(&mut stream, reply_budget, "worker limit bash")
+            .await
+            .expect("worker limit bash reply");
         let elapsed = started.elapsed();
         assert_eq!(frame.header.corr, corr);
         let text = tool_result_text(&frame);
         assert!(!tool_result_is_error(&frame), "{mode}: {text}");
         assert!(
-            elapsed >= Duration::from_millis(1_400) && elapsed < Duration::from_secs(15),
-            "{mode}: the call must return at the 1.5s limit, took {elapsed:?}"
+            elapsed >= wait_limit - Duration::from_millis(100) && elapsed < reply_budget,
+            "{mode}: the call must return at the {wait_limit:?} limit, took {elapsed:?}"
         );
         assert!(
-            text.contains("still running after 1.5s"),
+            text.contains(&format!(
+                "still running after {}s",
+                wait_limit.as_secs_f64()
+            )),
             "{mode}: {text:?}"
         );
         assert!(text.contains("it was not killed"), "{mode}: {text:?}");
@@ -5628,9 +5648,14 @@ async fn drive_bash_worker_wait_limit_daemon(input: FakeDaemonInput) {
             "{mode}: {text:?}"
         );
         let task_id = extract_bash_task_id(&text);
+        let status_deadline = if cfg!(windows) {
+            Instant::now() + Duration::from_secs(30)
+        } else {
+            started + Duration::from_secs(15)
+        };
         let status = loop {
             assert!(
-                started.elapsed() < Duration::from_secs(15),
+                Instant::now() < status_deadline,
                 "{mode}: command never started"
             );
             send_tool_call(
