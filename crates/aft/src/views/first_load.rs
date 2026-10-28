@@ -6082,8 +6082,8 @@ impl CheckoutDriver {
     }
 
     pub fn record_absolute_change(&self, absolute: &std::path::Path) {
-        if let Ok(relative) = absolute.strip_prefix(self.owner.root()) {
-            if let Ok(path) = RelPath::from_os_path(relative) {
+        if let Some(relative) = super::intent::relative_to_root(absolute, self.owner.root()) {
+            if let Ok(path) = RelPath::from_os_path(&relative) {
                 self.record_change(path);
             }
         }
@@ -6101,17 +6101,14 @@ impl super::intent::WriteIntentListener for CheckoutDriver {
         match change {
             super::intent::WriteIntent::Paths(paths) => {
                 for absolute in paths {
-                    if let Ok(relative) = absolute.strip_prefix(self.owner.root()) {
-                        if let Ok(path) = RelPath::from_os_path(relative) {
-                            self.record_change(path);
-                        }
-                    }
+                    self.record_absolute_change(absolute);
                 }
             }
             super::intent::WriteIntent::Directory(absolute) => {
-                if !absolute.starts_with(self.owner.root()) {
+                let Some(relative) = super::intent::relative_to_root(absolute, self.owner.root())
+                else {
                     return;
-                }
+                };
                 {
                     let mut live = self
                         .live
@@ -6124,7 +6121,9 @@ impl super::intent::WriteIntentListener for CheckoutDriver {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let installed = Arc::make_mut(&mut installed);
                     installed.revision += 1;
-                    installed.uncertain_paths.insert(absolute.clone());
+                    installed
+                        .uncertain_paths
+                        .insert(self.owner.root().join(&relative));
                     installed.snapshot = live
                         .snapshot()
                         .with_readers(installed.readers.clone())
@@ -6148,17 +6147,15 @@ impl super::intent::WriteIntentListener for CheckoutDriver {
                 }
                 // A directory write can create previously unknown members. Keep
                 // an explicit subtree intent even when the previous view was empty.
-                if let Ok(relative) = absolute.strip_prefix(self.owner.root()) {
-                    if let Ok(path) = RelPath::from_os_path(relative) {
-                        self.record_change(path);
-                    } else {
-                        let mut installed = self
-                            .installed
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let installed = Arc::make_mut(&mut installed);
-                        installed.revision += 1;
-                    }
+                if let Ok(path) = RelPath::from_os_path(&relative) {
+                    self.record_change(path);
+                } else {
+                    let mut installed = self
+                        .installed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let installed = Arc::make_mut(&mut installed);
+                    installed.revision += 1;
                 }
             }
         }
@@ -6576,6 +6573,48 @@ mod v3_bootstrap_tests {
         )
         .unwrap()
         .with_adapters(vec![plane.adapter.clone()])
+    }
+
+    #[test]
+    fn absolute_changes_match_canonical_roots_for_missing_descendants() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let driver = trigram_driver(root.path(), storage.path());
+        let relative = std::path::Path::new("missing").join("deleted.rs");
+        let ordinary = root.path().join(&relative);
+        let canonical = std::fs::canonicalize(root.path()).unwrap().join(&relative);
+        assert!(!ordinary.exists());
+
+        driver.record_absolute_change(&ordinary);
+        driver.record_absolute_change(&canonical);
+        driver.record_absolute_change(&outside.path().join(&relative));
+        driver.record_absolute_change(&relative);
+        use super::super::intent::{WriteIntent, WriteIntentListener, WritePhase};
+        WriteIntentListener::record_change(
+            &driver,
+            &WriteIntent::Paths(vec![ordinary]),
+            WritePhase::Before,
+        );
+        WriteIntentListener::record_change(
+            &driver,
+            &WriteIntent::Directory(root.path().join("missing")),
+            WritePhase::After,
+        );
+        assert_eq!(
+            driver.delivery.lock().unwrap().paths,
+            BTreeMap::from([
+                (RelPath::new(b"missing/deleted.rs".to_vec()).unwrap(), 3),
+                (RelPath::new(b"missing".to_vec()).unwrap(), 4),
+            ])
+        );
+        assert_eq!(
+            driver.installed_bundle().uncertain_paths,
+            std::collections::BTreeSet::from([std::fs::canonicalize(root.path())
+                .unwrap()
+                .join("missing")])
+        );
     }
 
     #[test]

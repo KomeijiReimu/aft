@@ -8,6 +8,7 @@ use super::*;
 use crate::semantic_index::{
     EmbedTextCaps, LocalEmbeddingProvider, SemanticEmbeddingModel, SemanticIndex, SemanticResult,
 };
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicUsize;
 
 /// Store rows a filled one-chunk file leaves in the family's v3 semantic
@@ -2074,7 +2075,12 @@ fn small_chunk_reuse_fill_completes_with_cold_cap_held() {
         (0, 0),
         "fold repeated source reconciliation: {work:?}"
     );
-    assert_eq!(runtime.plane().take_source_reads().get(&path), Some(&1));
+    // The v3 owner uses a canonical root, which has a verbatim prefix on
+    // Windows. Compare the entire map under that identity so extra reads of
+    // this file or any other file cannot go unnoticed.
+    let source_reads = runtime.plane().take_source_reads();
+    let canonical_path = std::fs::canonicalize(&path).unwrap();
+    assert_eq!(source_reads, BTreeMap::from([(canonical_path, 1)]));
     let summary = lines
         .iter()
         .find(|line| line.contains("INFO semantic view fill"))
@@ -2095,7 +2101,7 @@ fn small_chunk_reuse_fill_completes_with_cold_cap_held() {
         "lookup delay was not attributed: {summary}"
     );
     eprintln!(
-        "{summary}; reconcile_walks={} reconcile_reads={} fill_reads=1",
+        "{summary}; reconcile_walks={} reconcile_reads={} fill_sources={source_reads:?}",
         work.walks, work.reads
     );
 }
@@ -2415,9 +2421,10 @@ fn small_missing_vectors_wait_for_cold_slot_and_stay_pending() {
     assert!(queued);
     assert_eq!(calls_while_held, 0, "queued fill called the model");
     assert_eq!(pending_while_held, 1, "queued fill was reported as ready");
+    let canonical_path = std::fs::canonicalize(root.path().join("file.rs")).unwrap();
     assert_eq!(
-        reads_while_held.get(&root.path().join("file.rs")),
-        Some(&1),
+        reads_while_held,
+        BTreeMap::from([(canonical_path, 1)]),
         "small preparation did not reach the vector miss"
     );
     assert_eq!(model.calls(), 1);
@@ -3114,9 +3121,10 @@ fn transient_fill_recovery_does_not_reread_or_reembed_stored_content() {
         "retry repeated source work: {work:?}"
     );
     let reads = runtime.plane().take_source_reads();
+    let canonical_target = std::fs::canonicalize(&target).unwrap();
     assert_eq!(
         reads.keys().collect::<Vec<_>>(),
-        vec![&target],
+        vec![&canonical_target],
         "retry read an unchanged, already-embedded source: {reads:?}"
     );
     assert_eq!(
@@ -3786,7 +3794,10 @@ fn semantic_member_base_owner_fills_its_base_and_writes_nothing_outside_v3() {
     // Writer stop: no v2 view, v2 store or legacy import ledger.
     let outside_v3 = files_under(&storage)
         .into_iter()
-        .filter(|path| !path.starts_with("blobs/v3/") && !path.ends_with("reader-floor.json"))
+        .filter(|path| {
+            !Path::new(path).starts_with(Path::new("blobs").join("v3"))
+                && !path.ends_with("reader-floor.json")
+        })
         .collect::<Vec<_>>();
     assert_eq!(outside_v3, Vec::<String>::new());
 }

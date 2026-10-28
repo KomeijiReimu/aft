@@ -982,9 +982,12 @@ impl WriteIntentListener for WakeOnWrite {
             return;
         }
         let touches = match change {
-            WriteIntent::Paths(paths) => paths.iter().any(|path| path.starts_with(&self.root)),
+            WriteIntent::Paths(paths) => paths
+                .iter()
+                .any(|path| super::intent::relative_to_root(path, &self.root).is_some()),
             WriteIntent::Directory(directory) => {
-                directory.starts_with(&self.root) || self.root.starts_with(directory)
+                super::intent::relative_to_root(directory, &self.root).is_some()
+                    || super::intent::relative_to_root(&self.root, directory).is_some()
             }
         };
         if touches {
