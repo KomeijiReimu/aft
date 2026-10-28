@@ -377,6 +377,10 @@ pub(crate) fn acknowledge_delivery(
 
 #[cfg(test)]
 pub(crate) fn watch_gap_health_for_path(path: &std::path::Path) -> GapCensus {
+    // The census is keyed by SQLite's own file name, which resolves symlinks
+    // (macOS temp folders live under /var -> /private/var), so look up the
+    // same resolved spelling.
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     WATCH_GAP_CENSUS
         .get_or_init(Default::default)
         .lock()
