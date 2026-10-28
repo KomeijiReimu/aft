@@ -233,3 +233,62 @@ async fn foreground_call_cannot_acquire_a_current_only_repository() {
     assert_eq!(answer.data["reason"], "binding_changed");
     assert_eq!(fixture.plex.state.lock().unwrap().sends, 0);
 }
+
+#[tokio::test]
+async fn production_relay_refuses_different_argv_that_becomes_mechanical() {
+    let _lock = crate::test_env::process_env_lock();
+    let fixture = Fixture::new(false).await;
+    let mut params = fixture.params.clone();
+    params["invocation"]["args"] = json!(["issue", "list"]);
+    let answer = post_params(&fixture, &params, &fixture.routes(true)).await;
+    assert_eq!(answer.data["refusal_code"], "task_gh_policy_denied");
+    assert_eq!(answer.data["reason"], "classification_changed");
+    assert_eq!(fixture.plex.state.lock().unwrap().sends, 0);
+}
+
+#[tokio::test]
+async fn production_relay_requires_the_captured_binding_after_policy_mapping() {
+    let _lock = crate::test_env::process_env_lock();
+    let fixture = Fixture::new(false).await;
+    let mut record = fixture
+        .service
+        .store
+        .get(&fixture.incarnation)
+        .unwrap()
+        .record;
+    let repo = fixture.params["request"]["repository"].as_str().unwrap();
+    assert!(record.bindings.remove(repo).is_some());
+    let encoded = serde_json::to_string(&record).unwrap();
+    fixture
+        .service
+        .store
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE gh_speech_authorities SET record_json=?1,record_digest=?2 WHERE incarnation=?3",
+            rusqlite::params![
+                encoded,
+                blake3::hash(encoded.as_bytes()).as_bytes(),
+                fixture.incarnation
+            ],
+        )
+        .unwrap();
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = reads.clone();
+    fixture.partners(|partners| {
+        let binding_read = partners.bindings.clone();
+        partners.bindings = Arc::new(move |project, session| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            binding_read(project, session)
+        });
+    });
+    let answer = fixture.post(true, "missing-captured-binding").await;
+    assert_eq!(
+        answer.data["refusal_code"], "task_gh_policy_denied",
+        "{:?}",
+        answer.data
+    );
+    assert_eq!(answer.data["reason"], "repository_denied");
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(fixture.plex.state.lock().unwrap().sends, 0);
+}

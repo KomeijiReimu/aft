@@ -11428,7 +11428,7 @@ mod tests {
     /// v14 payload adds. Built here rather than read from the assembled
     /// payload, which lives under the gitignored `.alfonso/` and is absent on a
     /// clean checkout.
-    fn v14_manifest() -> Manifest {
+    pub(super) fn v14_manifest() -> Manifest {
         let mut manifest = v12_fixture_manifest();
         manifest.manifest_version = 14;
         manifest

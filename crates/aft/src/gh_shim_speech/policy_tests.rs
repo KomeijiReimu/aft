@@ -434,3 +434,235 @@ fn tampered_accepted_envelope_cannot_provision_speech_history() {
         assert_eq!(service.store.latest_policy().unwrap(), None);
     });
 }
+
+struct RunWithFixture {
+    _env: Vec<Env>,
+    _dir: tempfile::TempDir,
+    paths: StatePaths,
+    view: PathBuf,
+}
+
+impl RunWithFixture {
+    fn new(manifest: &Manifest) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let xdg = dir.path().join("config");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let paths = StatePaths::from_root(state.clone());
+        let view = dir.path().join("start.json");
+        let token = "11111111111111111111111111111111";
+        let env = vec![
+            Env::set("HOME", Some(home.as_os_str())),
+            Env::set("USERPROFILE", Some(home.as_os_str())),
+            Env::set("XDG_CONFIG_HOME", Some(xdg.as_os_str())),
+            Env::set("AFT_GH_SHIM_STATE_DIR", Some(state.as_os_str())),
+            Env::set("GH_SHIM_BYPASS", None),
+            Env::set(crate::gh_shim_speech::start_view::PROVISIONED_ENV, None),
+            Env::set(crate::gh_shim_speech::start_view::WORKER_POLICY_ENV, None),
+            Env::set(
+                crate::gh_shim_speech::start_view::START_VIEW_ENV,
+                Some(view.as_os_str()),
+            ),
+            Env::set(
+                crate::gh_shim_ticket::GH_SHIM_TICKET_ENV,
+                Some(OsStr::new(token)),
+            ),
+        ];
+        let config = crate::subc_config::user_config_path_from(
+            Some(xdg.as_os_str()),
+            Some(home.as_os_str()),
+        )
+        .unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(config, r#"{"github":{"shim":true}}"#).unwrap();
+        super::tests::write_signed_manifest(&paths, manifest.clone(), unix_seconds());
+        load_manifest(&paths, unix_seconds()).unwrap();
+        std::fs::write(
+            &view,
+            serde_json::to_vec(&json!({
+                "ticket_digest": crate::gh_shim_ticket::speech_digest(token).unwrap().to_vec(),
+                "policy": snapshot(manifest),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        Self {
+            _env: env,
+            _dir: dir,
+            paths,
+            view,
+        }
+    }
+}
+
+fn exact_policy_refusal(reason: &str) -> String {
+    format!("gh-shim: gh_shim_seam_refusal: task_gh_policy_denied: this GitHub write is not allowed by the routing policy the command started under, or by the current one ({reason}); use a permitted operation, or ask the operator to update the policy and start the command again.")
+}
+
+#[test]
+fn post_probe_policy_arms_recheck_new_protection_and_preserve_public_fallback() {
+    let _lock = crate::test_env::process_env_lock();
+    for mode in ["dormant", "invalid", "regressed"] {
+        for protected in [false, true] {
+            let manifest = super::tests::fixture_manifest();
+            let fixture = RunWithFixture::new(&manifest);
+            let repo = manifest.bindings.keys().next().unwrap();
+            let args: Vec<OsString> = ["issue", "comment", "7", "--repo", repo, "--body", "body"]
+                .into_iter()
+                .map(Into::into)
+                .collect();
+            assert!(!crate::gh_shim_speech::start_view::protected(&args));
+            let (_capture, lines) = capture_refusals_for_test();
+            let reads = std::cell::Cell::new(0);
+            let delegated = std::cell::Cell::new(0);
+            let exit = run_with(
+                &args,
+                |_| {
+                    delegated.set(delegated.get() + 1);
+                    71
+                },
+                |_, _, _, _| {
+                    reads.set(reads.get() + 1);
+                    if protected {
+                        unsafe {
+                            std::env::set_var(
+                                crate::gh_shim_speech::start_view::PROVISIONED_ENV,
+                                "1",
+                            )
+                        };
+                    }
+                    if mode == "dormant" {
+                        std::fs::remove_file(&fixture.paths.manifest).unwrap();
+                    } else {
+                        std::fs::write(&fixture.paths.manifest, b"invalid JSON").unwrap();
+                        if mode == "invalid" {
+                            std::fs::remove_file(&fixture.paths.last_valid_manifest).unwrap();
+                        }
+                    }
+                    Ok(None)
+                },
+            );
+            assert!(
+                reads.get() > 0,
+                "{mode}: production probe callback never ran"
+            );
+            assert!(
+                matches!(
+                    (mode, resolve_manifest(&fixture.paths, unix_seconds())),
+                    ("dormant", ManifestResolution::Dormant)
+                        | ("invalid", ManifestResolution::Invalid(_))
+                        | ("regressed", ManifestResolution::Regressed { .. })
+                ),
+                "{mode}: wrong post-probe arm"
+            );
+            if protected {
+                assert_ne!(exit, 0);
+                assert_eq!(delegated.get(), 0, "{mode}");
+                assert_eq!(*lines.lock().unwrap(), vec!["gh-shim: gh_shim_seam_refusal: task_gh_authority_unavailable: this command's bot-write permission cannot be verified (current_manifest_unverifiable); start the command again from a live session, and tell the operator if it repeats.".to_string()], "{mode}");
+            } else {
+                assert_eq!(exit, 71, "{mode}");
+                assert_eq!(delegated.get(), 1, "{mode}");
+                assert!(lines.lock().unwrap().is_empty(), "{mode}");
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn provisioned_operator_bypass_cannot_delegate_admin_or_pr_labels() {
+    let _lock = crate::test_env::process_env_lock();
+    let workflow: Manifest = serde_json::from_str(include_str!(
+        "../../tests/fixtures/gh_shim/v10-manifest.json"
+    ))
+    .unwrap();
+    for (manifest, argv) in [
+        (workflow, vec!["workflow", "run", "ci.yml", "--ref", "main"]),
+        (
+            super::tests::v14_manifest(),
+            vec![
+                "pr",
+                "edit",
+                "9",
+                "--add-label",
+                "trivial",
+                "-R",
+                "cortexkit/aft",
+            ],
+        ),
+    ] {
+        let _fixture = RunWithFixture::new(&manifest);
+        let _provisioned = Env::set(
+            crate::gh_shim_speech::start_view::PROVISIONED_ENV,
+            Some(OsStr::new("1")),
+        );
+        let _bypass = Env::set("GH_SHIM_BYPASS", Some(OsStr::new("operator")));
+        let args: Vec<OsString> = argv.into_iter().map(Into::into).collect();
+        assert!(matches!(
+            classify(&args, &manifest, current_platform()),
+            Classification::Admin { .. }
+        ));
+        let (_capture, lines) = capture_refusals_for_test();
+        let delegated = std::cell::Cell::new(false);
+        let exit = run_with(
+            &args,
+            |_| {
+                delegated.set(true);
+                0
+            },
+            |_, _, _, _| Ok(None),
+        );
+        assert_ne!(exit, 0);
+        assert!(!delegated.get());
+        assert_eq!(
+            *lines.lock().unwrap(),
+            vec![exact_policy_refusal("not_governed")]
+        );
+    }
+}
+
+#[test]
+fn invalid_start_views_have_exact_run_with_refusals_without_delegation() {
+    let _lock = crate::test_env::process_env_lock();
+    for invalid in ["missing", "corrupt", "wrong-ticket"] {
+        let manifest = super::tests::fixture_manifest();
+        let fixture = RunWithFixture::new(&manifest);
+        let _provisioned = Env::set(
+            crate::gh_shim_speech::start_view::PROVISIONED_ENV,
+            Some(OsStr::new("1")),
+        );
+        match invalid {
+            "missing" => std::fs::remove_file(&fixture.view).unwrap(),
+            "corrupt" => std::fs::write(&fixture.view, b"invalid JSON").unwrap(),
+            "wrong-ticket" => std::fs::write(&fixture.view, serde_json::to_vec(&json!({
+                "ticket_digest": crate::gh_shim_ticket::speech_digest("22222222222222222222222222222222").unwrap().to_vec(),
+                "policy": snapshot(&manifest),
+            })).unwrap()).unwrap(),
+            _ => unreachable!(),
+        }
+        let repo = manifest.bindings.keys().next().unwrap();
+        let args: Vec<OsString> = ["issue", "comment", "7", "--repo", repo, "--body", "body"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        let (_capture, lines) = capture_refusals_for_test();
+        let delegated = std::cell::Cell::new(false);
+        let exit = run_with(
+            &args,
+            |_| {
+                delegated.set(true);
+                0
+            },
+            |_, _, _, _| Ok(None),
+        );
+        assert_ne!(exit, 0, "{invalid}");
+        assert!(!delegated.get(), "{invalid}");
+        assert_eq!(
+            *lines.lock().unwrap(),
+            vec![exact_policy_refusal("not_r3")],
+            "{invalid}"
+        );
+    }
+}
