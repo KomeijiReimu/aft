@@ -2902,6 +2902,62 @@ fn subc_bridge_deleted_root_reclaim_late_call_is_route_reclaimed() {
     );
 }
 
+#[cfg(all(feature = "test-timing-hooks", debug_assertions))]
+#[test]
+fn subc_bridge_deleted_root_reclaim_ends_streams_while_database_initializes() {
+    struct DatabaseGates {
+        open: std::path::PathBuf,
+        resume: std::path::PathBuf,
+    }
+    impl Drop for DatabaseGates {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.open);
+            let _ = std::fs::remove_file(&self.resume);
+        }
+    }
+    let gate_dir = tempfile::tempdir().unwrap();
+    let gates = DatabaseGates {
+        open: gate_dir.path().join("database-open"),
+        resume: gate_dir.path().join("database-resume"),
+    };
+    std::fs::write(&gates.open, b"hold").unwrap();
+    std::fs::write(&gates.resume, b"hold").unwrap();
+    let open_env = gates.open.clone();
+    let resume_env = gates.resume.clone();
+    run_subc_bridge_test_with_env(
+        "subc_bridge_deleted_root_reclaim_ends_streams_while_database_initializes",
+        Duration::from_secs(120),
+        || {
+            vec![
+                set_test_env("AFT_TEST_DATABASE_OPEN_GATE", open_env.to_str().unwrap()),
+                set_test_env(
+                    "AFT_TEST_BG_EVENTS_DATABASE_RESUME_GATE",
+                    resume_env.to_str().unwrap(),
+                ),
+            ]
+        },
+        move |input| async move {
+            let (mut session, _root, frames, late_error) =
+                reclaim_bound_test_root_with_database_gates(
+                    input,
+                    Some((&gates.open, &gates.resume)),
+                )
+                .await;
+            assert_error_frame(&late_error, 121, 999, "route_reclaimed");
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|frame| frame.header.ty == FrameType::StreamEnd)
+                    .count(),
+                2,
+                "both installed subscriptions must end on reclamation"
+            );
+            send_connection_goodbye(&mut session.stream).await;
+        },
+        |_, _, _| {},
+    );
+}
+
 /// The root's executor gets a single reader slot, so one long read occupies it
 /// and every bash wait poll on that root queues behind the read.
 fn single_reader_executor_config() -> ExecutorConfig {
@@ -10354,6 +10410,13 @@ async fn pump_daemon_credits(
 async fn reclaim_bound_test_root(
     input: FakeDaemonInput,
 ) -> (FakeDaemonSession, tempfile::TempDir, Vec<Frame>, Frame) {
+    reclaim_bound_test_root_with_database_gates(input, None).await
+}
+
+async fn reclaim_bound_test_root_with_database_gates(
+    input: FakeDaemonInput,
+    database_gates: Option<(&std::path::Path, &std::path::Path)>,
+) -> (FakeDaemonSession, tempfile::TempDir, Vec<Frame>, Frame) {
     let mut session = open_fake_daemon_session(input).await;
     let root_dir = tempfile::tempdir().expect("reclaimed root tempdir");
     let root = root_dir.path();
@@ -10369,13 +10432,16 @@ async fn reclaim_bound_test_root(
         .await;
         expect_route_bind_ack(&mut session.stream, u64::from(channel)).await;
     }
+    if let Some((open, _)) = database_gates {
+        wait_for_file(&open.with_extension("entered"), "database open gate").await;
+    }
     let mut ledger = DaemonCreditLedger::default();
     for channel in [121, 122] {
         send_bg_events_subscribe(&mut session.stream, channel, 950).await;
         ledger.open(channel, 950, "held bg_events on deleted root");
     }
-    // The control reply is a FIFO barrier: both subscriptions have reached the
-    // frame loop before the directory disappears.
+    // bg_events installs inline, without waiting for database initialization.
+    // The later control reply fences installation before directory deletion.
     send_control_request(
         &mut session.stream,
         980,
@@ -10392,7 +10458,12 @@ async fn reclaim_bound_test_root(
     }
     assert_eq!(ledger.open.len(), 2, "streams must be held before deletion");
     std::fs::remove_dir_all(root).expect("delete bound root");
-    let deadline = Instant::now() + Duration::from_secs(15);
+    if let Some((open, _)) = database_gates {
+        // Configure maintenance must finish before the root can be reclaimed.
+        // Keep only database-wait continuations paused until after reclamation.
+        std::fs::remove_file(open).expect("release database open");
+    }
+    let deadline = Instant::now() + Duration::from_secs(if cfg!(windows) { 30 } else { 15 });
     let mut frames = Vec::new();
     while session.executor.actor_registered(&root_id) {
         assert!(
@@ -10409,6 +10480,15 @@ async fn reclaim_bound_test_root(
             ledger.observe(&frame);
             frames.push(frame);
         }
+    }
+    if let Some((_, resume)) = database_gates {
+        std::fs::remove_file(resume).expect("release database continuations");
+    }
+    while !ledger.open.is_empty() {
+        let frame =
+            read_frame_timeout(&mut session.stream, "reclaimed subscription terminal").await;
+        ledger.observe(&frame);
+        frames.push(frame);
     }
     // Restoring the same path must not resurrect the forgotten route. The
     // session needs a fresh bind, just as a reclaimed worktree's carrier does.
@@ -10441,8 +10521,20 @@ async fn reclaim_bound_test_root(
         ledger.unmatched_terminals
     );
     eprintln!(
-        "deleted-root frame-loop reproduction: held terminals={}, route GOODBYEs={:?}, old-route refusal={}",
+        "deleted-root frame-loop reproduction: stream ends={}, held terminals={:?}, route GOODBYEs={:?}, old-route refusal={}",
         frames.iter().filter(|frame| frame.header.ty == FrameType::StreamEnd).count(),
+        frames.iter().filter(|frame| {
+            [121, 122].contains(&frame.header.channel)
+                && frame.header.epoch == 1
+                && frame.header.corr == 950
+                && matches!(frame.header.ty, FrameType::Response | FrameType::Error | FrameType::StreamEnd)
+        }).map(|frame| (
+            frame.header.channel,
+            frame.header.epoch,
+            frame.header.corr,
+            frame.header.ty,
+            String::from_utf8_lossy(&frame.body).into_owned(),
+        )).collect::<Vec<_>>(),
         frames.iter().filter(|frame| frame.header.ty == FrameType::Goodbye).map(|frame| (frame.header.channel, frame.header.epoch)).collect::<Vec<_>>(),
         String::from_utf8_lossy(&late_error.body),
     );
