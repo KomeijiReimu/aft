@@ -72,9 +72,29 @@ fn binding_reply_diagnostics_distinguish_missing_generation_missing_rows_and_inv
             refusal.detail.as_deref().unwrap().starts_with(expected),
             "{refusal:?}"
         );
-        assert!(refusal.text().contains(expected));
         assert_eq!(refusal.wire_data()["detail"], refusal.detail.unwrap());
     }
+}
+
+#[test]
+fn no_binding_row_preserves_main_refusal_wording_and_structured_detail() {
+    let desired = BTreeMap::from([("cortexkit/subconscious".into(), "agent-subc".into())]);
+    let refusal = parse_bindings(
+        &desired,
+        &serde_json::json!({"repo_binding_generation":36,"bindings":[]}),
+        "agent-subc",
+    )
+    .unwrap_err();
+    assert_eq!(
+        refusal.agent_text(),
+        "task_gh_authority_unavailable: this command's bot-write permission cannot be verified (binding_unverifiable); start the command again from a live session, and tell the operator if it repeats."
+    );
+    let wire = refusal.wire_data();
+    assert_eq!(wire["message"], refusal.text());
+    assert!(wire["detail"]
+        .as_str()
+        .unwrap()
+        .starts_with("no_binding_row:"));
 }
 
 #[test]

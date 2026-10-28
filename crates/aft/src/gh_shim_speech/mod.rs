@@ -118,14 +118,10 @@ impl Refusal {
             Code::ScopeEnded => ENDED_TEXT,
             Code::ScopeUnknown => UNKNOWN_TEXT,
         };
-        let text = template.replace("{reason}", &self.reason).replace(
+        template.replace("{reason}", &self.reason).replace(
             "{scope_role}",
             self.role.unwrap_or(ScopeRole::Authority).label(),
-        );
-        match &self.detail {
-            Some(detail) => format!("{text} Detail: {detail}"),
-            None => text,
-        }
+        )
     }
 
     pub(crate) fn agent_text(&self) -> String {
