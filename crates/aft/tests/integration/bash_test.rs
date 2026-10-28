@@ -54,9 +54,9 @@ impl TestPty {
     }
 }
 
-/// How long a test waits for a task it expects to finish. Generous because a
-/// loaded CI runner can take seconds to start a shell (PowerShell on Windows
-/// especially); waits that expect nothing to happen stay short.
+/// Allow slow shell startup when polling for completion on a loaded CI runner;
+/// waits that expect nothing to happen stay short.
+#[cfg(unix)]
 const POSITIVE_COMPLETION_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[cfg(unix)]
