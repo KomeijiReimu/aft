@@ -286,12 +286,18 @@ static WATCH_GAP_CENSUS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, GapCensus>>,
 > = std::sync::OnceLock::new();
 
-pub(crate) fn refresh_watch_gap_health(conn: &Connection) {
-    let key = conn
-        .path()
+/// The census entry for one database: SQLite's own file name for it, so every
+/// connection to the same file shares an entry, or a per-connection key for an
+/// in-memory database.
+fn census_key(conn: &Connection) -> String {
+    conn.path()
         .filter(|path| !path.is_empty())
         .map(str::to_owned)
-        .unwrap_or_else(|| format!("memory:{:p}", conn));
+        .unwrap_or_else(|| format!("memory:{:p}", conn))
+}
+
+pub(crate) fn refresh_watch_gap_health(conn: &Connection) {
+    let key = census_key(conn);
     let census = (|| -> rusqlite::Result<GapCensus> {
         let mut stmt = conn.prepare("SELECT match_batch FROM bash_pattern_watches WHERE pending_match = 1 AND match_batch IS NOT NULL UNION ALL SELECT batch FROM bash_watch_delivery_gaps")?;
         let batches = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -375,17 +381,16 @@ pub(crate) fn acknowledge_delivery(
     Ok(())
 }
 
+/// One database's census entry. Uses the connection's own key rather than a
+/// path the test spells, since SQLite reports its file name in its own form
+/// (symlinks resolved on macOS, no verbatim prefix on Windows).
 #[cfg(test)]
-pub(crate) fn watch_gap_health_for_path(path: &std::path::Path) -> GapCensus {
-    // The census is keyed by SQLite's own file name, which resolves symlinks
-    // (macOS temp folders live under /var -> /private/var), so look up the
-    // same resolved spelling.
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+pub(crate) fn watch_gap_health_for(conn: &Connection) -> GapCensus {
     WATCH_GAP_CENSUS
         .get_or_init(Default::default)
         .lock()
         .unwrap()
-        .get(&path.to_string_lossy().into_owned())
+        .get(&census_key(conn))
         .copied()
         .unwrap_or_default()
 }

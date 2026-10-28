@@ -9611,7 +9611,7 @@ mod watch_gap_tests {
             match_context: None,
         };
         upsert_delivery_gap(&conn, &row).unwrap();
-        let (gaps, missing, uncertain) = watch_gap_health_for_path(&path);
+        let (gaps, missing, uncertain) = watch_gap_health_for(&conn);
         assert_eq!((gaps, missing, uncertain), (1, 1, false));
         let health = super::super::watch_delivery::health_from_census(gaps, missing, uncertain, 0);
         assert_eq!(health["status"], "degraded");
@@ -9630,7 +9630,7 @@ mod watch_gap_tests {
         )
         .unwrap();
         delete_delivery_gap(&conn, "opencode", "session", "task", "watch").unwrap();
-        let (gaps, missing, uncertain) = watch_gap_health_for_path(&path);
+        let (gaps, missing, uncertain) = watch_gap_health_for(&conn);
         let cleared = super::super::watch_delivery::health_from_census(gaps, missing, uncertain, 0);
         assert_eq!(cleared["status"], "ok");
         assert!(cleared["reason"].is_null());
