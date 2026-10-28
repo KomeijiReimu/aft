@@ -1353,6 +1353,22 @@ fn audit_head_write_still_routes_through_the_relay() {
     ]);
     let mut delegated = Vec::new();
     let (_sink, refusals) = capture_refusals_for_test();
+    // Seed a fresh cached R3 rung with the same provenance the shim computes,
+    // so the test never depends on live rung discovery timing: on a loaded
+    // runner the daemon probe can overrun the discovery budget (the test then
+    // takes ~2 s and the write refuses as governance-unavailable, as seen in
+    // Windows CI), while a cached fresh R3 record is reused with no probe at
+    // all. The write still travels the live relay below, so the test keeps
+    // proving the worker-only gate lets a head write through to the relay.
+    let now = unix_seconds();
+    let provenance = RungRecordProvenance::for_target(
+        &TargetRepository::from_invocation(&argv),
+        &std::env::current_dir().unwrap(),
+    );
+    write_rung_record_silently(
+        &fixture.paths,
+        &RungDetermination::r3(now, manifest.manifest_version, &provenance).record,
+    );
     let status = run_with(
         &argv,
         |forwarded| {
