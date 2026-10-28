@@ -1728,6 +1728,7 @@ pub(super) fn submit_deferred_bash(
     // relayed before the client's deadline. OpenCode and Pi extend their reply
     // deadlines for runon calls to allow input capture after task registration.
     let grant_scope = crate::access_policy::current_scope();
+    let grant_denial = crate::access_policy::scope_grants_denial();
     let ask_route = crate::access_policy::current_ask_route();
     // The attested scope decides confinement independently of consent routing:
     // heads and workers both ask, but only worker shells require the jail.
@@ -2122,6 +2123,7 @@ pub(super) fn submit_deferred_bash(
                             let _secret_identity = super::secret_consent::SecretIdentityGuard::install_optional(secret_identity);
                             let _secret_scopes = super::secret_consent::SecretScopeGuard::install(secret_scopes);
                             let _grant_scope = crate::access_policy::scope_guard(grant_scope);
+                            let _grants = crate::access_policy::scope_grants_guard(grant_denial);
                             let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
                             crate::sandbox_spawn::with_worker_jail(worker_jail, || {
                             crate::bash_background::with_call_key(call_key, || {

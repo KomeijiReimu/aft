@@ -292,3 +292,100 @@ async fn production_relay_requires_the_captured_binding_after_policy_mapping() {
     assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(fixture.plex.state.lock().unwrap().sends, 0);
 }
+
+#[tokio::test]
+async fn existing_storage_and_project_aliases_keep_capture_and_path_spellings() {
+    let _lock = crate::test_env::process_env_lock();
+    let fixture = Fixture::new(false).await;
+    let supplied_project = fixture._dir.path().join("project");
+    let original =
+        crate::gh_shim_ticket::redeem(fixture.params["ticket"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        original.project_root,
+        supplied_project.display().to_string()
+    );
+    assert_eq!(
+        fixture
+            .service
+            .store
+            .get(&fixture.incarnation)
+            .unwrap()
+            .record
+            .project_root,
+        supplied_project.display().to_string()
+    );
+    let canonical_project = fs::canonicalize(&supplied_project).unwrap();
+    let project_alias = fixture._dir.path().join("project-alias");
+    let storage_alias = fixture._dir.path().join("storage-alias");
+    std::os::unix::fs::symlink(&canonical_project, &project_alias).unwrap();
+    std::os::unix::fs::symlink(
+        fixture.service.store.path().parent().unwrap(),
+        &storage_alias,
+    )
+    .unwrap();
+    assert_ne!(project_alias, canonical_project);
+    assert_eq!(fs::canonicalize(&project_alias).unwrap(), canonical_project);
+    let speech =
+        crate::gh_shim_ticket::speech_for_ticket(fixture.params["ticket"].as_str().unwrap())
+            .unwrap();
+    let template = speech.prepared.context.seed.clone();
+    for (seed_project, ticket_project) in [
+        (
+            canonical_project.display().to_string(),
+            project_alias.display().to_string(),
+        ),
+        (
+            project_alias.display().to_string(),
+            canonical_project.display().to_string(),
+        ),
+    ] {
+        let mut seed = template.clone();
+        seed.project_root = seed_project.clone();
+        let root = storage_alias.clone();
+        let session = fixture.session.clone();
+        let supplied = ticket_project.clone();
+        let (pending, call) = tokio::task::spawn_blocking(move || {
+            std::thread::spawn(move || {
+                let lifecycle = seed.lifecycle.clone();
+                crate::gh_shim_speech::service::with_launch(Some(seed), &root, || {
+                    crate::bash_background::registry::with_scope_spawn(lifecycle, || {
+                        (
+                            crate::gh_shim_ticket::PendingTicket::issue(&session, &supplied),
+                            crate::gh_shim_ticket::ScopedTicket::issue(
+                                &session,
+                                "alias-call",
+                                &supplied,
+                            ),
+                        )
+                    })
+                })
+            })
+            .join()
+            .unwrap()
+        })
+        .await
+        .unwrap();
+        for raw in [pending.value().unwrap(), call.value().unwrap()] {
+            let attached = crate::gh_shim_ticket::speech_for_ticket(raw)
+                .expect("equivalent existing path aliases must retain launch context");
+            assert!(attached.failure.lock().unwrap().is_none());
+            assert!(attached.prepared.policy.is_some());
+            assert_eq!(attached.prepared.context.seed.project_root, seed_project);
+            assert_eq!(
+                crate::gh_shim_ticket::redeem(raw).unwrap().project_root,
+                ticket_project
+            );
+        }
+        let attached = crate::gh_shim_ticket::speech_for_ticket(call.value().unwrap()).unwrap();
+        assert_eq!(
+            fixture
+                .service
+                .store
+                .get(&attached.incarnation)
+                .unwrap()
+                .record
+                .project_root,
+            seed_project
+        );
+    }
+}

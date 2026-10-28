@@ -659,9 +659,16 @@ fn invalid_start_views_have_exact_run_with_refusals_without_delegation() {
         );
         assert_ne!(exit, 0, "{invalid}");
         assert!(!delegated.get(), "{invalid}");
+        // A platform the fixture manifest doesn't govern refuses before the
+        // rung check, as in the preflight cases above.
+        let expected = if current_platform() == "unsupported" {
+            "not_governed"
+        } else {
+            "not_r3"
+        };
         assert_eq!(
             *lines.lock().unwrap(),
-            vec![exact_policy_refusal("not_r3")],
+            vec![exact_policy_refusal(expected)],
             "{invalid}"
         );
     }
