@@ -383,31 +383,6 @@ async fn relay_inner<T: RelayTransport>(
             );
         };
         let memory_ticket = crate::gh_shim_ticket::redeem(ticket);
-        if memory_ticket.is_none() {
-            let cold_operation = call.operation == BOT_REQUEST_OPERATION
-                || (call.operation == BINDINGS_READ_OPERATION
-                    && params.get("purpose").and_then(Value::as_str) == Some("speech"));
-            let recognized = match (
-                cold_operation,
-                call.route_scopes.speech.as_ref(),
-                crate::gh_shim_ticket::speech_digest(ticket),
-            ) {
-                (true, Some(service), Some(digest)) => {
-                    match service.store.recognizes_ticket_digest(&digest) {
-                        Ok(recognized) => recognized,
-                        Err(error) => break 'reply RelayReply::task_refused(error),
-                    }
-                }
-                _ => false,
-            };
-            if !recognized {
-                break 'reply RelayReply::refused(
-                    "ticket_unknown",
-                    "ticket",
-                    "the command's session ticket is not live; it ended or was never issued",
-                );
-            }
-        }
         let durable_background =
             crate::gh_shim_ticket::speech_for_ticket(ticket).is_some_and(|speech| {
                 speech.background.load(std::sync::atomic::Ordering::SeqCst)
@@ -434,6 +409,33 @@ async fn relay_inner<T: RelayTransport>(
                     Ok(false) => {},
                     Err(_) => break 'reply RelayReply::refused("outcome_unknown", "plexus", "AFT could not check this GitHub write's prior dispatch state; do not repeat it with a new request key"),
                 }
+            }
+        }
+        // Keep a previously queued write outcome-unknown before admitting a
+        // retry. A stored ticket digest alone never authorizes a write.
+        if memory_ticket.is_none() {
+            let cold_operation = call.operation == BOT_REQUEST_OPERATION
+                || (call.operation == BINDINGS_READ_OPERATION
+                    && params.get("purpose").and_then(Value::as_str) == Some("speech"));
+            let recognized = match (
+                cold_operation,
+                call.route_scopes.speech.as_ref(),
+                crate::gh_shim_ticket::speech_digest(ticket),
+            ) {
+                (true, Some(service), Some(digest)) => {
+                    match service.store.recognizes_ticket_digest(&digest) {
+                        Ok(recognized) => recognized,
+                        Err(error) => break 'reply RelayReply::task_refused(error),
+                    }
+                }
+                _ => false,
+            };
+            if !recognized {
+                break 'reply RelayReply::refused(
+                    "ticket_unknown",
+                    "ticket",
+                    "the command's session ticket is not live; it ended or was never issued",
+                );
             }
         }
         let redeemed = match memory_ticket {
