@@ -1,4 +1,5 @@
 use super::*;
+use crate::subc::persistence::DatabaseWaits;
 use crate::subc::rich_ui::{carrier, chunks};
 
 const MANIFEST: &[u8] = include_bytes!("../../../../tests/fixtures/rich_ui/manifest.jcs.json");
