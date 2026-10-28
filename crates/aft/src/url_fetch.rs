@@ -3624,7 +3624,8 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         thread::spawn(move || {
-            let accepted: Vec<_> = listener.incoming().take(1).collect();
+            // Accept one connection and hold it open without answering.
+            let accepted = listener.accept();
             thread::sleep(Duration::from_secs(5));
             drop(accepted);
         });
