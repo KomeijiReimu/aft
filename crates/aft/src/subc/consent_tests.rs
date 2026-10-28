@@ -766,17 +766,38 @@ fn code(reply: &Value) -> &str {
 async fn occipital_outside_read_refuses_without_any_permission_ask() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
-    let mut carrier = identity(&f.worker.project_root, f.worker.scope.clone());
-    let data = Arc::get_mut(&mut carrier.0).unwrap();
-    if let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut data.spawn_principal {
-        *principal_id = Some("reserved:occipital".into());
-    }
-    data.consumer_elicitation_capable = true;
+    let carrier = |role| {
+        let mut carrier = identity(&f.worker.project_root, f.worker.scope.clone());
+        let data = Arc::get_mut(&mut carrier.0).unwrap();
+        data.role = role;
+        if let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut data.spawn_principal {
+            *principal_id = Some("reserved:occipital".into());
+        }
+        data.consumer_elicitation_capable = true;
+        carrier
+    };
     let target = f.head_root.join("shared.txt");
+    let v1 = carrier(tool_provider::RouteRole::ToolProviderV1);
+    let missing_operation = f.read(&v1, &target, 800).await;
+    assert_eq!(
+        missing_operation,
+        json!({
+            "content":[{"type":"text", "text":"rich_ui_op_malformed"}], "isError":true,
+            "structuredContent":{"success":false,"code":"rich_ui_op_malformed", "message":"A versioned rich UI operation is required."}
+        })
+    );
+
+    // Keep filesystem policy controls behind the legacy decoder: a missing
+    // operation marker on v1 is refused before a read can reach that policy.
+    let carrier = carrier(tool_provider::RouteRole::Legacy);
+    assert!(matches!(
+        crate::subc::access_grants::ask_route(&carrier),
+        crate::access_policy::AskRoute::Deny
+    ));
     let denied = f.read(&carrier, &target, 801).await;
     assert_eq!(denied["isError"], true, "{denied}");
     assert!(!text(&denied).contains("head-owned contents"), "{denied}");
-    assert!(!code(&denied).is_empty(), "{denied}");
+    assert_eq!(code(&denied), "path_outside_root", "{denied}");
     assert!(f.fake.calls("consent.request").is_empty());
     assert!(f.asks().is_empty());
     assert!(f.worker_grants().is_empty());
