@@ -566,7 +566,7 @@ fn authority_never_widens_across_reconnect() {
 // Exercise relay admission rather than only the immutable-authority helper:
 // a captured Call ticket must not adopt the session's replacement scope.
 #[tokio::test]
-async fn audit_proof_call_ticket_must_not_adopt_a_rebound_agent() {
+async fn call_ticket_must_not_adopt_a_rebound_agent() {
     let original = delegating_stamp();
     let live = crate::bash_background::registry::with_scope_spawn(Some(original.clone()), || {
         crate::gh_shim_ticket::ScopedTicket::issue("audit-call-rebind", "call", "/p")

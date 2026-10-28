@@ -3,7 +3,7 @@ use super::*;
 // These assertions describe the required authority boundary. They intentionally
 // fail on implementation d69a90a3d0; they are evidence, not fixes.
 #[tokio::test]
-async fn audit_proof_bound_background_must_not_follow_a_rotated_bot_handle() {
+async fn bound_background_must_not_follow_a_rotated_bot_handle() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(false).await;
     fixture.plex.state.lock().unwrap().handle = "app-rotated".into();
@@ -18,7 +18,7 @@ async fn audit_proof_bound_background_must_not_follow_a_rotated_bot_handle() {
 }
 
 #[tokio::test]
-async fn audit_proof_bound_codemode_must_require_the_program_to_remain_live() {
+async fn bound_codemode_must_require_the_program_to_remain_live() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(true).await;
     let run = fixture.run.as_ref().unwrap();
