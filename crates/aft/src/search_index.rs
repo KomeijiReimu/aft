@@ -12913,6 +12913,7 @@ mod tests {
     fn audit10_7_posting_failure_is_not_a_complete_empty_grep_reply() {
         let (_directory, context, _) = unreadable_postings_fixture();
         let request = crate::protocol::RawRequest {
+            handles_progress: false,
             id: "posting-failure".to_string(),
             command: "grep".to_string(),
             session_id: None,
@@ -12978,6 +12979,7 @@ mod tests {
         for content in ["no matches\n", "needle\n"] {
             fs::write(&explicit, content).unwrap();
             let request = crate::protocol::RawRequest {
+                handles_progress: false,
                 id: "partial-posting-failure".to_string(),
                 command: "grep".to_string(),
                 session_id: None,
@@ -13029,6 +13031,7 @@ mod tests {
     fn audit10_7_search_discloses_posting_failure_with_verified_exact_fallback() {
         let (_directory, context, _) = unreadable_postings_fixture();
         let request = crate::protocol::RawRequest {
+            handles_progress: false,
             id: "search-posting-failure".to_string(),
             command: "semantic_search".to_string(),
             session_id: None,
@@ -13056,6 +13059,7 @@ mod tests {
     fn audit10_7_split_search_discloses_posting_failure() {
         let (_directory, context, _) = unreadable_postings_fixture();
         let request = crate::protocol::RawRequest {
+            handles_progress: false,
             id: "split-posting-failure".to_string(),
             command: "semantic_search".to_string(),
             session_id: None,
@@ -13120,6 +13124,7 @@ mod tests {
     fn audit10_7_pattern_lock_timeout_fallback_rejects_unreadable_postings() {
         let (_directory, context, _) = unreadable_postings_fixture();
         let request = crate::protocol::RawRequest {
+            handles_progress: false,
             id: "pattern-lock-timeout".to_string(),
             command: "semantic_search".to_string(),
             session_id: None,
@@ -13141,6 +13146,7 @@ mod tests {
     fn audit10_7_split_lock_timeout_fallback_preserves_posting_read_gaps() {
         let (_directory, context, _) = unreadable_postings_fixture();
         let request = crate::protocol::RawRequest {
+            handles_progress: false,
             id: "split-lock-timeout".to_string(),
             command: "semantic_search".to_string(),
             session_id: None,

@@ -360,6 +360,7 @@ fn search_outcome(f: &Fixture, ctx: &AppContext, forced: bool, path: &Path) -> S
     let req_id = "outside-roots";
     let _forced = forced.then(|| ctx.force_restrict_guard(req_id));
     let request = crate::protocol::RawRequest {
+        handles_progress: false,
         id: req_id.into(),
         command: "semantic_search".into(),
         session_id: Some("outside-roots-session".into()),

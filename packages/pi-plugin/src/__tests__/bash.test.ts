@@ -1776,11 +1776,9 @@ describe("bash tool adapter", () => {
     expect(updates).toEqual([
       expect.objectContaining({
         content: [{ type: "text", text: "line1\n" }],
-        details: expect.objectContaining({ streaming: true }),
       }),
       expect.objectContaining({
         content: [{ type: "text", text: "line1\nline2\n" }],
-        details: expect.objectContaining({ streaming: true }),
       }),
     ]);
 

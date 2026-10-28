@@ -8276,6 +8276,7 @@ mod grant_path_tests {
         let mut pending = HashMap::from([(
             ReverseCorrKey { route, corr: 2 },
             PendingBashAsk {
+                handles_progress: false,
                 route,
                 tool_corr: 1,
                 tool_flags: control_flags(),

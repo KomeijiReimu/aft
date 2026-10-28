@@ -1064,6 +1064,7 @@ fn read_on_filesystem_helper(f: &Fixture, input: &str) -> Response {
     let ctx = Arc::new(context(&f.pin, f.storage.path(), None));
     ctx.update_config(|config| config.restrict_to_project_root = false);
     let request = crate::protocol::RawRequest {
+        handles_progress: false,
         id: "confine-helper".into(),
         command: "read".into(),
         lsp_hints: None,

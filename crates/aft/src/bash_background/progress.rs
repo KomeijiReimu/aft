@@ -35,6 +35,8 @@ impl StreamCursor {
             self.skipping_line = true;
         }
         let mut lines = Vec::new();
+        let mut chunk = String::new();
+        let mut chunk_start = 0;
         for &byte in bytes {
             self.position += 1;
             if self.skipping_line {
@@ -61,7 +63,7 @@ impl StreamCursor {
             let raw = std::mem::take(&mut self.pending);
             let from = self.line_start;
             self.line_start = self.position;
-            let Ok(mut text) = String::from_utf8(raw) else {
+            let Ok(text) = String::from_utf8(raw) else {
                 continue;
             };
             if text.contains("-----BEGIN ") && text.contains("PRIVATE KEY-----") {
@@ -70,15 +72,20 @@ impl StreamCursor {
             if self.private_key {
                 if text.contains("-----END ") && text.contains("PRIVATE KEY-----") {
                     self.private_key = false;
+                    mask_chunk(&mut chunk, chunk_start, mask, &mut lines);
                     lines.push("[REDACTED]\n".to_string());
                 }
                 continue;
             }
-            mask(from, &mut text);
-            if text.len() <= FRAME_BYTES {
-                lines.push(text);
+            if chunk.len() + text.len() > FRAME_BYTES || from != chunk_start + chunk.len() as u64 {
+                mask_chunk(&mut chunk, chunk_start, mask, &mut lines);
             }
+            if chunk.is_empty() {
+                chunk_start = from;
+            }
+            chunk.push_str(&text);
         }
+        mask_chunk(&mut chunk, chunk_start, mask, &mut lines);
         lines
     }
 
@@ -96,6 +103,22 @@ impl StreamCursor {
     }
 }
 
+fn mask_chunk(
+    chunk: &mut String,
+    from: u64,
+    mask: &impl Fn(u64, &mut String),
+    output: &mut Vec<String>,
+) {
+    if chunk.is_empty() {
+        return;
+    }
+    let mut text = std::mem::take(chunk);
+    mask(from, &mut text);
+    if text.len() <= FRAME_BYTES {
+        output.push(text);
+    }
+}
+
 #[derive(Default)]
 struct Batch {
     lines: Vec<(&'static str, String)>,
@@ -105,7 +128,7 @@ struct Batch {
 /// Owns only bounded channels. Dropping a call never joins a blocked file reader.
 pub(crate) struct BashProgressPump {
     tick: Option<SyncSender<()>>,
-    ready: Receiver<Batch>,
+    ready: Option<Receiver<Batch>>,
     request_id: String,
     next_tick: Instant,
     next_emit: Instant,
@@ -138,7 +161,7 @@ impl BashProgressPump {
             });
         Self {
             tick: Some(tick),
-            ready,
+            ready: Some(ready),
             request_id,
             next_tick: Instant::now(),
             next_emit: Instant::now(),
@@ -152,7 +175,7 @@ impl BashProgressPump {
             return;
         }
         if terminal || Instant::now() >= self.next_emit {
-            if let Ok(batch) = self.ready.try_recv() {
+            if let Some(batch) = self.ready.as_ref().and_then(|ready| ready.try_recv().ok()) {
                 self.tails = batch.tails;
                 self.emit(batch.lines, emit);
                 self.next_emit = Instant::now() + INTERVAL;
@@ -161,7 +184,7 @@ impl BashProgressPump {
         if terminal {
             let tails = std::mem::take(&mut self.tails);
             self.emit(tails, emit);
-            self.tick.take();
+            self.stop();
         } else if Instant::now() >= self.next_tick {
             if let Some(tick) = &self.tick {
                 let _ = tick.try_send(());
@@ -188,7 +211,7 @@ impl BashProgressPump {
             return;
         }
         if chunk.len() > CALL_BYTES - self.emitted {
-            self.tick.take();
+            self.stop();
             return;
         }
         self.emitted += chunk.len();
@@ -202,8 +225,14 @@ impl BashProgressPump {
             chunk,
         ));
         if self.emitted == CALL_BYTES {
-            self.tick.take();
+            self.stop();
         }
+    }
+
+    fn stop(&mut self) {
+        self.tick.take();
+        self.ready.take();
+        self.tails.clear();
     }
 }
 
@@ -295,7 +324,7 @@ mod tests {
         let (_results, ready) = mpsc::sync_channel(1);
         let mut pump = BashProgressPump {
             tick: Some(tick),
-            ready,
+            ready: Some(ready),
             request_id: "cap".into(),
             next_tick: Instant::now(),
             next_emit: Instant::now(),
@@ -325,7 +354,7 @@ mod tests {
         let (_results, ready) = mpsc::sync_channel(1);
         let mut pump = BashProgressPump {
             tick: Some(tick),
-            ready,
+            ready: Some(ready),
             request_id: "slow".into(),
             next_tick: Instant::now(),
             next_emit: Instant::now(),

@@ -1144,6 +1144,7 @@ fn scoped_read_lists_load_policy_and_grants_once_per_call() {
             ("outline", json!({"target":src,"files":true})),
         ] {
             let req = crate::protocol::RawRequest {
+                handles_progress: false,
                 id: format!("scoped-policy-once-{tool}"),
                 command: tool.into(),
                 session_id: Some(worker.session.clone()),

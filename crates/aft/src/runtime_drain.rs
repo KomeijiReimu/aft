@@ -4708,6 +4708,7 @@ mod tests {
         let _writer =
             crate::inspect::cache::tests::foreign_writer(&root, &ctx.inspect_dir(), false);
         let request = crate::protocol::RawRequest {
+            handles_progress: false,
             id: "unrelated-read".into(),
             command: "read".into(),
             params: serde_json::json!({"file": root.join("hello.txt")}),

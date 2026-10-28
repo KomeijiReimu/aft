@@ -16507,6 +16507,7 @@ mod tests {
             asks.insert(
                 ReverseCorrKey { route, corr: 100 },
                 PendingBashAsk {
+                    handles_progress: false,
                     route,
                     tool_corr: 78,
                     tool_flags: control_flags(),
@@ -17866,6 +17867,7 @@ mod tests {
         let ctx = test_ctx();
         ctx.mark_subc_bound();
         let request = crate::protocol::RawRequest {
+            handles_progress: false,
             id: "parent-bind".into(),
             command: "configure".into(),
             session_id: None,

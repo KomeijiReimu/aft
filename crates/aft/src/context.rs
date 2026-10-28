@@ -18198,6 +18198,7 @@ mod force_restrict_tests {
             let ctx = test_context(Some(root.path().into()), false);
             ctx.update_config(|config| config.harness = Some(harness));
             let request = crate::protocol::RawRequest {
+                handles_progress: false,
                 id: "native".into(),
                 command: "read".into(),
                 session_id: Some("session".into()),
