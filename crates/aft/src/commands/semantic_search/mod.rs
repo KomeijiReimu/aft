@@ -2390,12 +2390,11 @@ fn handle_semantic_search_inner(
             return refusal;
         }
     }
-    // Observing the lanes restarts a views-on lane that idle eviction
-    // released. The restart rewrites the shared status, which this request
-    // read before; report the restarted lane's status, not the `ready` the
-    // released lane left behind.
+    // Observing the lanes reloads a semantic index that idle eviction took,
+    // or restarts a views-on lane it released. The reload rewrites the shared
+    // status, which this request read before; report the reloading lane's
+    // status, not the `ready` the evicted lane left behind.
     let semantic_status_snapshot = if lanes.semantic_reload_started
-        && ctx.checkout_semantic().active()
         && matches!(semantic_status_snapshot, SemanticIndexStatus::Ready { .. })
     {
         try_read_with_budget(
