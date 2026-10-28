@@ -16427,6 +16427,9 @@ fn resolve_rust_target<I: ResolverIndex>(
         {
             return Some(("resolved".to_string(), target_file, target_symbol));
         }
+        // An unresolved qualifier must not bind an unrelated unqualified import
+        // that happens to share the final function name.
+        return None;
     }
 
     // A file-level function of the caller's own file wins over imports. Rust

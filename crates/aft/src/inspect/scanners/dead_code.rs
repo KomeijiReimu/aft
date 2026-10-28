@@ -8830,12 +8830,14 @@ mod tests {
             (
                 "src/driver.rs",
                 r#"
-pub fn run() { outer::run(); }
+use crate::targets::drop;
+pub fn run() { std::mem::drop(0); outer::run(); }
 pub(crate) fn via_super() {}
 mod outer {
     use crate::targets as alias;
     pub fn run() {
         child::plain();
+        child::typed::<()>();
         self::child::via_self();
         super::via_super();
         crate::targets::via_crate();
@@ -8844,6 +8846,7 @@ mod outer {
     }
     pub(crate) mod child {
         pub(crate) fn plain() {}
+        pub(crate) fn typed<T>() {}
         pub(crate) fn via_self() {}
         pub(crate) mod deep {
             pub fn run() { super::super::super::via_super(); }
@@ -8851,7 +8854,10 @@ mod outer {
     }
 }
 #[cfg(test)]
-mod tests { #[test] fn checks() { super::outer::child::plain(); } }
+mod tests {
+    use super::outer::child::typed;
+    #[test] fn checks() { super::outer::child::plain(); typed::<()>(); }
+}
 "#,
             ),
             (
@@ -8859,7 +8865,7 @@ mod tests { #[test] fn checks() { super::outer::child::plain(); } }
                 r#"
 pub(crate) fn via_crate() {}
 pub(crate) fn via_alias() {}
-pub(crate) fn planted_dead() {}
+pub(crate) fn drop(_value: i32) {}
 "#,
             ),
         ]);
@@ -8874,12 +8880,13 @@ pub(crate) fn planted_dead() {}
         let aggregate = scan(job(&root, paths, snapshot));
         assert_eq!(
             headline_symbols(&aggregate),
-            vec!["src/targets.rs::planted_dead"],
+            vec!["src/targets.rs::drop"],
             "{aggregate:#}"
         );
         assert_eq!(aggregate["test_only_count"], 0, "{aggregate:#}");
         for (file, symbol, expected_count) in [
             ("src/driver.rs", "outer::child::plain", 2),
+            ("src/driver.rs", "outer::child::typed", 2),
             ("src/driver.rs", "outer::child::via_self", 1),
             ("src/driver.rs", "via_super", 2),
             ("src/targets.rs", "via_crate", 1),
