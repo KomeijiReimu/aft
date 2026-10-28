@@ -1000,3 +1000,482 @@ fn audit_head_child_adapters_do_not_inherit_worker_markers() {
         .iter_full_env_as_str()
         .all(|(key, _)| key != crate::gh_shim_ticket::GH_SHIM_WORKER_ENV));
 }
+
+/// A worker shell carries a read broker, never a write ticket. Every
+/// write-class command from it must be refused with the report-to-parent line
+/// and exit 86 before any identity lookup, delegation, or relay traffic.
+#[test]
+fn audit_worker_write_is_refused_before_any_broker_or_relay_traffic() {
+    use std::sync::Arc;
+    let _lock = crate::test_env::process_env_lock();
+    let fixture = Fixture::new(20);
+    // A live relay is configured so that any contact would be observed; the
+    // worker refusal must happen before the shim reaches it.
+    let daemon = relay_client::tests::FakeRelayDaemon::spawn(Arc::new(|body| {
+        let operation = body["op"].as_str().unwrap_or("?");
+        if operation == crate::gh_shim_relay::BINDINGS_READ_OPERATION {
+            return json!({"op": operation, "status": "ok", "data": {"result": {
+                "repo_binding_generation": 1,
+                "bindings": [],
+            }}});
+        }
+        json!({"op": operation, "status": "ok", "data": {
+            "repo_binding_generation": 1,
+            "result": {"status": "completed", "result": {"url": "https://github.com/cortexkit/aft/issues/7#issuecomment-1"}},
+        }})
+    }));
+    let connection = fixture.home.path().join("connection.json");
+    daemon.write_connection_file(&connection);
+    let config = fixture.home.path().join("cortexkit/aft.jsonc");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(
+        &config,
+        json!({"subc":{"connection_file":connection}}).to_string(),
+    )
+    .unwrap();
+    // The worker shell: read-broker env present, no ticket.
+    let _worker = Env::set(
+        crate::gh_shim_ticket::GH_SHIM_WORKER_ENV,
+        Some(OsStr::new("1")),
+    );
+    let socket = fixture.home.path().join("broker.sock");
+    let capability = fixture.home.path().join("capability");
+    fs::write(&capability, "0123456789abcdef0123456789abcdef").unwrap();
+    let _socket_env = Env::set(
+        crate::gh_shim_worker_broker::SOCKET_ENV,
+        Some(socket.as_os_str()),
+    );
+    let _capability_env = Env::set(
+        crate::gh_shim_worker_broker::CAPABILITY_FILE_ENV,
+        Some(capability.as_os_str()),
+    );
+    let _no_ticket = Env::set(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, None);
+    let (_sink, lines) = capture_refusals_for_test();
+    let context = relay_client::RelayContext::from_process();
+    assert!(
+        context.worker_broker.is_some(),
+        "the test did not build a worker relay context"
+    );
+    assert!(context.ticket.is_none());
+    assert!(context.connection_file.is_none());
+    let mut delegated = Vec::new();
+    let mut lookups = 0;
+    for raw in [
+        vec![
+            "issue",
+            "comment",
+            "7",
+            "--body",
+            "hello",
+            "--repo",
+            "cortexkit/aft",
+        ],
+        vec!["pr", "review", "7", "--approve", "--repo", "cortexkit/aft"],
+        vec![
+            "issue",
+            "edit",
+            "7",
+            "--add-label",
+            "bug",
+            "--repo",
+            "cortexkit/aft",
+        ],
+        vec![
+            "issue",
+            "close",
+            "7",
+            "--reason",
+            "completed",
+            "--repo",
+            "cortexkit/aft",
+        ],
+        vec!["pr", "close", "7", "--repo", "cortexkit/aft"],
+        vec![
+            "api",
+            "-X",
+            "POST",
+            "repos/cortexkit/aft/issues/7/comments",
+            "-f",
+            "body=hello",
+        ],
+    ] {
+        let status = run_with(
+            &args(&raw),
+            |forwarded| {
+                delegated.push(forwarded.to_vec());
+                0
+            },
+            |_, _, _, _| {
+                lookups += 1;
+                Ok(None)
+            },
+        );
+        assert_eq!(status, 86, "{raw:?}");
+    }
+    assert!(
+        delegated.is_empty(),
+        "worker writes must never delegate: {delegated:?}"
+    );
+    assert_eq!(lookups, 0, "worker writes must not reach identity lookup");
+    assert!(
+        daemon.requests.lock().unwrap().is_empty(),
+        "worker writes must not reach the relay"
+    );
+    // The refusal the agent actually sees: the exact report-to-parent line,
+    // once per refused command.
+    let lines = lines.lock().unwrap();
+    assert_eq!(
+        lines.len(),
+        6,
+        "every worker write must refuse loudly: {lines:?}"
+    );
+    for line in lines.iter() {
+        assert_eq!(
+            line,
+            "gh-shim: gh_shim_worker_write_refused: workers cannot write to GitHub; report what should be posted to your parent instead"
+        );
+    }
+}
+
+/// The refusal above must not open a broker connection either. A bound
+/// listener observes the socket: with the refusal first, no handshake arrives.
+#[cfg(unix)]
+#[test]
+fn audit_worker_write_opens_no_broker_connection() {
+    use std::os::unix::net::UnixListener;
+    let _lock = crate::test_env::process_env_lock();
+    let fixture = Fixture::new(20);
+    let _worker = Env::set(
+        crate::gh_shim_ticket::GH_SHIM_WORKER_ENV,
+        Some(OsStr::new("1")),
+    );
+    let socket = fixture.home.path().join("broker.sock");
+    let capability = fixture.home.path().join("capability");
+    fs::write(&capability, "0123456789abcdef0123456789abcdef").unwrap();
+    let _socket_env = Env::set(
+        crate::gh_shim_worker_broker::SOCKET_ENV,
+        Some(socket.as_os_str()),
+    );
+    let _capability_env = Env::set(
+        crate::gh_shim_worker_broker::CAPABILITY_FILE_ENV,
+        Some(capability.as_os_str()),
+    );
+    let _no_ticket = Env::set(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, None);
+    let (_sink, lines) = capture_refusals_for_test();
+    let listener = UnixListener::bind(&socket).unwrap();
+    let status = run_with(
+        &args(&[
+            "issue",
+            "comment",
+            "7",
+            "--body",
+            "hello",
+            "--repo",
+            "cortexkit/aft",
+        ]),
+        |_| panic!("worker write must not delegate"),
+        |_, _, _, _| panic!("worker write must not reach identity lookup"),
+    );
+    assert_eq!(status, 86);
+    assert_eq!(
+        lines.lock().unwrap().as_slice(),
+        ["gh-shim: gh_shim_worker_write_refused: workers cannot write to GitHub; report what should be posted to your parent instead"],
+    );
+    listener.set_nonblocking(true).unwrap();
+    match listener.accept() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        connected => panic!("worker write opened a broker connection: {connected:?}"),
+    }
+}
+
+/// A worker read still goes to the read broker: the new write-only refusal
+/// must not divert it. A minimal fake broker answers the session context and
+/// one read; the test asserts the shim spoke to it and the read succeeded.
+#[cfg(unix)]
+#[test]
+fn audit_worker_read_still_reaches_the_broker() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    let _lock = crate::test_env::process_env_lock();
+    let fixture = Fixture::new(20);
+    let _worker = Env::set(
+        crate::gh_shim_ticket::GH_SHIM_WORKER_ENV,
+        Some(OsStr::new("1")),
+    );
+    let socket = fixture.home.path().join("broker.sock");
+    let capability = fixture.home.path().join("capability");
+    fs::write(&capability, "0123456789abcdef0123456789abcdef").unwrap();
+    let _socket_env = Env::set(
+        crate::gh_shim_worker_broker::SOCKET_ENV,
+        Some(socket.as_os_str()),
+    );
+    let _capability_env = Env::set(
+        crate::gh_shim_worker_broker::CAPABILITY_FILE_ENV,
+        Some(capability.as_os_str()),
+    );
+    let _no_ticket = Env::set(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, None);
+    let (_sink, refusals) = capture_refusals_for_test();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let served = seen.clone();
+    let server = std::thread::spawn(move || {
+        let listener = UnixListener::bind(&socket).unwrap();
+        loop {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let mut size = [0u8; 4];
+            if stream.read_exact(&mut size).is_err() {
+                break;
+            }
+            let mut body = vec![0u8; u32::from_be_bytes(size) as usize];
+            if stream.read_exact(&mut body).is_err() {
+                break;
+            }
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            let operation = request["operation"]["op"].as_str().unwrap().to_string();
+            let data = match operation.as_str() {
+                "gh_shim.session_context" => {
+                    json!({"worker": true, "head": false, "repository": "cortexkit/aft"})
+                }
+                "gh_shim.read_request" => json!({
+                    "result": {"status": 200, "body": {"number": 42}, "next_page": null},
+                    "isError": false,
+                }),
+                unexpected => panic!("worker read sent an unexpected broker op: {unexpected}"),
+            };
+            let reply = serde_json::to_vec(&json!({"status": "ok", "data": data})).unwrap();
+            stream
+                .write_all(&(reply.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(&reply).unwrap();
+            served.lock().unwrap().push(operation.clone());
+            if operation == "gh_shim.read_request" {
+                break;
+            }
+        }
+    });
+    let mut delegated = Vec::new();
+    let status = run_with(
+        &args(&[
+            "pr",
+            "view",
+            "42",
+            "--json",
+            "number",
+            "--repo",
+            "cortexkit/aft",
+        ]),
+        |forwarded| {
+            delegated.push(forwarded.to_vec());
+            23
+        },
+        worker_reads::identity_for_command,
+    );
+    assert_eq!(status, 0);
+    assert!(
+        refusals.lock().unwrap().is_empty(),
+        "a successful worker read must refuse nothing"
+    );
+    assert!(
+        delegated.is_empty(),
+        "a worker read must be brokered, not delegated: {delegated:?}"
+    );
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        vec![
+            "gh_shim.session_context",
+            "gh_shim.session_context",
+            "gh_shim.read_request"
+        ],
+        "a worker read must authenticate its session and read through the broker"
+    );
+    server.join().unwrap();
+}
+
+/// A head-session write keeps its existing route: the worker-only refusal
+/// must not catch it. The fake relay answers the bindings check and
+/// completes the write, so the command succeeds without delegation.
+#[test]
+fn audit_head_write_still_routes_through_the_relay() {
+    use std::sync::Arc;
+    let _lock = crate::test_env::process_env_lock();
+    let fixture = Fixture::new(20);
+    let mut manifest_value: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/gh_shim/v20-manifest.json"
+    ))
+    .unwrap();
+    // The fixture manifests review only macOS and Linux, but the shim
+    // classifies with current_platform(): anywhere else the exercised tuple
+    // would read as undeclared and the write could never route. Extend the
+    // exercised tuple to the running platform so run_with can reach the relay
+    // on every platform this test runs on. Nothing else about the fixture
+    // changes.
+    if let Some(entries) = manifest_value
+        .get_mut("tiers")
+        .and_then(|tiers| tiers.get_mut("governed"))
+        .and_then(Value::as_array_mut)
+    {
+        for entry in entries {
+            if entry.get("tuple").and_then(Value::as_str) != Some("issue comment") {
+                continue;
+            }
+            if let Some(platforms) = entry.get_mut("platform").and_then(Value::as_array_mut) {
+                let current = Value::String(current_platform().to_string());
+                if !platforms.contains(&current) {
+                    platforms.push(current);
+                }
+            }
+        }
+    }
+    let manifest: Manifest = serde_json::from_value(manifest_value).unwrap();
+    tests::write_signed_manifest(&fixture.paths, manifest.clone(), unix_seconds());
+    let bindings: Vec<Value> = manifest
+        .bindings
+        .iter()
+        .map(
+            |(repo, agent)| json!({"repository": repo, "agent_id": agent, "app_handle_id": "test"}),
+        )
+        .collect();
+    let daemon = relay_client::tests::FakeRelayDaemon::spawn(Arc::new(move |body| {
+        let operation = body["op"].as_str().unwrap_or("?");
+        if operation == crate::gh_shim_relay::BINDINGS_READ_OPERATION {
+            return json!({"op": operation, "status": "ok", "data": {"result": {
+                "repo_binding_generation": 1,
+                "bindings": bindings,
+            }}});
+        }
+        assert_eq!(operation, crate::gh_shim_relay::BOT_REQUEST_OPERATION);
+        json!({"op": operation, "status": "ok", "data": {
+            "repo_binding_generation": 1,
+            "result": {"status": "completed", "result": {"url": "https://github.com/cortexkit/aft/issues/7#issuecomment-1", "id": 1}},
+        }})
+    }));
+    let connection = fixture.home.path().join("connection.json");
+    daemon.write_connection_file(&connection);
+    let config = fixture.home.path().join("cortexkit/aft.jsonc");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(
+        &config,
+        json!({"subc":{"connection_file":connection}}).to_string(),
+    )
+    .unwrap();
+    let _no_worker = Env::set(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV, None);
+    let _no_socket = Env::set(crate::gh_shim_worker_broker::SOCKET_ENV, None);
+    let _no_capability = Env::set(crate::gh_shim_worker_broker::CAPABILITY_FILE_ENV, None);
+    let _ticket = Env::set(
+        crate::gh_shim_ticket::GH_SHIM_TICKET_ENV,
+        Some(OsStr::new("head-ticket")),
+    );
+    let argv = args(&[
+        "issue",
+        "comment",
+        "7",
+        "--body",
+        "hello",
+        "--repo",
+        "cortexkit/aft",
+    ]);
+    let mut delegated = Vec::new();
+    let (_sink, refusals) = capture_refusals_for_test();
+    // Seed a fresh cached R3 rung with the same provenance the shim computes,
+    // so the test never depends on live rung discovery timing: on a loaded
+    // runner the daemon probe can overrun the discovery budget (the test then
+    // takes ~2 s and the write refuses as governance-unavailable, as seen in
+    // Windows CI), while a cached fresh R3 record is reused with no probe at
+    // all. The write still travels the live relay below, so the test keeps
+    // proving the worker-only gate lets a head write through to the relay.
+    let now = unix_seconds();
+    let provenance = RungRecordProvenance::for_target(
+        &TargetRepository::from_invocation(&argv),
+        &std::env::current_dir().unwrap(),
+    );
+    write_rung_record_silently(
+        &fixture.paths,
+        &RungDetermination::r3(now, manifest.manifest_version, &provenance).record,
+    );
+    let status = run_with(
+        &argv,
+        |forwarded| {
+            delegated.push(forwarded.to_vec());
+            23
+        },
+        worker_reads::identity_for_command,
+    );
+    assert_eq!(
+        status,
+        0,
+        "a head write was refused instead of routed: {:?}",
+        refusals.lock().unwrap()
+    );
+    assert!(
+        refusals.lock().unwrap().is_empty(),
+        "a routed head write must refuse nothing"
+    );
+    assert!(
+        delegated.is_empty(),
+        "a head write must route, not delegate: {delegated:?}"
+    );
+    assert!(
+        daemon
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request["op"] == crate::gh_shim_relay::BOT_REQUEST_OPERATION),
+        "a head write must still reach the relay"
+    );
+}
+
+/// Credential commands are not writes: `gh auth token`, a token-revealing
+/// status flag, and `gh auth login` from a worker shell must keep the
+/// operator-credentials refusal (exit 86), never the worker-write line.
+#[test]
+fn audit_worker_credential_command_keeps_the_credential_refusal() {
+    let _lock = crate::test_env::process_env_lock();
+    // Held for its environment and installed manifest, not its paths: the
+    // credential arm needs an active manifest, nothing else from the fixture.
+    let _fixture = Fixture::new(20);
+    let _worker = Env::set(
+        crate::gh_shim_ticket::GH_SHIM_WORKER_ENV,
+        Some(OsStr::new("1")),
+    );
+    let _no_ticket = Env::set(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, None);
+    let _no_bypass = Env::set("GH_SHIM_BYPASS", None);
+    let (_sink, lines) = capture_refusals_for_test();
+    let mut lookups = 0;
+    for raw in [
+        vec!["auth", "token"],
+        vec!["auth", "status", "--show-token"],
+        vec!["auth", "login"],
+    ] {
+        let status = run_with(
+            &args(&raw),
+            |_| panic!("a credential refusal must not delegate: {raw:?}"),
+            // The read-identity check runs before the credential arm and
+            // declines credential shapes without any lookup; it must still
+            // never report a worker session for them.
+            |_, _, _, _| {
+                lookups += 1;
+                Ok(None)
+            },
+        );
+        assert_eq!(status, 86, "{raw:?}");
+    }
+    assert_eq!(
+        lookups, 3,
+        "each credential shape consults read identity once"
+    );
+    let lines = lines.lock().unwrap();
+    assert_eq!(
+        lines.len(),
+        3,
+        "every credential command must refuse loudly: {lines:?}"
+    );
+    for line in lines.iter() {
+        assert!(
+            line.starts_with("gh-shim: gh_shim_operator_credentials: "),
+            "a worker credential command must keep the credential refusal code: {line}"
+        );
+    }
+}
