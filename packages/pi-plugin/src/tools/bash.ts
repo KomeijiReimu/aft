@@ -1,6 +1,7 @@
 import {
   type AftProjectTransport,
   BASH_HOST_FALLBACK_REFUSAL,
+  BASH_RETURN_PATHS_DESCRIPTION,
   BASH_RUNON_DESCRIPTION,
   BASH_RUNON_GUIDANCE,
   BashOutputPageDecoder,
@@ -270,6 +271,9 @@ const BashPtyParams = {
 
 const BashRunonParam = {
   runon: Type.Optional(Type.String({ description: BASH_RUNON_DESCRIPTION })),
+  return_paths: Type.Optional(
+    Type.Array(Type.String(), { maxItems: 64, description: BASH_RETURN_PATHS_DESCRIPTION }),
+  ),
 };
 
 /** The full argument set, used for the parameter types `execute` receives. */
@@ -901,6 +905,8 @@ export function registerBashTool(
                 sandbox: params.sandbox,
                 ...(isPowerShell ? { shell: "powershell" } : {}),
                 ...(params.runon !== undefined ? { runon: params.runon } : {}),
+                // Forwarded like `runon`: the engine refuses it without `runon`.
+                ...(params.return_paths !== undefined ? { return_paths: params.return_paths } : {}),
               },
               extCtx,
               {
@@ -948,6 +954,13 @@ export function registerBashTool(
         }
         if (params.runon !== undefined) {
           throw refuseAftModuleOptionWithoutFallback(error, "runon", BASH_HOST_FALLBACK_REFUSAL);
+        }
+        if (params.return_paths !== undefined) {
+          throw refuseAftModuleOptionWithoutFallback(
+            error,
+            "return_paths",
+            BASH_HOST_FALLBACK_REFUSAL,
+          );
         }
         if (!bashCfg.host_fallback) throw error;
         if (bashCfg.memory_limit_mib !== undefined) {

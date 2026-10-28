@@ -588,6 +588,10 @@ pub(crate) struct RemoteLaunch {
     /// environment before it is sent, so only `bash.runon_env` can send a user
     /// value; see `commands::bash_remote_env`.
     pub configured_env_names: Vec<String>,
+    /// Files to copy back after the command, relative to its workdir. Set
+    /// only for an explicit `runon` call that passed `return_paths`.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub return_paths: Vec<String>,
 }
 
 /// Decide where a bash call that set `runon` runs, before anything is spawned.
