@@ -5728,7 +5728,7 @@ mod tests {
             .collect()
     }
 
-    fn files_request(files: &[PathBuf]) -> RawRequest {
+    fn files_request(files: &[impl serde::Serialize]) -> RawRequest {
         serde_json::from_value(serde_json::json!({
             "id": "files-bound", "command": "outline", "files": files,
         }))
