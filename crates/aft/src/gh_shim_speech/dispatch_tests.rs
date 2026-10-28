@@ -320,6 +320,10 @@ impl Fixture {
         let root = dir.path().join("store");
         let state_dir = dir.path().join("shim");
         let project = dir.path().join("project");
+        // Production opens its storage lease before registering speech. The
+        // directory must already exist so symlinked temp ancestors have the
+        // same canonical identity during registration and later lookup.
+        fs::create_dir_all(&root).unwrap();
         fs::create_dir_all(&project).unwrap();
         fs::create_dir_all(&state_dir).unwrap();
         let old_storage = std::env::var_os("AFT_STORAGE_DIR");
@@ -431,6 +435,12 @@ impl Fixture {
             }),
             "fixture-control".into(),
             true,
+        );
+        assert!(
+            crate::gh_shim_speech::service::lookup(&root)
+                .as_ref()
+                .is_some_and(|registered| Arc::ptr_eq(registered, &service)),
+            "fixture speech registration must be found through its supplied storage path: {root:?}"
         );
         let runtime = service.runtime_guard();
         let read = plex.clone();
