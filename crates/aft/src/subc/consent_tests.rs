@@ -787,8 +787,9 @@ async fn occipital_outside_read_refuses_without_any_permission_ask() {
         })
     );
 
-    // Keep filesystem policy controls behind the legacy decoder: a missing
-    // operation marker on v1 is refused before a read can reach that policy.
+    // V1 requests missing an operation marker never reach filesystem policy.
+    // Use the older request format to exercise the read's outside-root refusal
+    // and in-root success independently of operation admission.
     let carrier = carrier(tool_provider::RouteRole::Legacy);
     assert!(matches!(
         crate::subc::access_grants::ask_route(&carrier),
