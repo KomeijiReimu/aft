@@ -49,7 +49,7 @@ fn identity(root: &Path, kind: &str, id: &str, channel: u16) -> RouteIdentity {
             }))
             .unwrap(),
         ),
-        call_mode: Default::default(),
+        call_mode: subc_protocol::call_mode::CallMode::Classic,
         run_scope: OnceLock::new(),
         made_tool_call: AtomicBool::new(false),
         run_owner: None,
@@ -255,6 +255,34 @@ fn stripped_expiry_is_not_head_or_worker_proof() {
             call_modes: true,
             on_behalf_of: false,
         },
+        false,
+    );
+}
+
+#[test]
+fn role_proof_uses_declared_stamp_fields_not_missing_stripped_values() {
+    let mut manifest = manifest::build_manifest();
+    for missing in ["call-modes/v1", "scope-on-behalf-of/v1"] {
+        let provides = &mut manifest.capabilities.as_mut().unwrap().provides;
+        *provides = vec!["call-modes/v1".into(), "scope-on-behalf-of/v1".into()];
+        provides.retain(|value| value != missing);
+        reads_and_calls(
+            &Fixture::new("head"),
+            ProofCapabilities::from_manifest(&manifest),
+            false,
+        );
+        if missing == "call-modes/v1" {
+            reads_and_calls(
+                &Fixture::new("worker"),
+                ProofCapabilities::from_manifest(&manifest),
+                false,
+            );
+        }
+    }
+    manifest.capabilities = None;
+    reads_and_calls(
+        &Fixture::new("head"),
+        ProofCapabilities::from_manifest(&manifest),
         false,
     );
 }
@@ -536,6 +564,14 @@ fn policy_disables_and_reader_admission_have_native_precedence() {
         "tool_disabled"
     );
     session.admit(&f.ctx, "bash_watch").unwrap();
+    Arc::get_mut(&mut f.policy.0).unwrap().disabled_tools = Arc::new(vec!["bash_watch".into()]);
+    assert_eq!(
+        f.resolve().admit(&f.ctx, "bash_watch").unwrap_err().code,
+        "tool_disabled"
+    );
+    Arc::get_mut(&mut f.policy.0).unwrap().disabled_tools = Arc::new(vec!["bash".into()]);
+    reads_and_calls(&f, PROOFS, true);
+    Arc::get_mut(&mut f.policy.0).unwrap().disabled_tools = Arc::new(vec!["bash_status".into()]);
     Arc::get_mut(&mut f.carrier.0)
         .unwrap()
         .scope
@@ -676,7 +712,12 @@ async fn carrier_presets_never_promote_flow_head_and_task_seam_fails_closed() {
 async fn worker_opening_database_waits_for_every_carrier_operation() {
     use std::future::Future;
     let _manifest = super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
-    for name in ["read", "bash_status", "bash_watch"] {
+    for op in ["read", "bash_status", "bash_output", "bash_watch"] {
+        let name = if op == "bash_output" {
+            "bash_status"
+        } else {
+            op
+        };
         let f = Fixture::new("worker");
         f.ctx.clear_db();
         f.ctx.mark_database_runtime_initializing_for_test();
@@ -687,7 +728,7 @@ async fn worker_opening_database_waits_for_every_carrier_operation() {
         } else if name == "bash_watch" {
             json!({"rich_ui_op":"bash_watch@1","task":"call","pattern":"done"})
         } else {
-            json!({"rich_ui_op":"bash_status@1","task":"call"})
+            json!({"rich_ui_op":format!("{op}@1"),"task":"call"})
         };
         let decoded = DecodedFrame {
             frame: Frame::build(
@@ -838,4 +879,75 @@ async fn flow_read_carrier_keeps_earlier_principal_refusal() {
     .await;
     let body: Value = serde_json::from_slice(&reply.body).unwrap();
     assert_eq!(body["code"], "file_read_exact_route_not_admitted", "{body}");
+}
+
+#[tokio::test]
+async fn unscoped_occipital_tool_call_is_not_session_bound() {
+    let _manifest = super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let mut f = Fixture::new("head");
+    Arc::get_mut(&mut f.carrier.0).unwrap().scope = None;
+    let reply = exchange(
+        &f,
+        "read",
+        json!({"rich_ui_op":"read@1","path":"x"}),
+        "head",
+    )
+    .await;
+    assert_eq!(reply.header.ty, FrameType::Error);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&reply.body).unwrap()["code"],
+        "session_not_bound"
+    );
+}
+
+#[tokio::test]
+async fn unresolved_policy_is_typed_and_database_and_preset_errors_precede_mode() {
+    let _manifest = super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let mut f = Fixture::new("head");
+    Arc::get_mut(&mut f.policy.0).unwrap().session.push('x');
+    let reply = exchange(
+        &f,
+        "read",
+        json!({"rich_ui_op":"read@1","path":"x"}),
+        "head",
+    )
+    .await;
+    assert_eq!(reply.header.ty, FrameType::Error);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&reply.body).unwrap()["code"],
+        "session_not_bound"
+    );
+    let mut f = Fixture::new("worker");
+    remote_policy::catalog(json!({"preset":"reader"}), &f.policy, &f.ctx).unwrap();
+    Arc::get_mut(&mut f.carrier.0).unwrap().call_mode =
+        subc_protocol::call_mode::CallMode::Unknown("unsupported".into());
+    let reply = exchange(
+        &f,
+        "read",
+        json!({"rich_ui_op":"read@1","path":"x"}),
+        "worker",
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&reply.body).unwrap(),
+        super::super::carrier::error_body("session_preset_ambiguous")
+    );
+    f.ctx.clear_db();
+    for op in ["read", "bash_status", "bash_output", "bash_watch"] {
+        let name = if op == "bash_output" {
+            "bash_status"
+        } else {
+            op
+        };
+        let args = match op {
+            "read" => json!({"rich_ui_op":"read@1","path":"x"}),
+            "bash_watch" => json!({"rich_ui_op":"bash_watch@1","task":"call","pattern":"done"}),
+            _ => json!({"rich_ui_op":format!("{op}@1"),"task":"call"}),
+        };
+        let reply = exchange(&f, name, args, "head").await;
+        assert_eq!(
+            serde_json::from_slice::<Value>(&reply.body).unwrap(),
+            super::super::carrier::error_body("database_unavailable")
+        );
+    }
 }
