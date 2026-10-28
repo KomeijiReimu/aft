@@ -110,8 +110,12 @@ async fn foreground_call_rejects_each_rebound_launch_identity_field() {
             _ => unreachable!(),
         }
         params["request"]["metadata"]["agent_id"] = json!(stamp.attributes.agent_id);
-        let mut routes = fixture.routes(true);
-        routes.routes.clear();
+        let mut routes = RouteScopes::default();
+        routes.speech = Some(fixture.service.clone());
+        routes.push_origin(
+            fixture.launch.origin.clone().unwrap(),
+            Some(fixture.head.clone()),
+        );
         routes.push(&fixture.session, Some(stamp));
         let answer = post_params(&fixture, &params, &routes).await;
         assert_eq!(
