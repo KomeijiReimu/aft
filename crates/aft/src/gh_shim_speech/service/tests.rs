@@ -49,6 +49,87 @@ fn fixture() -> (tempfile::TempDir, Arc<Service>, Arc<AtomicUsize>) {
     (dir, service, calls)
 }
 
+#[test]
+fn binding_reply_diagnostics_distinguish_missing_generation_missing_rows_and_invalid_rows() {
+    use serde_json::json;
+    let desired = BTreeMap::from([("cortexkit/subconscious".into(), "agent-subc".into())]);
+    for (reply, expected) in [
+        (json!({"bindings":[]}), "missing_repo_binding_generation"),
+        (json!({"repo_binding_generation":36}), "invalid_binding"),
+        (
+            json!({"repo_binding_generation":36,"bindings":[]}),
+            "no_binding_row:",
+        ),
+        (
+            json!({"repo_binding_generation":36,"bindings":[{"repository":"cortexkit/subconscious","agent_id":"agent-subc","app_handle_id":""}]}),
+            "invalid_binding",
+        ),
+    ] {
+        let refusal = parse_bindings(&desired, &reply, "agent-subc").unwrap_err();
+        assert_eq!(refusal.code, Code::AuthorityUnavailable);
+        assert_eq!(refusal.reason, "binding_unverifiable");
+        assert!(
+            refusal.detail.as_deref().unwrap().starts_with(expected),
+            "{refusal:?}"
+        );
+        assert!(refusal.text().contains(expected));
+        assert_eq!(refusal.wire_data()["detail"], refusal.detail.unwrap());
+    }
+}
+
+#[test]
+fn binding_reply_diagnostics_name_both_agents_without_accepting_mismatches() {
+    use serde_json::json;
+    let desired = BTreeMap::from([("cortexkit/subconscious".into(), "agent-subc".into())]);
+    let reply = json!({"repo_binding_generation":36,"bindings":[{
+        "repository":"cortexkit/subconscious","agent_id":"agent-aft","app_handle_id":"aft-alfonso"
+    }]});
+    let refusal = parse_bindings(&desired, &reply, "agent-subc").unwrap_err();
+    assert_eq!(refusal.code, Code::IdentityConflict);
+    assert_eq!(refusal.reason, "binding_changed");
+    let detail = refusal.detail.unwrap();
+    assert!(
+        detail.contains("agent-subc") && detail.contains("agent-aft"),
+        "{detail}"
+    );
+}
+
+#[tokio::test]
+async fn binding_read_diagnostics_distinguish_missing_relay_transport_failure_and_timeout() {
+    let (_dir, service, _calls) = fixture();
+    let refusal = service
+        .read_bindings("/project", "session", "agent-a")
+        .await
+        .unwrap_err();
+    assert_eq!(refusal.detail.as_deref(), Some("relay_unavailable"));
+
+    let relay = GhRelay::new(service.root.join("missing-connection.json"));
+    service.runtime.lock().unwrap().as_mut().unwrap().relay = Arc::downgrade(&relay);
+    let refusal = service
+        .read_bindings("/project", "session", "agent-a")
+        .await
+        .unwrap_err();
+    assert!(
+        refusal
+            .detail
+            .as_deref()
+            .unwrap()
+            .starts_with("binding_read_transport:"),
+        "{refusal:?}"
+    );
+
+    let daemon = crate::gh_shim_relay::tests::fake_daemon_holding_first_request().await;
+    let relay = Arc::new(GhRelay {
+        transport: daemon.transport().await,
+    });
+    service.runtime.lock().unwrap().as_mut().unwrap().relay = Arc::downgrade(&relay);
+    let refusal = service
+        .read_bindings("/project", "session", "agent-a")
+        .await
+        .unwrap_err();
+    assert_eq!(refusal.detail.as_deref(), Some("binding_read_timeout"));
+}
+
 #[tokio::test]
 async fn route_loss_scope_probes_are_single_flight_and_expired_answers_are_refreshed() {
     let (_dir, service, calls) = fixture();

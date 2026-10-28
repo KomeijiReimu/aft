@@ -298,6 +298,9 @@ struct LaunchOptions {
     command: Option<String>,
     seal_failure: Option<Refusal>,
     fail_revocation: bool,
+    repository: Option<String>,
+    agent: Option<String>,
+    handle: Option<String>,
     pause: Option<(
         std::sync::mpsc::Sender<String>,
         std::sync::mpsc::Receiver<()>,
@@ -319,7 +322,13 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("store");
         let state_dir = dir.path().join("shim");
-        let project = dir.path().join("project");
+        let project = dir.path().join(
+            options
+                .repository
+                .as_deref()
+                .and_then(|repo| repo.split('/').next_back())
+                .unwrap_or("project"),
+        );
         // Production opens its storage lease before registering speech. The
         // directory must already exist so symlinked temp ancestors have the
         // same canonical identity during registration and later lookup.
@@ -333,10 +342,19 @@ impl Fixture {
             Env::set("AFT_GH_SHIM_STATE_DIR", state_dir.as_os_str()),
         ];
         let paths = StatePaths::from_root(state_dir);
-        let manifest = super::tests::fixture_manifest();
+        let mut manifest = super::tests::fixture_manifest();
+        if let Some(repo) = &options.repository {
+            manifest
+                .bindings
+                .insert(repo.clone(), options.agent.clone().unwrap());
+        }
         super::tests::write_signed_manifest(&paths, manifest.clone(), unix_seconds());
         load_manifest(&paths, unix_seconds()).unwrap();
-        let (repo, agent) = manifest.bindings.iter().next().unwrap();
+        let (repo, agent) = options
+            .repository
+            .as_ref()
+            .map(|repo| manifest.bindings.get_key_value(repo).unwrap())
+            .unwrap_or_else(|| manifest.bindings.iter().next().unwrap());
         let head = ScopeStamp::new(
             subc_protocol::Principal::Reserved {
                 module_id: "prefrontal-core".into(),
@@ -378,7 +396,10 @@ impl Fixture {
             state: Arc::new(Mutex::new(PlexState {
                 repo: repo.clone(),
                 agent: agent.clone(),
-                handle: "app-original".into(),
+                handle: options
+                    .handle
+                    .clone()
+                    .unwrap_or_else(|| "app-original".into()),
                 generation: 4,
                 scopes,
                 unknown: HashSet::new(),
@@ -398,8 +419,23 @@ impl Fixture {
                 crate::gh_shim_relay::tests::fake_daemon_with_reply(Arc::new(
                     move |body, scope| {
                         let args = &body["arguments"];
+                        if args["op"] == "bindings.read_for_agent" {
+                            if args.as_object().unwrap().len() != 2 || !args["agent_id"].is_string() {
+                                return json!({"error":{"code":"invalid_request"}});
+                            }
+                            let reply = server.bindings();
+                            return if args["agent_id"] == reply["bindings"][0]["agent_id"] {
+                                json!({"result":reply})
+                            } else {
+                                json!({"result":{"repo_binding_generation":reply["repo_binding_generation"],"bindings":[]}})
+                            };
+                        }
                         if args["op"] == "bindings.read" {
-                            return server.bindings();
+                            let mut reply = server.bindings();
+                            if args["connection_id"] != format!("github-handle-{}", reply["bindings"][0]["app_handle_id"].as_str().unwrap()) {
+                                reply["bindings"] = json!([]);
+                            }
+                            return json!({"result":reply});
                         }
                         let expected = serde_json::to_value(subc_client_rs::ScopeSelector::new(
                             server.head.owner.clone(),

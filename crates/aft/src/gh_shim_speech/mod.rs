@@ -79,6 +79,7 @@ pub(crate) struct Refusal {
     pub(crate) code: Code,
     pub(crate) reason: String,
     pub(crate) role: Option<ScopeRole>,
+    pub(crate) detail: Option<String>,
 }
 
 impl Refusal {
@@ -87,6 +88,7 @@ impl Refusal {
             code,
             reason: reason.into(),
             role: None,
+            detail: None,
         }
     }
 
@@ -95,6 +97,7 @@ impl Refusal {
             code,
             reason: reason.into(),
             role: Some(role),
+            detail: None,
         }
     }
 
@@ -115,10 +118,14 @@ impl Refusal {
             Code::ScopeEnded => ENDED_TEXT,
             Code::ScopeUnknown => UNKNOWN_TEXT,
         };
-        template.replace("{reason}", &self.reason).replace(
+        let text = template.replace("{reason}", &self.reason).replace(
             "{scope_role}",
             self.role.unwrap_or(ScopeRole::Authority).label(),
-        )
+        );
+        match &self.detail {
+            Some(detail) => format!("{text} Detail: {detail}"),
+            None => text,
+        }
     }
 
     pub(crate) fn agent_text(&self) -> String {
@@ -134,6 +141,9 @@ impl Refusal {
         });
         if let Some(role) = self.role {
             value["scope_role"] = json!(role);
+        }
+        if let Some(detail) = &self.detail {
+            value["detail"] = json!(detail);
         }
         value
     }
