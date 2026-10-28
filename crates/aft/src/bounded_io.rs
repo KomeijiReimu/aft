@@ -377,9 +377,10 @@ pub(crate) fn with_budget<T>(budget: Option<Budget>, work: impl FnOnce() -> T) -
 pub(crate) fn enter(budget: Option<Budget>) -> Scope {
     Scope(CURRENT.with(|current| current.replace(budget)))
 }
-/// How long the request's filesystem deadline is held off while
-/// [`excluding_wait`] runs. Each bounded call inside still has its own
-/// per-access cap, so a stalled filesystem fails within that cap.
+/// The deadline bounded calls see while [`excluding_wait`] runs, far enough
+/// out that only their per-access cap limits them, so a stalled filesystem
+/// still fails within that cap. Afterwards the request's own deadline moves
+/// later by the time the wait actually took, not by this amount.
 const WAIT_DEADLINE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Runs `wait`, work that waits for or brings up shared state the request then
 /// reads (binding the checkout's lexical view, for example), without spending
