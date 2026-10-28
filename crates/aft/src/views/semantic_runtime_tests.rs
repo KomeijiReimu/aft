@@ -2428,9 +2428,151 @@ fn semantic_fill_releases_cold_slot_during_model_call_and_readmits_before_store(
         "non-semantic cold build was blocked by an embedding wait"
     );
     assert_eq!(pending_during_call, 1, "embedding wait was reported ready");
-    assert!(readmitted, "fill stored vectors without local-work admission");
+    assert!(
+        readmitted,
+        "fill stored vectors without local-work admission"
+    );
     assert_eq!(pending_before_store, 1);
     assert!(query(&runtime, "delayed vector").complete());
+}
+
+fn build_independent_callgraph(root: &Path, storage: &Path) {
+    let graph = super::super::callgraph::CallgraphView::new(
+        root.to_path_buf(),
+        crate::root_cache::StoragePaths::same(storage),
+        "independent-callgraph".into(),
+        crate::blob_store::v2::TrigramPolicy {
+            max_file_size: 1 << 20,
+        },
+    )
+    .unwrap();
+    let reader = graph.reader().unwrap();
+    assert_eq!(
+        reader
+            .callers_of(Path::new("a.ts"), "target", 1)
+            .unwrap()
+            .callers
+            .len(),
+        1
+    );
+}
+
+#[test]
+#[ignore = "fixed-delay before/after measurement; run explicitly with --ignored --nocapture"]
+fn semantic_fill_cold_slot_fixed_delay_measurement() {
+    const ROOTS: usize = 6;
+    const GRAPHS: usize = 8;
+    const DELAY: Duration = Duration::from_millis(150);
+    let cold = crate::cold_build_limiter::isolated_limiter(2);
+    let preparation = crate::cold_build_limiter::isolated_limiter(PREPARATION_LIMIT);
+    let storage: Vec<_> = (0..ROOTS).map(|_| tempfile::tempdir().unwrap()).collect();
+    let roots: Vec<_> = (0..ROOTS).map(|_| tempfile::tempdir().unwrap()).collect();
+    let graph_storage: Vec<_> = (0..GRAPHS).map(|_| tempfile::tempdir().unwrap()).collect();
+    let graph_roots: Vec<_> = (0..GRAPHS).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut lanes = Vec::new();
+    for (i, root) in roots.iter().enumerate() {
+        for file in 0..4 {
+            write_tree(
+                root.path(),
+                &[(
+                    &format!("file_{file}.rs"),
+                    &format!("pub fn root_{i}_file_{file}() {{}}\n"),
+                )],
+            );
+        }
+        lanes.push(served_lane(storage[i].path(), root.path()));
+    }
+    for root in &graph_roots {
+        write_tree(
+            root.path(),
+            &[
+                ("a.ts", "export function target() {}\n"),
+                (
+                    "b.ts",
+                    "import { target } from './a';\nexport function caller() { target(); }\n",
+                ),
+            ],
+        );
+    }
+    let barrier = Arc::new(std::sync::Barrier::new(ROOTS + 1));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (entered_tx, entered_rx) = crossbeam_channel::unbounded();
+    let mut fills = Vec::new();
+    for (i, (slot, epoch, _, runtime)) in lanes.iter().enumerate() {
+        let weak = Arc::downgrade(slot);
+        let epoch = *epoch;
+        let runtime = Arc::clone(runtime);
+        let mut schedule = fast_schedule(roots[i].path());
+        schedule.limiter = Arc::clone(&cold);
+        let preparation = Arc::clone(&preparation);
+        let barrier = Arc::clone(&barrier);
+        let calls = Arc::clone(&calls);
+        let entered = entered_tx.clone();
+        fills.push(std::thread::spawn(move || {
+            barrier.wait();
+            let started = Instant::now();
+            let outcome = catch_up_with_preparation_limiter(
+                &weak,
+                epoch,
+                &runtime,
+                &schedule,
+                FillBudget {
+                    max_batch: 1,
+                    ..FillBudget::default()
+                },
+                &mut |texts| {
+                    assert_eq!(texts.len(), 1);
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    entered.send(()).unwrap();
+                    std::thread::sleep(DELAY);
+                    Model::default().embed(texts)
+                },
+                &preparation,
+            );
+            assert!(matches!(outcome, FillOutcome::Settled));
+            assert!(query(&runtime, "root file").complete());
+            started.elapsed()
+        }));
+    }
+    barrier.wait();
+    // Start unrelated cold builds only after both admitted fills reach the backend.
+    entered_rx.recv().unwrap();
+    entered_rx.recv().unwrap();
+    let mut graphs = Vec::new();
+    for (root, storage) in graph_roots.iter().zip(&graph_storage) {
+        let root = root.path().to_path_buf();
+        let storage = storage.path().to_path_buf();
+        let cold = Arc::clone(&cold);
+        graphs.push(std::thread::spawn(move || {
+            let started = Instant::now();
+            let _permit = crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
+                &cold,
+                "call-graph build",
+                &root,
+                || true,
+            )
+            .unwrap();
+            let wait = started.elapsed();
+            build_independent_callgraph(&root, &storage);
+            wait
+        }));
+    }
+    let fill_time = fills
+        .into_iter()
+        .map(|fill| fill.join().unwrap())
+        .max()
+        .unwrap();
+    let mut waits: Vec<_> = graphs
+        .into_iter()
+        .map(|graph| graph.join().unwrap())
+        .collect();
+    waits.sort();
+    let p95 = waits[(waits.len() * 95).div_ceil(100) - 1];
+    assert_eq!(calls.load(Ordering::SeqCst), ROOTS * 4);
+    eprintln!(
+        "fixed-delay fixture: semantic_roots={ROOTS} files_per_root=4 max_batch=1 backend_delay_ms={} cold_slots=2 callgraph_builds={GRAPHS} non_semantic_wait_p95_ms={:.3} total_fill_ms={:.3}",
+        DELAY.as_millis(), p95.as_secs_f64() * 1000.0, fill_time.as_secs_f64() * 1000.0,
+    );
 }
 
 #[test]
