@@ -70,6 +70,11 @@ pub struct PatternMatch {
     pub once: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch: Option<LineBatch>,
+    /// The watch is a substring watch, so `match_text` is the pattern exactly
+    /// as the agent supplied it rather than text taken from the output.
+    /// Presentation masking must leave it as it is.
+    #[serde(skip)]
+    pub literal_pattern: bool,
 }
 
 impl PatternMatch {
@@ -150,6 +155,8 @@ impl WatchRegistry {
                 context: String::new(),
                 once: watch.once && matched,
                 batch: Some(batch),
+                // A batch's rows are rendered from the output separately.
+                literal_pattern: false,
             });
             if watch.once && matched {
                 self.unregister(task_id, &watch.watch_id);
@@ -403,13 +410,20 @@ impl WatchRegistry {
                 find_match(&watch.pattern, &text, &scan_bytes, prefix_len)
             {
                 self.matched_tasks.insert(task_id.to_string());
-                let (match_text, context) = render(
+                let (rendered_match, context) = render(
                     &text,
                     text_start,
                     text_end,
                     scan_base_offset.saturating_add(source_start as u64),
                     scan_base_offset.saturating_add(source_end as u64),
                 );
+                // A substring watch matches exactly the text the agent gave it,
+                // which the agent already has, so it is shown as given. Only a
+                // regex match is text taken from the output and may be masked.
+                let (match_text, literal_pattern) = match &watch.pattern {
+                    WatchPattern::Substring(needle) => (needle.clone(), true),
+                    WatchPattern::Regex(_) => (rendered_match, false),
+                };
                 matches.push(PatternMatch {
                     watch_id: watch.watch_id.clone(),
                     task_id: watch.task_id.clone(),
@@ -418,6 +432,7 @@ impl WatchRegistry {
                     context,
                     once: watch.once,
                     batch: None,
+                    literal_pattern,
                 });
                 if watch.once {
                     remove_once.push(watch.watch_id);
