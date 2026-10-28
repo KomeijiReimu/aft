@@ -283,14 +283,25 @@ async fn chunk_queries_answer_occipital_on_every_route_shape_and_refuse_others()
     // two-byte UTF-8 character.
     let asset = chunks::tests::split_utf8_asset();
     let template_digest = sha256(&asset);
+    // Store the bytes with a real view record, as the task writer does.
+    // Unreferenced templates can be swept by the module's maintenance timer.
+    let view_manifest = crate::db::rich_ui::ViewManifest {
+        row_digest: template_digest.clone(),
+        row_bytes: asset.clone(),
+        ..crate::db::rich_ui::test_view_manifest_for_test()
+    };
+    let metadata =
+        crate::db::rich_ui::terminal_task_metadata_for_test(Some(&view_manifest.pins[0]));
+    let _view_writing = crate::db::rich_ui::enable_test_view_writing_for_test(view_manifest);
+    let row =
+        crate::db::rich_ui::task_row_for_test(&metadata, "runner", "completed", Some(7), false);
     let db = wire.ctx.app().db().expect("the shared App holds aft.db");
-    db.lock()
-        .unwrap()
-        .execute(
-            "INSERT INTO rich_ui_templates (digest, bytes) VALUES (?1, ?2)",
-            rusqlite::params![template_digest, asset],
-        )
-        .unwrap();
+    {
+        let mut conn = db.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        crate::db::rich_ui::upsert_task_row_with_view(&tx, &row, &metadata).unwrap();
+        tx.commit().unwrap();
+    }
 
     let mut corr = 100;
     for channel in [UNSCOPED, SELF_OWNED, CARRIED] {
@@ -306,6 +317,11 @@ async fn chunk_queries_answer_occipital_on_every_route_shape_and_refuse_others()
                 .await;
             assert_eq!(ty, FrameType::Response, "{reply}");
             replies.push(reply);
+            if channel == UNSCOPED && index == 0 {
+                // Retention between chunk reads must keep the referenced bytes.
+                let mut conn = db.lock().unwrap();
+                crate::db::compression_events::prune_retention_tick(&mut conn, 1).unwrap();
+            }
         }
         let mut sizes = Vec::new();
         let joined = chunks::tests::reassemble(&template_digest, |index| {
