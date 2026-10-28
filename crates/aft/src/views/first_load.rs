@@ -1684,6 +1684,8 @@ enum StableRead {
 struct CachedAttachment(crate::blob_store::v2::FamilyKey);
 
 fn v3_contains(route: &super::snapshot::V3Route, key: &crate::blob_store::v2::FamilyKey) -> bool {
+    #[cfg(test)]
+    let _profile = crate::blob_store::v3::work_profile::span("firstload_contains");
     crate::blob_store::v3::PlaneReader::open_existing(&route.storage, &route.family, key.plane())
         .and_then(|reader| reader.contains(key))
         .unwrap_or(false)

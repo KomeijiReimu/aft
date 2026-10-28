@@ -468,6 +468,8 @@ fn schema_rows(c: &Connection) -> rusqlite::Result<Vec<SchemaRow>> {
         .query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect()
 }
 fn validate(c: &Connection, path: &Path, kind: Kind) -> Result<()> {
+    #[cfg(test)]
+    let _profile = work_profile::span("validate_database");
     let version = c
         .query_row(
             "SELECT format_version FROM format_meta WHERE singleton=1",
