@@ -6590,16 +6590,19 @@ mod v3_bootstrap_tests {
     }
 
     #[test]
-    fn checkout_driver_directory_policy_error_names_operation_and_path() {
+    fn checkout_driver_regular_policy_read_error_names_operation_and_path() {
         let _serial = crate::blob_store::v3::serial_for_test();
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let _attributes = super::super::verification::known_attribute_sources_for_test(root.path());
         let policy_path = root.path().join("nested").join(".gitignore");
-        std::fs::create_dir_all(&policy_path).unwrap();
+        std::fs::create_dir_all(policy_path.parent().unwrap()).unwrap();
+        std::fs::write(&policy_path, b"ignored.rs\n").unwrap();
+        let policy_path = std::fs::canonicalize(policy_path).unwrap();
+        let _failure = super::super::verification::fail_policy_read_for_test(&policy_path);
         let driver = trigram_driver(root.path(), storage.path());
         let error = match driver.reconcile(&driver.access()) {
-            Ok(_) => panic!("directory policy input must not be accepted"),
+            Ok(_) => panic!("regular policy file read failure must not be accepted"),
             Err(error) => error.to_string(),
         };
         assert!(error.contains("view loader [driver]"), "{error}");
@@ -6608,7 +6611,80 @@ mod v3_bootstrap_tests {
             error.contains(&policy_path.display().to_string()),
             "{error}"
         );
-        assert!(policy_path.is_dir());
+        assert!(error.contains("injected policy read failure"), "{error}");
+        assert!(policy_path.is_file());
+    }
+
+    fn policy_git(root: &std::path::Path, args: &[&str]) -> std::process::Output {
+        let mut command = std::process::Command::new("git");
+        command.current_dir(root).args(args);
+        crate::test_env::apply_hermetic_git_env(&mut command);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    #[test]
+    fn checkout_driver_verifies_tracked_policy_named_directories_and_keeps_ignore_rules() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let _attributes = super::super::verification::known_attribute_sources_for_test(root.path());
+        policy_git(root.path(), &["init", "-q"]);
+        for name in [".ignore", ".gitignore"] {
+            let directory = root.path().join("fixtures").join(name);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("keep.rs"), b"fn keep() {}\n").unwrap();
+        }
+        for name in ["by-git.rs", "by-ignore.rs", "by-aft.rs", "keep.rs"] {
+            std::fs::write(root.path().join(name), b"fn sample() {}\n").unwrap();
+        }
+        std::fs::write(root.path().join(".gitignore"), b"by-git.rs\n").unwrap();
+        std::fs::write(root.path().join(".ignore"), b"by-ignore.rs\n").unwrap();
+        std::fs::write(root.path().join(".aftignore"), b"by-aft.rs\n").unwrap();
+        policy_git(root.path(), &["add", "."]);
+        let tracked = policy_git(root.path(), &["ls-files", "-z"]);
+        for name in [
+            b"fixtures/.ignore/keep.rs".as_slice(),
+            b"fixtures/.gitignore/keep.rs",
+        ] {
+            assert!(tracked.stdout.split(|b| *b == 0).any(|path| path == name));
+        }
+        let driver = trigram_driver(root.path(), storage.path());
+        let access = driver.access();
+        let (snapshot, revision) = driver
+            .verified_bind(&access, driver.installed_snapshot().generation().clone())
+            .unwrap();
+        driver.install(&access, &snapshot, revision).unwrap();
+        for name in [
+            "fixtures/.ignore/keep.rs",
+            "fixtures/.gitignore/keep.rs",
+            "keep.rs",
+        ] {
+            let path = RelPath::new(name.as_bytes().to_vec()).unwrap();
+            assert!(
+                matches!(
+                    snapshot.disk_state(&path),
+                    super::super::snapshot::DiskState::Present { .. }
+                ),
+                "{name}"
+            );
+        }
+        for name in ["by-git.rs", "by-ignore.rs", "by-aft.rs"] {
+            assert_eq!(
+                snapshot.disk_state(&RelPath::new(name.as_bytes().to_vec()).unwrap()),
+                super::super::snapshot::DiskState::Absent,
+                "{name}"
+            );
+        }
+        let (verified, _) = driver
+            .verified_bind(&access, snapshot.generation().clone())
+            .unwrap();
+        assert_eq!(verified.membership(), snapshot.membership());
     }
 
     #[test]
@@ -6617,18 +6693,19 @@ mod v3_bootstrap_tests {
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let _attributes = super::super::verification::known_attribute_sources_for_test(root.path());
-        let mut command = std::process::Command::new("git");
-        command.current_dir(root.path()).args(["init", "-q"]);
-        crate::test_env::apply_hermetic_git_env(&mut command);
-        assert!(command.output().unwrap().status.success());
+        policy_git(root.path(), &["init", "-q"]);
         std::fs::write(
             root.path().join(".gitignore"),
             b"excluded/\n!excluded/keep.rs\n",
         )
         .unwrap();
-        std::fs::create_dir_all(root.path().join("excluded/nested/.ignore")).unwrap();
+        std::fs::create_dir_all(root.path().join("excluded/nested")).unwrap();
+        let broken = root.path().join("excluded/nested/.ignore");
+        std::fs::write(&broken, b"*\n").unwrap();
         std::fs::write(root.path().join("excluded/keep.rs"), b"fn excluded() {}\n").unwrap();
         std::fs::write(root.path().join("keep.rs"), b"fn keep() {}\n").unwrap();
+        let broken = std::fs::canonicalize(broken).unwrap();
+        let _failure = super::super::verification::fail_policy_read_for_test(&broken);
         let driver = trigram_driver(root.path(), storage.path());
         super::super::verification::take_policy_input_visits_for_test();
         let reconciled = driver.reconcile(&driver.access()).unwrap();

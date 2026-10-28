@@ -37,12 +37,39 @@ use crate::blob_store::v2::{ContentHash, FamilyKey, FamilyPlane};
 
 #[cfg(test)]
 thread_local! {
+    static POLICY_READ_FAILURE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     static POLICY_INPUT_VISITS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+pub(crate) struct PolicyReadFailure(Option<PathBuf>);
+
+#[cfg(test)]
+impl Drop for PolicyReadFailure {
+    fn drop(&mut self) {
+        POLICY_READ_FAILURE.with(|path| *path.borrow_mut() = self.0.take());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fail_policy_read_for_test(path: &Path) -> PolicyReadFailure {
+    PolicyReadFailure(POLICY_READ_FAILURE.with(|current| current.replace(Some(path.to_path_buf()))))
 }
 
 #[cfg(test)]
 pub(crate) fn take_policy_input_visits_for_test() -> (usize, usize) {
     POLICY_INPUT_VISITS.with(|counts| counts.replace((0, 0)))
+}
+
+fn read_policy_input(path: &Path) -> io::Result<Vec<u8>> {
+    #[cfg(test)]
+    if POLICY_READ_FAILURE.with(|current| current.borrow().as_deref() == Some(path)) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected policy read failure",
+        ));
+    }
+    fs::read(path)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -283,22 +310,34 @@ pub(crate) struct Policy {
     pub reusable: bool,
 }
 
-fn metadata_source(path: &Path, hash: &mut blake3::Hasher) -> io::Result<()> {
+fn metadata_source(path: &Path, hash: &mut blake3::Hasher) -> io::Result<bool> {
     let name = path.as_os_str().as_encoded_bytes();
     hash.update(&(name.len() as u64).to_le_bytes());
     hash.update(name);
-    match fs::read(path) {
+    // A directory or special file with a policy name has no policy bytes. Keep
+    // following symlinks through the existing read path, including its errors.
+    let candidate = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata.is_file() || metadata.file_type().is_symlink(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => return Err(at("reading policy input metadata", path, e)),
+    };
+    if !candidate {
+        hash.update(&[0]);
+        return Ok(false);
+    }
+    match read_policy_input(path) {
         Ok(bytes) => {
             hash.update(&[1]);
             hash.update(&(bytes.len() as u64).to_le_bytes());
             hash.update(&bytes);
+            Ok(true)
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             hash.update(&[0]);
+            Ok(false)
         }
-        Err(e) => return Err(at("reading policy input", path, e)),
+        Err(e) => Err(at("reading policy input", path, e)),
     }
-    Ok(())
 }
 
 impl Policy {
@@ -363,8 +402,7 @@ impl Policy {
                     } else {
                         root.join(path)
                     };
-                    metadata_source(&path, &mut hash)?;
-                    reusable &= !path.exists();
+                    reusable &= !metadata_source(&path, &mut hash)?;
                 }
                 _ => reusable = false,
             }
@@ -422,8 +460,8 @@ impl Policy {
             }
         }
         for path in metadata {
-            metadata_source(path, &mut hash)?;
-            if path.exists()
+            let present = metadata_source(path, &mut hash)?;
+            if present
                 && path
                     .file_name()
                     .is_some_and(|name| name == ".gitattributes" || name == "attributes")
@@ -1258,6 +1296,65 @@ mod tests {
         assert!(!paths
             .iter()
             .any(|path| path.starts_with(root.path().join("excluded"))));
+    }
+
+    #[test]
+    fn nonregular_policy_names_are_absent_but_regular_files_still_contribute() {
+        let root = tempfile::tempdir().unwrap();
+        for name in [".ignore", ".gitignore", ".gitattributes", ".aftignore"] {
+            let path = root.path().join(name);
+            let mut absent = blake3::Hasher::new();
+            assert!(!metadata_source(&path, &mut absent).unwrap());
+            fs::create_dir(&path).unwrap();
+            let mut directory = blake3::Hasher::new();
+            assert!(!metadata_source(&path, &mut directory).unwrap());
+            assert_eq!(directory.finalize(), absent.finalize());
+            fs::remove_dir(&path).unwrap();
+            fs::write(&path, b"ignored.rs\n").unwrap();
+            let mut regular = blake3::Hasher::new();
+            assert!(metadata_source(&path, &mut regular).unwrap());
+            assert_ne!(regular.finalize(), absent.finalize());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_and_socket_policy_names_are_absent_without_opening_them() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = tempfile::tempdir().unwrap();
+        let fifo = root.path().join(".ignore");
+        let socket = root.path().join(".gitignore");
+        let mut absent_fifo = blake3::Hasher::new();
+        let mut absent_socket = blake3::Hasher::new();
+        assert!(!metadata_source(&fifo, &mut absent_fifo).unwrap());
+        assert!(!metadata_source(&socket, &mut absent_socket).unwrap());
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // The path is NUL-terminated and the FIFO remains inside the fixture.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let mut fifo_hash = blake3::Hasher::new();
+        let mut socket_hash = blake3::Hasher::new();
+        assert!(!metadata_source(&fifo, &mut fifo_hash).unwrap());
+        assert!(!metadata_source(&socket, &mut socket_hash).unwrap());
+        assert_eq!(fifo_hash.finalize(), absent_fifo.finalize());
+        assert_eq!(socket_hash.finalize(), absent_socket.finalize());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_symlinks_keep_their_existing_follow_and_error_behavior() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let link = root.path().join(".ignore");
+        fs::write(&target, b"ignored.rs\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(metadata_source(&link, &mut blake3::Hasher::new()).unwrap());
+        fs::remove_file(&target).unwrap();
+        assert!(!metadata_source(&link, &mut blake3::Hasher::new()).unwrap());
+        fs::create_dir(&target).unwrap();
+        let error = metadata_source(&link, &mut blake3::Hasher::new()).unwrap_err();
+        assert!(error.to_string().contains("reading policy input"));
+        assert!(error.to_string().contains(&link.display().to_string()));
     }
 
     #[test]
