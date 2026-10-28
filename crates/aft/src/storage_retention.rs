@@ -13545,6 +13545,11 @@ mod v3_collector_tests {
                         registry.parse::<u64>().unwrap(),
                         store.parse::<u64>().unwrap(),
                     ),
+                    crate::file_identity::metadata(&crate::reader_floor::floor_path(
+                        &observed_storage,
+                    ))
+                    .unwrap()
+                    .1,
                 ));
             }),
         );
@@ -13648,12 +13653,14 @@ mod v3_collector_tests {
         let after = stores(&floor);
         check_baseline(&after);
         let publications = publications.lock().unwrap();
-        let (_, v3_existed, _, _) = publications.first().expect("v3 publication observed");
+        let (_, v3_existed, _, _, _) = publications.first().expect("v3 publication observed");
         assert!(
             !v3_existed,
             "v3 data existed before the first floor boundary"
         );
-        for (published_floor, _, syncs, (registry, store)) in publications.iter() {
+        #[cfg(unix)]
+        let mut durable_floor = None;
+        for (published_floor, _, syncs, (registry, store), identity) in publications.iter() {
             for (domain, required) in [
                 (PersistedStore::ViewsV3Registry, registry),
                 (PersistedStore::ViewsV3Store, store),
@@ -13666,12 +13673,22 @@ mod v3_collector_tests {
                 );
             }
             #[cfg(unix)]
-            assert!(
-                syncs.contains(&(crate::durability::EventKind::DirectorySync, storage.clone())),
-                "the reader floor must be synced before publication: {syncs:?}"
-            );
+            {
+                let proof = (*identity, published_floor.clone());
+                // The first boundary, and every replaced floor entry, must
+                // perform a real sync. Later boundaries may reuse that exact
+                // entry's observed successful sync, never just its versions.
+                if syncs.contains(&(crate::durability::EventKind::DirectorySync, storage.clone())) {
+                    durable_floor = Some(proof.clone());
+                }
+                assert_eq!(
+                    durable_floor.as_ref(),
+                    Some(&proof),
+                    "the current reader floor must be durable before publication: {syncs:?}"
+                );
+            }
             #[cfg(not(unix))]
-            let _ = syncs;
+            let _ = (syncs, identity);
         }
         for required_registry in [
             crate::blob_store::v3::REGISTRY_BASE_REFS_VERSION,
@@ -13680,7 +13697,7 @@ mod v3_collector_tests {
             assert!(
                 publications
                     .iter()
-                    .any(|(_, _, _, (registry, _))| *registry == u64::from(required_registry)),
+                    .any(|(_, _, _, (registry, _), _)| *registry == u64::from(required_registry)),
                 "the production path must exercise registry schema {required_registry}"
             );
         }
