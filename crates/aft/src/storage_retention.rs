@@ -132,6 +132,8 @@ pub(crate) struct TrashReport {
     /// Work examined by the pass's read-only durable-directory census.
     pub protection_census: crate::bash_background::persistence::IdentityCensus,
     pub protection_failure: Option<ProtectionFailure>,
+    /// A failed protection decision remains visible while reaping backs off.
+    pub protection_retry_at_ms: Option<u64>,
     /// The durable-storage census (directory identities no trash removal may
     /// touch), taken at most once per reaper pass and shared by every trash
     /// container that pass visits. Taking it again for each container spent
@@ -248,6 +250,34 @@ struct State {
     reaping: bool,
     trash: TrashReport,
     reaper_cancelled: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    protection_failures: u32,
+    protection_retry: Option<Instant>,
+}
+
+impl State {
+    fn record_trash(&mut self, mut report: TrashReport, now: Instant) {
+        if report.protection_failure.is_some() {
+            self.protection_failures = self.protection_failures.saturating_add(1);
+            // Skip at least one scheduled pass after a failed census. Repeated
+            // failures reach an hourly retry without spending CPU every interval.
+            let delay = (INTERVAL * 2u32.saturating_pow(self.protection_failures.min(3)))
+                .min(Duration::from_secs(60 * 60));
+            self.protection_retry = Some(now + delay);
+            report.protection_retry_at_ms =
+                Some(crate::pins::now_ms().saturating_add(delay.as_millis() as u64));
+        } else {
+            self.protection_failures = 0;
+            self.protection_retry = None;
+        }
+        self.trash = report.clone();
+        if let Some(sweep) = &mut self.report {
+            sweep.trash = report;
+        }
+    }
+
+    fn reaper_ready(&self, now: Instant) -> bool {
+        !self.reaping && self.protection_retry.is_none_or(|retry| now >= retry)
+    }
 }
 
 struct TrashScan {
@@ -3393,19 +3423,19 @@ fn reap_retired(storage: &StoragePaths) -> io::Result<()> {
             report.keep(&storage.artifacts, "reaper_pass", error);
         }
     }
+    let report = {
+        let mut states = states()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = states.entry(storage.artifacts.clone()).or_default();
+        state.record_trash(report, Instant::now());
+        state.trash.clone()
+    };
     crate::slog_info!(
         "storage retention trash root={} report={}",
         storage.artifacts.display(),
         serde_json::to_string(&report).unwrap_or_default()
     );
-    let mut states = states()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let state = states.entry(storage.artifacts.clone()).or_default();
-    state.trash = report.clone();
-    if let Some(sweep) = &mut state.report {
-        sweep.trash = report;
-    }
     result
 }
 
@@ -3518,18 +3548,18 @@ fn reap_retired_with_budget(
 }
 
 fn schedule_reaper(storage: &StoragePaths) {
-    #[cfg(test)]
-    test_hook(&storage.artifacts, "reaper-launch");
     {
         let mut states = states()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = states.entry(storage.artifacts.clone()).or_default();
-        if state.reaping {
+        if !state.reaper_ready(Instant::now()) {
             return;
         }
         state.reaping = true;
     }
+    #[cfg(test)]
+    test_hook(&storage.artifacts, "reaper-launch");
     let storage = storage.clone();
     let worker_storage = storage.clone();
     let spawned = std::thread::Builder::new()
@@ -5689,6 +5719,38 @@ fn record_v3_removal(domain: &mut DomainReport, bytes: Option<u64>) {
 #[cfg(test)]
 mod storage_retention_tests {
     #[test]
+    fn retention_protection_failure_backs_off_and_stays_in_health() {
+        let now = Instant::now();
+        let mut state = State {
+            report: Some(SweepReport::default()),
+            ..Default::default()
+        };
+        for attempt in 1..=5 {
+            state.record_trash(
+                TrashReport {
+                    incomplete: true,
+                    protection_failure: Some(ProtectionFailure::Budget),
+                    ..Default::default()
+                },
+                now,
+            );
+            assert!(!state.reaper_ready(now + INTERVAL));
+            let retry = state.protection_retry.unwrap();
+            assert!(retry <= now + Duration::from_secs(60 * 60));
+            assert!(state.reaper_ready(retry));
+            assert_eq!(state.protection_failures, attempt);
+            let health = serde_json::to_value(state.report.as_ref().unwrap()).unwrap();
+            assert_eq!(health["trash"]["incomplete"], true);
+            assert_eq!(health["trash"]["protection_failure"], "budget");
+            assert!(health["trash"]["protection_retry_at_ms"].as_u64().is_some());
+        }
+        state.record_trash(TrashReport::default(), now);
+        assert!(state.reaper_ready(now));
+        assert_eq!(state.protection_failures, 0);
+        assert!(state.trash.protection_retry_at_ms.is_none());
+    }
+
+    #[test]
     fn retention_protection_large_task_store_fixture() {
         let stress = std::env::var("AFT_STRESS").as_deref() == Ok("1");
         let tasks = if stress { 30_000 } else { 300 };
@@ -5727,6 +5789,41 @@ mod storage_retention_tests {
             fs::write(source.join("payload"), b"retired cache").unwrap();
             retire_directory(temp.path(), &source).unwrap();
         }
+        // Even the default fixture exceeds a small census allowance. An
+        // incomplete protection set must authorize no deletion, then a fresh
+        // pass must be able to reclaim the same prefetched trash entries.
+        let mut cutoff = TrashReport::default();
+        assert!(reap_trash_with_snapshot_budget(
+            &storage,
+            &temp.path().join("index/.retention-trash"),
+            false,
+            Instant::now() + Duration::from_secs(60),
+            &mut crate::bash_background::persistence::RepairBudget::with_entries(500),
+            &mut cutoff,
+            NO_TIME_BOUND,
+        )
+        .unwrap());
+        assert_eq!(cutoff.protection_failure, Some(ProtectionFailure::Budget));
+        assert!(cutoff.incomplete);
+        assert_eq!(cutoff.removed_entries, 0);
+        let mut state = State::default();
+        let failed_at = Instant::now();
+        state.record_trash(cutoff, failed_at);
+        assert!(!state.reaper_ready(failed_at + INTERVAL));
+        assert!(state.reaper_ready(state.protection_retry.unwrap()));
+        for domain in ["index", "inspect"] {
+            let entries = fs::read_dir(temp.path().join(domain).join(".retention-trash"))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(entries.len(), 25);
+            for entry in entries {
+                assert_eq!(
+                    fs::read(entry.path().join("payload")).unwrap(),
+                    b"retired cache"
+                );
+            }
+        }
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut budget = crate::bash_background::persistence::RepairBudget::new();
         let mut report = TrashReport::default();
@@ -5741,7 +5838,7 @@ mod storage_retention_tests {
             }),
         );
         let started = Instant::now();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let cpu_started = thread_cpu_seconds();
         for domain in ["index", "inspect"] {
             reap_trash_with_snapshot_budget(
@@ -5760,7 +5857,7 @@ mod storage_retention_tests {
             started.elapsed().as_secs_f64() * 1_000.0,
             serde_json::to_string(&report).unwrap(),
         );
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         eprintln!(
             "retention fixture: thread_cpu_ms={:.3}",
             (thread_cpu_seconds() - cpu_started) * 1_000.0
@@ -5769,9 +5866,13 @@ mod storage_retention_tests {
         assert!(!report.incomplete, "{report:?}");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(report.protection_census.directories >= tasks * 3);
+        state.record_trash(report, Instant::now());
+        assert!(state.reaper_ready(Instant::now()));
+        assert!(state.protection_retry.is_none());
+        assert!(state.trash.protection_retry_at_ms.is_none());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn thread_cpu_seconds() -> f64 {
         let mut time = libc::timespec {
             tv_sec: 0,
@@ -5851,9 +5952,29 @@ mod storage_retention_tests {
         assert_eq!(report.kept_by_reason.get("protections_budget"), Some(&1));
         assert_eq!(report.removed_entries, 0);
         assert!(report.incomplete);
-        for entry in entries {
+        for entry in &entries {
             assert!(entry.join("payload").exists());
         }
+        let storage = StoragePaths::same(temp.path());
+        states()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(storage.artifacts.clone())
+            .or_default()
+            .record_trash(report, Instant::now());
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = launches.clone();
+        let _hook = observe_test_hook(
+            temp.path(),
+            Arc::new(move |step| {
+                if step == "reaper-launch" {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }),
+        );
+        schedule_reaper(&storage);
+        schedule_reaper(&storage);
+        assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -5916,11 +6037,43 @@ mod storage_retention_tests {
 
     #[test]
     fn retention_protection_keeps_a_nested_live_task_alias() {
-        use crate::bash_background::persistence::{PinnedDir, REPAIR_IDENTITIES};
+        assert_nested_task_alias_protected(false);
+    }
+
+    #[test]
+    fn retention_protection_keeps_a_nested_finished_task_alias() {
+        assert_nested_task_alias_protected(true);
+    }
+
+    fn assert_nested_task_alias_protected(finished: bool) {
+        use crate::bash_background::persistence::{PersistedTask, PinnedDir, REPAIR_IDENTITIES};
+        use crate::bash_background::BgTaskStatus;
         let temp = tempfile::tempdir().unwrap();
-        let task = temp.path().join("tasks/session/live-task");
-        fs::create_dir_all(&task).unwrap();
-        fs::write(task.join("task.json"), b"running task").unwrap();
+        let task = temp.path().join("tasks/session").join("a".repeat(32));
+        fs::create_dir_all(task.join("control")).unwrap();
+        fs::create_dir_all(task.join("io")).unwrap();
+        let mut metadata = PersistedTask::starting(
+            "a".repeat(32),
+            "session".into(),
+            "echo output".into(),
+            temp.path().into(),
+            None,
+            None,
+            false,
+            false,
+        );
+        metadata.status = if finished {
+            BgTaskStatus::Completed
+        } else {
+            BgTaskStatus::Running
+        };
+        if finished {
+            metadata.finished_at = Some(crate::pins::now_ms());
+            metadata.exit_code = Some(0);
+        }
+        let metadata = serde_json::to_vec(&metadata).unwrap();
+        fs::write(task.join("control/metadata.json"), &metadata).unwrap();
+        fs::write(task.join("io/stdout"), b"task output").unwrap();
         let source = temp.path().join("views/0123456789abcdef");
         fs::create_dir_all(source.join("nested")).unwrap();
         fs::write(source.join("nested/output"), b"task output").unwrap();
@@ -5939,7 +6092,7 @@ mod storage_retention_tests {
             entry.join("nested"),
             fs::canonicalize(entry.join("nested")).unwrap(),
         ];
-        let task_id = PinnedDir::open(&task)
+        let task_id = PinnedDir::open(&task.join("io"))
             .unwrap()
             .directory_identity()
             .unwrap();
@@ -5974,7 +6127,11 @@ mod storage_retention_tests {
             fs::read(entry.join("nested/output")).unwrap(),
             b"task output"
         );
-        assert_eq!(fs::read(task.join("task.json")).unwrap(), b"running task");
+        assert_eq!(
+            fs::read(task.join("control/metadata.json")).unwrap(),
+            metadata
+        );
+        assert_eq!(fs::read(task.join("io/stdout")).unwrap(), b"task output");
     }
 
     fn followup_trash_fixture(count: usize) -> (tempfile::TempDir, Vec<PathBuf>) {
