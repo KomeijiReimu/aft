@@ -33,6 +33,8 @@ fn put_batch_keeps_conflict_winners_and_commits_other_rows_in_one_transaction() 
         (key(), b"different".to_vec()),
         (next, b"new row".to_vec()),
         (key(), b"v3 data".to_vec()),
+        (next, b"new row".to_vec()),
+        (next, b"different new row".to_vec()),
     ];
     work_profile::take();
     let outcomes = publish(root.path(), A, 1 << 20, None, |p| {
@@ -45,6 +47,11 @@ fn put_batch_keeps_conflict_winners_and_commits_other_rows_in_one_transaction() 
     ));
     assert!(matches!(outcomes[1], Ok(true)));
     assert!(matches!(outcomes[2], Ok(false)));
+    assert!(matches!(outcomes[3], Ok(false)));
+    assert!(matches!(
+        outcomes[4],
+        Err(Error::Refused("payload_mismatch"))
+    ));
     assert_eq!(work_profile::count("put_transaction"), 1);
     let reader = PlaneReader::open_existing(root.path(), A, FamilyPlane::Semantic).unwrap();
     assert_eq!(reader.get(&key()).unwrap().unwrap(), b"v3 data");

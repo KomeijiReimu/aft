@@ -1895,6 +1895,7 @@ pub fn v3_format_report(path: &Path) -> Result<V3FormatReport> {
     )?)
 }
 
+#[derive(Clone)]
 pub struct PlaneReader {
     database: Arc<connections::Database>,
 }
