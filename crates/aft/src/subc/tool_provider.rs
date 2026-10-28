@@ -5051,7 +5051,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod route_tests {
+pub(in crate::subc) mod route_tests {
     mod carrier_samples;
     #[path = "../../rich_ui/admission/route_tests.rs"]
     mod operation_admission;
@@ -5196,12 +5196,33 @@ mod route_tests {
         exchange_decoded_with_actor(decoded, &routes, &executor, metrics, dispatch).await
     }
 
-    async fn exchange_decoded_with_actor(
+    pub(in crate::subc) async fn exchange_decoded_with_actor(
         decoded: DecodedFrame,
         routes: &HashMap<RouteChannel, RouteIdentity>,
         executor: &Arc<Executor>,
         metrics: &Arc<DispatchPathMetrics>,
         dispatch: DispatchFn,
+    ) -> WriterFrame {
+        exchange_decoded_with_capabilities(
+            decoded,
+            routes,
+            executor,
+            metrics,
+            dispatch,
+            crate::subc::rich_ui::session::ProofCapabilities::from_manifest(
+                &manifest::build_manifest(),
+            ),
+        )
+        .await
+    }
+
+    pub(in crate::subc) async fn exchange_decoded_with_capabilities(
+        decoded: DecodedFrame,
+        routes: &HashMap<RouteChannel, RouteIdentity>,
+        executor: &Arc<Executor>,
+        metrics: &Arc<DispatchPathMetrics>,
+        dispatch: DispatchFn,
+        proofs: crate::subc::rich_ui::session::ProofCapabilities,
     ) -> WriterFrame {
         let (writer, mut replies) = mpsc::channel(8);
         let (bash_tx, _bash_rx) = mpsc::channel(8);
@@ -5212,7 +5233,7 @@ mod route_tests {
             wake: crate::response_finalize::DeferredResponseWake::default(),
         };
         let frame = decoded.frame;
-        handle_tool_call(
+        handle_tool_call_with_capabilities(
             &writer,
             &frame,
             None,
@@ -5243,6 +5264,7 @@ mod route_tests {
             1024 * 1024,
             &drain::ModuleDrainWindow::default(),
             None,
+            proofs,
         )
         .await
         .unwrap();
@@ -8506,6 +8528,7 @@ mod authorization_failure_tests {
         let identity =
             test_support::route_identity_with_trust(root, "authorization", BindTrust::Untrusted);
         PendingBashAsk {
+            handles_progress: false,
             route: route_key(42, 3),
             tool_corr: 78,
             tool_flags: control_flags(),

@@ -282,7 +282,6 @@ pub(super) enum BashLoopAnswer {
     Cancel,
 }
 
-#[derive(Clone)]
 struct HeldBashCall {
     since: Instant,
     phase: BashHoldPhase,
@@ -290,6 +289,34 @@ struct HeldBashCall {
     /// Set once the call reaches its foreground wait; until then the module
     /// loop cannot detach the command because it does not exist yet.
     detach: Option<BashDetachTarget>,
+    _progress: Option<RequestProgress>,
+}
+
+struct RequestProgress {
+    context: std::sync::Weak<crate::context::AppContext>,
+    request_id: String,
+}
+
+impl Drop for RequestProgress {
+    fn drop(&mut self) {
+        if let Some(context) = self.context.upgrade() {
+            context.clear_request_handles_progress(&self.request_id);
+        }
+    }
+}
+
+pub(super) struct ProgressLifetimeGuard(Arc<DispatchPathMetrics>);
+
+impl ProgressLifetimeGuard {
+    pub(super) fn new(metrics: Arc<DispatchPathMetrics>) -> Self {
+        Self(metrics)
+    }
+}
+
+impl Drop for ProgressLifetimeGuard {
+    fn drop(&mut self) {
+        self.0.held_bash_calls.clear_all_progress();
+    }
 }
 
 /// Every bash call whose route request has not yet received a terminal frame.
@@ -311,9 +338,27 @@ impl HeldBashCalls {
                 phase: BashHoldPhase::Spawning,
                 claim: Arc::clone(&claim),
                 detach: None,
+                _progress: None,
             },
         );
         claim
+    }
+
+    /// The held call retains the opt-in to receive progress updates until answered or abandoned.
+    pub(super) fn record_progress(
+        &self,
+        route: RouteChannel,
+        corr: u64,
+        context: &Arc<crate::context::AppContext>,
+        request_id: &str,
+    ) {
+        if let Some(call) = self.lock().get_mut(&(route, corr)) {
+            call._progress = Some(RequestProgress {
+                context: Arc::downgrade(context),
+                request_id: request_id.to_owned(),
+            });
+            context.record_request_handles_progress(request_id);
+        }
     }
 
     pub(super) fn set_phase(&self, route: RouteChannel, corr: u64, phase: BashHoldPhase) {
@@ -347,12 +392,27 @@ impl HeldBashCalls {
     /// Records a client Cancel for a held call. Returns false when no bash
     /// call is held under that id.
     pub(super) fn request_cancel(&self, route: RouteChannel, corr: u64) -> bool {
-        match self.lock().get(&(route, corr)) {
+        match self.lock().get_mut(&(route, corr)) {
             Some(call) => {
+                call._progress.take();
                 call.claim.request_cancel();
                 true
             }
             None => false,
+        }
+    }
+
+    pub(super) fn clear_progress_for_route(&self, route: RouteChannel) {
+        for (&(held_route, _), call) in self.lock().iter_mut() {
+            if held_route == route {
+                call._progress.take();
+            }
+        }
+    }
+
+    pub(super) fn clear_all_progress(&self) {
+        for call in self.lock().values_mut() {
+            call._progress.take();
         }
     }
 

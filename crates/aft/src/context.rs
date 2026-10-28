@@ -29,6 +29,7 @@ mod read_policy_cache {
         context: usize,
         request: String,
         scope: Option<ScopeKey>,
+        scope_grants_denial: Option<crate::access_policy::ScopeGrantsDenial>,
         route_generation: u64,
         policy: RefCell<Option<Arc<AccessPolicy>>>,
         unrestored: RefCell<Option<Vec<crate::context::launch_grants::UnrestoredGrant>>>,
@@ -69,6 +70,7 @@ mod read_policy_cache {
                 .as_ref()
                 .filter(|entry| {
                     let authority_matches = crate::access_policy::scope_matches(&entry.scope)
+                        && entry.scope_grants_denial == crate::access_policy::scope_grants_denial()
                         && entry.route_generation == crate::access_policy::ask_route_generation();
                     if !authority_matches {
                         entry.clear();
@@ -92,6 +94,7 @@ mod read_policy_cache {
             context,
             request: request.to_owned(),
             scope: crate::access_policy::current_scope(),
+            scope_grants_denial: crate::access_policy::scope_grants_denial(),
             route_generation: crate::access_policy::ask_route_generation(),
             policy: RefCell::new(None),
             unrestored: RefCell::new(None),
@@ -102,6 +105,7 @@ mod read_policy_cache {
             // A nested call under another authority must not revive the outer
             // call's old grants when its cache slot is restored on return.
             if !crate::access_policy::scope_matches(&previous.scope)
+                || previous.scope_grants_denial != crate::access_policy::scope_grants_denial()
                 || previous.route_generation != crate::access_policy::ask_route_generation()
             {
                 previous.clear();
@@ -4535,6 +4539,7 @@ pub struct AppContext {
     #[cfg(test)]
     path_restriction_root_canonicalizations: AtomicUsize,
     force_restrict_requests: parking_lot::Mutex<BTreeMap<String, usize>>,
+    progress_requests: parking_lot::Mutex<HashSet<String>>,
     pub harness: parking_lot::Mutex<Option<Harness>>,
     canonical_cache_root: parking_lot::Mutex<Option<PathBuf>>,
     is_worktree_bridge: parking_lot::Mutex<bool>,
@@ -5417,6 +5422,7 @@ impl AppContext {
             #[cfg(test)]
             path_restriction_root_canonicalizations: AtomicUsize::new(0),
             force_restrict_requests: parking_lot::Mutex::new(BTreeMap::new()),
+            progress_requests: parking_lot::Mutex::new(HashSet::new()),
             harness: parking_lot::Mutex::new(None),
             canonical_cache_root: parking_lot::Mutex::new(None),
             is_worktree_bridge: parking_lot::Mutex::new(false),
@@ -6711,6 +6717,10 @@ impl AppContext {
     pub(crate) fn mark_subc_bound(&self) {
         self.lsp().resume();
         self.subc_lifecycle.mark_bound();
+        // Idle release holds the lifecycle gate while clearing the pools. Once
+        // mark_bound returns, an earlier release has finished and later releases
+        // skip this root. Repair even if configure committed before the release.
+        self.attach_ready_database_pools(&self.database_open.lock());
         self.inspect_manager.resume_root_work();
         // A views-on semantic lane pauses its fills while the root is unbound
         // past the grace window; resume them now rather than at the next edit.
@@ -8247,10 +8257,10 @@ impl AppContext {
     /// still running for an older configure from publishing over this one;
     /// taking the open mutex orders this against `publish_database_open`.
     ///
-    /// A rebind that keeps the root and storage directory of a database that
-    /// is already open and ready changes nothing: re-marking it as
-    /// initializing would refuse bash and edits on a working root until the
-    /// rebind's open ran again. A failed or busy database is always retried.
+    /// A rebind that keeps an open, ready database reattaches any detached
+    /// root-local pools without marking persistence as initializing, which
+    /// would refuse bash and edits until another open ran. A failed or busy
+    /// database is always retried.
     pub(crate) fn begin_database_runtime(
         &self,
         canonical_cache_root: PathBuf,
@@ -8259,12 +8269,7 @@ impl AppContext {
     ) {
         let mut slot = self.database_open.lock();
         let target = (canonical_cache_root, storage_root);
-        if self.database_runtime_state.load(Ordering::Acquire) == 2
-            && !slot.running
-            && slot.pending.is_none()
-            && slot.ready_for.as_ref() == Some(&target)
-            && self.app.db_for_path(&target.1.join("aft.db")).is_some()
-        {
+        if slot.ready_for.as_ref() == Some(&target) && self.attach_ready_database_pools(&slot) {
             return;
         }
         slot.epoch = slot.epoch.wrapping_add(1);
@@ -8279,6 +8284,33 @@ impl AppContext {
             dispatched_at: None,
         });
         self.database_runtime_state.store(1, Ordering::Release);
+    }
+
+    /// The caller holds the database-open slot so a newer configure or open
+    /// cannot replace the ready target between checking and attaching its pool.
+    fn attach_ready_database_pools(&self, slot: &crate::database_open::DatabaseOpenSlot) -> bool {
+        if self.database_runtime_state.load(Ordering::Acquire) != 2
+            || slot.running
+            || slot.pending.is_some()
+        {
+            return false;
+        }
+        let Some((_, storage_root)) = slot.ready_for.as_ref() else {
+            return false;
+        };
+        let Some(shared) = self.app.db_for_path(&storage_root.join("aft.db")) else {
+            return false;
+        };
+        {
+            let backup = self.backup.lock();
+            if !backup.uses_db_pool(&shared) {
+                backup.set_db_pool(shared.clone());
+            }
+        }
+        if !self.bash_background.uses_db_pool(&shared) {
+            self.bash_background.set_db_pool(shared);
+        }
+        true
     }
 
     /// Mark persistence as initializing with nothing staged, for tests of the
@@ -9156,6 +9188,20 @@ impl AppContext {
 
     pub fn request_force_restrict(&self, req_id: &str) -> bool {
         self.force_restrict_requests.lock().contains_key(req_id)
+    }
+
+    /// Records a transport capability, never an agent-supplied tool argument.
+    pub fn record_request_handles_progress(&self, req_id: &str) {
+        self.progress_requests.lock().insert(req_id.to_owned());
+    }
+
+    pub fn request_handles_progress(&self, req_id: &str) -> bool {
+        self.progress_requests.lock().contains(req_id)
+    }
+
+    /// Terminal replies retire the capability before the ID can be reused.
+    pub fn clear_request_handles_progress(&self, req_id: &str) {
+        self.progress_requests.lock().remove(req_id);
     }
 
     /// The outside-roots rule this request is judged under: the configured
@@ -14671,7 +14717,9 @@ impl AppContext {
     /// Release resources that can be recreated by an equivalent later bind.
     /// LSP shutdown can wait on child processes, so all work stays off the
     /// executor and subc frame loops.
-    pub(crate) fn release_idle_reopenable_resources_in_background(self: &Arc<Self>) {
+    pub(crate) fn release_idle_reopenable_resources_in_background(
+        self: &Arc<Self>,
+    ) -> std::thread::JoinHandle<()> {
         let ctx = Arc::clone(self);
         std::thread::spawn(move || {
             #[cfg(all(test, windows))]
@@ -14715,7 +14763,7 @@ impl AppContext {
             // Dropped after the lifecycle check releases, so their shutdown
             // never holds up a rebind.
             drop(released);
-        });
+        })
     }
 
     /// Run the idle release again for an evicted root whose filters were kept
@@ -16139,7 +16187,9 @@ impl AppContext {
         // refusals that the admitted route applies.
         let guarded = standalone || self.missing_plugin_route();
         let temp_override = crate::access_policy::temp::roots_override();
+        let scope_grants_denial = crate::access_policy::scope_grants_denial();
         let build = move || {
+            let _grants = crate::access_policy::scope_grants_guard(scope_grants_denial);
             let mut policy = AccessPolicy::from_config(&config, &storage, roots, &home);
             policy.standalone_main_roots = main_roots;
             if guarded {
@@ -16671,7 +16721,7 @@ impl AppContext {
                     original.display()
                 ),
             )),
-            AccessDecision::Deny(AccessDenial::OutsideRoots) => {
+            AccessDecision::Deny(AccessDenial::OutsideRoots | AccessDenial::ScopeGrants(_)) => {
                 let root = self
                     .config()
                     .project_root
@@ -22886,6 +22936,247 @@ mod harness_path_tests {
 mod shared_db_tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn bound_database_root(app: Arc<App>, root: &Path, storage: &Path) -> Arc<AppContext> {
+        let ctx = Arc::new(AppContext::from_app(
+            app,
+            Config {
+                project_root: Some(root.to_path_buf()),
+                storage_dir: Some(storage.to_path_buf()),
+                ..Config::default()
+            },
+        ));
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        ctx.set_canonical_cache_root(root.to_path_buf());
+        ctx.bash_background()
+            .set_harness(crate::harness::Harness::Opencode);
+        {
+            let mut backup = ctx.backup().lock();
+            backup.set_storage_dir(storage.to_path_buf(), 72);
+            backup.set_db_harness(crate::harness::Harness::Opencode);
+        }
+        ctx.begin_database_runtime(
+            root.to_path_buf(),
+            storage.to_path_buf(),
+            "idle-rebind".into(),
+        );
+        crate::database_open::run_staged_open(
+            &ctx,
+            crate::database_open::DatabaseOpenRunner::ConfigureTail,
+            true,
+        );
+        ctx.mark_subc_bound();
+        assert_eq!(ctx.database_runtime_state.load(Ordering::Acquire), 2);
+        ctx
+    }
+
+    fn assert_rebound_backup_is_persisted(ctx: &AppContext, root: &Path, storage: &Path) {
+        let file = root.join("edited.txt");
+        std::fs::write(&file, "before rebind edit").unwrap();
+        let id = ctx
+            .backup()
+            .lock()
+            .snapshot("idle-rebind", &file, "before edit after rebind")
+            .unwrap()
+            .unwrap();
+        std::fs::write(&file, "after rebind edit").unwrap();
+        ctx.backup().lock().record_post_mutation_states();
+        let conn = ctx.db().unwrap();
+        let count: u32 = conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM backups WHERE backup_id = ?1 AND harness = 'opencode'
+             AND session_id = 'idle-rebind' AND project_key = ?2",
+                rusqlite::params![id, crate::path_identity::project_scope_key(root)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "backup taken after rebind must be mirrored to aft.db"
+        );
+
+        // A fresh store must recover the persisted backup rather than reuse
+        // the original store's in-memory backup entries.
+        let mut recovered = BackupStore::new();
+        recovered.set_storage_dir(storage.to_path_buf(), 72);
+        recovered.set_db_harness(crate::harness::Harness::Opencode);
+        recovered.set_db_project_key(crate::path_identity::project_scope_key(root));
+        recovered.set_db_pool(conn);
+        let (entry, warning) = recovered.restore_latest("idle-rebind", &file).unwrap();
+        assert_eq!(entry.backup_id, id);
+        assert!(warning.is_none(), "unexpected restore warning: {warning:?}");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "before rebind edit");
+    }
+
+    #[cfg(unix)]
+    fn completed_rebind_bash_task(ctx: &AppContext, root: &Path, storage: &Path) -> String {
+        let id = ctx
+            .bash_background()
+            .spawn(
+                crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+                "printf 'idle rebind persistence\\n'",
+                "idle-rebind".into(),
+                root.to_path_buf(),
+                std::collections::HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
+                storage.to_path_buf(),
+                16,
+                true,
+                true,
+                Some(root.to_path_buf()),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(completion) = ctx
+                .bash_background()
+                .drain_completions_for_session(Some("idle-rebind"))
+                .into_iter()
+                .find(|completion| completion.task_id == id)
+            {
+                assert_eq!(completion.exit_code, Some(0));
+                return id;
+            }
+            assert!(Instant::now() < deadline, "bash task {id} did not complete");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_rebind_bash_row(ctx: &AppContext, id: &str) {
+        let count: u32 = ctx
+            .db()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM bash_tasks WHERE task_id = ?1 AND status = 'completed'",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "bash task {id} must have an aft.db row");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let events: u32 = ctx
+                .db()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM compression_events WHERE task_id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if events == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "bash task {id} lost its compression event"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ready_root_rebind_reattaches_pools_after_idle_release() {
+        let storage = tempdir().unwrap();
+        let root_a = tempdir().unwrap();
+        let root_b = tempdir().unwrap();
+        let app = App::default_shared();
+        let a = bound_database_root(app.clone(), root_a.path(), storage.path());
+        let b = bound_database_root(app.clone(), root_b.path(), storage.path());
+        let shared = b.db().unwrap();
+        assert!(Arc::ptr_eq(&a.db().unwrap(), &shared));
+        let first = completed_rebind_bash_task(&a, root_a.path(), storage.path());
+        assert_rebind_bash_row(&a, &first);
+
+        a.mark_subc_unbound();
+        a.release_idle_reopenable_resources_in_background()
+            .join()
+            .unwrap();
+        assert!(!a.bash_background().uses_db_pool(&shared));
+        assert!(!a.backup().lock().uses_db_pool(&shared));
+        assert!(!b.subc_unbound_quiesced());
+        assert!(b.bash_background().uses_db_pool(&shared));
+        assert!(b.backup().lock().uses_db_pool(&shared));
+        assert!(Arc::ptr_eq(
+            &app.db_for_path(&storage.path().join("aft.db")).unwrap(),
+            &shared
+        ));
+        a.begin_database_runtime(
+            root_a.path().to_path_buf(),
+            storage.path().to_path_buf(),
+            "idle-rebind".into(),
+        );
+        a.mark_subc_bound();
+        assert_eq!(a.database_open_attempts.load(Ordering::Acquire), 1);
+        assert!(!a.database_runtime_initializing());
+        let second = completed_rebind_bash_task(&a, root_a.path(), storage.path());
+        assert_ne!(first, second);
+        assert_rebind_bash_row(&a, &second);
+        assert_rebound_backup_is_persisted(&a, root_a.path(), storage.path());
+    }
+
+    #[test]
+    fn ready_root_reconfigure_repairs_each_detached_pool_without_another_open() {
+        let storage = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let ctx = bound_database_root(App::default_shared(), root.path(), storage.path());
+        let shared = ctx.db().unwrap();
+        ctx.backup().lock().clear_db_pool();
+        ctx.begin_database_runtime(
+            root.path().to_path_buf(),
+            storage.path().to_path_buf(),
+            "idle-rebind".into(),
+        );
+        assert!(ctx.backup().lock().uses_db_pool(&shared));
+        assert!(ctx.bash_background().uses_db_pool(&shared));
+        ctx.bash_background().clear_db_pool();
+        ctx.begin_database_runtime(
+            root.path().to_path_buf(),
+            storage.path().to_path_buf(),
+            "idle-rebind".into(),
+        );
+        assert!(ctx.backup().lock().uses_db_pool(&shared));
+        assert!(ctx.bash_background().uses_db_pool(&shared));
+        assert!(!ctx.database_runtime_initializing());
+        assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn ready_root_rebind_orders_pool_attach_after_release_and_before_late_release() {
+        let storage = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let ctx = bound_database_root(App::default_shared(), root.path(), storage.path());
+        ctx.mark_subc_unbound();
+
+        // Configure commits before the bound transition. Force idle release into
+        // that gap, so repairing pools only during configure cannot pass.
+        ctx.begin_database_runtime(
+            root.path().to_path_buf(),
+            storage.path().to_path_buf(),
+            "idle-rebind".into(),
+        );
+        ctx.release_idle_reopenable_resources_in_background()
+            .join()
+            .unwrap();
+        ctx.mark_subc_bound();
+        assert_rebound_backup_is_persisted(&ctx, root.path(), storage.path());
+
+        // After the bind, an idle release must not clear the database pools.
+        ctx.release_idle_reopenable_resources_in_background()
+            .join()
+            .unwrap();
+        assert_rebound_backup_is_persisted(&ctx, root.path(), storage.path());
+        assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 1);
+    }
 
     fn failed_database_context() -> (tempfile::TempDir, tempfile::TempDir, AppContext) {
         // Each context owns its storage fixture. A process-wide override would

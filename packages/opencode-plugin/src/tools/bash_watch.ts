@@ -46,6 +46,7 @@ import {
 } from "../v2-session-lifecycle.js";
 import { callBashBridge, coerceOptionalInt, optionalInt, projectRootFor } from "./_shared.js";
 import { bashCompanionRegistered } from "./bash.js";
+import { metadataUpdater } from "./metadata.js";
 
 const z = tool.schema;
 const REGEX_WAIT_SCAN_WINDOW_BYTES = 64 * 1024;
@@ -211,9 +212,7 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
           throw new Error(`${code}: ${message}`);
         }
         await trackV2Watch(ctx, context, taskId, registered.watch_id);
-        const metadata = (context as { metadata?: (data: Record<string, unknown>) => void })
-          .metadata;
-        metadata?.({ taskId, registered: true, watchId: registered.watch_id });
+        await metadataUpdater(context)({ taskId, registered: true, watchId: registered.watch_id });
         return `Watch registered: ${registered.watch_id} on task ${taskId}\nA notification will fire when the pattern matches or the task exits.`;
       }
 
@@ -260,13 +259,16 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
           waited.elapsed_ms,
           role,
         );
-        const metadata = (context as { metadata?: (data: Record<string, unknown>) => void })
-          .metadata;
-        metadata?.({ taskId, status: data.status, waited, convertedToAsync: true });
+        await metadataUpdater(context)({
+          taskId,
+          status: data.status,
+          waited,
+          convertedToAsync: true,
+        });
         return withKillDeadline(convertedText, data, role);
       }
-      const metadata = (context as { metadata?: (data: Record<string, unknown>) => void }).metadata;
-      if (waited) metadata?.({ taskId, status: data.status, waited, effectiveWaitMs });
+      if (waited)
+        await metadataUpdater(context)({ taskId, status: data.status, waited, effectiveWaitMs });
       return withKillDeadline(
         formatWatchResultText(taskId, data, waited, role, syncWaitCap),
         data,

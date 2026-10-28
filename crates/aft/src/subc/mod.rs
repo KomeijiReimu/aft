@@ -1685,6 +1685,7 @@ struct ReverseCorrKey {
 }
 
 struct PendingBashAsk {
+    handles_progress: bool,
     route: RouteChannel,
     tool_corr: u64,
     tool_flags: Flags,
@@ -2890,6 +2891,7 @@ fn purge_deleted_root_residents(
     );
 
     for route in stale_routes.iter().copied() {
+        metrics.held_bash_calls.clear_progress_for_route(route);
         reclaimed_routes.insert(route);
         remove_installed_route(installed_route_epochs, route);
         remove_route_channel(routes, root_channels, route);
@@ -3500,10 +3502,16 @@ async fn handle_bash_elicitation_reply(
             let _grant_scope = crate::access_policy::scope_guard(
                 routes.get(&key.route).map(access_grants::policy_scope_key),
             );
+            let _grants = crate::access_policy::scope_grants_guard(
+                routes
+                    .get(&key.route)
+                    .and_then(access_grants::scope_grants_denial),
+            );
             let _ask_route = crate::access_policy::ask_route_guard(
                 routes.get(&key.route).map(access_grants::ask_route),
             );
             bash::submit_deferred_bash(
+                pending.handles_progress,
                 executor,
                 bash_deferred_tx,
                 bash_poll_touch_tx,
@@ -3932,6 +3940,7 @@ async fn teardown_installed_route(
     if let Some(cancel) = route_bash_cancels.remove(&channel) {
         cancel.token.cancel();
     }
+    metrics.held_bash_calls.clear_progress_for_route(channel);
     for resolved in pending_responses.drain_route(channel, executor) {
         deliver_resolved_subc_response(
             tx,
@@ -5016,6 +5025,7 @@ where
     let launch_nonce = crate::launch_nonce::current();
     let mut manifest = build_manifest_without(&catalog_disabled);
     manifest::declare_provenance(&mut manifest, crate::launch_nonce::provenance());
+    let rich_ui_proofs = rich_ui::session::ProofCapabilities::from_manifest(&manifest);
     let manifest_provides = manifest.provides.clone();
     let hello_at = tokio::time::Instant::now();
     let hello = ModuleHelloBody {
@@ -5068,6 +5078,7 @@ where
         .as_ref()
         .map(|hooks| Arc::clone(&hooks.metrics))
         .unwrap_or(dispatch_path_metrics);
+    let _progress_lifetime = drain::ProgressLifetimeGuard::new(Arc::clone(&dispatch_path_metrics));
     // Lives until this function returns, i.e. for the whole attached session,
     // including teardown. Dropping it stops the thread.
     #[cfg(test)]
@@ -5967,7 +5978,7 @@ where
                             // The tool-call future is polled on this loop's
                             // thread, so it is boxed to keep its own frame on
                             // the heap instead of widening this loop's frame.
-                            Box::pin(handle_tool_call(
+                            Box::pin(handle_tool_call_with_capabilities(
                                 &writer_tx,
                                 &frame,
                                 parsed_body,
@@ -5998,6 +6009,7 @@ where
                                 tool_response_body_limit,
                                 &module_drain,
                                 Some(&control),
+                                rich_ui_proofs,
                             ))
                             .await
                         };
@@ -6616,6 +6628,7 @@ where
         }
     };
 
+    dispatch_path_metrics.held_bash_calls.clear_all_progress();
     a0.stop();
     let loop_result = if matches!(loop_result, Ok(ModuleLoopExit::Graceful)) {
         candidate_requests
@@ -10201,11 +10214,83 @@ fn bash_watch_warning_wait_ms(
     })
 }
 
+// Direct decoder fixtures use the build's default HELLO capabilities. The live
+// loop passes the snapshot of the actual HELLO sent on that connection instead.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn handle_tool_call(
+    tx: &WriterSender,
+    frame: &Frame,
+    parsed_body: Option<Result<Value, serde_json::Error>>,
+    confinement: Option<remote_policy::CarriedConfinement>,
+    phase_trace: PhaseTrace,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    pending_binds: &HashMap<RouteChannel, PendingBind>,
+    reclaimed_routes: &ReclaimedRoutes,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    executor: &Arc<Executor>,
+    active_tool_calls: &ActiveToolCalls,
+    pending_deferred_setups: &Arc<PendingDeferredSetups>,
+    shutdown: &Arc<Notify>,
+    connection_cancel: &PersistentCancelSignal,
+    bash_deferred_tx: &mpsc::Sender<bash::BashDeferredCompletion>,
+    bash_poll_touch_tx: &mpsc::Sender<ProjectRootId>,
+    metrics: &Arc<DispatchPathMetrics>,
+    route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
+    pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
+    next_bash_ask_corr: &mut u64,
+    bg_subs: &mut HashMap<RouteChannel, BgSub>,
+    bg_sub_by_session: &mut BgSubsBySession,
+    bg_wake_pending: &mut BgWakePending,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    dispatch: DispatchFn,
+    deferred_response_tx: &DeferredResponseSender,
+    allow_native_passthrough: bool,
+    tool_response_body_limit: usize,
+    module_drain: &drain::ModuleDrainWindow,
+    daemon_control: Option<&Arc<readiness::DaemonControl>>,
+) -> Result<(), SubcError> {
+    handle_tool_call_with_capabilities(
+        tx,
+        frame,
+        parsed_body,
+        confinement,
+        phase_trace,
+        routes,
+        pending_binds,
+        reclaimed_routes,
+        live_roots,
+        executor,
+        active_tool_calls,
+        pending_deferred_setups,
+        shutdown,
+        connection_cancel,
+        bash_deferred_tx,
+        bash_poll_touch_tx,
+        metrics,
+        route_bash_cancels,
+        pending_bash_asks,
+        next_bash_ask_corr,
+        bg_subs,
+        bg_sub_by_session,
+        bg_wake_pending,
+        bg_wake_epoch,
+        dispatch,
+        deferred_response_tx,
+        allow_native_passthrough,
+        tool_response_body_limit,
+        module_drain,
+        daemon_control,
+        rich_ui::session::ProofCapabilities::from_manifest(&manifest::build_manifest()),
+    )
+    .await
+}
+
 /// Route-channel tool call: `{name, arguments}` → executor lane → dispatch to
 /// the sync command core → wrap the structured Response in a CallToolResult
 /// `{content, isError}`. Tool-result mapping: the whole `{success, ...}` Response
 /// serialized into ONE text block; `isError` carries `success == false`.
-async fn handle_tool_call(
+async fn handle_tool_call_with_capabilities(
     tx: &WriterSender,
     frame: &Frame,
     parsed_body: Option<Result<Value, serde_json::Error>>,
@@ -10236,6 +10321,7 @@ async fn handle_tool_call(
     tool_response_body_limit: usize,
     module_drain: &drain::ModuleDrainWindow,
     daemon_control: Option<&Arc<readiness::DaemonControl>>,
+    rich_ui_proofs: rich_ui::session::ProofCapabilities,
 ) -> Result<(), SubcError> {
     metrics.mark_frame_loop_entry("handle_tool_call", frame);
     let module_draining = module_drain.is_active();
@@ -10388,6 +10474,12 @@ async fn handle_tool_call(
     }
     let mut route_request = if identity.role == tool_provider::RouteRole::ToolProviderV1 {
         note_route_tool_call(&identity, metrics);
+        let mut envelope = envelope;
+        let handles_progress = envelope
+            .as_object_mut()
+            .and_then(|body| body.remove("handles_progress"))
+            .and_then(|value| value.as_bool())
+            == Some(true);
         let mut call = match serde_json::from_value::<
             cortexkit_role_tool_provider::call::ToolCallRequest,
         >(envelope)
@@ -10421,14 +10513,18 @@ async fn handle_tool_call(
                 )
                 .await;
             }
-            Ok(Some(_operation)) => {
-                // A published operation alone grants no access to a session.
-                // Refuse rather than dispatch without a proven session policy.
-                return send_provider_error(
+            Ok(Some(operation)) => {
+                return rich_ui::session::submit(
                     tx,
-                    metrics,
                     frame,
-                    rich_ui::chunks::refusal("session_not_bound"),
+                    identity,
+                    routes,
+                    executor,
+                    active_tool_calls,
+                    metrics,
+                    operation,
+                    dispatch,
+                    rich_ui_proofs,
                 )
                 .await;
             }
@@ -10497,6 +10593,7 @@ async fn handle_tool_call(
         }
         RouteRequest::ToolCall(ToolCallRequest {
             name: call.name,
+            handles_progress,
             arguments,
             edit_slot_survives: None,
             preview: false,
@@ -10987,6 +11084,7 @@ async fn handle_tool_call(
                     corr: reverse_corr,
                 },
                 PendingBashAsk {
+                    handles_progress: call.handles_progress,
                     route: route_id,
                     tool_corr: frame.header.corr,
                     tool_flags: frame.header.flags,
@@ -11045,11 +11143,14 @@ async fn handle_tool_call(
 
         let _grant_scope =
             crate::access_policy::scope_guard(Some(access_grants::policy_scope_key(&identity)));
+        let _grants =
+            crate::access_policy::scope_grants_guard(access_grants::scope_grants_denial(&identity));
         let _secret_identity = secret_consent::SecretIdentityGuard::install(identity.clone());
         let _ask_route = crate::access_policy::ask_route_guard(Some(
             access_grants::ask_route_for_call(&identity, &bare_name, &arguments),
         ));
         bash::submit_deferred_bash(
+            call.handles_progress,
             executor,
             bash_deferred_tx,
             bash_poll_touch_tx,
@@ -11181,6 +11282,9 @@ async fn handle_tool_call(
             let _grant_scope = crate::access_policy::scope_guard(Some(
                 access_grants::policy_scope_key(&identity_for_run),
             ));
+            let _grants = crate::access_policy::scope_grants_guard(
+                access_grants::scope_grants_denial(&identity_for_run),
+            );
             let _ask_route =
                 crate::access_policy::ask_route_guard(Some(access_grants::ask_route_for_call(
                     &identity_for_run,
@@ -12179,6 +12283,7 @@ fn decode_legacy_route_request(envelope: Value) -> Result<RouteRequest, SubcErro
             };
             Ok(RouteRequest::ToolCall(ToolCallRequest {
                 name,
+                handles_progress: false,
                 arguments,
                 edit_slot_survives: None,
                 preview: false,
@@ -12230,6 +12335,9 @@ fn provider_shell_selector(name: &str, args: &mut serde_json::Map<String, Value>
 /// `schema_pin`) keep the shared type's wire names.
 #[derive(Debug, Deserialize)]
 struct ToolCallRequest {
+    /// The transport has a receiver for request-scoped progress pushes.
+    #[serde(default)]
+    handles_progress: bool,
     name: String,
     #[serde(default)]
     arguments: Value,
@@ -16491,6 +16599,7 @@ mod tests {
             asks.insert(
                 ReverseCorrKey { route, corr: 100 },
                 PendingBashAsk {
+                    handles_progress: false,
                     route,
                     tool_corr: 78,
                     tool_flags: control_flags(),
