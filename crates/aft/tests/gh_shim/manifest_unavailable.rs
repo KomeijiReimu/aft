@@ -2,7 +2,7 @@ use super::*;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Output;
 
-const UNAVAILABLE: &str = "gh-shim: gh_shim_manifest_unavailable: no valid signed routing manifest is available; GitHub writes are refused to prevent use of the operator's credentials. Repair or activate the manifest before retrying. Reads remain available.\n";
+const UNAVAILABLE: &str = "gh-shim: gh_shim_manifest_unavailable: GitHub writes are refused because this machine's signed routing manifest is missing or invalid; without it the write would run as the operator's own account. Ask the operator to repair the manifest. Reads still work.\n";
 
 struct Fixture {
     _root: tempfile::TempDir,
@@ -92,7 +92,7 @@ impl Fixture {
     fn assert_refused(&self, args: &[&str], bypass: bool, text: &str) {
         let output = self.run(args, bypass);
         assert_eq!(output.status.code(), Some(86), "{args:?}: {output:?}");
-        assert_eq!(String::from_utf8_lossy(&output.stderr), text);
+        assert_eq!(output.stderr, text.as_bytes());
         assert!(
             !self.record.exists(),
             "refused command executed upstream gh"
@@ -229,7 +229,7 @@ fn gh_shim_manifest_unavailable_home_default_survives_empty_override() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(86), "{output:?}");
-    assert_eq!(String::from_utf8_lossy(&output.stderr), UNAVAILABLE);
+    assert_eq!(output.stderr, UNAVAILABLE.as_bytes());
     assert!(!fixture.record.exists());
 }
 
@@ -299,6 +299,95 @@ fn gh_shim_manifest_unavailable_safe_reads_keep_native_worker_guard() {
 }
 
 #[test]
+fn gh_shim_manifest_unavailable_captured_authority_and_operator_bypass() {
+    use sha2::Digest;
+
+    let fixture = Fixture::new();
+    fixture.activate();
+    let manifest = fixture.state.join("gh-routing-manifest.json");
+    let envelope = fs::read(&manifest).unwrap();
+    let ticket = (0..TEST_GH_SHIM_TICKET.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&TEST_GH_SHIM_TICKET[index..index + 2], 16).unwrap())
+        .collect::<Vec<_>>();
+    let view = fixture._root.path().join("speech-start.json");
+    fs::write(
+        &view,
+        serde_json::to_vec(&json!({
+            "ticket_digest": blake3::derive_key("aft-gh-speech-ticket-v1", &ticket).to_vec(),
+            "policy": {
+                "artifact_id": "gh-routing-manifest",
+                "version": 12,
+                "digest": sha2::Sha256::digest(&envelope).to_vec(),
+                "signed_envelope": envelope,
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(manifest).unwrap();
+    fs::remove_file(&fixture.record).unwrap();
+
+    for bypass in [false, true] {
+        for args in [
+            vec!["issue", "comment", "1", "--body", "offline"],
+            vec!["pr", "merge", "1", "--squash"],
+        ] {
+            let output = fixture
+                .command(&args, bypass)
+                .env("AFT_GH_SPEECH_PROVISIONED", "1")
+                .env("AFT_GH_SPEECH_START_VIEW", &view)
+                .env("AFT_GH_SHIM_TICKET", TEST_GH_SHIM_TICKET)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(86), "{output:?}");
+            assert_eq!(output.stderr, UNAVAILABLE.as_bytes());
+            assert!(!fixture.record.exists());
+            assert!(!fixture.state.join("operator-bypass.jsonl").exists());
+        }
+    }
+}
+
+#[test]
+fn gh_shim_manifest_unavailable_worker_refusal_keeps_priority_with_bypass() {
+    let fixture = Fixture::new();
+    fixture.high_water();
+    let capability = fixture._root.path().join("capability");
+    fs::write(&capability, "0123456789abcdef0123456789abcdef").unwrap();
+    for policy_marker in [false, true] {
+        for bypass in [false, true] {
+            for args in [
+                vec!["issue", "comment", "1", "--body", "offline"],
+                vec!["pr", "merge", "1", "--squash"],
+            ] {
+                let mut command = fixture.command(&args, bypass);
+                command
+                    .env("AFT_GH_SHIM_WORKER", "1")
+                    .env("AFT_GH_SPEECH_PROVISIONED", "1");
+                if policy_marker {
+                    command.env("AFT_GH_WORKER_WRITE_POLICY", "1");
+                } else {
+                    command
+                        .env(
+                            "AFT_GH_READ_SOCKET",
+                            fixture._root.path().join("broker.sock"),
+                        )
+                        .env("AFT_GH_READ_CAPABILITY_FILE", &capability);
+                }
+                let output = command.output().unwrap();
+                assert_eq!(output.status.code(), Some(86), "{output:?}");
+                assert_eq!(
+                    output.stderr,
+                    b"gh-shim: gh_shim_worker_write_refused: workers cannot write to GitHub; report what should be posted to your parent instead\n"
+                );
+                assert!(!fixture.record.exists());
+                assert!(!fixture.state.join("operator-bypass.jsonl").exists());
+            }
+        }
+    }
+}
+
+#[test]
 fn gh_shim_manifest_unavailable_disappears_at_late_r3_recheck() {
     let fixture = Fixture::new();
     write_fresh_v12_manifest(&fixture.state_home, unix_seconds());
@@ -328,7 +417,7 @@ fn gh_shim_manifest_unavailable_disappears_at_late_r3_recheck() {
         serde_json::from_slice(&fs::read(fixture.state.join("rung-cache.json")).unwrap()).unwrap();
     assert_eq!(rung["rung"], "R3", "{rung}");
     assert_eq!(output.status.code(), Some(86), "{output:?}");
-    assert_eq!(String::from_utf8_lossy(&output.stderr), UNAVAILABLE);
+    assert_eq!(output.stderr, UNAVAILABLE.as_bytes());
     assert!(
         !fixture.record.exists(),
         "late refusal executed upstream gh"

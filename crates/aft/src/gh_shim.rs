@@ -752,7 +752,7 @@ fn run(args: &[OsString]) -> i32 {
 
 fn run_with(
     args: &[OsString],
-    mut delegate: impl FnMut(&[OsString]) -> i32,
+    mut native_delegate: impl FnMut(&[OsString]) -> i32,
     mut read_identity: impl FnMut(
         &[OsString],
         &Manifest,
@@ -761,6 +761,10 @@ fn run_with(
     ) -> Result<Option<bool>, String>,
 ) -> i32 {
     let paths = StatePaths::from_process();
+    // The manifest can disappear after authority and audit checks finish.
+    // Recheck it before calling upstream gh, including audited operator writes.
+    let mut delegate =
+        |args: &[OsString]| delegate_with_manifest_guard(args, &paths, &mut native_delegate);
     if args.first().and_then(|arg| arg.to_str()) == Some(CO_AUTHOR_LINE_REPORT) {
         if let Some(line) = co_author_line(&paths) {
             println!("{line}");
@@ -915,15 +919,27 @@ fn run_with(
                 &manifest,
                 current_platform(),
             ),
-            ManifestResolution::Regressed { .. }
-            | ManifestResolution::Invalid(_)
-            | ManifestResolution::Dormant => {
+            ManifestResolution::Regressed { manifest, problem } => {
+                if let Some(status) = captured_now() {
+                    return status;
+                }
+                return match regressed_disposition(args, &manifest, current_platform(), &problem) {
+                    RegressedDisposition::Passthrough => {
+                        delegate_after_invalid_manifest_notice(args, &problem, delegate)
+                    }
+                    RegressedDisposition::Refuse { code, text } => refuse(code, &text),
+                };
+            }
+            ManifestResolution::Invalid(_) | ManifestResolution::Dormant => {
+                if let Some(status) = captured_now() {
+                    return status;
+                }
                 return dispatch_without_valid_manifest(
                     args,
                     &paths,
                     invalid_manifest_problem.as_ref(),
                     delegate,
-                )
+                );
             }
         };
         return match disposition {
@@ -4475,6 +4491,16 @@ fn dispatch_without_valid_manifest(
     problem: Option<&ManifestProblem>,
     delegate: impl FnOnce(&[OsString]) -> i32,
 ) -> i32 {
+    if let Some(status) = unavailable_manifest_refusal(args, paths) {
+        return status;
+    }
+    match problem {
+        Some(problem) => delegate_after_invalid_manifest_notice(args, problem, delegate),
+        None => delegate(args),
+    }
+}
+
+fn unavailable_manifest_refusal(args: &[OsString], paths: &StatePaths) -> Option<i32> {
     // The agent may select an empty override. Check the default location too,
     // without constructing StatePaths there: that constructor tightens permissions.
     let default_root = gh_shim_state_dir_from(
@@ -4486,15 +4512,37 @@ fn dispatch_without_valid_manifest(
         || manifest_state_was_provisioned(&default_root))
         && !is_unbound_safe(args)
     {
-        return refuse(
+        return Some(refuse(
             RefusalCode::ManifestUnavailable,
-            "no valid signed routing manifest is available; GitHub writes are refused to prevent use of the operator's credentials. Repair or activate the manifest before retrying. Reads remain available.",
-        );
+            "GitHub writes are refused because this machine's signed routing manifest is missing or invalid; without it the write would run as the operator's own account. Ask the operator to repair the manifest. Reads still work.",
+        ));
     }
-    match problem {
-        Some(problem) => delegate_after_invalid_manifest_notice(args, problem, delegate),
-        None => delegate(args),
+    None
+}
+
+fn delegate_with_manifest_guard(
+    args: &[OsString],
+    paths: &StatePaths,
+    delegate: impl FnOnce(&[OsString]) -> i32,
+) -> i32 {
+    if !is_unbound_safe(args) {
+        match resolve_manifest(paths, unix_seconds()) {
+            ManifestResolution::Invalid(_) | ManifestResolution::Dormant => {
+                if let Some(status) = unavailable_manifest_refusal(args, paths) {
+                    return status;
+                }
+            }
+            ManifestResolution::Regressed { manifest, problem } => {
+                if let RegressedDisposition::Refuse { code, text } =
+                    regressed_disposition(args, &manifest, current_platform(), &problem)
+                {
+                    return refuse(code, &text);
+                }
+            }
+            ManifestResolution::Active(_) => {}
+        }
     }
+    delegate(args)
 }
 
 fn delegate_after_invalid_manifest_notice(
@@ -8743,6 +8791,41 @@ mod tests {
         let _guard = crate::test_env::gh_shim_state_guard();
         let selected = std::env::var_os(GH_SHIM_STATE_DIR_ENV).expect("test state override");
         assert_eq!(StatePaths::from_process().root, PathBuf::from(selected));
+    }
+
+    #[test]
+    fn native_manifest_guard_rechecks_writes_before_upstream_execution() {
+        let _guard = crate::test_env::gh_shim_state_guard();
+        let paths = StatePaths::from_process();
+        let _home = ScopedTestEnvVar::set("HOME", paths.root.to_str());
+        let _xdg = ScopedTestEnvVar::set("XDG_STATE_HOME", paths.root.to_str());
+        write_version_high_water(&paths, 1);
+        let mut calls = 0;
+        for bypass in [None, Some("operator")] {
+            let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", bypass);
+            let status = delegate_with_manifest_guard(
+                &os_args(&["pr", "merge", "1", "--squash"]),
+                &paths,
+                |_| {
+                    calls += 1;
+                    73
+                },
+            );
+            assert_eq!(status, 86);
+        }
+        assert_eq!(calls, 0);
+
+        write_signed_manifest(&paths, fixture_manifest(), unix_seconds());
+        let status = delegate_with_manifest_guard(
+            &os_args(&["pr", "merge", "1", "--squash"]),
+            &paths,
+            |_| {
+                calls += 1;
+                73
+            },
+        );
+        assert_eq!(status, 73);
+        assert_eq!(calls, 1);
     }
 
     /// The shim's state ladder is the operator's XDG state home, deliberately
@@ -16623,6 +16706,16 @@ fn run_captured_protected(
     now: u64,
 ) -> i32 {
     use crate::gh_shim_speech::{Code, Refusal};
+    // Background writes retain a signed policy snapshot from command launch,
+    // but still require the current manifest. Report its absence before dispatch.
+    if matches!(
+        resolve_manifest(paths, now),
+        ManifestResolution::Invalid(_) | ManifestResolution::Dormant
+    ) {
+        if let Some(status) = unavailable_manifest_refusal(args, paths) {
+            return status;
+        }
+    }
     let (manifest, classification, binding, rung) =
         match captured_plan(args, paths, target, cwd, now) {
             Ok(plan) => plan,

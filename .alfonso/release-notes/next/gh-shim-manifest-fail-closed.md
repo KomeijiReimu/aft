@@ -1,1 +1,1 @@
-- GitHub writes now fail closed when a previously provisioned machine has no valid signed routing manifest, while safe reads and unprovisioned installations retain passthrough.
+- GitHub writes now refuse with repair guidance when a previously provisioned machine's routing manifest is missing or invalid; safe reads remain available.
