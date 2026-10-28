@@ -282,14 +282,29 @@ fn session_identity_is_scope_then_exact_labels() {
                 data.root = ProjectRootId::from_path(&data.project_root).unwrap();
             }
         }
-        assert_eq!(
-            resolve(&f.ctx, &carrier, &[f.policy.clone()], PROOFS)
-                .err()
-                .unwrap()
-                .code,
-            "session_not_bound",
-            "{label}"
+        let mut decoy = identity(
+            &carrier.project_root,
+            "head",
+            "reserved:prefrontal-core",
+            45,
         );
+        let decoy_data = Arc::get_mut(&mut decoy.0).unwrap();
+        decoy_data.harness = carrier.harness.clone();
+        decoy_data.session = carrier.session.clone();
+        decoy_data.scope.as_mut().unwrap().scope_ref = "different-session-scope".into();
+        for routes in [
+            vec![f.policy.clone(), decoy.clone()],
+            vec![decoy, f.policy.clone()],
+        ] {
+            assert_eq!(
+                resolve(&f.ctx, &carrier, &routes, PROOFS)
+                    .err()
+                    .unwrap()
+                    .code,
+                "session_not_bound",
+                "{label}"
+            );
+        }
     }
     Arc::get_mut(&mut f.policy.0)
         .unwrap()

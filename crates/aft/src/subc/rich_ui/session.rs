@@ -263,7 +263,7 @@ pub(in crate::subc) async fn submit(
         command_lane(&name),
         id.clone(),
         RouteDetachPolicy::RetainForReplay,
-        &name,
+        &name.clone(),
         RequestFrameMeta {
             ver: frame.header.ver,
             flags: frame.header.flags,
