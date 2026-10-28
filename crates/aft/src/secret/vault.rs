@@ -160,6 +160,14 @@ pub trait SecretVault: Send + Sync {
 
     /// Hand one record to the vault's audit sink.
     fn audit(&self, record: &AuditRecordV1) -> Result<(), AuditError>;
+
+    /// Whether this vault can ever hand key bytes to AFT. A launch hardens the
+    /// process (no core dumps; non-dumpable on Linux) before talking to a vault
+    /// that can. The hardening is irreversible and on Linux costs the daemon
+    /// its own /proc counters, so a vault that never releases material skips it.
+    fn can_release_material(&self) -> bool {
+        true
+    }
 }
 
 /// The vault production uses while the live vault is undeployed and AFT holds
@@ -193,6 +201,10 @@ impl SecretVault for UnavailableVault {
         // it until the vault's shape is live. Count it rather than drop it.
         UNRECORDED_AUDIT_RECORDS.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    fn can_release_material(&self) -> bool {
+        false
     }
 }
 

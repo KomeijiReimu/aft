@@ -975,6 +975,20 @@ fn the_production_vault_ends_an_eligible_launch_with_secrets_unavailable() {
 }
 
 #[test]
+fn the_production_vault_never_hardens_the_process() {
+    // Hardening is irreversible, and on Linux a non-dumpable daemon loses its
+    // own /proc counters. A vault that can never release a key must not
+    // trigger it, even when an eligible launch names a placeholder.
+    let LaunchDecision::Refuse(outcome) =
+        resolve_label_for_launch(&head(), &crate::secret::UnavailableVault, "repo")
+    else {
+        panic!("the production vault refuses every launch")
+    };
+    assert_eq!(outcome.code(), Some(SECRETS_UNAVAILABLE));
+    assert!(!crate::secret_proxy::test_hardening::hardened_on_this_thread());
+}
+
+#[test]
 fn with_several_labels_no_part_starts_while_any_label_is_pending_or_refused() {
     // The launch either starts whole or not at all. A covered label past
     // the pending one does not change that: the proxy must never begin with a
