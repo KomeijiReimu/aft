@@ -1049,7 +1049,6 @@ async fn consent_folder_grant_settles_and_withdraws_covered_sibling() {
     let requests = f.fake.calls("consent.request");
     assert_eq!(requests.len(), 2);
     let key1 = requests[0]["call_key"].as_str().unwrap().to_string();
-    // let _key2 = requests[1]["call_key"].as_str().unwrap().to_string();
     let before: std::collections::HashSet<String> = f
         .asks()
         .into_iter()
@@ -1088,6 +1087,23 @@ async fn consent_folder_grant_settles_and_withdraws_covered_sibling() {
     );
 }
 
+/// The call key of the consent request for `file_name`. Parallel calls file
+/// their requests in either order, so a test must not take the first one.
+#[cfg(unix)]
+fn call_key_for_file(requests: &[Value], file_name: &str) -> String {
+    requests
+        .iter()
+        .find(|request| {
+            request["paths"][0]
+                .as_str()
+                .is_some_and(|path| path.ends_with(file_name))
+        })
+        .unwrap_or_else(|| panic!("no consent request for {file_name}: {requests:?}"))["call_key"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn consent_folder_grant_leaves_uncovered_asks_pending() {
@@ -1108,10 +1124,7 @@ async fn consent_folder_grant_leaves_uncovered_asks_pending() {
         let mut rx1 = f.send_read(&f.worker, &a, 911).await;
         let mut rx2 = f.send_read(&f.worker, &b, 912).await;
         wait_for(|| f.fake.calls("consent.request").len() >= 2).await;
-        let key1 = f.fake.calls("consent.request")[0]["call_key"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let key1 = call_key_for_file(&f.fake.calls("consent.request"), "a.txt");
         f.fake.answer(
             &key1,
             json!({"state": "settled", "outcome": "allow_scope", "answered_by": "user"}),
@@ -1204,10 +1217,7 @@ async fn consent_folder_grant_leaves_uncovered_asks_pending() {
         let mut rx1 = f.send_read(&f.worker, &a, 915).await;
         let mut rx2 = f.send_read(&other, &b, 916).await;
         wait_for(|| f.fake.calls("consent.request").len() >= 2).await;
-        let key1 = f.fake.calls("consent.request")[0]["call_key"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let key1 = call_key_for_file(&f.fake.calls("consent.request"), "a.txt");
         f.fake.answer(
             &key1,
             json!({"state": "settled", "outcome": "allow_scope", "answered_by": "user"}),
@@ -1257,10 +1267,7 @@ async fn consent_folder_grant_leaves_uncovered_asks_pending() {
         let mut rx1 = f.send_read(&f.worker, &a, 917).await;
         let mut rx2 = f.send_read(&other, &b, 918).await;
         wait_for(|| f.fake.calls("consent.request").len() >= 2).await;
-        let key1 = f.fake.calls("consent.request")[0]["call_key"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let key1 = call_key_for_file(&f.fake.calls("consent.request"), "a.txt");
         f.fake.answer(
             &key1,
             json!({"state": "settled", "outcome": "allow_scope", "answered_by": "user"}),
@@ -1305,8 +1312,8 @@ async fn consent_folder_grant_withdraw_race_uses_recorded_outcome() {
     let mut rx2 = f.send_read(&f.worker, &b, 922).await;
     wait_for(|| f.fake.calls("consent.request").len() >= 2).await;
     let requests = f.fake.calls("consent.request");
-    let key1 = requests[0]["call_key"].as_str().unwrap().to_string();
-    let key2 = requests[1]["call_key"].as_str().unwrap().to_string();
+    let key1 = call_key_for_file(&requests, "a.txt");
+    let key2 = call_key_for_file(&requests, "b.txt");
     // Hold the sibling's denial inside its finish so the covering grant's
     // withdraw finds it still live: the withdraw then returns the settled
     // record (like settled-withdraw-reply) and must not override it.
