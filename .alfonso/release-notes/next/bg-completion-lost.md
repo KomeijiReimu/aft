@@ -1,1 +1,0 @@
-Background bash tasks that finish before their launch reply is built now retain their completion notification, including replay after a restart. A terminal status on a launch-only reply no longer acknowledges command output the caller has not received. Foreground results and completed watches still acknowledge their terminal output.

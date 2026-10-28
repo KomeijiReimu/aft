@@ -1,1 +1,0 @@
-Storage cleanup frees more disk space: background command records whose scratch folders hold read-only files (such as Go's module cache) are deleted again, and cache trash left by AFT v0.62.0 or earlier or too large for one cleanup pass is now reclaimed.

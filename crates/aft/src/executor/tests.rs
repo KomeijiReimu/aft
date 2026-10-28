@@ -176,9 +176,13 @@ fn lane_paused_six_cold_roots_leave_slots_and_maintenance_available() {
             })
         }));
     }
-    let paused = (0..ROOTS)
-        .take_while(|_| entered_rx.recv_timeout(Duration::from_secs(3)).is_ok())
-        .count();
+    // Each notification follows the attempt's permit and writer-lock drops.
+    // Allow slow roots to arrive before probing resources; no pause is resumed yet.
+    let pause_deadline = Instant::now() + Duration::from_secs(60);
+    let mut paused = 0;
+    while paused < ROOTS && entered_rx.recv_deadline(pause_deadline).is_ok() {
+        paused += 1;
+    }
     let writer_locks_free = directories
         .iter()
         .filter(|(_, key)| {
@@ -222,7 +226,7 @@ fn lane_paused_six_cold_roots_leave_slots_and_maintenance_available() {
     }
     assert_eq!(
         paused, ROOTS,
-        "paused roots monopolized the shared cold limiter"
+        "not all roots entered the pause before the deadline"
     );
     assert_eq!(writer_locks_free, ROOTS, "a pause retained a writer lock");
     assert_eq!(

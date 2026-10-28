@@ -14135,7 +14135,7 @@ impl BuildPool {
             // constructed.
             match rayon::ThreadPoolBuilder::new()
                 .num_threads(build_pool_size())
-                .thread_name(|index| format!("aft-callgraph-build-{index}"))
+                .thread_name(|index| format!("aft-rayon-callgraph-build-{index}"))
                 .stack_size(8 * 1024 * 1024)
                 .build()
             {

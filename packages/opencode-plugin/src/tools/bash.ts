@@ -9,6 +9,7 @@ import {
   classifyBashHostFallbackError,
   coerceBoolean,
   escalationAskText,
+  formatBashOutputPages,
   groupBashPermissionAsks,
   isLiveBackgroundTaskReply,
   LONGEST_TIMER_DELAY_MS,
@@ -38,6 +39,8 @@ import { runAsk } from "./permissions.js";
 
 const z = tool.schema;
 const METADATA_PREVIEW_LIMIT = 30 * 1024;
+export const BASH_SECRET_HOST_FALLBACK_REFUSAL =
+  "Secret placeholder commands need AFT's shell; OpenCode's built-in shell cannot run them.";
 // Default hard timeout of 30 minutes when the caller omits a timeout. This
 // sizes the bridge transport timeout for bash calls where the server blocks
 // until the command completes or is killed.
@@ -697,6 +700,9 @@ export function createBashTool(
       } catch (error) {
         const fallbackCause = classifyBashHostFallbackError(error);
         if (fallbackCause === undefined) throw error;
+        if (command.includes("{{ck-secret:")) {
+          throw new Error(BASH_SECRET_HOST_FALLBACK_REFUSAL);
+        }
         if (!backgroundDisabled && rawRequestedBackground) {
           throw refuseAftModuleOptionWithoutFallback(
             error,
@@ -801,6 +807,12 @@ export function createBashStatusTool(ctx: PluginContext): ToolDefinition {
         .describe(
           "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
         ),
+      outputOffset: optionalInt(0, Number.MAX_SAFE_INTEGER).describe(
+        "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+      ),
+      stderrOffset: optionalInt(0, Number.MAX_SAFE_INTEGER).describe(
+        "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+      ),
       outputMode: z
         .enum(["screen", "raw", "both"])
         .optional()
@@ -814,7 +826,27 @@ export function createBashStatusTool(ctx: PluginContext): ToolDefinition {
       // bash_status is snapshot-only as of bash_watch landing. waitFor/exit/
       // timeoutMs moved to bash_watch — if the agent passes them here, they're
       // silently ignored at the Zod schema layer (extra keys stripped).
-      const data = await bashStatusSnapshot(ctx, context, taskId, outputMode);
+      const paging = args.outputOffset !== undefined || args.stderrOffset !== undefined;
+      const data = paging
+        ? await callBashBridge(ctx, context, "bash_status", {
+            task_id: taskId,
+            output_mode: outputMode,
+            output_offset: coerceOptionalInt(
+              args.outputOffset,
+              "outputOffset",
+              0,
+              Number.MAX_SAFE_INTEGER,
+            ),
+            stderr_offset: coerceOptionalInt(
+              args.stderrOffset,
+              "stderrOffset",
+              0,
+              Number.MAX_SAFE_INTEGER,
+            ),
+          })
+        : await bashStatusSnapshot(ctx, context, taskId, outputMode);
+      if (data.success === false) throw new Error(String(data.message ?? "bash_status failed"));
+      if (paging) return formatBashOutputPages(data, true);
       const isSubagent = await resolveIsSubagent(ctx.client, context.sessionID, context.directory);
       return await formatBashStatusText(
         context,

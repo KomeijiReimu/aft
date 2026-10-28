@@ -1,1 +1,0 @@
-- Reduced the background-command watchdog's per-tick disk work: while a running task's exit marker is still missing or is the same empty file, the watchdog checks it with a single file-status lookup instead of re-resolving the task folder, re-reading its metadata and reopening the marker every half second. Exits are still seen on the next tick.

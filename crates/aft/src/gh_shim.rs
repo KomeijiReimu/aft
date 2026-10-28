@@ -536,6 +536,12 @@ const REPO_VALUE_FLAGS: &[&str] = &[
 const RESERVED_SELF_REPORT: &[&str] = &["--status", "--shim-version"];
 const CO_AUTHOR_LINE_REPORT: &str = "--co-author-line";
 const GOVERNANCE_UNAVAILABLE_TEXT: &str = "the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns";
+/// Refusal text for a write-class command from a worker shell. A worker shell
+/// carries a read broker, never a write ticket, so no write can ever be
+/// spoken from it: the text names the permanent condition and tells the agent
+/// where to take the write instead of suggesting a retry.
+const WORKER_WRITE_REFUSED_TEXT: &str =
+    "workers cannot write to GitHub; report what should be posted to your parent instead";
 /// Human-readable text for a local discovery-probe deadline expiry. A deadline
 /// that expires on a loaded host does not mean the daemon is unreachable, so
 /// this arm must not say "unreachable". The classification stays
@@ -555,6 +561,7 @@ const GH_SHIM_STATE_DIR_ENV: &str = "AFT_GH_SHIM_STATE_DIR";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RefusalCode {
     WorkerNativeGh,
+    WorkerWriteRefused,
     Unclassified,
     AdminTier,
     ManifestBelowFloor,
@@ -577,8 +584,9 @@ pub enum RefusalCode {
 }
 
 impl RefusalCode {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::WorkerNativeGh,
+        Self::WorkerWriteRefused,
         Self::Unclassified,
         Self::AdminTier,
         Self::ManifestBelowFloor,
@@ -603,6 +611,7 @@ impl RefusalCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::WorkerNativeGh => "gh_shim_worker_native_gh",
+            Self::WorkerWriteRefused => "gh_shim_worker_write_refused",
             Self::Unclassified => "gh_shim_unclassified",
             Self::AdminTier => "gh_shim_admin_tier",
             Self::ManifestBelowFloor => "gh_shim_manifest_below_floor",
@@ -786,6 +795,25 @@ fn run_with(
             },
             delegate,
         );
+    }
+
+    // A worker shell carries a read broker, never a write ticket, so no
+    // write-class command can be spoken from it. Refuse here, before the
+    // manifest lookup, the rung probe for governance reachability, and any
+    // relay traffic, with an instruction instead of a retry hint: retrying
+    // cannot help, and the old governance-unavailable text sent agents back
+    // to retry forever. Credential commands (`gh auth token`, token-revealing
+    // status flags, login/logout and friends) are not writes: they are
+    // excluded here so they keep their existing operator-credentials refusal
+    // below. Reads (`is_unbound_safe`) fall through to the governed-read path
+    // unchanged.
+    if relay_client::RelayContext::from_process()
+        .worker_broker
+        .is_some()
+        && operator_credential_use(args).is_none()
+        && !is_unbound_safe(args)
+    {
+        return refuse(RefusalCode::WorkerWriteRefused, WORKER_WRITE_REFUSED_TEXT);
     }
 
     // Presence-based regressed-manifest arm. Decide from the installed artifact
@@ -7827,9 +7855,57 @@ fn exec_real_gh(real_gh: PathBuf, args: &[OsString]) -> i32 {
     }
 }
 
-fn refuse(code: RefusalCode, text: &str) -> i32 {
+fn refusal_line(code: RefusalCode, text: &str) -> String {
     let text = text.replace(['\n', '\r'], " ");
-    eprintln!("gh-shim: {}: {text}", code.as_str());
+    format!("gh-shim: {}: {text}", code.as_str())
+}
+
+// Test seam: when a test installs a refusal sink, `refuse` records the
+// rendered line there instead of writing to stderr, so tests can assert the
+// exact refusal the agent would see without stealing the process's shared
+// file descriptor 2 (which parallel tests also use). The sink is
+// thread-local, so parallel tests never see each other's refusals.
+// (Plain comments: doc comments do not attach to a `thread_local!` block.)
+#[cfg(test)]
+thread_local! {
+    static REFUSAL_SINK: std::cell::RefCell<
+        Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Holds an installed refusal sink; dropping restores plain stderr output.
+#[cfg(test)]
+pub(crate) struct RefusalSinkGuard;
+
+#[cfg(test)]
+impl Drop for RefusalSinkGuard {
+    fn drop(&mut self) {
+        REFUSAL_SINK.with(|slot| slot.replace(None));
+    }
+}
+
+/// Records every `refuse` line until the returned guard drops.
+#[cfg(test)]
+pub(crate) fn capture_refusals_for_test() -> (
+    RefusalSinkGuard,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    REFUSAL_SINK.with(|slot| slot.replace(Some(lines.clone())));
+    (RefusalSinkGuard, lines)
+}
+
+fn emit_refusal_line(line: &str) {
+    #[cfg(test)]
+    if let Some(sink) = REFUSAL_SINK.with(|slot| slot.borrow().clone()) {
+        sink.lock().unwrap().push(line.to_string());
+        return;
+    }
+    eprintln!("{line}");
+}
+
+fn refuse(code: RefusalCode, text: &str) -> i32 {
+    emit_refusal_line(&refusal_line(code, text));
     match code {
         RefusalCode::OutcomeUnknown => OUTCOME_UNKNOWN_EXIT_STATUS,
         _ => REFUSAL_EXIT_STATUS,
@@ -7867,6 +7943,13 @@ mod v22_tests;
 // use read as dead there; the module compiles in both profiles.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod tests {
+    /// Deadline for tests that expect rung discovery to finish. The product
+    /// budget is 2 s; a loaded Windows runner has exceeded it, which turns the
+    /// answer into R1 (budget exhausted) and fails tests that are not about the
+    /// budget. Tests of the budget itself (expired deadlines, slow test
+    /// daemons, probe stages) keep `DISCOVERY_BUDGET` so they still time out.
+    const TEST_DISCOVERY_DEADLINE: Duration = Duration::from_secs(60);
+
     #[cfg(unix)]
     #[test]
     fn supplemental_numeric_id_probe_does_not_accept_an_expired_deadline() {
@@ -8393,7 +8476,7 @@ mod tests {
             &paths,
             Path::new("/cwd"),
             123,
-            std::time::Instant::now() + DISCOVERY_BUDGET,
+            std::time::Instant::now() + TEST_DISCOVERY_DEADLINE,
             Some(&doc),
         );
         assert_eq!(record.record.rung, Rung::R1);
@@ -8422,7 +8505,7 @@ mod tests {
             &paths,
             Path::new("/cwd"),
             1,
-            std::time::Instant::now() + DISCOVERY_BUDGET,
+            std::time::Instant::now() + TEST_DISCOVERY_DEADLINE,
             Some(&doc),
         );
         assert_eq!(record.record.rung, Rung::R1);
@@ -8445,7 +8528,7 @@ mod tests {
             &paths,
             Path::new("/cwd"),
             1,
-            std::time::Instant::now() + DISCOVERY_BUDGET,
+            std::time::Instant::now() + TEST_DISCOVERY_DEADLINE,
             Some("{}"),
         );
         assert_eq!(record.record.rung, Rung::R1);
@@ -10615,7 +10698,7 @@ mod tests {
             "subc": { "connection_file": connection_file }
         })
         .to_string();
-        let future_deadline = || std::time::Instant::now() + DISCOVERY_BUDGET;
+        let future_deadline = || std::time::Instant::now() + TEST_DISCOVERY_DEADLINE;
         let r1_cases = [
             (
                 R1Reason::DisabledByConfig,
@@ -10826,7 +10909,7 @@ mod tests {
 
     #[test]
     fn refusal_and_self_report_codes_are_separate_closed_sets() {
-        assert_eq!(RefusalCode::ALL.len(), 20);
+        assert_eq!(RefusalCode::ALL.len(), 21);
         assert_eq!(
             RefusalCode::WorkerNativeGh.as_str(),
             "gh_shim_worker_native_gh"
@@ -10835,8 +10918,20 @@ mod tests {
             .iter()
             .all(|code| code.as_str().starts_with("gh_shim_")));
         assert_eq!(
+            RefusalCode::WorkerWriteRefused.as_str(),
+            "gh_shim_worker_write_refused"
+        );
+        assert_eq!(
             RefusalCode::GovernanceUnavailable.as_str(),
             "gh_shim_governance_unavailable"
+        );
+        assert_eq!(
+            WORKER_WRITE_REFUSED_TEXT,
+            "workers cannot write to GitHub; report what should be posted to your parent instead"
+        );
+        assert_eq!(
+            refusal_line(RefusalCode::WorkerWriteRefused, WORKER_WRITE_REFUSED_TEXT),
+            "gh-shim: gh_shim_worker_write_refused: workers cannot write to GitHub; report what should be posted to your parent instead"
         );
         assert_eq!(
             RefusalCode::OutcomeUnknown.as_str(),
@@ -15270,7 +15365,7 @@ INHERITED FLAGS
                     &paths,
                     &project,
                     TEST_NOW,
-                    Instant::now() + DISCOVERY_BUDGET,
+                    Instant::now() + TEST_DISCOVERY_DEADLINE,
                     Some(&doc),
                 );
                 let same_repo = repo == Some("cortexkit/motor");
@@ -15346,7 +15441,7 @@ INHERITED FLAGS
             &paths,
             &unbound,
             now,
-            Instant::now() + DISCOVERY_BUDGET,
+            Instant::now() + TEST_DISCOVERY_DEADLINE,
             Some(&doc),
         );
         assert_eq!(unbound_determination.record.rung, Rung::R2);
@@ -15370,7 +15465,7 @@ INHERITED FLAGS
             &target,
             &bound,
             now + 1,
-            Instant::now() + DISCOVERY_BUDGET,
+            Instant::now() + TEST_DISCOVERY_DEADLINE,
             Some(&doc),
         );
         assert!(

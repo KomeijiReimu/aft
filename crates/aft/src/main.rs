@@ -132,6 +132,59 @@ fn storage_lease_exit_probe() {
     }
 }
 
+fn initialize_global_rayon_pool() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        // Names only help profiling, so never fail startup over them: if
+        // something already used Rayon, its unnamed pool keeps working.
+        if let Err(error) = rayon::ThreadPoolBuilder::new()
+            .thread_name(|index| format!("aft-rayon-{index}"))
+            .build_global()
+        {
+            eprintln!("aft: Rayon pool already started; its threads stay unnamed: {error}");
+        }
+    });
+}
+
+#[cfg(test)]
+mod rayon_thread_tests {
+    #[test]
+    fn global_rayon_worker_names() {
+        const CHILD: &str = "AFT_RAYON_NAME_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            super::initialize_global_rayon_pool();
+            super::initialize_global_rayon_pool();
+            let names = rayon::broadcast(|_| {
+                assert!(rayon::current_thread_index().is_some());
+                std::thread::current().name().unwrap_or("").to_owned()
+            });
+            assert!(!names.is_empty());
+            for name in names {
+                assert!(name.starts_with("aft-rayon-"), "worker name: {name:?}");
+            }
+            return;
+        }
+
+        // Rayon cannot reset a process-global pool, so other parallel tests
+        // must not be able to initialize it before the startup hook is tested.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "rayon_thread_tests::global_rayon_worker_names",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 fn main() {
     // The subc daemon hands a supervised module its launch nonce through an
     // inherited pipe (and, for now, an environment copy). Take it before
@@ -235,6 +288,9 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some("index") {
         let _process_storage_lease = hold_process_storage_lease();
         let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        // Offline semantic collection can use Rayon. This branch exits without
+        // running the server's later process-environment mutations.
+        initialize_global_rayon_pool();
         match cli::index::run(args) {
             Ok(cli::index::IndexExit::Success) => return,
             Ok(exit) => std::process::exit(exit.code()),
@@ -307,6 +363,10 @@ fn main() {
     // not an outer daemon's. The gh-shim entry point above runs first and
     // keeps its legitimate read of these markers.
     aft::agent_child_env::scrub_inherited_process_markers();
+
+    // Environment capture and scrubbing must precede worker creation, while
+    // the named global pool must precede context construction and index work.
+    initialize_global_rayon_pool();
 
     let subc_connection_file = parse_subc_arg(std::env::args_os().skip(1));
     if uses_subc_stderr(

@@ -1,1 +1,0 @@
-- A call graph that was just published no longer answers "busy" for a moment while a background refresh opens it; reads wait briefly, and a lock that lasts longer still reports busy.

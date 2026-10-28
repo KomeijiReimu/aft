@@ -1,1 +1,0 @@
-AFT can keep its rebuildable caches (indexes and views) on another volume with the user setting `storage.cache_dir`. If that volume is missing or the setting can't be read, AFT turns the caches off instead of writing them to the main disk, and `doctor --clean-old-caches` removes the old copies after you confirm.

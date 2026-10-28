@@ -574,6 +574,7 @@ fn same_file_zoom_targets(req: &RawRequest, file: &str) -> Vec<serde_json::Value
 /// whitespace in `symbol`/`symbols` strings separate same-file lookups; nested
 /// signature text stays intact.
 pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
+    let _fetch_temp = super::url_resolution::FetchTempScope::enter();
     super::url_output::cap_zoom_response(req, ctx, handle_zoom_inner(req, ctx))
 }
 

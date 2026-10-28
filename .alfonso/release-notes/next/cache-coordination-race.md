@@ -1,1 +1,0 @@
-- Projects no longer lose their caches when many open at once on macOS; a rare busy moment now says the cache folder is busy and AFT retries automatically.

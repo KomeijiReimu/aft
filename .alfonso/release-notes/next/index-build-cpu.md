@@ -1,1 +1,0 @@
-- Index builds reuse each caller's symbol lookup table instead of scanning all of its symbols for every local call.

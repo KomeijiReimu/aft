@@ -115,11 +115,13 @@ static TEST_TRANSPORT: LazyLock<StdMutex<Option<Arc<dyn ConsentTransport>>>> =
 
 /// Install the production transport for this process's daemon connection.
 pub(super) fn install_subc_transport(connection_file: &Path) {
+    let transport: Arc<dyn ConsentTransport> = Arc::new(SharedSubcConsent(Arc::new(
+        SubcConsentTransport::new(connection_file.to_path_buf()),
+    )));
     *TRANSPORT
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(SharedSubcConsent(
-        Arc::new(SubcConsentTransport::new(connection_file.to_path_buf())),
-    )));
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&transport));
+    super::secret_consent::install_subc_transport(transport);
 }
 
 /// Replace the transport for consent tests; the module loop's production
@@ -592,6 +594,229 @@ pub(super) fn note_route_closed(route: RouteChannel) {
             flag.store(true, Ordering::SeqCst);
         }
     }
+}
+
+/// A consent ask that is still waiting for Cingulate, registered when its
+/// `consent.request` returns an elicitation id and removed when its hold ends.
+/// A folder (`allow_scope`) grant that truly covers one of these asks withdraws
+/// its card so the phone no longer shows it, and the waiting call runs without
+/// needing a second answer. Both sides already carry canonical policy
+/// identities (`policy_path` on insert and on the ask), so the coverage check
+/// below compares them the same way the grant check does.
+#[derive(Clone)]
+struct LiveCoverable {
+    key: AskKey,
+    session: String,
+    scope: crate::db::access_grants::ScopeKey,
+    operation: AccessOperation,
+    path: PathBuf,
+    elicitation: String,
+    selector: ScopeSelector,
+    project_root: PathBuf,
+}
+
+static LIVE_COVERABLE: LazyLock<StdMutex<HashMap<String, LiveCoverable>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// Removes the live entry when the hold ends, on every return path.
+struct LiveCoverGuard {
+    elicitation: Option<String>,
+}
+
+impl Drop for LiveCoverGuard {
+    fn drop(&mut self) {
+        if let Some(elicitation) = self.elicitation.take() {
+            LIVE_COVERABLE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&elicitation);
+        }
+    }
+}
+
+fn track_live_coverable(call: &HeldCall, prep: &Prepared, elicitation: &str) -> LiveCoverGuard {
+    LIVE_COVERABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            elicitation.to_string(),
+            LiveCoverable {
+                key: prep.key.clone(),
+                session: call.identity.session.clone(),
+                scope: prep.key.scope.clone(),
+                operation: prep.grant.operation,
+                path: prep.grant.path.clone(),
+                elicitation: elicitation.to_string(),
+                selector: prep.selector.clone(),
+                project_root: call.identity.project_root.clone(),
+            },
+        );
+    LiveCoverGuard {
+        elicitation: Some(elicitation.to_string()),
+    }
+}
+
+/// One info line per withdrawn ask, naming the grant that covered it. The
+/// covering grant's path is logged as a hash, like every other consent grant
+/// line, so no raw path leaves the daemon in logs.
+fn log_covered_withdrawn(session: &str, withdrawn: &str, covering_ask: &str, grant: &AccessGrant) {
+    if !crate::logging::slog_info_enabled(module_path!()) {
+        return;
+    }
+    let path_hash = cortexkit_role_tool_provider::catalog::composition_digest(&json!(grant.path))
+        .expect("canonical consent path is JSON");
+    let kind = match grant.kind {
+        GrantKind::File => "file",
+        GrantKind::Subtree => "subtree",
+    };
+    crate::log_ctx::with_session(Some(session.to_owned()), || {
+        crate::slog_info!("consent covering grant withdrew covered ask ask={withdrawn} covered_by={covering_ask} kind={kind} path_hash={path_hash:.12}");
+    });
+}
+
+/// After an `allow_scope` folder grant is stored, withdraw every other live ask
+/// it truly covers: same scope (owner, ref and epoch), same session, same
+/// operation kind, and a path inside the granted subtree. Each withdraw runs on
+/// AFT's normal route under the covered ask's own scope stamp and session, the
+/// same route its `consent.request` used, so Cingulate sees the same principal
+/// that requested the ask withdrawing its own ask.
+///
+/// When the withdraw reports the ask was already settled (the user answered it
+/// at the same moment), the recorded outcome is left for its own waiting call
+/// to apply; nothing is assumed and nothing is logged as withdrawn. An
+/// `elicitation_not_found` or `elicitation_not_owner` refusal likewise leaves
+/// the ask untouched so it stays pending.
+async fn settle_covered_asks(
+    call: &HeldCall,
+    covering: &AccessGrant,
+    covering_key: &AskKey,
+    covering_elicitation: &str,
+) {
+    if covering.kind != GrantKind::Subtree {
+        return;
+    }
+    let Some(transport) = transport() else {
+        return;
+    };
+    let live: Vec<LiveCoverable> = LIVE_COVERABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .cloned()
+        .collect();
+    for covered in live {
+        if covered.elicitation == covering_elicitation
+            || covered.key == *covering_key
+            || covered.scope != covering_key.scope
+            || covered.session != call.identity.session
+            || covered.operation != covering.operation
+        {
+            continue;
+        }
+        // Both paths are canonical policy identities, so `covers` compares
+        // them exactly as the grant check does.
+        if !covering.covers(covered.operation, &covered.path) {
+            continue;
+        }
+        let withdraw = ConsentCall {
+            scope: covered.selector.clone(),
+            project_root: covered.project_root.clone(),
+            session: covered.session.clone(),
+            method: "consent.withdraw",
+            params: json!({"elicitation_id": covered.elicitation}),
+            timeout: UNARY_TIMEOUT,
+        };
+        match transport.call(withdraw).await {
+            Ok(record) => match decode_record(&record) {
+                Ok(Settlement::Refused(code)) if code == "access_withdrawn" => {
+                    log_covered_withdrawn(
+                        &call.identity.session,
+                        &covered.elicitation,
+                        covering_elicitation,
+                        covering,
+                    );
+                }
+                // Already settled: its own waiting call applies that real
+                // answer through its own `consent.await`. Anything else
+                // (including a pending record, which a withdraw never
+                // returns) leaves the ask alone.
+                _ => {}
+            },
+            // The ask is gone or belongs to another principal: it stays
+            // pending and untouched.
+            Err(_) => {}
+        }
+    }
+}
+
+/// A waiting call whose card was withdrawn because a folder grant now covers
+/// it runs with that covering authority instead of answering `access_withdrawn`.
+/// Claims the call's own pending file (already inside the stored subtree) so
+/// the rerun owns exactly one approval, like any other allowed call.
+async fn try_apply_covering_grant(
+    call: &HeldCall,
+    prep: &Prepared,
+    retry_after_deadline: Arc<AtomicBool>,
+    elicitation: &str,
+) -> Option<Hold> {
+    let Some(ctx) = call.executor.actor_context(&call.identity.root) else {
+        return None;
+    };
+    let Some(db) = ctx.db() else {
+        return None;
+    };
+    let identity = call.identity.clone();
+    let key = prep.key.clone();
+    let call_key = prep.call_key.clone();
+    let pending = prep.grant.clone();
+    let covered: bool = tokio::task::spawn_blocking(move || {
+        let conn = db.lock().ok()?;
+        let scope = access_grants::policy_scope_key(&identity);
+        let grants = crate::db::access_grants::list(&conn, &scope).ok()?;
+        Some(grants.into_iter().any(|grant| {
+            grant.operation == pending.operation && grant.covers(pending.operation, &pending.path)
+        }))
+    })
+    .await
+    .ok()??;
+    if !covered {
+        return None;
+    }
+    let Some(ctx) = call.executor.actor_context(&call.identity.root) else {
+        return None;
+    };
+    let Some(db) = ctx.db() else {
+        return None;
+    };
+    let holder = asks::new_holder();
+    let key_clone = key.clone();
+    let call_key_clone = call_key.clone();
+    let holder_clone = holder.clone();
+    let db_for_claim = Arc::clone(&db);
+    let joined: Option<Option<Vec<AccessGrant>>> = tokio::task::spawn_blocking(move || {
+        let conn = db_for_claim.lock().ok()?;
+        let claimed = asks::claim(&conn, &key_clone, &call_key_clone, &holder_clone).ok()?;
+        Some(claimed)
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(claimed) = joined else {
+        return None;
+    };
+    let Some(once) = claimed else {
+        return Some(Hold::Answer(retry_answer(call, &prep.grant)));
+    };
+    let claim = Arc::new(ClaimedAsk {
+        db: Arc::clone(&db),
+        key,
+        holder,
+        armed: AtomicBool::new(true),
+        retry_after_deadline,
+        original: None,
+        elicitation: elicitation.to_owned(),
+    });
+    Some(Hold::Run { once, claim })
 }
 
 /// The parts of a held call the consent flow reads.
@@ -2027,6 +2252,10 @@ async fn hold(
         })
         .await;
     }
+    // Registered until this hold returns: a folder grant stored by a sibling
+    // call finds this ask here (same scope, session, operation and covered
+    // path) and withdraws its card so it resumes without a second answer.
+    let _live = track_live_coverable(call, &prep, &elicitation);
     // Await at least once, even with no budget left, so an ask that already
     // settled (a retry after the answer) is applied rather than parked.
     let mut first = true;
@@ -2212,6 +2441,16 @@ async fn finish(
             ))
         }
         Settlement::Refused(code) => {
+            // A card withdrawn because a folder grant now covers its path runs
+            // under that covering authority instead of ending withdrawn. Any
+            // other withdrawn card keeps its recorded refusal.
+            if code == "access_withdrawn" {
+                if let Some(run) =
+                    try_apply_covering_grant(call, prep, retry_after_deadline, elicitation).await
+                {
+                    return run;
+                }
+            }
             discard(call, prep).await;
             Hold::Answer(refused_answer(call, &prep.grant, &code, None))
         }
@@ -2263,6 +2502,8 @@ async fn finish(
             });
             let ownership = Arc::clone(&claim);
             let claimant = holder.clone();
+            let covering_key = key.clone();
+            let covering_grant = grant.clone();
             #[cfg(test)]
             let request_id = call.request_id.clone();
             let applied = tokio::task::spawn_blocking(move || {
@@ -2282,7 +2523,16 @@ async fn finish(
             .map_err(|error| error.to_string())
             .and_then(|applied| applied);
             match applied {
-                Ok(Applied::Run(once)) => Hold::Run { once, claim },
+                Ok(Applied::Run(once)) => {
+                    // Beside the grant insert: withdraw every other live ask this
+                    // folder grant truly covers so its card disappears from the
+                    // phone and its waiting call resumes without a second answer.
+                    if scope {
+                        settle_covered_asks(call, &covering_grant, &covering_key, elicitation)
+                            .await;
+                    }
+                    Hold::Run { once, claim }
+                }
                 Ok(Applied::HeadNotHeld) => Hold::Answer(refused_answer(
                     call,
                     &prep.grant,

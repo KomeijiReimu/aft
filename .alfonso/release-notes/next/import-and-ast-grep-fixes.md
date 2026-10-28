@@ -1,1 +1,0 @@
-- Organizing imports keeps comments with their imports and sorts Python in isort order; removing an import removes its end-of-line comment; ast-grep previews refuse invalid rewrites and show `$$$` captures as written (#827, #828, thanks @null-axiom)

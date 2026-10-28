@@ -14,14 +14,18 @@
 //! - `operations`: versioned schemas, closed projections and safe messages.
 //! - `builder`: deterministic assembly and caps, with no production manifest
 //!   until the publication prerequisites are reviewed.
+//! - `chunks`: the `rich_ui.manifest_chunk` and `rich_ui.template_chunk`
+//!   provider reads that serve manifest and template bytes to Occipital.
 //!
-//! Nothing here touches the daemon, the database or the wire. Until publication
-//! the only users are tests, so the dead-code allowances are module-local.
+//! Apart from `chunks`, nothing here touches the daemon, the database or the
+//! wire. Until publication the other modules' only users are tests, so their
+//! dead-code allowances are module-local.
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod builder;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod canonical;
+pub(crate) mod chunks;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod jcs_number;
 #[cfg_attr(not(test), allow(dead_code))]

@@ -56,6 +56,7 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
         "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write* (literal \"/dev/null\"))\n",
     );
     render_signal_scope(&mut source, profile);
+    render_secret_memory_boundary(&mut source, profile);
 
     for root in profile.write_allow_roots() {
         source.push_str(&format!(
@@ -144,6 +145,7 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
 fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
     let mut source = String::from("(version 1)\n(allow default)\n");
     render_signal_scope(&mut source, profile);
+    render_secret_memory_boundary(&mut source, profile);
     for path in &profile.write_deny {
         source.push_str(&format!(
             "(deny file-write* {})\n",
@@ -238,6 +240,42 @@ fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
     render_worker_canary_metadata(&mut source, profile)?;
     render_worker_keychain_denies(&mut source, profile)?;
     Ok(source)
+}
+
+fn render_secret_memory_boundary(source: &mut String, profile: &SandboxProfile) {
+    if profile.secret_proxy {
+        source.push_str("(deny mach-priv-task-port)\n");
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn secret_bash_task_ports_are_denied_only_for_secret_profiles() {
+    let root = tempfile::tempdir().unwrap();
+    let mut profile = SandboxProfile::build(
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        root.path().to_owned(),
+    )
+    .unwrap();
+    for mode in [
+        aft::config::SandboxMode::Strict,
+        aft::config::SandboxMode::Relaxed,
+    ] {
+        profile.mode = mode;
+        profile.secret_proxy = false;
+        let ordinary = render_profile(&profile).unwrap();
+        assert!(!ordinary.contains("mach-priv-task-port"));
+        profile.secret_proxy = true;
+        let secret = render_profile(&profile).unwrap();
+        assert!(secret.contains("(deny mach-priv-task-port)\n"));
+        assert_eq!(secret.replace("(deny mach-priv-task-port)\n", ""), ordinary);
+    }
 }
 
 fn render_signal_scope(source: &mut String, profile: &SandboxProfile) {
@@ -846,6 +884,7 @@ mod tests {
         std::fs::create_dir_all(&nested_deny).expect("nested deny directory");
         std::fs::create_dir_all(&task_temp).expect("task temp directory");
         let profile = SandboxProfile {
+            secret_proxy: false,
             v: 1,
             mode: aft::config::SandboxMode::Strict,
             worker_jail: false,
@@ -888,6 +927,7 @@ mod tests {
             .map(|path| path.parent().unwrap().to_path_buf())
             .collect::<Vec<_>>();
         let mut profile = SandboxProfile {
+            secret_proxy: false,
             v: 1,
             mode: aft::config::SandboxMode::Strict,
             worker_jail: false,

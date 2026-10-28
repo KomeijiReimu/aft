@@ -284,15 +284,14 @@ fn a_label_that_is_the_hex_of_its_own_key_is_refused() {
 fn a_key_spelled_by_another_matchers_replacement_is_refused() {
     // The second matcher's key is the whole placeholder the first one
     // generates. A scrubber that never rescans its output would still write
-    // that placeholder, which is the second key, so the pair refuses.
+    // that placeholder, which is the second key, so the pair can never be
+    // installed: a key holding the placeholder prefix is refused as soon as
+    // its matcher is built, before any pairing.
     let first: &[u8] = b"aaaaaaaaaaaaaaaa";
     let generated: &[u8] = b"{{ck-secret:other}}";
+    assert!(MatcherSet::new("other", first).is_ok());
     assert_eq!(
-        Scrubber::new(vec![
-            MatcherSet::new("other", first).unwrap(),
-            MatcherSet::new("aaaaaaaaaaaaaaaa", generated).unwrap(),
-        ])
-        .err(),
+        MatcherSet::new("aaaaaaaaaaaaaaaa", generated).err(),
         Some(secret_rules::ScrubError::ReplacementDisclosesKey)
     );
 }

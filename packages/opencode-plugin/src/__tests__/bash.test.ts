@@ -712,6 +712,24 @@ describe("OpenCode bash adapter", () => {
     expect(ask).not.toHaveBeenCalled();
   });
 
+  test("secret placeholders refuse host fallback before asking or executing", async () => {
+    for (const command of ["printf '{{ck-secret:test}}'", "printf '{{ck-secret:malformed'"]) {
+      const ask = mockAsk();
+      const { tool: bash } = createHarness(
+        () => {
+          throw new BridgeTransportUnavailableError("offline");
+        },
+        undefined,
+        false,
+        { bash: { host_fallback: true } } as PluginContext["config"],
+      );
+      await expect(bash.execute({ command }, createMockSdkContext({ ask }))).rejects.toThrow(
+        "Secret placeholder commands need AFT's shell; OpenCode's built-in shell cannot run them.",
+      );
+      expect(ask).not.toHaveBeenCalled();
+    }
+  });
+
   test("a bash call that timed out at the bridge names the task AFT started (issue #577)", async () => {
     const ask = mockAsk();
     const { tool: bash } = createHarness(
@@ -1736,6 +1754,50 @@ describe("bash_status tool", () => {
     );
 
     expect(sessionBgStates.get("s-watch")?.outstandingTaskIds.has("bash-finished")).toBe(false);
+  });
+
+  test("each_line recovery pages forward byte offsets and show only masked text", async () => {
+    const { calls, statusTool } = makeCtx(() => ({
+      success: true,
+      status: "running",
+      output_page_text: "masked output",
+      stderr_page_text: "masked error",
+      output_chunk_base64: "RAW-SECRET",
+      output_next_offset: 48,
+      stderr_next_offset: 20,
+      output_has_more: false,
+      stderr_has_more: false,
+    }));
+    const result = await statusTool.execute(
+      { taskId: "bash-lines", outputOffset: 16, stderrOffset: 10 },
+      createMockSdkContext(),
+    );
+    expect(calls.find((call) => call.cmd === "bash_status")?.params).toMatchObject({
+      output_offset: 16,
+      stderr_offset: 10,
+    });
+    expect(result).toContain("masked output");
+    expect(result).toContain("next outputOffset: 48");
+    expect(result).not.toContain("RAW-SECRET");
+  });
+
+  test("each_line forwards async delivery and refuses sync delivery", async () => {
+    const { calls, watchTool } = makeCtx(() => ({
+      success: true,
+      watch_id: "watch-lines",
+      status: "running",
+    }));
+    await watchTool.execute(
+      { taskId: "bash-lines", pattern: "ERROR", background: true, deliver: "each_line" },
+      createMockSdkContext(),
+    );
+    expect(calls.find((call) => call.cmd === "bash_notify")?.params.deliver).toBe("each_line");
+    await expect(
+      watchTool.execute(
+        { taskId: "bash-lines", pattern: "ERROR", deliver: "each_line" },
+        createMockSdkContext(),
+      ),
+    ).rejects.toThrow('bash_watch: deliver: "each_line" needs background: true.');
   });
 
   test('async bash_watch forwards string once "false" as boolean false', async () => {

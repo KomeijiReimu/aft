@@ -1,1 +1,0 @@
-Reduce peak memory during cold call-graph indexing with a small parsed-file working set and an 8 MiB build page cache. Graph results, bulk-write batching, and interrupted-build recovery are unchanged.

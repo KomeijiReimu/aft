@@ -1,1 +1,0 @@
-- Connecting a project AFT hasn't seen before no longer re-reads and re-resolves every entry of its old cache-key file on each connect (about 0.1 to 0.5 s per new project on large files).

@@ -21,6 +21,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { linkCachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
+import { __test__ } from "../index.js";
 
 /** How long the process may live after its shutdown hook returned. */
 const EXIT_BOUND_MS = 5_000;
@@ -589,7 +590,7 @@ describe.skipIf(process.platform === "win32")("approved session UI binding", () 
   }
 
   test(
-    "factory without UI delivers the actual plugin version through session context",
+    "factory without UI delivers the release announcement through session context",
     async () => {
       const run = await notifications("notification-upgrade");
       expect(run.code).toBe(0);
@@ -600,11 +601,9 @@ describe.skipIf(process.platform === "win32")("approved session UI binding", () 
         message: string;
         type: string;
       };
-      const version = (
-        JSON.parse(readFileSync(join(import.meta.dir, "../../package.json"), "utf8")) as {
-          version: string;
-        }
-      ).version;
+      // The dialog names the announcement release, not the package version:
+      // a patch release keeps the last minor's announcement.
+      const version = __test__.announcementVersion;
       expect(toast.sessionId).toBe("harness-session");
       expect(toast.type).toBe("info");
       expect(toast.message).toContain(`v${version}:`);
@@ -711,9 +710,7 @@ describe.skipIf(process.platform === "win32")("approved session UI binding", () 
         .filter((toast) => toast.type === "info" && toast.message.startsWith("🔧 AFT: ✨"));
       expect(announcements).toHaveLength(1);
       expect(announcements[0]?.sessionId).toBe("retry-session");
-      const version = JSON.parse(
-        readFileSync(join(import.meta.dir, "../../package.json"), "utf8"),
-      ).version;
+      const version = __test__.announcementVersion;
       expect(announcements[0]?.message).toContain(`v${version}:`);
       expect(run.stdout).toContain(`EVENT announcement-marker ${version}`);
     },

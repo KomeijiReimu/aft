@@ -81,6 +81,15 @@ export {
   TERMINAL_SCAN_INCOMPLETE_TEXT,
 } from "./bash-output-page.js";
 export {
+  type BashAckTarget,
+  bashAckKey,
+  bashAckRequest,
+  bashAcksConfirmed,
+  bashAckTargetFromKey,
+  bashAckTargets,
+  bashPatternAckTarget,
+} from "./bash-pattern-ack.js";
+export {
   BASH_PERMISSION_NOT_SETTLED,
   type BashPermissionAsk,
   BashPermissionLoopError,
@@ -89,6 +98,17 @@ export {
   groupBashPermissionAsks,
   withBashPermissionLoop,
 } from "./bash-permissions.js";
+export {
+  formatBashOutputPages,
+  formatWatchLineBatch,
+  mergeWatchLineBatches,
+  WATCH_EACH_LINE_NEEDS_BACKGROUND,
+} from "./bash-watch-lines.js";
+export {
+  WatchBatchAdmissions,
+  WatchBatchProgress,
+  watchBatchHasContent,
+} from "./bash-watch-progress.js";
 // --- binary identity (no-exec cache trust) ---
 export type { BinaryIdentity, BinaryIdentityCheck } from "./binary-identity.js";
 export {
@@ -106,6 +126,7 @@ export type {
   BashLongRunningPayload,
   BashPatternMatchAck,
   BashPatternMatchFrame,
+  BashWatchLineBatch,
   BridgeClock,
   BridgeOptions,
   BridgeRequestOptions,

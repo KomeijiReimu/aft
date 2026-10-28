@@ -1920,6 +1920,7 @@ mod tests {
         for (threads, reversed) in [(1, false), (8, false), (1, true), (8, true)] {
             crate::grep_executor::scan_order_for_test::set(&root, reversed);
             let pool = rayon::ThreadPoolBuilder::new()
+                .thread_name(|index| format!("aft-rayon-grep-test-{index}"))
                 .num_threads(threads)
                 .build()
                 .unwrap();

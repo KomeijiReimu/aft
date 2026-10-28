@@ -8967,14 +8967,26 @@ mod guard_tests {
             outcome_tx.send(outcome).expect("send rebound outcome");
         });
 
+        // Cache reopening and source checks can be slow on a busy runner. Holding
+        // the only cold slot until the reply, not a short deadline, proves bypass.
         let rebound = outcome_rx
-            .recv_timeout(Duration::from_secs(3))
-            .expect("unchanged persisted aggregate bypasses the occupied cold-build queue");
+            .recv_timeout(Duration::from_secs(60))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "unchanged persisted aggregate bypasses the occupied cold-build queue: \
+                     {error:?}; cold limiter: {:?}",
+                    limiter.census()
+                )
+            });
         assert!(rebound.payload().is_some());
         assert_eq!(
             limiter.admission_events().len(),
             events_before,
             "quick reuse must not request an interactive cold-build permit"
+        );
+        assert!(
+            limiter.try_acquire().is_none(),
+            "maintenance must still own the only cold slot when quick reuse replies"
         );
         drop(maintenance);
         assert_eq!(

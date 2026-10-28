@@ -1,1 +1,0 @@
-- Keep subc logging and flushes responsive behind a blocked stderr pipe with a bounded, loss-counted mirror, while preserving standalone stderr delivery.

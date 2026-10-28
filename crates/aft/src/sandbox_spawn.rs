@@ -211,6 +211,7 @@ pub enum SandboxTaskKind {
 
 #[cfg(unix)]
 struct PreparedTaskInner {
+    secret_runtime: Mutex<Option<crate::bash_background::secrets::SharedRuntime>>,
     paths: crate::bash_background::persistence::TaskPaths,
     dirs: crate::bash_background::persistence::TaskDirs,
     digest: blake3::Hash,
@@ -259,6 +260,24 @@ pub(crate) struct PayloadInvocation {
 
 #[cfg(unix)]
 impl PreparedTask {
+    pub(crate) fn set_secret_runtime(
+        &self,
+        runtime: crate::bash_background::secrets::SharedRuntime,
+    ) {
+        *self
+            .0
+            .secret_runtime
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(runtime);
+    }
+
+    pub(crate) fn secret_runtime(&self) -> Option<crate::bash_background::secrets::SharedRuntime> {
+        self.0
+            .secret_runtime
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
     #[cfg(test)]
     pub(crate) fn paths(&self) -> &crate::bash_background::persistence::TaskPaths {
         &self.0.paths
@@ -590,6 +609,58 @@ impl SpawnPlan {
             && matches!(self.policy(), Self::Launcher { profile, .. } if profile.mode == SandboxMode::Strict)
     }
 
+    /// A launcher alone is not a memory boundary. Linux also needs Yama on
+    /// the daemon side; reading it in the launcher would be too late to ask
+    /// for consent safely. Windows has no enforcing backend.
+    #[cfg(unix)]
+    pub(crate) fn protects_secret_memory(&self) -> bool {
+        let Self::Launcher { profile, .. } = self.policy() else {
+            return false;
+        };
+        if profile.v != crate::sandbox_profile::SANDBOX_PROFILE_VERSION
+            || !profile.temp_dir.is_absolute()
+            || std::fs::canonicalize(&profile.temp_dir).ok().as_ref() != Some(&profile.temp_dir)
+            || profile
+                .read_deny
+                .iter()
+                .any(|deny| profile.temp_dir.starts_with(deny))
+        {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            profile.mode == SandboxMode::Strict
+                && secret_ptrace_scope_safe(
+                    std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+                        .ok()
+                        .as_deref(),
+                )
+        }
+        #[cfg(target_os = "macos")]
+        {
+            profile.mode == SandboxMode::Strict
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            false
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn enable_secret_proxy(&mut self, port: u16) -> Result<(), ()> {
+        match self {
+            Self::Prepared { plan, .. } => plan.enable_secret_proxy(port),
+            Self::Launcher { profile, .. } => {
+                if cfg!(target_os = "macos") && profile.loopback_tcp_connect_deny.contains(&port) {
+                    return Err(());
+                }
+                profile.secret_proxy = true;
+                Ok(())
+            }
+            _ => Err(()),
+        }
+    }
+
     /// Why a jailed worker's shell launched under this plan must not receive
     /// the host-local GitHub read broker, or `None` when it may. The broker's
     /// isolation needs an OS policy that keeps each worker out of the shared
@@ -661,6 +732,13 @@ impl SpawnPlan {
             mismatch_class: None,
         }
     }
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn secret_ptrace_scope_safe(value: Option<&str>) -> bool {
+    value
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .is_some_and(|value| value > 0)
 }
 
 /// One resolver invocation captured by the project-keyed test seam.
@@ -1107,6 +1185,7 @@ fn verify_payload(
         .seek(SeekFrom::Start(0))
         .map_err(|error| format!("failed to rewind environment payload: {error}"))?;
     Ok(PreparedTask(Arc::new(PreparedTaskInner {
+        secret_runtime: Mutex::new(None),
         paths: task.paths,
         dirs: task.dirs,
         digest,
@@ -2147,6 +2226,7 @@ fn build_relaxed_profile(
             .extend(crate::worker_jail_canary::prepare_homes(home, false)?);
     }
     let mut profile = SandboxProfile {
+        secret_proxy: false,
         v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
         mode: SandboxMode::Relaxed,
         worker_jail: false,
@@ -4450,10 +4530,6 @@ fn build_linux_profile(
         "/dev/tty",
         "/dev/ptmx",
         "/dev/pts",
-        "/dev/fd",
-        "/dev/stdin",
-        "/dev/stdout",
-        "/dev/stderr",
     ] {
         if let Some(path) = canonicalize_existing_static(Path::new(path))? {
             intended.push(IntendedReadGrant {
@@ -4463,6 +4539,9 @@ fn build_linux_profile(
             });
         }
     }
+    // Do not canonicalize /dev/fd or the stdio links in the daemon: they name
+    // its /proc/<pid>/fd entries, which a non-dumpable daemon hides from the
+    // launcher. The /proc rule and payload/device rules cover child targets.
     if let Some(path) = canonicalize_existing_static(Path::new("/var"))? {
         intended.push(IntendedReadGrant {
             path,
@@ -5843,6 +5922,14 @@ pub(crate) fn apply_sandbox_environment(
             }
         }
     }
+    #[cfg(unix)]
+    if let Some(runtime) = plan.prepared_task().and_then(PreparedTask::secret_runtime) {
+        let runtime = runtime.lock().unwrap_or_else(|p| p.into_inner());
+        for key in crate::bash_background::secrets::REMOVE_KEYS {
+            command.env_remove(key);
+        }
+        command.envs(runtime.exec_environment());
+    }
 }
 
 /// Install after all environment/session/fd adapters and before spawning.
@@ -5929,6 +6016,16 @@ pub(crate) fn pty_command_for_plan(
     crate::agent_child_env::scrub_pty_command(&mut command);
     for key in crate::gh_shim_worker_broker::CHILD_KEYS {
         if let Some(value) = env.get(key) {
+            command.env(key, value);
+        }
+    }
+    #[cfg(unix)]
+    if let Some(runtime) = plan.prepared_task().and_then(PreparedTask::secret_runtime) {
+        let runtime = runtime.lock().unwrap_or_else(|p| p.into_inner());
+        for key in crate::bash_background::secrets::REMOVE_KEYS {
+            command.env_remove(key);
+        }
+        for (key, value) in runtime.exec_environment() {
             command.env(key, value);
         }
     }
@@ -6665,6 +6762,16 @@ pub(crate) mod environment_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_bash_yama_fail_closed() {
+        for value in [None, Some(""), Some("broken"), Some("0"), Some("-1")] {
+            assert!(!secret_ptrace_scope_safe(value));
+        }
+        for value in ["1", " 2\n", "3"] {
+            assert!(secret_ptrace_scope_safe(Some(value)));
+        }
+    }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -11035,6 +11142,7 @@ mod read_allow_tests {
         let binary = format!("{data}/bin/ck-aft");
         let connection = PathBuf::from("/home/alice/daemon/connection.json");
         let profile = SandboxProfile {
+            secret_proxy: false,
             v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
             mode: crate::config::SandboxMode::Strict,
             worker_jail: false,
@@ -11667,6 +11775,7 @@ mod worker_gh_fence_tests {
 
     fn fenced_profile(canary_dir: &Path) -> SandboxProfile {
         SandboxProfile {
+            secret_proxy: false,
             v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
             mode: crate::config::SandboxMode::Strict,
             worker_jail: true,

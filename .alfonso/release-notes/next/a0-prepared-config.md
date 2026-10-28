@@ -1,1 +1,0 @@
-- Bind configuration, source tracking and legacy-location notices now use one bounded local snapshot for the bind's selected harness, without rereading config during configure retries.

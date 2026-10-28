@@ -1,1 +1,0 @@
-- aft_inspect keeps its findings accurate across edits and partially parsed files, reports a gap when its cache is damaged instead of serving stale results, and refreshes outdated analysis safely.

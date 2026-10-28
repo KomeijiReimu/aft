@@ -1,1 +1,0 @@
-Status updates no longer regress to an older value under load. When many updates arrive quickly, they are folded into the latest value before delivery, and a late out-of-order update no longer replaces a newer queued one. Reliable completion delivery is unchanged.

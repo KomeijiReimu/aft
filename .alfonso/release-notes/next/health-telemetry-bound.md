@@ -1,1 +1,0 @@
-- The daemon health report keeps its per-project detail on long-running machines: view cleanup statistics are capped at the 64 most recently swept families and are dropped first when the report is full.

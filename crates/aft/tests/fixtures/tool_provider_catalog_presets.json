@@ -10,8 +10,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "2111895a0a09efca0b7dd4b6734737c70647f9cd1e685c8e5fa84c9635098304",
-      "catalog_digest": "2111895a0a09efca0b7dd4b6734737c70647f9cd1e685c8e5fa84c9635098304",
+      "generation": "eab0c31b7875b73dac12f8a0e6f1274ac817cefb627f0cca0fd72b546a038616",
+      "catalog_digest": "eab0c31b7875b73dac12f8a0e6f1274ac817cefb627f0cca0fd72b546a038616",
       "tools": [
         {
           "name": "status",
@@ -1034,7 +1034,7 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -1053,6 +1053,18 @@
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
               },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
                 "type": "string",
@@ -1070,7 +1082,7 @@
         },
         {
           "name": "bash_watch",
-          "schema_digest": "1f3fb25a580902d58c7e391df1c2da3d065079f62c9ba1a3363f6eb880955a35",
+          "schema_digest": "f311ed43521271004ef01a1c1a87c8bb7b0bb38985b3bf02410061681f7dc935",
           "semantics": 2,
           "result_format": "tool-result/v1",
           "capabilities": [
@@ -1116,6 +1128,11 @@
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 1800000
+              },
+              "deliver": {
+                "description": "Rejected: this watch always waits synchronously; deliver requires background:true with an async notification channel.",
+                "type": "string",
+                "const": "each_line"
               },
               "once": {
                 "description": "Accepted for compatibility; only an async watch reads it.",
@@ -1260,8 +1277,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "4fd58920eb47227531e7a3c8c56c0a223d311cf9c8e17c863474397bf65d2009",
-      "catalog_digest": "4fd58920eb47227531e7a3c8c56c0a223d311cf9c8e17c863474397bf65d2009",
+      "generation": "86f1dd440ebde41112a0f8043b0518d38f7de33c72968f48743dac38afea3297",
+      "catalog_digest": "86f1dd440ebde41112a0f8043b0518d38f7de33c72968f48743dac38afea3297",
       "tools": [
         {
           "name": "status",
@@ -2358,7 +2375,7 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -2377,6 +2394,18 @@
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
               },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
                 "type": "string",
@@ -2394,7 +2423,7 @@
         },
         {
           "name": "bash_watch",
-          "schema_digest": "1f3fb25a580902d58c7e391df1c2da3d065079f62c9ba1a3363f6eb880955a35",
+          "schema_digest": "f311ed43521271004ef01a1c1a87c8bb7b0bb38985b3bf02410061681f7dc935",
           "semantics": 2,
           "result_format": "tool-result/v1",
           "capabilities": [
@@ -2440,6 +2469,11 @@
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 1800000
+              },
+              "deliver": {
+                "description": "Rejected: this watch always waits synchronously; deliver requires background:true with an async notification channel.",
+                "type": "string",
+                "const": "each_line"
               },
               "once": {
                 "description": "Accepted for compatibility; only an async watch reads it.",
@@ -3492,8 +3526,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "bd64527bddcaa6bf8faf6a884faba123a50d86f6cac19ed17174d14fc6a11104",
-      "catalog_digest": "bd64527bddcaa6bf8faf6a884faba123a50d86f6cac19ed17174d14fc6a11104",
+      "generation": "dd0a9ace2cb15419d75f8fee0a124a604446c7e92285a5ec1631ed25117e0716",
+      "catalog_digest": "dd0a9ace2cb15419d75f8fee0a124a604446c7e92285a5ec1631ed25117e0716",
       "tools": [
         {
           "name": "status",
@@ -4528,7 +4562,7 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -4547,6 +4581,18 @@
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
               },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
                 "type": "string",
@@ -4564,7 +4610,7 @@
         },
         {
           "name": "bash_watch",
-          "schema_digest": "1f3fb25a580902d58c7e391df1c2da3d065079f62c9ba1a3363f6eb880955a35",
+          "schema_digest": "f311ed43521271004ef01a1c1a87c8bb7b0bb38985b3bf02410061681f7dc935",
           "semantics": 2,
           "result_format": "tool-result/v1",
           "capabilities": [
@@ -4610,6 +4656,11 @@
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 1800000
+              },
+              "deliver": {
+                "description": "Rejected: this watch always waits synchronously; deliver requires background:true with an async notification channel.",
+                "type": "string",
+                "const": "each_line"
               },
               "once": {
                 "description": "Accepted for compatibility; only an async watch reads it.",
@@ -4755,8 +4806,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "e3d5b309182b2e65fdd660b8b14c48bfbb669b0ca6c469e5a61556776536af94",
-      "catalog_digest": "e3d5b309182b2e65fdd660b8b14c48bfbb669b0ca6c469e5a61556776536af94",
+      "generation": "a3a5e195d9610bccfcf40339b3fa7cd4dbe15e32b97c401ba0140c21d42cdc4b",
+      "catalog_digest": "a3a5e195d9610bccfcf40339b3fa7cd4dbe15e32b97c401ba0140c21d42cdc4b",
       "tools": [
         {
           "name": "status",
@@ -5865,7 +5916,7 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -5884,6 +5935,18 @@
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
               },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
                 "type": "string",
@@ -5901,7 +5964,7 @@
         },
         {
           "name": "bash_watch",
-          "schema_digest": "1f3fb25a580902d58c7e391df1c2da3d065079f62c9ba1a3363f6eb880955a35",
+          "schema_digest": "f311ed43521271004ef01a1c1a87c8bb7b0bb38985b3bf02410061681f7dc935",
           "semantics": 2,
           "result_format": "tool-result/v1",
           "capabilities": [
@@ -5947,6 +6010,11 @@
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 1800000
+              },
+              "deliver": {
+                "description": "Rejected: this watch always waits synchronously; deliver requires background:true with an async notification channel.",
+                "type": "string",
+                "const": "each_line"
               },
               "once": {
                 "description": "Accepted for compatibility; only an async watch reads it.",

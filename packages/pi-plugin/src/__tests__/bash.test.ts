@@ -1269,6 +1269,63 @@ describe("bash tool adapter", () => {
     expect(sessionBgStates.get("s-watch")?.outstandingTaskIds.has("bash-finished")).toBe(false);
   });
 
+  test("each_line recovery pages forward byte offsets and show only masked text", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const { bridge, calls } = makeTrackableMockBridge({
+      status: "running",
+      output_page_text: "masked output",
+      output_chunk_base64: "RAW-SECRET",
+      output_next_offset: 48,
+      output_has_more: false,
+    });
+    registerBashTool(makeMockApi(tools), makeMockContext(bridge));
+    const result = (await tools
+      .get("bash_status")!
+      .execute(
+        "call",
+        { task_id: "bash-lines", output_offset: 16, stderr_offset: 10 },
+        undefined,
+        undefined,
+        { cwd: projectRoot },
+      )) as { content: { text: string }[] };
+    const status = calls.find((call) => (call as [string])[0] === "bash_status") as [
+      string,
+      Record<string, unknown>,
+    ];
+    expect(status[1]).toMatchObject({ output_offset: 16, stderr_offset: 10 });
+    expect(result.content[0].text).toContain("masked output");
+    expect(result.content[0].text).toContain("next output_offset: 48");
+    expect(result.content[0].text).not.toContain("RAW-SECRET");
+  });
+
+  test("each_line forwards async delivery and refuses sync delivery", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const { bridge, calls } = makeTrackableMockBridge({ watch_id: "watch-lines" });
+    registerBashTool(makeMockApi(tools), makeMockContext(bridge));
+    const tool = tools.get("bash_watch")!;
+    await tool.execute(
+      "call",
+      { task_id: "bash-lines", pattern: "ERROR", background: true, deliver: "each_line" },
+      undefined,
+      undefined,
+      { cwd: projectRoot },
+    );
+    const notify = calls.find((call) => (call as [string])[0] === "bash_notify") as [
+      string,
+      Record<string, unknown>,
+    ];
+    expect(notify[1].deliver).toBe("each_line");
+    await expect(
+      tool.execute(
+        "call",
+        { task_id: "bash-lines", pattern: "ERROR", deliver: "each_line" },
+        undefined,
+        undefined,
+        { cwd: projectRoot },
+      ),
+    ).rejects.toThrow('bash_watch: deliver: "each_line" needs background: true.');
+  });
+
   test('async bash_watch forwards string once "false" as boolean false', async () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
@@ -1509,6 +1566,50 @@ describe("bash tool adapter", () => {
           hasUI: false,
         }),
     ).rejects.toThrow("bash.memory_limit_mib");
+  });
+
+  test("secret placeholders refuse host fallback before confirmation", async () => {
+    for (const [command, effective] of [
+      ["printf '{{ck-secret:test}}'", undefined],
+      ["printf '{{ck-secret:unfinished'", undefined],
+      ["printf clean", "printf '{{ck-secret:test}}'"],
+      ["printf '{{ck-secret:test}}'", "printf clean"],
+    ] as const) {
+      const tools = new Map<string, MockToolDef>();
+      let confirmations = 0;
+      const bridge = {
+        send: async () => {
+          throw new BridgeTransportUnavailableError("offline");
+        },
+      } as unknown as BinaryBridge;
+      const api =
+        effective === undefined
+          ? makeMockApi(tools)
+          : ({
+              registerTool: (tool: MockToolDef) => tools.set(tool.name, tool),
+              getHook: (name: string) =>
+                name === "bashSpawn" ? async () => ({ command: effective }) : undefined,
+            } as unknown as ExtensionAPI);
+      registerBashTool(
+        api,
+        makeMockContext(bridge, { bash: { host_fallback: true } } as PluginContext["config"]),
+      );
+      await expect(
+        tools.get("bash")!.execute("call", { command }, undefined, undefined, {
+          cwd: projectRoot,
+          hasUI: true,
+          ui: {
+            confirm: async () => {
+              confirmations++;
+              return false;
+            },
+          },
+        }),
+      ).rejects.toThrow(
+        "Secret placeholder commands need AFT's shell; Pi's built-in shell cannot run them.",
+      );
+      expect(confirmations).toBe(0);
+    }
   });
 
   test("a bash call that timed out at the bridge names the task AFT started (issue #577)", async () => {

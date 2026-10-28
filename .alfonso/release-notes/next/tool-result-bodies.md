@@ -1,1 +1,0 @@
-- Heads and codemode programs that request `tool-result/v1` receive AFT replies as text, data, error codes and budget-fitted images; omitted GitHub images are listed by link.

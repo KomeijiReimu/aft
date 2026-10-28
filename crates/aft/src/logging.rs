@@ -2414,7 +2414,15 @@ pub fn note_tool_call_trace(
         root.display(),
     );
 
-    if phases.total > SLOW_TOOL_CALL_THRESHOLD {
+    // Waiting tools do not separate their requested wait from execution work.
+    // Exclude that whole phase rather than warning about an intentional wait;
+    // queueing, translation, formatting and transport delays still warrant a warning.
+    let diagnostic_elapsed = if phases.intentional_wait {
+        phases.total.saturating_sub(phases.execute)
+    } else {
+        phases.total
+    };
+    if diagnostic_elapsed > SLOW_TOOL_CALL_THRESHOLD {
         let level = slow_tool_call_level(caller);
         // The argument shape and edit phase times go before `root=`, which
         // stays last because a root path may contain spaces.
@@ -3446,6 +3454,7 @@ mod tests {
             waiting_on: WaitingOn::None,
             waiting_on_build_id: None,
             wait_ms: 0,
+            intentional_wait: false,
             arg_shape: None,
             edit_phases: None,
         }
@@ -3507,6 +3516,56 @@ mod tests {
             slow_call_levels("read", ToolCallCaller::Agent),
             vec![log::Level::Warn]
         );
+    }
+
+    #[test]
+    fn slow_intentional_wait_excludes_execution_but_warns_for_overhead() {
+        let mut phases = slow_phases();
+        phases.intentional_wait = true;
+        phases.execute = Duration::from_secs(120);
+        phases.total = phases.execute + SLOW_TOOL_CALL_THRESHOLD;
+        let _ = take_slow_tool_call_logs_for_test();
+        note_tool_call_trace(
+            "bash_watch",
+            "waiting-session",
+            Path::new("/repo"),
+            7,
+            1,
+            phases.clone(),
+            ToolCallCaller::Agent,
+        );
+        assert!(take_slow_tool_call_logs_for_test().is_empty());
+
+        phases.queue = SLOW_TOOL_CALL_THRESHOLD + Duration::from_millis(1);
+        phases.total = phases.execute + phases.queue;
+        note_tool_call_trace(
+            "bash_watch",
+            "waiting-session",
+            Path::new("/repo"),
+            7,
+            2,
+            phases.clone(),
+            ToolCallCaller::Agent,
+        );
+        let lines = SLOW_TOOL_CALL_CAPTURE.with(|captured| captured.take());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, log::Level::Warn);
+
+        phases.intentional_wait = false;
+        phases.queue = Duration::ZERO;
+        phases.total = phases.execute;
+        note_tool_call_trace(
+            "bash",
+            "waiting-session",
+            Path::new("/repo"),
+            7,
+            3,
+            phases,
+            ToolCallCaller::Agent,
+        );
+        let lines = SLOW_TOOL_CALL_CAPTURE.with(|captured| captured.take());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, log::Level::Warn);
     }
 
     #[test]

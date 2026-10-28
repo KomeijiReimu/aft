@@ -500,7 +500,28 @@ export interface BashLongRunningPayload {
   elapsed_ms: number;
 }
 
+export interface BashWatchLineBatch {
+  pending_id?: string;
+  version?: number;
+  terminal_summary?: boolean;
+  snapshot?: boolean;
+  lines: {
+    stream: string;
+    offset: number;
+    end_offset: number;
+    text: string;
+    count: number;
+    unavailable?: boolean;
+  }[];
+  masking_limit_bytes?: number;
+  dropped_lines: number;
+  first_dropped_offset: number | null;
+  first_dropped_stream: string | null;
+  skipped_long_lines: number;
+}
+
 export interface BashPatternMatchFrame {
+  batch?: BashWatchLineBatch;
   type: "bash_pattern_match";
   task_id: string;
   session_id: string;

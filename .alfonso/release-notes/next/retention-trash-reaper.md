@@ -1,1 +1,0 @@
-- Disk space from removed checkouts is now reclaimed; previously deleted views could stay in AFT's trash folder.

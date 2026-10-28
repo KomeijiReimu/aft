@@ -544,6 +544,7 @@ briefly exceed the limit.
 **`bash_status`** — read-only snapshot of a background or PTY task's current state and output.
 Never waits. For PTY tasks, `outputMode` selects `screen` (vt100-rendered), `raw` (byte stream),
 or `both`.
+Optional `outputOffset` / `stderrOffset` (`output_offset` / `stderr_offset` in Pi) read masked stdout/PTY or stderr pages from a byte offset and return the next offset.
 
 **`bash_watch`** — block on or register for a background task's output. In a main session sync
 waits are for a short remaining wait on a task (default 30s, max `bash.watch_sync_max_ms`, 120s
@@ -557,6 +558,9 @@ but never extends it beyond the configured worker limit. Every session's blockin
 call (`wait: true`, or any foreground call when
 `bash.subagent_background` is false) is bounded the same way: at the limit the command moves to the
 background, not killed, and the reply gives its task id, including on the tool-provider/v1 route.
+With `background: true`, `deliver: "each_line"` batches matching lines with byte offsets and combines consecutive identical lines with a count.
+Notices are capped at 50 lines and 12 a minute per watch (the final drop summary is exempt from the rate cap).
+Drops name a `bash_status` offset to read.
 The head preset declares a reply deadline for `bash`; the worker preset declares it for `bash`
 and `bash_watch`. Both use the resolved `bash.worker_wait_max_ms` plus 240 seconds for spawn,
 terminal handoff and reply delivery. A watch does not spawn a command, but retains the same

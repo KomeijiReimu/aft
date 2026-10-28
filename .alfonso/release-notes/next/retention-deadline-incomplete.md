@@ -1,1 +1,0 @@
-- Storage retention reports a cache walk cut off by its time limit as incomplete instead of protected, so later passes retry it.

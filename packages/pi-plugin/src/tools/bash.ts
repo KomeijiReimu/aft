@@ -11,6 +11,7 @@ import {
   classifyBashHostFallbackError,
   coerceBoolean,
   escalationAskText,
+  formatBashOutputPages,
   formatWatchWaited,
   interruptedWatchTail,
   isBridgeTransportTimeout,
@@ -28,6 +29,7 @@ import {
   TERMINAL_SCAN_INCOMPLETE_TEXT,
   taskKillDeadlineText,
   taskKillDeadlineWithinHandoffMargin,
+  WATCH_EACH_LINE_NEEDS_BACKGROUND,
   WATCH_SYNC_DEFAULTS_DESCRIPTION,
   WATCH_TIMEOUT_PARAM_DESCRIPTION,
   WATCH_UNAVAILABLE_GIVE_UP_MS,
@@ -137,6 +139,8 @@ function resolveForegroundWaitMs(configured: number): number {
 // orchestrated bash tool overrides this per request because Rust may hold the
 // final response until the foreground wait window or hard-kill cap elapses.
 const BASH_TRANSPORT_TIMEOUT_MS = 30_000;
+const BASH_SECRET_HOST_FALLBACK_REFUSAL =
+  "Secret placeholder commands need AFT's shell; Pi's built-in shell cannot run them.";
 const DEFAULT_HARD_TIMEOUT_MS = 30 * 60 * 1000;
 // The margin gives Rust time to promote or finalize the task and deliver the
 // final response after the server's foreground wait window or hard kill timeout.
@@ -412,6 +416,22 @@ const BashTaskParams = Type.Object({
 });
 
 const BashStatusParams = Type.Object({
+  output_offset: Type.Optional(
+    Type.Integer({
+      minimum: 0,
+      maximum: Number.MAX_SAFE_INTEGER,
+      description:
+        "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+    }),
+  ),
+  stderr_offset: Type.Optional(
+    Type.Integer({
+      minimum: 0,
+      maximum: Number.MAX_SAFE_INTEGER,
+      description:
+        "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+    }),
+  ),
   task_id: Type.String({
     description: "Background bash task id returned by bash({ background: true }).",
   }),
@@ -430,6 +450,12 @@ const BashWatchParams = Type.Object({
   pattern: Type.Optional(Type.Union([Type.String(), Type.Object({ regex: Type.String() })])),
   background: Type.Optional(Type.Boolean()),
   timeout_ms: optionalInt(1, 1800000, WATCH_TIMEOUT_PARAM_DESCRIPTION),
+  deliver: Type.Optional(
+    Type.Literal("each_line", {
+      description:
+        "Async-only: batch every matching complete line, fold consecutive duplicates, and report cap drops with byte offsets.",
+    }),
+  ),
   once: Type.Optional(Type.Boolean()),
 });
 
@@ -935,6 +961,9 @@ export function registerBashTool(
       } catch (error) {
         const fallbackCause = classifyBashHostFallbackError(error);
         if (fallbackCause === undefined) throw error;
+        if (params.command.includes("{{ck-secret:") || bridgeCommand.includes("{{ck-secret:")) {
+          throw new Error(BASH_SECRET_HOST_FALLBACK_REFUSAL);
+        }
         if (isPowerShell) {
           throw refuseAftModuleOptionWithoutFallback(
             error,
@@ -1126,7 +1155,36 @@ export function createBashStatusTool(ctx: PluginContext) {
       // bash_status is snapshot-only. wait_for / exit / timeout_ms moved to
       // bash_watch; if the agent passes them here they're silently ignored
       // at the TypeBox schema layer.
-      const data = await bashStatusSnapshot(bridge, extCtx, params.task_id, params.output_mode);
+      const paging = params.output_offset !== undefined || params.stderr_offset !== undefined;
+      const data = paging
+        ? await callBashBridge(
+            bridge,
+            "bash_status",
+            {
+              task_id: params.task_id,
+              output_mode: params.output_mode,
+              output_offset: coerceOptionalInt(
+                params.output_offset,
+                "output_offset",
+                0,
+                Number.MAX_SAFE_INTEGER,
+              ),
+              stderr_offset: coerceOptionalInt(
+                params.stderr_offset,
+                "stderr_offset",
+                0,
+                Number.MAX_SAFE_INTEGER,
+              ),
+            },
+            extCtx,
+          )
+        : await bashStatusSnapshot(bridge, extCtx, params.task_id, params.output_mode);
+      if (data.success === false) throw new Error(String(data.message ?? "bash_status failed"));
+      if (paging)
+        return bashStatusResult(
+          formatBashOutputPages(data, false),
+          data as unknown as BashStatusDetails,
+        );
       const details = data as unknown as BashStatusDetails;
       return bashStatusResult(
         await formatBashStatus(extCtx, params.task_id, details, params.output_mode, {
@@ -1164,6 +1222,12 @@ export function createBashWatchTool(ctx: PluginContext) {
         coerceBoolean(params.background) &&
         !bashCfg.subagent_background &&
         isPiWorkerSession(extCtx);
+      if (params.deliver !== undefined && (!coerceBoolean(params.background) || workerForcedSync)) {
+        throw new Error(WATCH_EACH_LINE_NEEDS_BACKGROUND);
+      }
+      if (params.deliver !== undefined && params.deliver !== "each_line") {
+        throw new Error("invalid_request: bash_watch deliver must be each_line");
+      }
       // Coerce at the boundary: stringified background must enable async mode (coerceBoolean).
       if (coerceBoolean(params.background) && !workerForcedSync) {
         if (!waitFor) {
@@ -1175,6 +1239,7 @@ export function createBashWatchTool(ctx: PluginContext) {
           task_id: params.task_id,
           once: coerceBoolean(params.once, true),
         };
+        if (params.deliver !== undefined) notifyParams.deliver = params.deliver;
         if (waitFor.kind === "regex") notifyParams.regex = waitFor.source;
         else notifyParams.pattern = waitFor.value;
         const sessionId = resolveSessionId(extCtx);

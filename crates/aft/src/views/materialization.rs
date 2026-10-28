@@ -1648,7 +1648,7 @@ impl join::ManifestBlobReader for ManifestViewBlobReader<'_> {
         let decoded = if payloads.len() > 1 {
             rayon::ThreadPoolBuilder::new()
                 .num_threads(crate::callgraph_store::build_pool_size())
-                .thread_name(|index| format!("aft-view-decode-{index}"))
+                .thread_name(|index| format!("aft-rayon-view-decode-{index}"))
                 .build()
                 .map_or_else(|_| decode(), |pool| pool.install(decode))
         } else {
