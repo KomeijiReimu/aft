@@ -339,8 +339,8 @@ fn decode_chunk_vector(payload: &[u8], identity: &str, text: &str) -> Option<Vec
 
 /// Where a fill reads and writes semantic rows: the owner's v2 family store,
 /// or the family's v3 semantic plane store for a generation published in the
-/// v3 namespace. A v3 write goes through one v3 publication (reservation,
-/// closure flush, ledger commit) per call.
+/// v3 namespace. Each completed model batch is stored before requesting more
+/// embeddings, sharing its v3 reservation, plane transaction and ledger flush.
 pub(crate) enum SemanticStore {
     V2(FamilyStore),
     V3(super::snapshot::V3Route),
@@ -420,41 +420,77 @@ impl SemanticStore {
         }
     }
 
+    #[cfg(test)]
     fn put_or_touch(
         &self,
         key: &FamilyKey,
         payload: &[u8],
     ) -> Result<PutOrTouch, crate::blob_store::v2::StoreError> {
+        self.put_batch(&[(*key, payload.to_vec())])?
+            .pop()
+            .expect("one row")
+    }
+
+    fn put_batch(
+        &self,
+        rows: &[(FamilyKey, Vec<u8>)],
+    ) -> Result<
+        Vec<Result<PutOrTouch, crate::blob_store::v2::StoreError>>,
+        crate::blob_store::v2::StoreError,
+    > {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
         match self {
-            Self::V2(store) => store.put_or_touch(key, payload),
+            Self::V2(store) => Ok(rows
+                .iter()
+                .map(|(key, payload)| store.put_or_touch(key, payload))
+                .collect()),
             Self::V3(route) => {
-                let request = (payload.len() as u64)
+                #[cfg(test)]
+                let _profile =
+                    crate::blob_store::v3::work_profile::span("semantic_put_publication");
+                let request = rows
+                    .iter()
+                    .fold(0u64, |bytes, (_, payload)| {
+                        bytes.saturating_add(payload.len() as u64)
+                    })
                     .saturating_mul(2)
                     .saturating_add(1 << 20);
-                let inserted = crate::blob_store::v3::publish(
+                let outcomes = crate::blob_store::v3::publish(
                     &route.storage,
                     &route.family,
                     request,
                     None,
                     |publication| {
-                        publication.put_or_touch(
-                            key,
-                            payload,
+                        publication.put_or_touch_batch(
+                            FamilyPlane::Semantic,
+                            rows,
                             FamilyPlane::Semantic.payload_schema(),
                         )
                     },
                 )
-                .map_err(|error| match error {
-                    crate::blob_store::v3::Error::Refused("payload_mismatch") => {
-                        crate::blob_store::v2::StoreError::ConflictingPayload(*key)
-                    }
-                    other => v3_store_error(other),
-                })?;
-                Ok(if inserted {
-                    PutOrTouch::Inserted { ref_epoch: 0 }
-                } else {
-                    PutOrTouch::Reused { ref_epoch: 0 }
-                })
+                .map_err(v3_store_error)?;
+                Ok(rows
+                    .iter()
+                    .zip(outcomes)
+                    .map(|((key, _), outcome)| {
+                        outcome
+                            .map(|inserted| {
+                                if inserted {
+                                    PutOrTouch::Inserted { ref_epoch: 0 }
+                                } else {
+                                    PutOrTouch::Reused { ref_epoch: 0 }
+                                }
+                            })
+                            .map_err(|error| match error {
+                                crate::blob_store::v3::Error::Refused("payload_mismatch") => {
+                                    crate::blob_store::v2::StoreError::ConflictingPayload(*key)
+                                }
+                                other => v3_store_error(other),
+                            })
+                    })
+                    .collect())
             }
         }
     }
@@ -1702,12 +1738,34 @@ impl SemanticPlane {
             match embedded {
                 Ok(runs) => {
                     let store_started = Instant::now();
-                    for ((item, relative, full_key, claim), mut run) in
-                        to_embed.into_iter().zip(runs)
+                    let payloads: Vec<_> = to_embed
+                        .iter()
+                        .zip(&runs)
+                        .map(|((_, _, _, claim), run)| {
+                            (*claim.key(), run.encode_view_payload(&payload_producer))
+                        })
+                        .collect();
+                    let outcomes = match store.put_batch(&payloads) {
+                        Ok(outcomes) => outcomes,
+                        Err(error) => {
+                            if store_error_is_busy(&error) {
+                                report.errors.push(error.to_string());
+                            } else {
+                                report.store_errors.push(error.to_string());
+                            }
+                            report.deferred += to_embed.len() + pending.count();
+                            report.timing.store_write += store_started.elapsed();
+                            break;
+                        }
+                    };
+                    for (((item, relative, full_key, claim), mut run), ((_, payload), outcome)) in
+                        to_embed
+                            .into_iter()
+                            .zip(runs)
+                            .zip(payloads.into_iter().zip(outcomes))
                     {
                         let key = *claim.key();
-                        let payload = run.encode_view_payload(&payload_producer);
-                        match store.put_or_touch(&key, &payload) {
+                        match outcome {
                             Ok(PutOrTouch::Inserted { .. } | PutOrTouch::Reused { .. }) => {
                                 succeeded.push(full_key);
                                 // The stored row now holds exactly `payload`.
@@ -1956,8 +2014,31 @@ impl SemanticPlane {
             report.embedded_texts += misses.len();
             // Validate backend rows and consume adaptive HTTP metadata before
             // caching: shortened or skipped input must not poison the original.
-            let mut embedded =
-                crate::semantic_index::execute_build_embedding_batch(misses, embed)?.into_iter();
+            let embedded = crate::semantic_index::execute_build_embedding_batch(misses, embed)?;
+            let store_started = Instant::now();
+            let mut payloads = Vec::new();
+            let missing_texts = rows
+                .iter()
+                .zip(&texts)
+                .zip(&keys)
+                .filter(|((row, _), _)| row.is_none());
+            for (((_, text), key), result) in missing_texts.zip(&embedded) {
+                if let BuildEmbeddingRow::Embedded {
+                    embedded_text,
+                    vector,
+                } = result
+                {
+                    if embedded_text == text {
+                        payloads.push((*key, encode_chunk_vector(&identity, text, vector)?));
+                    }
+                }
+            }
+            let mut outcomes = store
+                .put_batch(&payloads)
+                .map_err(|error| chunk_store_error(error, report))?
+                .into_iter();
+            report.timing.store_write += store_started.elapsed();
+            let mut embedded = embedded.into_iter();
             for ((row, text), key) in rows.iter_mut().zip(&texts).zip(&keys) {
                 if row.is_some() {
                     continue;
@@ -1970,8 +2051,7 @@ impl SemanticPlane {
                 {
                     if embedded_text == text {
                         let store_started = Instant::now();
-                        let payload = encode_chunk_vector(&identity, text, vector)?;
-                        let cacheable = match store.put_or_touch(key, &payload) {
+                        let cacheable = match outcomes.next().expect("stored exact-text chunk") {
                             Ok(PutOrTouch::Inserted { .. } | PutOrTouch::Reused { .. }) => true,
                             Ok(PutOrTouch::Quarantined) => false,
                             Err(crate::blob_store::v2::StoreError::ConflictingPayload(_)) => {

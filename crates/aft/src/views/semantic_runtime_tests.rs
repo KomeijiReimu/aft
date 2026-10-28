@@ -1765,7 +1765,14 @@ fn large_semantic_materialization_batches_pins_and_touches() {
     let _profile = crate::blob_store::v3::work_profile::Report;
     use crate::pins::work_counters::{key_file_bytes, key_file_work};
     let (_storage, root, runtime) = large_own_pin_fixture();
+    let publications = crate::blob_store::v3::work_profile::count("semantic_put_publication");
     fill_large(&runtime);
+    let publications =
+        crate::blob_store::v3::work_profile::count("semantic_put_publication") - publications;
+    assert!(
+        publications <= 128,
+        "2048 file and chunk rows need model batches, not {publications} per-key publications"
+    );
     let answer = query(&runtime, "item");
     let (writes, syncs) = key_file_work();
     let bytes = key_file_bytes();

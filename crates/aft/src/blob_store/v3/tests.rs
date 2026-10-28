@@ -22,6 +22,34 @@ fn seed(storage: &Path, family: &str) {
     })
     .unwrap();
 }
+
+#[test]
+fn put_batch_keeps_conflict_winners_and_commits_other_rows_in_one_transaction() {
+    let _guard = serial();
+    let root = tempdir().unwrap();
+    seed(root.path(), A);
+    let next = FamilyKey::new(FamilyPlane::Semantic, [8; 32]);
+    let rows = vec![
+        (key(), b"different".to_vec()),
+        (next, b"new row".to_vec()),
+        (key(), b"v3 data".to_vec()),
+    ];
+    work_profile::take();
+    let outcomes = publish(root.path(), A, 1 << 20, None, |p| {
+        p.put_or_touch_batch(FamilyPlane::Semantic, &rows, 1)
+    })
+    .unwrap();
+    assert!(matches!(
+        outcomes[0],
+        Err(Error::Refused("payload_mismatch"))
+    ));
+    assert!(matches!(outcomes[1], Ok(true)));
+    assert!(matches!(outcomes[2], Ok(false)));
+    assert_eq!(work_profile::count("put_transaction"), 1);
+    let reader = PlaneReader::open_existing(root.path(), A, FamilyPlane::Semantic).unwrap();
+    assert_eq!(reader.get(&key()).unwrap().unwrap(), b"v3 data");
+    assert_eq!(reader.get(&next).unwrap().unwrap(), b"new row");
+}
 #[cfg(unix)]
 pub(super) fn inventory(path: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;

@@ -1648,6 +1648,49 @@ impl Publication<'_, '_> {
     ) -> Result<bool> {
         self.put_row(key, payload, payload_schema)
     }
+    /// Stores one plane's rows in one transaction. A payload conflict is a
+    /// per-row result: it leaves the winner unchanged without discarding other
+    /// rows in the batch. Database or commit failures fail the whole batch.
+    pub(crate) fn put_or_touch_batch(
+        &mut self,
+        plane: FamilyPlane,
+        rows: &[(FamilyKey, Vec<u8>)],
+        payload_schema: u32,
+    ) -> Result<Vec<Result<bool>>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        if rows.iter().any(|(key, _)| key.plane() != plane) {
+            return Err(Error::Refused("plane_mismatch"));
+        }
+        #[cfg(test)]
+        let _profile = work_profile::span("put_transaction");
+        let mut c = self.plane(plane)?;
+        #[cfg(test)]
+        if replay::unflushed_closure() {
+            c.pragma_update(None, "synchronous", 0)?;
+        }
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let layout = plane_layout(&tx)?;
+        let mut outcomes = Vec::with_capacity(rows.len());
+        let mut payload_bytes = 0u64;
+        for (key, payload) in rows {
+            match Self::write_row(&tx, layout, key, payload, payload_schema) {
+                Ok(inserted) => {
+                    if inserted {
+                        payload_bytes = payload_bytes.saturating_add(payload.len() as u64);
+                    }
+                    outcomes.push(Ok(inserted));
+                }
+                Err(error @ Error::Refused("payload_mismatch")) => outcomes.push(Err(error)),
+                Err(error) => return Err(error),
+            }
+        }
+        tx.commit()?;
+        drop(c);
+        self.payload_bytes = self.payload_bytes.saturating_add(payload_bytes);
+        Ok(outcomes)
+    }
     /// Stamps the plane's current `gc_epoch` on each existing row of `keys`
     /// and returns the keys that have no row. Never inserts, and never creates
     /// a plane store. The caller protects every key (a pin or live pin) before
@@ -1655,26 +1698,43 @@ impl Publication<'_, '_> {
     pub fn touch(&mut self, keys: &[FamilyKey]) -> Result<Vec<FamilyKey>> {
         #[cfg(test)]
         let _profile = work_profile::span("touch");
-        let mut missing = Vec::new();
-        for key in keys {
-            let Some(mut c) = self.plane_with(key.plane(), false)? else {
-                missing.push(*key);
+        let mut missing = vec![false; keys.len()];
+        for plane in FamilyPlane::V3_STORES {
+            let group: Vec<_> = keys
+                .iter()
+                .enumerate()
+                .filter(|(_, key)| key.plane() == plane)
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            let Some(mut c) = self.plane_with(plane, false)? else {
+                for (index, _) in group {
+                    missing[index] = true;
+                }
                 continue;
             };
-            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             #[cfg(test)]
             let _transaction = work_profile::span("touch_transaction");
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let sql = if plane_layout(&tx)? == 1 {
                 "UPDATE blob_payloads SET ref_epoch=(SELECT gc_epoch FROM store_meta) WHERE full_key=?1"
             } else {
                 "UPDATE blob_liveness SET ref_epoch=(SELECT gc_epoch FROM store_meta) WHERE blob_id=(SELECT id FROM blob_payloads WHERE full_key=?1)"
             };
-            if tx.execute(sql, [key.as_bytes().as_slice()])? == 0 {
-                missing.push(*key);
+            {
+                let mut statement = tx.prepare(sql)?;
+                for (index, key) in group {
+                    missing[index] = statement.execute([key.as_bytes().as_slice()])? == 0;
+                }
             }
             tx.commit()?;
         }
-        Ok(missing)
+        Ok(keys
+            .iter()
+            .zip(missing)
+            .filter_map(|(key, missing)| missing.then_some(*key))
+            .collect())
     }
     /// Inserts the row, or touches an equal existing one. `true` means inserted.
     fn put_row(&mut self, key: &FamilyKey, payload: &[u8], payload_schema: u32) -> Result<bool> {
@@ -1689,6 +1749,21 @@ impl Publication<'_, '_> {
             c.pragma_update(None, "synchronous", 0)?;
         }
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let written = Self::write_row(&tx, plane_layout(&tx)?, key, payload, payload_schema)?;
+        tx.commit()?;
+        drop(c);
+        if written {
+            self.payload_bytes = self.payload_bytes.saturating_add(payload.len() as u64);
+        }
+        Ok(written)
+    }
+    fn write_row(
+        tx: &rusqlite::Transaction<'_>,
+        layout: u32,
+        key: &FamilyKey,
+        payload: &[u8],
+        payload_schema: u32,
+    ) -> Result<bool> {
         let digest = blake3::hash(payload);
         let existing: Option<Vec<u8>> = tx
             .query_row(
@@ -1701,7 +1776,7 @@ impl Publication<'_, '_> {
             if existing != digest.as_bytes() {
                 return Err(Error::Refused("payload_mismatch"));
             }
-            let sql = if plane_layout(&tx)? == 1 {
+            let sql = if layout == 1 {
                 "UPDATE blob_payloads SET ref_epoch=(SELECT gc_epoch FROM store_meta) WHERE full_key=?1"
             } else {
                 "UPDATE blob_liveness SET ref_epoch=(SELECT gc_epoch FROM store_meta) WHERE blob_id=(SELECT id FROM blob_payloads WHERE full_key=?1)"
@@ -1709,7 +1784,7 @@ impl Publication<'_, '_> {
             tx.execute(sql, [key.as_bytes().as_slice()])?;
             false
         } else {
-            if plane_layout(&tx)? == 1 {
+            if layout == 1 {
                 tx.execute("INSERT INTO blob_payloads VALUES(?1,?2,?3,?4,(SELECT gc_epoch FROM store_meta),?5)",params![key.as_bytes().as_slice(),payload,digest.as_bytes().as_slice(),payload_schema,crate::pins::now_ms()])?;
             } else {
                 tx.execute("INSERT INTO blob_payloads(full_key,payload,payload_digest,payload_schema,created_at_ms) VALUES(?1,?2,?3,?4,?5)",params![key.as_bytes().as_slice(),payload,digest.as_bytes().as_slice(),payload_schema,crate::pins::now_ms()])?;
@@ -1717,11 +1792,6 @@ impl Publication<'_, '_> {
             }
             true
         };
-        tx.commit()?;
-        drop(c);
-        if written {
-            self.payload_bytes = self.payload_bytes.saturating_add(payload.len() as u64);
-        }
         Ok(written)
     }
     fn flush(&self) -> Result<()> {
@@ -1765,6 +1835,10 @@ pub(crate) mod work_profile {
 
     pub(crate) fn take() -> BTreeMap<&'static str, (usize, Duration)> {
         WORK.with_borrow_mut(std::mem::take)
+    }
+
+    pub(crate) fn count(name: &'static str) -> usize {
+        WORK.with_borrow(|work| work.get(name).map_or(0, |entry| entry.0))
     }
 
     pub(crate) struct Report;
