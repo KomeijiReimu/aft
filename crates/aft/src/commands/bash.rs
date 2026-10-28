@@ -941,6 +941,7 @@ mod tests {
             let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
             let marker = root.path().join("must-not-run-locally");
             let req = RawRequest {
+                handles_progress: false,
                 id: "standalone-runon".into(),
                 command: "bash".into(),
                 lsp_hints: None,

@@ -1519,6 +1519,7 @@ mod approved_audit11 {
             },
         );
         let req = RawRequest {
+            handles_progress: false,
             id: "match-guard".into(),
             command: "apply_patch".into(),
             params: serde_json::json!({"patch_text": patch, "validate": "off"}),
@@ -1553,6 +1554,7 @@ mod approved_audit11 {
             },
         );
         let req = RawRequest {
+            handles_progress: false,
             id: "parse-guard".into(),
             command: "apply_patch".into(),
             params: serde_json::json!({"patch_text": patch, "validate": "off"}),
@@ -1594,6 +1596,7 @@ mod write_warning_tests {
             },
         );
         let req = RawRequest {
+            handles_progress: false,
             id: "rollback-warnings".into(),
             command: "apply_patch".into(),
             params: serde_json::json!({"patch_text": patch, "validate": "off"}),

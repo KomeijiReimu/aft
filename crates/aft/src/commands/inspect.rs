@@ -1422,6 +1422,7 @@ pub(crate) fn handle_inspect_deferred_with_reply_deadline(
     };
 
     let request = RawRequest {
+        handles_progress: req.handles_progress(),
         id: req.id.clone(),
         command: req.command.clone(),
         lsp_hints: req.lsp_hints.clone(),
@@ -6389,6 +6390,7 @@ mod fresh_payload_tests {
             serde_json::json!({"scope":root.join("lib.ts")}),
         ] {
             let req = RawRequest {
+                handles_progress: false,
                 id: "off".to_string(),
                 command: "inspect".to_string(),
                 lsp_hints: None,

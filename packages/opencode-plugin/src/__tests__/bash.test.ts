@@ -1004,7 +1004,11 @@ describe("OpenCode bash adapter", () => {
 
   test("progress callback forwards rolling output previews through ctx.metadata", async () => {
     const applied: unknown[] = [];
-    const metadata = mock((update: unknown) => Effect.sync(() => { applied.push(update); }));
+    const metadata = mock((update: unknown) =>
+      Effect.sync(() => {
+        applied.push(update);
+      }),
+    );
     const { tool: bash } = createHarness((_command, _params, options) => {
       options?.onProgress?.({ text: "hello " });
       options?.onProgress?.({ text: "world" });
@@ -1018,19 +1022,21 @@ describe("OpenCode bash adapter", () => {
       ),
     );
 
-    expect(metadata.mock.calls[0][0]).toEqual({ metadata: { output: "hello ", description: "Print greeting" } });
+    expect(metadata.mock.calls[0][0]).toEqual({
+      metadata: { output: "hello ", description: "Print greeting" },
+    });
     expect(metadata.mock.calls[1][0]).toEqual({
       metadata: {
-      output: "hello world",
-      description: "Print greeting",
+        output: "hello world",
+        description: "Print greeting",
       },
     });
     expect(metadata.mock.calls.at(-1)?.[0]).toEqual({
       metadata: {
-      output: "hello world",
-      description: "Print greeting",
-      exit: 0,
-      truncated: false,
+        output: "hello world",
+        description: "Print greeting",
+        exit: 0,
+        truncated: false,
       },
     });
     expect(applied).toEqual(metadata.mock.calls.map(([update]) => update));
@@ -1933,7 +1939,7 @@ describe("bash_status tool", () => {
         createMockSdkContext({ metadata }),
       );
       expect(result).toContain('matched "Server listening" in stdout at offset 7');
-      expect(metadata.mock.calls.at(-1)?.[0].waited).toMatchObject({
+      expect(metadata.mock.calls.at(-1)?.[0].metadata.waited).toMatchObject({
         reason: "matched",
         match: "Server listening",
         match_offset: 7,
@@ -2136,7 +2142,7 @@ describe("bash_status tool", () => {
         { taskId: `bash-default-${sessionID}` },
         createMockSdkContext({ sessionID, metadata }),
       );
-      return metadata.mock.calls.at(-1)?.[0].effectiveWaitMs;
+      return metadata.mock.calls.at(-1)?.[0].metadata.effectiveWaitMs;
     };
     expect(await effectiveFor(true, "ses_watch_worker_default")).toBe(1_800_000);
     // A configured limit is honoured.
@@ -2433,7 +2439,7 @@ describe("bash_status tool", () => {
         createMockSdkContext({ metadata }),
       );
       expect(result).toContain('matched "READY" in stderr at offset 9');
-      expect(metadata.mock.calls.at(-1)?.[0].waited).toMatchObject({
+      expect(metadata.mock.calls.at(-1)?.[0].metadata.waited).toMatchObject({
         reason: "matched",
         match: "READY",
         match_offset: 9,
@@ -2464,7 +2470,7 @@ describe("bash_status tool", () => {
 
       expect(result).toContain("task exited (completed, exit 0)");
       expect(result).not.toContain("matched");
-      expect(metadata.mock.calls.at(-1)?.[0].waited).toMatchObject({ reason: "exited" });
+      expect(metadata.mock.calls.at(-1)?.[0].metadata.waited).toMatchObject({ reason: "exited" });
     } finally {
       await rm(spill.dir, { recursive: true, force: true });
     }
@@ -2495,7 +2501,7 @@ describe("bash_status tool", () => {
       );
 
       expect(result).toContain('matched "READY" in stdout at offset 0');
-      expect(metadata.mock.calls.at(-1)?.[0].waited).toMatchObject({
+      expect(metadata.mock.calls.at(-1)?.[0].metadata.waited).toMatchObject({
         reason: "matched",
         match: "READY",
         match_offset: 0,

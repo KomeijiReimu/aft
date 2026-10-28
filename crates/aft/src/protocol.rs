@@ -484,6 +484,9 @@ pub const DEFAULT_SESSION_ID: &str = "__default__";
 /// dispatch on `command` and pull specific params from the flattened `params`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawRequest {
+    /// Transport capability: the caller installed a progress handler.
+    #[serde(default)]
+    pub handles_progress: bool,
     /// Unique while pending on one standalone connection, across all sessions.
     /// Reusing an ID is allowed after the earlier response has completed.
     pub id: String,
@@ -506,6 +509,11 @@ pub struct RawRequest {
 }
 
 impl RawRequest {
+    /// Transport opt-in for live previews, not an agent-facing tool argument.
+    pub fn handles_progress(&self) -> bool {
+        self.handles_progress
+    }
+
     /// Session namespace for this request, falling back to [`DEFAULT_SESSION_ID`]
     /// when the plugin didn't supply one.
     pub fn session(&self) -> &str {

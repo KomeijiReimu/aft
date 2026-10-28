@@ -1774,6 +1774,7 @@ mod tests {
 
     fn make_request(id: &str, command: &str, params: serde_json::Value) -> RawRequest {
         RawRequest {
+            handles_progress: false,
             id: id.to_string(),
             command: command.to_string(),
             params,

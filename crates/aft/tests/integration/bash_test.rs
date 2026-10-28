@@ -453,12 +453,21 @@ fn bash_streams_progress_and_returns_final_response() {
     );
     let response = frames.last().unwrap();
     assert_eq!(response["success"], true);
-    assert!(response["output"].as_str().unwrap().replace("\r\n", "\n").starts_with("hello\n"));
+    assert!(response["output"]
+        .as_str()
+        .unwrap()
+        .replace("\r\n", "\n")
+        .starts_with("hello\n"));
     assert_eq!(response["exit_code"], 0);
-    assert!(frames[..frames.len() - 1].iter().any(|frame| {
-        frame["type"] == "progress" && frame["request_id"] == "bash-1"
-            && frame["kind"] == "stdout" && frame["chunk"] == "hello\n"
-    }), "missing stdout progress before terminal reply: {frames:?}");
+    assert!(
+        frames[..frames.len() - 1].iter().any(|frame| {
+            frame["type"] == "progress"
+                && frame["request_id"] == "bash-1"
+                && frame["kind"] == "stdout"
+                && frame["chunk"] == "hello\n"
+        }),
+        "missing stdout progress before terminal reply: {frames:?}"
+    );
     assert!(aft.shutdown().success());
 }
 
@@ -470,7 +479,36 @@ fn bash_progress_requires_transport_opt_in() {
         |frame| frame["id"] == "bash-no-progress",
     );
     assert_eq!(frames.last().unwrap()["success"], true);
-    assert!(frames.iter().all(|frame| frame["type"] != "progress"), "unexpected progress: {frames:?}");
+    assert!(
+        frames.iter().all(|frame| frame["type"] != "progress"),
+        "unexpected progress: {frames:?}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn bash_progress_masks_environment_secrets() {
+    let mut aft = AftProcess::spawn();
+    let secret = "progress-secret-1052-very-sensitive-value";
+    let frames = aft.send_until(&serde_json::json!({
+        "id": "bash-mask-progress", "method": "bash", "handles_progress": true,
+        "params": { "command": "echo $PROGRESS_SECRET_TOKEN; sleep 1", "env": {"PROGRESS_SECRET_TOKEN": secret}, "foreground_orchestrate": true, "wait": true }
+    }).to_string(), |frame| frame["id"] == "bash-mask-progress");
+    let progress = frames
+        .iter()
+        .filter(|frame| frame["type"] == "progress")
+        .collect::<Vec<_>>();
+    assert!(!progress.is_empty(), "no progress: {frames:?}");
+    for frame in progress {
+        assert!(
+            !frame["chunk"].as_str().unwrap().contains(secret),
+            "secret in progress: {frame:?}"
+        );
+        assert!(
+            frame["chunk"].as_str().unwrap().contains("REDACTED"),
+            "expected redaction: {frame:?}"
+        );
+    }
     assert!(aft.shutdown().success());
 }
 

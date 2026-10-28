@@ -663,6 +663,7 @@ async fn read_tool_allows_on(
         arguments: arguments.clone(),
         format_context: Default::default(),
         tool_call_context: ToolCallContext {
+            handles_progress: false,
             project_root: identity.project_root.clone(),
             session_id: Some(identity.session.clone()),
             request_id: request_id.clone(),

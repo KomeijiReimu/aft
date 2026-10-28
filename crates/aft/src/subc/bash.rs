@@ -405,6 +405,7 @@ mod frame_loop_lock_tests {
         tokio::time::timeout(
             Duration::from_secs(60),
             run_deferred_bash_wait(
+                false,
                 executor,
                 completion_tx,
                 poll_touch_tx,
@@ -1579,6 +1580,7 @@ mod run_permission_tests {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn submit_deferred_bash(
+    handles_progress: bool,
     executor: &Arc<Executor>,
     completion_tx: &mpsc::Sender<BashDeferredCompletion>,
     poll_touch_tx: &mpsc::Sender<ProjectRootId>,
@@ -2012,13 +2014,11 @@ pub(super) fn submit_deferred_bash(
                     let command_timeout_ms = settings.timeout.unwrap_or_else(|| {
                         crate::bash_background::registry::DEFAULT_BG_TIMEOUT.as_millis() as u64
                     });
-                    let raw_req = RawRequest {
-                        id: request_id_for_spawn.clone(),
-                        command: "bash".to_string(),
-                        lsp_hints: None,
-                        session_id: Some(session_for_spawn.clone()),
-                        params: Value::Object(translated.args),
-                    };
+                    let raw_req = RawRequest { handles_progress: false, id: request_id_for_spawn.clone(),
+                    command: "bash".to_string(),
+                    lsp_hints: None,
+                    session_id: Some(session_for_spawn.clone()),
+                    params: Value::Object(translated.args), };
                     let (response, storage_dir) =
                         crate::sandbox_spawn::with_authenticated_principal(spawn_principal, || {
                             // Declared first so its test-only drop check runs after
@@ -2620,6 +2620,7 @@ pub(super) fn submit_deferred_bash(
                 };
                 let repeat_for_deadline = repeat.clone();
                 let wait_future = run_deferred_bash_wait(
+                    handles_progress,
                     executor,
                     completion_tx.clone(),
                     poll_touch_tx,
@@ -2852,6 +2853,7 @@ fn startup_refusal_reason(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_deferred_bash_wait(
+    handles_progress: bool,
     executor: Arc<Executor>,
     completion_tx: mpsc::Sender<BashDeferredCompletion>,
     poll_touch_tx: mpsc::Sender<ProjectRootId>,
@@ -2901,6 +2903,14 @@ async fn run_deferred_bash_wait(
         return;
     };
     let registry = wait_ctx.bash_background().clone();
+    let mut progress = handles_progress.then(|| {
+        crate::bash_background::progress::BashProgressPump::new(
+            &wait_ctx,
+            task_id.clone(),
+            session_id.clone(),
+            request_id.clone(),
+        )
+    });
     // From here the module loop can answer this call and detach its command
     // without this task, should the executor polls below stall.
     metrics.held_bash_calls.set_detach_target(
@@ -3024,6 +3034,10 @@ async fn run_deferred_bash_wait(
                 // deadline. The command keeps running and its completion is
                 // delivered like any promoted task's.
                 let drain_detach_due = cancel.drain.is_active() && !server_completion;
+                if let Some(progress) = &mut progress {
+                    let _origin = crate::context::progress_origin_guard(&request_id, route.channel, route.epoch, corr);
+                    progress.poll(target_finished || detach_pending || promotion_due || drain_detach_due || remote_handback_due, &mut |frame| wait_ctx.emit_progress(frame));
+                }
                 if !target_finished
                     && !detach_pending
                     && !promotion_due
@@ -3948,6 +3962,89 @@ pub(super) async fn assert_deferred_wait_entrypoint_for_test(
 
 #[cfg(test)]
 mod grant_path_tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_progress_reaches_subc_origin_before_command_finishes() {
+        use super::*;
+        let (dir, root) = super::super::test_support::test_root("bash-progress");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| {
+            config.project_root = Some(dir.path().into());
+            config.storage_dir = Some(dir.path().join("storage"));
+        });
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        ctx.set_progress_sender(Some(Arc::new(Box::new(move |frame| {
+            if let crate::protocol::PushFrame::Progress(frame) = frame {
+                let _ = progress_tx.send(frame);
+            }
+        }))));
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx.clone());
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (tx, mut rx) = mpsc::channel(8);
+        let (touch, _touch_rx) = mpsc::channel(8);
+        submit_deferred_bash(
+            true,
+            &executor,
+            &tx,
+            &touch,
+            &metrics,
+            |req, ctx| crate::commands::bash::handle(&req, ctx),
+            root,
+            dir.path().to_path_buf(),
+            "progress-session".into(),
+            "progress-request".into(),
+            RouteChannel {
+                channel: 7,
+                epoch: 3,
+            },
+            1052,
+            Flags::new(false, Priority::Interactive, false),
+            PROTOCOL_VERSION,
+            json!({"command": "echo hello; while [ ! -f release ]; do sleep 0.1; done", "wait": true}),
+            crate::subc_format::FormatContext::default(),
+            BashWaitCancel {
+                run_scope: None,
+                scope: None,
+                late_results: false,
+                ledger_carrier: None,
+                connection: PersistentCancelSignal::new(),
+                route: PersistentCancelSignal::new(),
+                drain: drain::ModuleDrainWindow::default(),
+            },
+            BindTrust::FirstParty,
+            crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            super::remote_policy::RemoteSource::None,
+            Instant::now(),
+        );
+        let frame = tokio::time::timeout(Duration::from_secs(15), progress_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.request_id, "progress-request");
+        assert_eq!(frame.chunk, "hello\n");
+        let origin = frame.origin.unwrap();
+        assert_eq!((origin.channel, origin.epoch, origin.corr), (7, 3, 1052));
+        assert!(
+            rx.try_recv().is_err(),
+            "terminal reply arrived before releasing the child"
+        );
+        std::fs::write(dir.path().join("release"), "").unwrap();
+        let done = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(done.response_for_test().success);
+    }
     #[test]
     fn finalized_terminal_bash_result_carries_the_stored_record_on_tool_result_routes() {
         let manifest = crate::db::rich_ui::test_view_manifest_for_test();
@@ -4048,6 +4145,7 @@ mod grant_path_tests {
         let (touch, _touch_rx) = mpsc::channel(8);
         let session = "pin-dispatch-session";
         submit_deferred_bash(
+            false,
             &executor,
             &tx,
             &touch,
@@ -4341,6 +4439,7 @@ mod grant_path_tests {
             let (tx, mut rx) = mpsc::channel(8);
             let (touch, _touch_rx) = mpsc::channel(8);
             submit_deferred_bash(
+                false,
                 &executor,
                 &tx,
                 &touch,
@@ -4491,6 +4590,7 @@ mod grant_path_tests {
         };
         let session = "detach-log-session";
         let request = RawRequest {
+            handles_progress: false,
             id: "detach-log".into(),
             command: "bash".into(),
             lsp_hints: None,
@@ -4547,6 +4647,7 @@ mod grant_path_tests {
         // A failed metadata write must not destroy the task id that the caller
         // already received. Exercise the same status handler the caller can use.
         let status_request = RawRequest {
+            handles_progress: false,
             id: "status-after-detach-error".into(),
             command: "bash_status".into(),
             lsp_hints: None,
@@ -4783,6 +4884,7 @@ mod grant_path_tests {
         let (tx, mut rx) = mpsc::channel(8);
         let (touch, _touch_rx) = mpsc::channel(8);
         submit_deferred_bash(
+            false,
             &executor,
             &tx,
             &touch,
@@ -4859,6 +4961,7 @@ mod grant_path_tests {
                     },
                 ));
                 submit_deferred_bash(
+                    false,
                     &executor,
                     &tx,
                     &touch,
@@ -4937,6 +5040,7 @@ mod grant_path_tests {
         let (completion_tx, mut completion_rx) = mpsc::channel(8);
         let (touch_tx, _touch_rx) = mpsc::channel(8);
         submit_deferred_bash(
+            false,
             &executor,
             &completion_tx,
             &touch_tx,
@@ -5027,6 +5131,7 @@ mod grant_path_tests {
             let (touch_tx, _touch_rx) = mpsc::channel(8);
             let started = Instant::now();
             submit_deferred_bash(
+                false,
                 &executor,
                 &completion_tx,
                 &touch_tx,
@@ -5240,6 +5345,7 @@ mod grant_path_tests {
             false,
         );
         submit_deferred_bash(
+            false,
             executor,
             &tx,
             &touch_tx,
@@ -5991,6 +6097,7 @@ mod grant_path_tests {
         let status = || {
             crate::commands::bash_status::handle(
                 &RawRequest {
+                    handles_progress: false,
                     id: "capture-status".into(),
                     command: "bash_status".into(),
                     params: json!({"task_id":task_id}),
@@ -6210,6 +6317,7 @@ mod grant_path_tests {
             let status = || {
                 crate::commands::bash_status::handle(
                     &RawRequest {
+                        handles_progress: false,
                         id: "restart-capture-status".into(),
                         command: "bash_status".into(),
                         params: json!({"task_id":task_id}),
@@ -6675,6 +6783,7 @@ mod grant_path_tests {
         let kill = tokio::task::spawn_blocking(move || {
             crate::commands::bash_kill::handle(
                 &RawRequest {
+                    handles_progress: false,
                     id: "kill-before-submit".into(),
                     command: "bash_kill".into(),
                     lsp_hints: None,
@@ -6760,6 +6869,7 @@ mod grant_path_tests {
     fn admission_status(ctx: &AppContext, task_id: &str) -> Response {
         crate::commands::bash_status::handle(
             &RawRequest {
+                handles_progress: false,
                 id: "admission-status".into(),
                 command: "bash_status".into(),
                 lsp_hints: None,
@@ -6794,6 +6904,7 @@ mod grant_path_tests {
             tokio::task::spawn_blocking(move || {
                 crate::commands::bash_kill::handle(
                     &RawRequest {
+                        handles_progress: false,
                         id: "kill-admission".into(),
                         command: "bash_kill".into(),
                         lsp_hints: None,
@@ -8697,6 +8808,7 @@ mod grant_path_tests {
                 with_spawn_commit_time_for_test(now, || {
                     running_bash_stub(
                         RawRequest {
+                            handles_progress: false,
                             id: "deadline-call".into(),
                             command: "bash".into(),
                             lsp_hints: None,
@@ -9325,6 +9437,7 @@ mod grant_path_tests {
             let connection = PersistentCancelSignal::new();
             let route = PersistentCancelSignal::new();
             submit_deferred_bash(
+                false,
                 &executor,
                 &completion_tx,
                 &poll_touch_tx,
@@ -9496,6 +9609,7 @@ mod grant_path_tests {
         let _no_task_locks = crate::bash_background::registry::forbid_task_state_locks_for_test();
 
         submit_deferred_bash(
+            false,
             &executor,
             &completion_tx,
             &poll_touch_tx,
@@ -9612,6 +9726,7 @@ mod run_tests {
         let (completion_tx, mut completion_rx) = mpsc::channel(8);
         let (touch_tx, _touch_rx) = mpsc::channel(8);
         submit_deferred_bash(
+            false,
             &executor,
             &completion_tx,
             &touch_tx,

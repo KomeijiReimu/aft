@@ -100,6 +100,7 @@ fn handle_on_route(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchFn<'_>
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let tool_ctx = ToolCallContext {
+        handles_progress: req.handles_progress(),
         project_root,
         session_id: Some(req.session().to_string()),
         request_id: req.id.clone(),

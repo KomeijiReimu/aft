@@ -133,6 +133,7 @@ mod tests {
 
     fn make_request(lsp_hints: Option<serde_json::Value>) -> RawRequest {
         RawRequest {
+            handles_progress: false,
             id: "test-1".into(),
             command: "edit_symbol".into(),
             lsp_hints,

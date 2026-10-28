@@ -11361,6 +11361,7 @@ mod tests {
 
     fn configure_request(project_root: serde_json::Value) -> RawRequest {
         RawRequest {
+            handles_progress: false,
             id: "cfg".to_string(),
             command: "configure".to_string(),
             lsp_hints: None,
@@ -11371,6 +11372,7 @@ mod tests {
 
     fn configure_request_with_params(params: serde_json::Value) -> RawRequest {
         RawRequest {
+            handles_progress: false,
             id: "cfg".to_string(),
             command: "configure".to_string(),
             lsp_hints: None,
@@ -11381,6 +11383,7 @@ mod tests {
 
     fn configure_request_with_session(params: serde_json::Value, session_id: &str) -> RawRequest {
         RawRequest {
+            handles_progress: false,
             id: "cfg".to_string(),
             command: "configure".to_string(),
             lsp_hints: None,
@@ -11596,6 +11599,7 @@ mod tests {
         assert!(ctx.configure_tail_has_work());
 
         let request = |command: &str, params: serde_json::Value| RawRequest {
+            handles_progress: false,
             id: command.to_string(),
             command: command.to_string(),
             lsp_hints: None,
@@ -12624,6 +12628,7 @@ mod tests {
         );
         ctx.install_view_runtime(prepared.snapshot, prepared.pin);
         let request = RawRequest {
+            handles_progress: false,
             id: "restart-dirty".into(),
             command: "callers".into(),
             session_id: None,
@@ -22038,6 +22043,7 @@ mod tests {
         // starting a build.
         let (response, query_events) = crate::logging::capture_index_events(|| {
             let navigation = RawRequest {
+                handles_progress: false,
                 id: "off-callers".to_string(),
                 command: "callers".to_string(),
                 lsp_hints: None,
@@ -22105,6 +22111,7 @@ mod tests {
         );
 
         let navigation = RawRequest {
+            handles_progress: false,
             id: "pending-upgrade-navigation".into(),
             command: "callers".into(),
             lsp_hints: None,
@@ -22198,6 +22205,7 @@ mod tests {
         let fixture = busy_obsolete_non_git_upgrade();
         assert!(fixture.ctx.configure_callgraph_upgrade_pending());
         let inspect = RawRequest {
+            handles_progress: false,
             id: "pending-upgrade-inspect".into(),
             command: "inspect".into(),
             lsp_hints: None,
@@ -22392,6 +22400,7 @@ mod tests {
         let (reached, release) =
             crate::context::install_callgraph_build_start_gate_for_test(canonical_root);
         let navigation = RawRequest {
+            handles_progress: false,
             id: "navigation".to_string(),
             command: "callers".to_string(),
             lsp_hints: None,
@@ -22465,6 +22474,7 @@ mod tests {
         }
 
         let suspended_navigation = RawRequest {
+            handles_progress: false,
             id: "suspended-navigation".to_string(),
             command: "callers".to_string(),
             lsp_hints: None,
@@ -23599,6 +23609,7 @@ mod tests {
             assert_eq!(observation["reason"], "root_too_broad");
         }
         let inspect = RawRequest {
+            handles_progress: false,
             id: "inspect-broad".into(),
             command: "inspect".into(),
             session_id: None,
@@ -23609,6 +23620,7 @@ mod tests {
         assert!(!response.success);
         assert_eq!(response.data["code"], "root_too_broad");
         let search = RawRequest {
+            handles_progress: false,
             id: "search-broad".into(),
             command: "semantic_search".into(),
             session_id: None,
@@ -23758,6 +23770,7 @@ mod tests {
         let file = project.path().join("readable.txt");
         std::fs::write(&file, "explicit path still works\n").unwrap();
         let read = RawRequest {
+            handles_progress: false,
             id: "read-root".into(),
             command: "read".into(),
             session_id: None,
@@ -25049,6 +25062,7 @@ mod tests {
         );
         assert!(ctx.has_configure_session_binding(&canonical_root, "session-b"));
         let read = RawRequest {
+            handles_progress: false,
             id: "session-b-read".to_string(),
             command: "read".to_string(),
             lsp_hints: None,

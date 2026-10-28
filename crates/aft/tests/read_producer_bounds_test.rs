@@ -18,6 +18,7 @@ fn read_response(root: &Path, file: &Path, extra: Value) -> Response {
     params.insert("file".into(), json!(file));
     handle_read(
         &RawRequest {
+            handles_progress: false,
             id: "bounds".into(),
             command: "read".into(),
             lsp_hints: None,

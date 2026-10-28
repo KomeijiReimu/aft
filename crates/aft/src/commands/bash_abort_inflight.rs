@@ -29,6 +29,7 @@ mod tests {
         let app = App::default_shared();
         let ctx = AppContext::from_app(Arc::clone(&app), Config::default());
         let req = RawRequest {
+            handles_progress: false,
             id: "abort-inflight".to_string(),
             command: "bash_abort_inflight".to_string(),
             lsp_hints: None,

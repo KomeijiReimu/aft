@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 
 fn glob_request(params: Value) -> RawRequest {
     RawRequest {
+        handles_progress: false,
         id: "glob-test".to_string(),
         command: "glob".to_string(),
         params,

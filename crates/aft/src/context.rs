@@ -18575,6 +18575,7 @@ mod callgraph_store_for_ops_tests {
             let _wait = force_async_callgraph_builds(&ctx);
             let response = crate::commands::callers::handle_callers(
                 &RawRequest {
+                    handles_progress: false,
                     id: "busy-callers".into(),
                     command: "callers".into(),
                     lsp_hints: None,
@@ -19545,6 +19546,7 @@ mod callgraph_store_for_ops_tests {
 
     fn configure_request_with_params(params: serde_json::Value) -> RawRequest {
         RawRequest {
+            handles_progress: false,
             id: "cfg".to_string(),
             command: "configure".to_string(),
             lsp_hints: None,
@@ -19628,6 +19630,7 @@ mod callgraph_store_for_ops_tests {
                 .iter()
                 .any(|reason| reason == "home_root"));
             let status_request = RawRequest {
+                handles_progress: false,
                 id: "home-status".to_string(),
                 command: "status".to_string(),
                 lsp_hints: None,
@@ -19667,6 +19670,7 @@ mod callgraph_store_for_ops_tests {
             );
 
             let navigation = RawRequest {
+                handles_progress: false,
                 id: "home-callers".to_string(),
                 command: "callers".to_string(),
                 lsp_hints: None,
@@ -20473,6 +20477,7 @@ mod callgraph_store_for_ops_tests {
         fn callers(&self) -> crate::protocol::Response {
             crate::commands::callers::handle_callers(
                 &RawRequest {
+                    handles_progress: false,
                     id: "views-callers".to_owned(),
                     command: "callers".to_owned(),
                     lsp_hints: None,
@@ -20732,6 +20737,7 @@ mod callgraph_store_for_ops_tests {
         let inspect = || {
             crate::commands::inspect::handle_inspect(
                 &RawRequest {
+                    handles_progress: false,
                     id: "views-inspect".to_owned(),
                     command: "inspect".to_owned(),
                     lsp_hints: None,
@@ -20811,6 +20817,7 @@ mod callgraph_store_for_ops_tests {
         let zoom = || {
             crate::commands::zoom::handle_zoom(
                 &RawRequest {
+                    handles_progress: false,
                     id: "views-zoom".to_owned(),
                     command: "zoom".to_owned(),
                     lsp_hints: None,

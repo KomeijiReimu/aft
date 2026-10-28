@@ -607,6 +607,7 @@ fn handle_trace_to_attaches_envelope_when_depth_capped() {
     // (main -> processData -> validate). With depth: 1, search cuts off at
     // processData and fails to reach 'main', setting max_depth_reached.
     let req = RawRequest {
+        handles_progress: false,
         id: "trace-to-live-depth".into(),
         command: "trace_to".into(),
         lsp_hints: None,
@@ -660,6 +661,7 @@ fn handle_trace_to_untruncated_produces_no_envelope_and_matches_pre_spec() {
 
     // With depth: 5, the 2-hop path to 'main' completes inside the limit.
     let req = RawRequest {
+        handles_progress: false,
         id: "trace-to-live-complete".into(),
         command: "trace_to".into(),
         lsp_hints: None,
@@ -732,6 +734,7 @@ fn handle_trace_data_attaches_envelope_when_depth_capped() {
     // processInput in data_processor.ts. With depth: 0, cross-file tracking
     // is limited, producing depth_limited = true.
     let req = RawRequest {
+        handles_progress: false,
         id: "trace-data-live-depth".into(),
         command: "trace_data".into(),
         lsp_hints: None,
@@ -790,6 +793,7 @@ fn handle_trace_data_untruncated_produces_no_envelope_and_matches_pre_spec() {
 
     // With depth: 5, tracking crosses into processInput in data_processor.ts and finishes.
     let req = RawRequest {
+        handles_progress: false,
         id: "trace-data-live-complete".into(),
         command: "trace_data".into(),
         lsp_hints: None,

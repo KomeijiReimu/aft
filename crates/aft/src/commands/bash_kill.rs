@@ -163,6 +163,7 @@ mod tests {
 
     fn kill_request(task_id: &str, session: &str) -> RawRequest {
         RawRequest {
+            handles_progress: false,
             id: "kill-project-filter".to_string(),
             command: "bash_kill".to_string(),
             lsp_hints: None,

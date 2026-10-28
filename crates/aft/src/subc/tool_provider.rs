@@ -6537,6 +6537,7 @@ mod route_tests {
                     registration();
                 }
                 let call_context = ToolCallContext {
+                    handles_progress: false,
                     project_root: root.as_path().into(),
                     session_id: Some(session.into()),
                     request_id: "standard-edit".into(),
@@ -6972,6 +6973,7 @@ mod route_tests {
                 arguments: json!({"path": "pin.rs", "content": "pub fn edited() {}\n"}),
                 format_context: Default::default(),
                 tool_call_context: ToolCallContext {
+                    handles_progress: false,
                     project_root: identity.project_root.clone(),
                     session_id: Some(identity.session.clone()),
                     request_id: "tool-policy-dispatch".into(),
@@ -7093,6 +7095,7 @@ mod route_tests {
                 arguments: json!({"path": "pin.rs", "content": content}),
                 format_context: Default::default(),
                 tool_call_context: ToolCallContext {
+                    handles_progress: false,
                     project_root: identity.project_root.clone(),
                     session_id: Some(identity.session.clone()),
                     request_id: "tool-policy-lazy".into(),

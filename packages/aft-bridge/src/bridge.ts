@@ -1293,6 +1293,8 @@ export class BinaryBridge implements AftProjectTransport {
       } else {
         request = { id, command, ...params };
       }
+      delete request.handles_progress;
+      if (options?.onProgress) request.handles_progress = true;
       const line = `${JSON.stringify(request)}\n`;
 
       // Passive polls and completion drains always take the typed keep-warm

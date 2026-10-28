@@ -2789,6 +2789,7 @@ mod pending_response_tests {
         }))));
         let session_id = "session-wait-detach";
         let request = RawRequest {
+            handles_progress: false,
             id: "wait-detach".to_string(),
             command: "bash".to_string(),
             lsp_hints: None,
@@ -2830,6 +2831,7 @@ mod pending_response_tests {
 
         let detach = super::dispatch(
             RawRequest {
+                handles_progress: false,
                 id: "wait-detach-signal".to_string(),
                 command: "bash_wait_detach".to_string(),
                 lsp_hints: None,
@@ -3178,6 +3180,7 @@ mod deferred_semantic_search_tests {
 
     fn request(id: &str, command: &str, params: serde_json::Value) -> RawRequest {
         RawRequest {
+            handles_progress: false,
             id: id.to_string(),
             command: command.to_string(),
             lsp_hints: None,
@@ -4819,6 +4822,7 @@ mod watcher_filter_tests {
         ] {
             let response = dispatch(
                 RawRequest {
+                    handles_progress: false,
                     id: command.to_string(),
                     command: command.to_string(),
                     params: serde_json::json!({}),

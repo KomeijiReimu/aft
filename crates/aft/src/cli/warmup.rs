@@ -328,6 +328,7 @@ fn configure(
     // any cold-build admission occurs.
     let params = build_warmup_configure_params(root, storage_dir, areas, force);
     let req = RawRequest {
+        handles_progress: false,
         id: "warmup-configure".to_string(),
         command: "configure".to_string(),
         lsp_hints: None,

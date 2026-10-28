@@ -16,6 +16,7 @@ fn outline(root: &std::path::Path) -> serde_json::Value {
     .with_test_checkpoint_store();
     let response = handle_outline(
         &RawRequest {
+            handles_progress: false,
             id: "bounds".into(),
             command: "outline".into(),
             session_id: None,

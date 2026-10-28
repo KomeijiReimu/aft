@@ -192,6 +192,7 @@ fn defer_lsp_navigation(
     reply_deadline: Option<Instant>,
 ) -> DispatchOutcome {
     let request = RawRequest {
+        handles_progress: req.handles_progress(),
         id: req.id.clone(),
         command: req.command.clone(),
         lsp_hints: req.lsp_hints.clone(),

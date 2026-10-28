@@ -220,6 +220,7 @@ fn isolated_restriction_probe() {
         ctx.set_harness(Harness::Runner);
     }
     let request = RawRequest {
+        handles_progress: false,
         id: format!("{case}-github-read"),
         command: "read".to_string(),
         lsp_hints: None,
@@ -248,6 +249,7 @@ fn isolated_restriction_probe() {
         ("zoom", json!({ "file": "issue://7", "symbols": ["1"] })),
     ] {
         let request = RawRequest {
+            handles_progress: false,
             id: format!("{case}-github-{command}"),
             command: command.to_string(),
             lsp_hints: None,

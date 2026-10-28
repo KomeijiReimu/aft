@@ -672,6 +672,7 @@ fn tool_request(tool: &str, request: &RewriteRequest, ctx: &AppContext) -> RawRe
         params["path"] = Value::String(root.display().to_string());
     }
     RawRequest {
+        handles_progress: false,
         id: request.request_id.clone(),
         command: tool.to_string(),
         lsp_hints: None,
@@ -1095,6 +1096,7 @@ fn find_shape_is_faithful(ctx: &AppContext, params: &Value) -> bool {
     }
     let response = crate::commands::glob::handle_glob(
         &RawRequest {
+            handles_progress: false,
             id: "bash-rewrite-find-faithfulness".to_string(),
             command: "glob".to_string(),
             lsp_hints: None,

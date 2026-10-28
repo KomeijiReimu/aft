@@ -26,6 +26,7 @@ fn call_with_drain(
         arguments,
         &FormatContext::default(),
         &ToolCallContext {
+            handles_progress: false,
             request_id: name.into(),
             project_root: root,
             standard_edit_grammar: true,

@@ -83,6 +83,7 @@ fn has_floor_skip(response: &Response, path: &Path) -> bool {
 
 fn request(command: &str, params: serde_json::Value) -> RawRequest {
     RawRequest {
+        handles_progress: false,
         id: "storage-floor".into(),
         command: command.into(),
         session_id: Some("storage-floor".into()),

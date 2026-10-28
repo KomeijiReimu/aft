@@ -46,6 +46,7 @@ fn context(root: &Path, trigram: bool) -> AppContext {
 
 fn request(command: &str, params: Value) -> RawRequest {
     RawRequest {
+        handles_progress: false,
         id: format!("os-metadata-{command}"),
         command: command.to_string(),
         lsp_hints: None,

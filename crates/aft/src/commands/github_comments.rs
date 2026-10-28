@@ -671,6 +671,7 @@ mod tests {
         config.git.co_author = "off".into();
         let ctx = AppContext::new(default_language_provider_factory(), config);
         let mut request = RawRequest {
+            handles_progress: false,
             id: "comment".into(),
             command: "write".into(),
             lsp_hints: None,
@@ -785,6 +786,7 @@ mod tests {
             client: "github-write-test".to_string(),
         });
         let request = RawRequest {
+            handles_progress: false,
             id: "untrusted-github-write".to_string(),
             command: "write".to_string(),
             lsp_hints: None,
