@@ -6711,6 +6711,10 @@ impl AppContext {
     pub(crate) fn mark_subc_bound(&self) {
         self.lsp().resume();
         self.subc_lifecycle.mark_bound();
+        // Idle release holds the lifecycle gate while clearing the pools. Once
+        // mark_bound returns, an earlier release has finished and later releases
+        // skip this root. Repair even if configure committed before the release.
+        self.attach_ready_database_pools(&self.database_open.lock());
         self.inspect_manager.resume_root_work();
         // A views-on semantic lane pauses its fills while the root is unbound
         // past the grace window; resume them now rather than at the next edit.
@@ -8247,10 +8251,10 @@ impl AppContext {
     /// still running for an older configure from publishing over this one;
     /// taking the open mutex orders this against `publish_database_open`.
     ///
-    /// A rebind that keeps the root and storage directory of a database that
-    /// is already open and ready changes nothing: re-marking it as
-    /// initializing would refuse bash and edits on a working root until the
-    /// rebind's open ran again. A failed or busy database is always retried.
+    /// A rebind that keeps an open, ready database reattaches any detached
+    /// root-local pools without marking persistence as initializing, which
+    /// would refuse bash and edits until another open ran. A failed or busy
+    /// database is always retried.
     pub(crate) fn begin_database_runtime(
         &self,
         canonical_cache_root: PathBuf,
@@ -8259,12 +8263,7 @@ impl AppContext {
     ) {
         let mut slot = self.database_open.lock();
         let target = (canonical_cache_root, storage_root);
-        if self.database_runtime_state.load(Ordering::Acquire) == 2
-            && !slot.running
-            && slot.pending.is_none()
-            && slot.ready_for.as_ref() == Some(&target)
-            && self.app.db_for_path(&target.1.join("aft.db")).is_some()
-        {
+        if slot.ready_for.as_ref() == Some(&target) && self.attach_ready_database_pools(&slot) {
             return;
         }
         slot.epoch = slot.epoch.wrapping_add(1);
@@ -8279,6 +8278,33 @@ impl AppContext {
             dispatched_at: None,
         });
         self.database_runtime_state.store(1, Ordering::Release);
+    }
+
+    /// The caller holds the database-open slot so a newer configure or open
+    /// cannot replace the ready target between checking and attaching its pool.
+    fn attach_ready_database_pools(&self, slot: &crate::database_open::DatabaseOpenSlot) -> bool {
+        if self.database_runtime_state.load(Ordering::Acquire) != 2
+            || slot.running
+            || slot.pending.is_some()
+        {
+            return false;
+        }
+        let Some((_, storage_root)) = slot.ready_for.as_ref() else {
+            return false;
+        };
+        let Some(shared) = self.app.db_for_path(&storage_root.join("aft.db")) else {
+            return false;
+        };
+        {
+            let backup = self.backup.lock();
+            if !backup.uses_db_pool(&shared) {
+                backup.set_db_pool(shared.clone());
+            }
+        }
+        if !self.bash_background.uses_db_pool(&shared) {
+            self.bash_background.set_db_pool(shared);
+        }
+        true
     }
 
     /// Mark persistence as initializing with nothing staged, for tests of the
@@ -23053,7 +23079,11 @@ mod shared_db_tests {
         a.release_idle_reopenable_resources_in_background()
             .join()
             .unwrap();
+        assert!(!a.bash_background().uses_db_pool(&shared));
+        assert!(!a.backup().lock().uses_db_pool(&shared));
         assert!(!b.subc_unbound_quiesced());
+        assert!(b.bash_background().uses_db_pool(&shared));
+        assert!(b.backup().lock().uses_db_pool(&shared));
         assert!(Arc::ptr_eq(
             &app.db_for_path(&storage.path().join("aft.db")).unwrap(),
             &shared
@@ -23070,6 +23100,32 @@ mod shared_db_tests {
         assert_ne!(first, second);
         assert_rebind_bash_row(&a, &second);
         assert_rebound_backup_is_persisted(&a, root_a.path(), storage.path());
+    }
+
+    #[test]
+    fn ready_root_reconfigure_repairs_each_detached_pool_without_another_open() {
+        let storage = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let ctx = bound_database_root(App::default_shared(), root.path(), storage.path());
+        let shared = ctx.db().unwrap();
+        ctx.backup().lock().clear_db_pool();
+        ctx.begin_database_runtime(
+            root.path().to_path_buf(),
+            storage.path().to_path_buf(),
+            "idle-rebind".into(),
+        );
+        assert!(ctx.backup().lock().uses_db_pool(&shared));
+        assert!(ctx.bash_background().uses_db_pool(&shared));
+        ctx.bash_background().clear_db_pool();
+        ctx.begin_database_runtime(
+            root.path().to_path_buf(),
+            storage.path().to_path_buf(),
+            "idle-rebind".into(),
+        );
+        assert!(ctx.backup().lock().uses_db_pool(&shared));
+        assert!(ctx.bash_background().uses_db_pool(&shared));
+        assert!(!ctx.database_runtime_initializing());
+        assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 1);
     }
 
     #[test]
