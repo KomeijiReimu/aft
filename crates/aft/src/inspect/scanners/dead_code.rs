@@ -8723,6 +8723,63 @@ mod tests {
     }
 
     #[test]
+    fn rust_module_paths_and_function_values_in_impl_bodies_are_live() {
+        let (temp, root, paths) = canonical_fixture(&[
+            (
+                "src/main.rs",
+                r#"
+mod checks;
+struct Handler { draw: fn() }
+impl Handler {
+    fn new() -> Self { Self { draw: checks::draw } }
+    fn register(&self) { checks::check(); }
+}
+fn main() { let handler = Handler::new(); handler.register(); }
+"#,
+            ),
+            (
+                "src/checks.rs",
+                r#"
+pub(crate) fn check() {}
+pub(crate) fn draw() {}
+pub(crate) fn planted_dead() {}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn checks() { super::check(); }
+}
+"#,
+            ),
+        ]);
+        let store = crate::callgraph_store::CallGraphStore::open(
+            temp.path().join("callgraph-store"),
+            root.clone(),
+        )
+        .unwrap();
+        store.cold_build(&paths).unwrap();
+        let snapshot =
+            crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path()).unwrap();
+        let aggregate = scan(job(&root, paths, snapshot));
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/checks.rs::planted_dead"],
+            "{aggregate:#}"
+        );
+        assert_eq!(aggregate["test_only_count"], 0, "{aggregate:#}");
+        for symbol in ["check", "draw"] {
+            let callers = store
+                .direct_callers_of(Path::new("src/checks.rs"), symbol)
+                .unwrap();
+            assert!(
+                callers
+                    .iter()
+                    .any(|caller| caller.caller.file == "src/main.rs"),
+                "{symbol}: {callers:#?}"
+            );
+        }
+    }
+
+    #[test]
     fn own_repo_cfg_test_declarations_are_not_product_dead_code() {
         let aggregate = stored_rust_fixture_scan(&[
             ("Cargo.toml", "[package]\nname = 'demo'\nversion = '0.1.0'\n"),
