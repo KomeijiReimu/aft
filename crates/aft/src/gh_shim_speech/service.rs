@@ -844,6 +844,7 @@ impl Service {
         session: &str,
         scope: &ScopeStamp,
         body: Value,
+        deadline: tokio::time::Instant,
     ) -> Result<super::partner::ReservedBotRequest, Refusal> {
         #[cfg(test)]
         if let Some(partners) = self.test_partners() {
@@ -857,7 +858,9 @@ impl Service {
             runtime.as_ref().and_then(|runtime| runtime.relay.upgrade())
         }
         .ok_or_else(|| Refusal::new(Code::AuthorityUnavailable, "guard_unsupported"))?;
-        relay.reserve_bot(project, session, scope, body).await
+        relay
+            .reserve_bot(project, session, scope, body, deadline)
+            .await
     }
 }
 

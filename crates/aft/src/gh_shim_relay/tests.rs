@@ -622,7 +622,7 @@ async fn production_foreground_forwards_while_reconnected_background_is_guarded(
     let mut routes = scopes_for("unconfirmed-post", Some(stamp.clone()));
     routes.speech = Some(service);
     let transport = FakeTransport::scoped();
-    assert!(crate::gh_shim_speech::partner::require_reserved_send().is_err());
+    assert!(crate::gh_shim_speech::partner::require_reserved_send().is_ok());
     let answer = relay(
         &transport,
         RelayCall {
@@ -642,6 +642,11 @@ async fn production_foreground_forwards_while_reconnected_background_is_guarded(
     assert_eq!(transport.calls().len(), 1);
 
     let background = background_ticket(root.path(), "unconfirmed-post", &stamp);
+    *crate::gh_shim_ticket::speech_for_ticket(background.value().unwrap())
+        .unwrap()
+        .failure
+        .lock()
+        .unwrap() = None;
     params["ticket"] = json!(background.value().unwrap());
     routes.push_origin(launch_origin(), Some(stamp.clone()));
     let bound = relay(
@@ -678,9 +683,9 @@ async fn production_foreground_forwards_while_reconnected_background_is_guarded(
     )
     .await;
     assert!(!answer.ok);
-    assert_eq!(answer.data["reason"], "guard_unsupported");
+    assert_eq!(answer.data["reason"], "start_policy_missing");
     assert_eq!(answer.data["refusal_code"], "task_gh_authority_unavailable");
-    assert_eq!(answer.data["message"], "this command's bot-write permission cannot be verified (guard_unsupported); start the command again from a live session, and tell the operator if it repeats.");
+    assert_eq!(answer.data["message"], "this command's bot-write permission cannot be verified (start_policy_missing); start the command again from a live session, and tell the operator if it repeats.");
     assert_eq!(transport.calls().len(), 1);
 }
 
@@ -2292,7 +2297,13 @@ async fn published_sdk_reservation_does_not_send_until_committed_and_releases_on
         json!({"op":"bot_request","request_nonce":"reserved-before-send","request":{"action":"issue comment"}}),
     );
     let reservation = relay
-        .reserve_bot("/project", "reserved-session", &delegating_stamp(), body)
+        .reserve_bot(
+            "/project",
+            "reserved-session",
+            &delegating_stamp(),
+            body,
+            tokio::time::Instant::now() + RELAY_CALL_TIMEOUT,
+        )
         .await
         .expect("published SUBC 0.32.7 must reserve rather than return guard_unsupported");
     assert!(
@@ -2303,6 +2314,26 @@ async fn published_sdk_reservation_does_not_send_until_committed_and_releases_on
     drop(reservation);
     assert_eq!(daemon.closes(1).await.len(), 1);
     assert!(daemon.requests().is_empty());
+    let sent = relay
+        .reserve_bot(
+            "/project",
+            "reserved-session",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request","request_nonce":"reserved-committed"})),
+            tokio::time::Instant::now() + RELAY_CALL_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    assert!(daemon.requests().is_empty());
+    let queued = sent.send().unwrap();
+    let reply = queued.response().await.unwrap();
+    assert_eq!(facade_reply(&reply)["status"], "completed");
+    assert_eq!(daemon.requests().len(), 1);
+    assert_eq!(
+        daemon.requests()[0]["arguments"]["request_nonce"],
+        "reserved-committed"
+    );
+    assert_eq!(daemon.closes(2).await.len(), 2);
 }
 
 #[tokio::test]
@@ -2321,6 +2352,7 @@ async fn published_sdk_reservation_names_scoped_route_end_before_any_send() {
             "reserved-ended",
             &delegating_stamp(),
             github_call(json!({"op":"bot_request","request_nonce":"reserved-ended"})),
+            tokio::time::Instant::now() + RELAY_CALL_TIMEOUT,
         )
         .await
         .err()

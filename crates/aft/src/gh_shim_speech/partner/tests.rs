@@ -96,26 +96,14 @@ fn run_scope_is_not_in_the_nonce_fingerprint_but_expect_is() {
 }
 
 #[test]
-fn placed_plex_guards_do_not_override_the_unpublished_reserved_send_seam() {
+fn placed_plex_and_published_subc_reservation_prerequisites_are_confirmed() {
     for codemode in [false, true] {
         require_plex_guards(codemode).unwrap();
-        let err = require_reserved_send().unwrap_err();
-        assert_eq!(err.code, Code::AuthorityUnavailable);
-        assert_eq!(err.reason, "guard_unsupported");
+        require_reserved_send().unwrap();
     }
     assert_eq!(PLEX_EXPECT_PLACED_COMMIT, Some("ee7e5acf2b0b"));
     assert_eq!(PLEX_RUN_SCOPE_PLACED_COMMIT, Some("ee7e5acf2b0b"));
-    assert_eq!(SUBC_RESERVATION_LAST_CHECKED, "0.32.3");
-}
-
-#[tokio::test]
-async fn unpublished_subc_slot_stays_unavailable_without_an_async_send_fallback() {
-    let result = reserve_bot_request(json!({"op":"bot_request"})).await;
-    let refusal = result
-        .err()
-        .expect("the published client cannot reserve a send slot");
-    assert_eq!(refusal.code, Code::AuthorityUnavailable);
-    assert_eq!(refusal.reason, "guard_unsupported");
+    assert_eq!(SUBC_RESERVATION_LAST_CHECKED, "0.32.7");
 }
 
 #[test]

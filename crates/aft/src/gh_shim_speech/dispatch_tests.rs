@@ -656,7 +656,7 @@ impl Fixture {
 async fn captured_dispatch_reaches_the_real_gate_with_a_precommitted_pinned_nonce() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(false).await;
-    assert!(crate::gh_shim_speech::partner::require_reserved_send().is_err());
+    assert!(crate::gh_shim_speech::partner::require_reserved_send().is_ok());
     let path = fixture.service.store.path().to_path_buf();
     fixture.partners(|partners| {
         let reserve = partners.reserve.clone();

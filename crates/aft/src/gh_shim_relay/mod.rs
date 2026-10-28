@@ -287,6 +287,7 @@ pub struct RelayCall<'a> {
 }
 
 mod bound;
+mod reservation;
 
 /// How a call reached plexus, for the relay log line: under the session's
 /// scope stamp, or (for the binding read) on an unscoped route.
@@ -1048,6 +1049,7 @@ async fn post_captured(
             &redeemed.session_id,
             &launch.authority,
             github_call(body.value()),
+            probe_deadline,
         )
         .await
     {
@@ -1154,11 +1156,14 @@ async fn post_captured(
     };
     let reply = match queued.response().await {
         Ok(reply) => reply,
-        Err(_) => {
+        Err(crate::gh_shim_speech::partner::QueuedResponseError::NotSent(refusal)) => {
+            return Ok(RelayReply::task_refused(refusal));
+        }
+        Err(crate::gh_shim_speech::partner::QueuedResponseError::Unknown(cause)) => {
             return Ok(RelayReply::refused(
                 "outcome_unknown",
                 "plexus",
-                "the queued write returned no verifiable result",
+                format!("the queued write returned no verifiable result ({cause})"),
             ))
         }
     };
@@ -1482,10 +1487,11 @@ async fn route_request(
         error: TransportError::Unavailable(error.to_string()),
         reconnect: false,
     })?;
-    let key = serde_json::to_string(&(&target, &identity, scope)).map_err(|error| CallFailure {
-        error: TransportError::Unavailable(error.to_string()),
-        reconnect: false,
-    })?;
+    let key =
+        route_lease_key(consumer, &target, &identity, scope).map_err(|error| CallFailure {
+            error: TransportError::Unavailable(error.to_string()),
+            reconnect: false,
+        })?;
     let permit = RELAY_OPERATIONS
         .clone()
         .try_acquire_owned()
@@ -1643,7 +1649,7 @@ async fn open_and_send(
 /// connection is opened lazily on first use and reopened after a failure.
 pub struct SubcRelayTransport {
     connection_file: PathBuf,
-    consumer: tokio::sync::Mutex<Option<Arc<subc_client_rs::SubcConsumer>>>,
+    consumer: Arc<tokio::sync::Mutex<Option<Arc<subc_client_rs::SubcConsumer>>>>,
     leases: Arc<RouteLeases>,
     /// Replaces the subc client's route-open deadline (30 s, with retries for
     /// up to 90 s) when set. Production leaves it unset; tests shorten it so a
@@ -1655,7 +1661,7 @@ impl SubcRelayTransport {
     fn new(connection_file: PathBuf) -> Self {
         Self {
             connection_file,
-            consumer: tokio::sync::Mutex::new(None),
+            consumer: Arc::new(tokio::sync::Mutex::new(None)),
             leases: Arc::new(RouteLeases::default()),
             route_open_deadline: None,
         }
@@ -1795,17 +1801,27 @@ impl RelayTransport for SubcRelayTransport {
 #[cfg(test)]
 mod tests;
 
+fn route_lease_key(
+    consumer: &Arc<subc_client_rs::SubcConsumer>,
+    target: &subc_protocol::RouteTarget,
+    identity: &subc_protocol::BindIdentity,
+    scope: Option<&ScopeSelector>,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&(Arc::as_ptr(consumer) as usize, target, identity, scope))
+}
+
 impl GhRelay {
     pub(crate) async fn reserve_bot(
         &self,
-        _project: &str,
-        _session: &str,
-        _scope: &ScopeStamp,
+        project: &str,
+        session: &str,
+        scope: &ScopeStamp,
         body: Value,
+        deadline: tokio::time::Instant,
     ) -> Result<crate::gh_shim_speech::partner::ReservedBotRequest, crate::gh_shim_speech::Refusal>
     {
-        // The published SDK has no synchronous commit-to-queue primitive. Do not
-        // substitute its awaited request method or spawn a send behind the gate.
-        crate::gh_shim_speech::partner::reserve_bot_request(body).await
+        self.transport
+            .reserve_scoped(project, session, scope, body, deadline)
+            .await
     }
 }

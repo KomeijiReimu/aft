@@ -61,6 +61,9 @@ fn temporary_reasons_and_lasting_reasons_use_different_approved_templates() {
         "storage_busy",
         "revocation_pending",
         "dispatch_queue_full",
+        "reservation_timeout",
+        "route_closed",
+        "relay_unavailable",
     ] {
         assert_eq!(
             Refusal::new(Code::AuthorityUnavailable, reason).text(),

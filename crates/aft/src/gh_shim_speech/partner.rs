@@ -1,4 +1,4 @@
-//! Partner wire contracts; unpublished queue APIs remain fail closed.
+//! Partner wire contracts and the validated reserved-send boundary.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -13,7 +13,7 @@ use super::{Code, Refusal, ScopeRole};
 // Placement is a release decision, never a command argument or inherited env flag.
 const PLEX_EXPECT_PLACED_COMMIT: Option<&str> = Some("ee7e5acf2b0b");
 const PLEX_RUN_SCOPE_PLACED_COMMIT: Option<&str> = Some("ee7e5acf2b0b");
-pub(crate) const SUBC_RESERVATION_LAST_CHECKED: &str = "0.32.3";
+pub(crate) const SUBC_RESERVATION_LAST_CHECKED: &str = "0.32.7";
 
 pub(crate) fn require_plex_guards(codemode: bool) -> Result<(), Refusal> {
     if PLEX_EXPECT_PLACED_COMMIT.is_none() || (codemode && PLEX_RUN_SCOPE_PLACED_COMMIT.is_none()) {
@@ -27,10 +27,7 @@ pub(crate) fn require_plex_guards(codemode: bool) -> Result<(), Refusal> {
 }
 
 pub(crate) fn require_reserved_send() -> Result<(), Refusal> {
-    Err(Refusal::new(
-        Code::AuthorityUnavailable,
-        "guard_unsupported",
-    ))
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -108,6 +105,13 @@ pub(crate) struct ReservedBotRequest {
 }
 
 impl ReservedBotRequest {
+    pub(crate) fn new(
+        commit: impl FnOnce() -> Result<QueuedBotResponse, Refusal> + Send + 'static,
+    ) -> Self {
+        Self {
+            commit: Box::new(commit),
+        }
+    }
     #[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn for_test(
         commit: impl FnOnce() -> Result<QueuedBotResponse, Refusal> + Send + 'static,
@@ -123,10 +127,23 @@ impl ReservedBotRequest {
 }
 
 pub(crate) struct QueuedBotResponse {
-    response: Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>,
+    response: Pin<Box<dyn Future<Output = Result<Value, QueuedResponseError>> + Send>>,
+}
+
+#[derive(Debug)]
+pub(crate) enum QueuedResponseError {
+    NotSent(Refusal),
+    Unknown(String),
 }
 
 impl QueuedBotResponse {
+    pub(crate) fn new(
+        response: impl Future<Output = Result<Value, QueuedResponseError>> + Send + 'static,
+    ) -> Self {
+        Self {
+            response: Box::pin(response),
+        }
+    }
     #[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn for_test(reply: Value) -> Self {
         Self {
@@ -134,22 +151,9 @@ impl QueuedBotResponse {
         }
     }
 
-    pub(crate) async fn response(self) -> Result<Value, String> {
+    pub(crate) async fn response(self) -> Result<Value, QueuedResponseError> {
         self.response.await
     }
-}
-
-/// Published SubcConsumer 0.32.3 has only awaited sends. Never spawn one inside a gate.
-pub(crate) async fn reserve_bot_request(
-    _prepared_body: Value,
-) -> Result<ReservedBotRequest, Refusal> {
-    log::debug!(
-        "SUBC reserved-send API unavailable; latest checked client {SUBC_RESERVATION_LAST_CHECKED}"
-    );
-    Err(Refusal::new(
-        Code::AuthorityUnavailable,
-        "guard_unsupported",
-    ))
 }
 
 pub(crate) fn map_refusal(result: &Value, route_role: ScopeRole) -> Option<Refusal> {

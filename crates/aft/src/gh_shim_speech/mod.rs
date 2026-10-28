@@ -106,7 +106,10 @@ impl Refusal {
                 "serving_lock_unavailable"
                 | "storage_busy"
                 | "revocation_pending"
-                | "dispatch_queue_full" => TEMPORARY_TEXT,
+                | "dispatch_queue_full"
+                | "reservation_timeout"
+                | "route_closed"
+                | "relay_unavailable" => TEMPORARY_TEXT,
                 _ => UNAVAILABLE_TEXT,
             },
             Code::ScopeEnded => ENDED_TEXT,
