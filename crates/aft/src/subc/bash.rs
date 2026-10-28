@@ -4278,6 +4278,7 @@ mod grant_path_tests {
             let (touch, _touch_rx) = mpsc::channel(8);
             let submit = || {
                 submit_deferred_bash(
+                    false,
                     &executor,
                     &tx,
                     &touch,

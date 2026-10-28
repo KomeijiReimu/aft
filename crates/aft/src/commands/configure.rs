@@ -13973,6 +13973,7 @@ mod tests {
             ),
         ] {
             let request = RawRequest {
+                handles_progress: false,
                 id: format!("lexical-views-{command}"),
                 command: command.into(),
                 lsp_hints: None,
@@ -14230,6 +14231,7 @@ mod tests {
         );
         let glob = crate::commands::glob::handle_glob(
             &RawRequest {
+                handles_progress: false,
                 id: "lexical-refused-glob".into(),
                 command: "glob".into(),
                 lsp_hints: None,
@@ -14353,6 +14355,7 @@ mod tests {
         let initialized = ctx.lexical_view_snapshot("bind").unwrap();
         assert!(initialized.is_ok(), "{:?}", initialized.err());
         let request = RawRequest {
+            handles_progress: false,
             id: "lexical-views-slow-bind".into(),
             command: "grep".into(),
             lsp_hints: None,
@@ -14482,6 +14485,7 @@ mod tests {
             .into_iter()
             .map(|(command, file, symbol, depth)| {
                 let request = RawRequest {
+                    handles_progress: false,
                     id: format!("callgraph-views-{command}"),
                     command: command.into(),
                     lsp_hints: None,
@@ -14772,6 +14776,7 @@ mod tests {
         let callers = |ctx: &AppContext| {
             crate::commands::callers::handle_callers(
                 &RawRequest {
+                    handles_progress: false,
                     id: "routed-callers".into(),
                     command: "callers".into(),
                     lsp_hints: None,
@@ -14859,6 +14864,7 @@ mod tests {
         let callers = || {
             crate::commands::callers::handle_callers(
                 &RawRequest {
+                    handles_progress: false,
                     id: "evicted-callers".into(),
                     command: "callers".into(),
                     lsp_hints: None,
