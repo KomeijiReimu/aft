@@ -1042,6 +1042,20 @@ describe("OpenCode bash adapter", () => {
     expect(applied).toEqual(metadata.mock.calls.map(([update]) => update));
   });
 
+  test("a rejected metadata Effect does not replace the final bash result", async () => {
+    const metadata = mock(() => Effect.fail(new Error("tool part closed")));
+    const { tool: bash } = createHarness((_command, _params, options) => {
+      options?.onProgress?.({ text: "live output\n" });
+      return { success: true, output: "final output\n", exit_code: 0, truncated: false };
+    });
+    const result = await bash.execute(
+      { command: "echo hello" },
+      createMockSdkContext({ metadata }),
+    );
+    expect(bashText(result)).toBe("final output\n");
+    expect(metadata.mock.calls).toHaveLength(2);
+  });
+
   test("bg_completions are captured for notification hooks, not appended by bash adapter", async () => {
     const { tool: bash } = createHarness(() => ({
       success: true,
