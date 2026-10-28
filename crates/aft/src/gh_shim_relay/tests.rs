@@ -1121,6 +1121,7 @@ fn route_scopes_answer_only_when_the_sessions_routes_agree() {
 #[derive(Clone, Default)]
 struct DaemonScript {
     reply: Option<Arc<dyn Fn(&Value, Option<&Value>) -> Value + Send + Sync>>,
+    scoped_open_pause: Option<Arc<LeaseTestPause>>,
     /// Refuse every route.open that carries a scope with this code.
     refuse_scoped_opens: Option<String>,
     /// Before writing each scoped route.open refusal, wait this long in real
@@ -1396,6 +1397,12 @@ async fn fake_daemon(script: DaemonScript) -> FakeDaemon {
                                                 }
                                             }
                                             _ => {
+                                                if scoped {
+                                                    if let Some(pause) = &script.scoped_open_pause {
+                                                        pause.acquired.notify_one();
+                                                        pause.resume.notified().await;
+                                                    }
+                                                }
                                                 next_channel += 1;
                                                 if scoped {
                                                     scoped_channels.push(next_channel);
@@ -2487,4 +2494,137 @@ async fn published_sdk_reservation_old_connection_cleanup_cannot_close_a_replace
         "new-send"
     );
     assert_eq!(daemon.closes(2).await.len(), 2);
+}
+
+#[tokio::test]
+async fn published_sdk_reservation_deadline_bounds_waiting_for_the_consumer_slot() {
+    let daemon = fake_daemon(DaemonScript::default()).await;
+    let relay = GhRelay {
+        transport: daemon.transport().await,
+    };
+    let slot = relay.transport.consumer.lock().await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        relay.reserve_bot(
+            "/project",
+            "consumer-slot-deadline",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request"})),
+            tokio::time::Instant::now() + Duration::from_millis(50),
+        ),
+    )
+    .await;
+    drop(slot);
+    let refusal = result
+        .expect("the reservation deadline must bound consumer-slot contention")
+        .err()
+        .expect("no reservation is possible while the consumer slot is locked");
+    assert_eq!(refusal.code, crate::gh_shim_speech::Code::AuthorityUnavailable);
+    assert_eq!(refusal.reason, "reservation_timeout");
+    assert!(daemon.opens().is_empty());
+    assert!(daemon.requests().is_empty());
+}
+
+#[tokio::test]
+async fn published_sdk_reservation_deadline_bounds_waiting_for_a_route_lease() {
+    let daemon = fake_daemon(DaemonScript::default()).await;
+    let relay = GhRelay {
+        transport: daemon.transport().await,
+    };
+    let holders = relay.transport.leases.holders.lock().await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        relay.reserve_bot(
+            "/project",
+            "lease-deadline",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request"})),
+            tokio::time::Instant::now() + Duration::from_millis(50),
+        ),
+    )
+    .await;
+    drop(holders);
+    let refusal = result
+        .expect("the reservation deadline must bound route-lease contention")
+        .err()
+        .expect("no reservation is possible while route leases are locked");
+    assert_eq!(refusal.reason, "reservation_timeout");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if Arc::strong_count(&relay.transport.leases) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the detached owner must release its expired lease");
+    assert!(relay.transport.leases.holders.lock().await.is_empty());
+    assert!(daemon.opens().is_empty());
+    assert!(daemon.requests().is_empty());
+}
+
+#[tokio::test]
+async fn published_sdk_reservation_deadline_during_open_retains_cleanup_ownership() {
+    let pause = Arc::new(LeaseTestPause::default());
+    let daemon = fake_daemon(DaemonScript {
+        scoped_open_pause: Some(pause.clone()),
+        ..Default::default()
+    })
+    .await;
+    let relay = GhRelay {
+        transport: daemon.transport().await,
+    };
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        relay.reserve_bot(
+            "/project",
+            "open-deadline",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request"})),
+            tokio::time::Instant::now() + Duration::from_millis(100),
+        ),
+    )
+    .await;
+    pause.resume.notify_one();
+    let refusal = result
+        .expect("the reservation deadline must bound a successful open still in flight")
+        .err()
+        .expect("the paused open must not produce a reservation before the deadline");
+    assert_eq!(refusal.reason, "reservation_timeout");
+    assert_eq!(daemon.closes(1).await.len(), 1);
+    assert!(daemon.requests().is_empty());
+}
+
+#[tokio::test]
+async fn published_sdk_reservation_canceled_open_registers_and_releases_without_sending() {
+    let pause = Arc::new(LeaseTestPause::default());
+    let daemon = fake_daemon(DaemonScript {
+        scoped_open_pause: Some(pause.clone()),
+        ..Default::default()
+    })
+    .await;
+    let relay = Arc::new(GhRelay {
+        transport: daemon.transport().await,
+    });
+    let owner = relay.clone();
+    let request = tokio::spawn(async move {
+        owner
+            .reserve_bot(
+                "/project",
+                "open-canceled",
+                &delegating_stamp(),
+                github_call(json!({"op":"bot_request"})),
+                tokio::time::Instant::now() + RELAY_CALL_TIMEOUT,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), pause.acquired.notified())
+        .await
+        .unwrap();
+    request.abort();
+    assert!(request.await.err().unwrap().is_cancelled());
+    pause.resume.notify_one();
+    assert_eq!(daemon.closes(1).await.len(), 1);
+    assert!(daemon.requests().is_empty());
 }
