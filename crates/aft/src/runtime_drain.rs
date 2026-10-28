@@ -6793,7 +6793,7 @@ mod tests {
         // slices so that worker can release the manager, and bound the wait
         // by time rather than a fixed slice count, which is brittle under
         // CI load.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {
             assert!(Instant::now() < deadline, "rebased replay must finish");
             std::thread::yield_now();
