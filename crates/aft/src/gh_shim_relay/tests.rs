@@ -638,7 +638,7 @@ fn launch_origin() -> crate::gh_shim_speech::model::RouteOrigin {
 }
 
 #[tokio::test]
-async fn production_foreground_forwards_while_reconnected_background_is_guarded() {
+async fn production_foreground_without_capture_and_background_without_policy_are_refused() {
     let root = tempfile::tempdir().unwrap();
     let relay_state = GhRelay::new(root.path().join("unused-connection.json"));
     let service = crate::gh_shim_speech::service::start(
@@ -670,12 +670,10 @@ async fn production_foreground_forwards_while_reconnected_background_is_guarded(
         &|_| {},
     )
     .await;
-    assert!(
-        answer.ok,
-        "foreground must not depend on undeployed background guards: {:?}",
-        answer.data
-    );
-    assert_eq!(transport.calls().len(), 1);
+    assert!(!answer.ok);
+    assert_eq!(answer.data["refusal_code"], "task_gh_authority_unavailable");
+    assert_eq!(answer.data["reason"], "owner_unresolved");
+    assert!(transport.calls().is_empty());
 
     let background = background_ticket(root.path(), "unconfirmed-post", &stamp);
     *crate::gh_shim_ticket::speech_for_ticket(background.value().unwrap())
@@ -701,7 +699,7 @@ async fn production_foreground_forwards_while_reconnected_background_is_guarded(
         bound.data["reason"], "start_policy_missing",
         "a bound route cannot authorize an uncaptured background ticket"
     );
-    assert_eq!(transport.calls().len(), 1);
+    assert!(transport.calls().is_empty());
     routes.origins.clear();
     let mut reconnected = stamp;
     reconnected.scope_epoch += 1;
@@ -722,7 +720,7 @@ async fn production_foreground_forwards_while_reconnected_background_is_guarded(
     assert_eq!(answer.data["reason"], "start_policy_missing");
     assert_eq!(answer.data["refusal_code"], "task_gh_authority_unavailable");
     assert_eq!(answer.data["message"], "this command's bot-write permission cannot be verified (start_policy_missing); start the command again from a live session, and tell the operator if it repeats.");
-    assert_eq!(transport.calls().len(), 1);
+    assert!(transport.calls().is_empty());
 }
 
 #[tokio::test]

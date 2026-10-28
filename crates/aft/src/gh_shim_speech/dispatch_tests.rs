@@ -433,8 +433,6 @@ impl Fixture {
                 bindings: Arc::new(move |_, _| Ok(read.bindings())),
                 reserve: Arc::new(move |_, _, scope, body| reserve.reserve(scope, body)),
                 before_final_gate: None,
-                on_bound_enqueue: None,
-                after_bound_commit: None,
             }));
         }
         let mut config = crate::config::Config::default();
@@ -899,18 +897,13 @@ fn cancel_from_sibling(root: &Path, scope: &ScopeStamp) -> Value {
 }
 
 #[tokio::test]
-async fn bound_dispatch_refuses_a_sibling_cancel_committed_before_local_enqueue() {
+async fn bound_background_cancel_committed_before_sdk_send_is_refused() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(false).await;
     let root = fixture.service.store.path().parent().unwrap().to_path_buf();
     let scope = fixture.head.clone();
     let incarnation = fixture.incarnation.clone();
-    let enqueued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let observer = enqueued.clone();
     fixture.partners(|partners| {
-        partners.expect_placed = None;
-        partners.run_placed = None;
-        partners.reserved_send_placed = false;
         partners.before_final_gate = Some(Arc::new(move || {
             let receipt = cancel_from_sibling(&root, &scope);
             assert_eq!(receipt["success"], true);
@@ -927,26 +920,22 @@ async fn bound_dispatch_refuses_a_sibling_cancel_committed_before_local_enqueue(
             assert_eq!(
                 marker,
                 Some("revoked".into()),
-                "cancellation must commit the speech marker before acknowledging: {receipt:?}"
+                "cancellation must commit before acknowledging: {receipt:?}"
             );
-        }));
-        partners.on_bound_enqueue = Some(Arc::new(move || {
-            observer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }));
     });
     let answer = fixture.post(true, "cancel-before").await;
     assert_eq!(answer.data["refusal_code"], "task_gh_authority_unavailable");
     assert_eq!(answer.data["reason"], "revoked");
     assert_eq!(
-        enqueued.load(std::sync::atomic::Ordering::SeqCst),
+        fixture.plex.state.lock().unwrap().sends,
         0,
-        "an item must not be enqueued after an earlier cancellation commit"
+        "no SDK mutation may be sent after an earlier cancellation commit"
     );
-    assert_eq!(fixture.plex.state.lock().unwrap().sends, 0);
 }
 
 #[tokio::test]
-async fn bound_dispatch_queued_before_cancel_posts_once_and_cancel_discloses_the_window() {
+async fn bound_sdk_send_precedes_cancel_without_a_legacy_mailbox() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(false).await;
     let root = fixture.service.store.path().parent().unwrap().to_path_buf();
@@ -954,30 +943,24 @@ async fn bound_dispatch_queued_before_cancel_posts_once_and_cancel_discloses_the
     let receipt = Arc::new(Mutex::new(None));
     let captured = receipt.clone();
     fixture.partners(|partners| {
-        partners.expect_placed = None;
-        partners.run_placed = None;
-        partners.reserved_send_placed = false;
-        partners.after_bound_commit = Some(Arc::new(move || {
-            *captured.lock().unwrap() = Some(cancel_from_sibling(&root, &scope));
-            true
-        }));
+        let reserve = partners.reserve.clone();
+        partners.reserve = Arc::new(move |project, session, head, body| {
+            let slot = reserve(project, session, head, body)?;
+            let root = root.clone();
+            let scope = scope.clone();
+            let captured = captured.clone();
+            Ok(ReservedBotRequest::new(move || {
+                let queued = slot.send()?;
+                Ok(QueuedBotResponse::new(async move {
+                    *captured.lock().unwrap() = Some(cancel_from_sibling(&root, &scope));
+                    queued.response().await
+                }))
+            }))
+        });
     });
     let answer = fixture.post(true, "cancel-after").await;
     assert!(answer.ok, "{:?}", answer.data);
-    let receipt = receipt.lock().unwrap().clone().unwrap();
-    assert_eq!(receipt["success"], true);
-    assert_eq!(
-        fixture
-            .service
-            .store
-            .get(&fixture.incarnation)
-            .err()
-            .map(|error| error.reason),
-        Some("revoked".into()),
-        "{receipt:?}"
-    );
-    assert_eq!(receipt["bot_writes_already_queued"], 1);
-    assert_eq!(receipt["bot_write_revocation_warning"],"bot_writes_already_queued: 1 writes already queued for this command may still post; cancellation cannot unsend them.");
+    assert_eq!(receipt.lock().unwrap().as_ref().unwrap()["success"], true);
     assert_eq!(fixture.plex.state.lock().unwrap().posts.len(), 1);
     assert_eq!(
         fixture
@@ -990,25 +973,22 @@ async fn bound_dispatch_queued_before_cancel_posts_once_and_cancel_discloses_the
 }
 
 #[tokio::test]
-async fn bound_queue_full_is_retryable_and_rolls_back_the_dispatch_record() {
+async fn bound_sdk_reservation_queue_full_does_not_prepare_or_send() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(false).await;
-    let mut held = Vec::new();
-    for _ in 0..16 {
-        held.push(fixture.service.try_legacy_slot().unwrap());
-    }
+    fixture.partners(|partners| {
+        partners.reserve = Arc::new(|_, _, _, _| {
+            Err(Refusal::new(
+                Code::AuthorityUnavailable,
+                "dispatch_queue_full",
+            ))
+        });
+    });
     let answer = fixture.post(true, "full-bound").await;
     assert_eq!(answer.data["refusal_code"], "task_gh_authority_unavailable");
     assert_eq!(answer.data["reason"], "dispatch_queue_full");
-    assert_eq!(answer.data["message"],"bot writes from background commands are briefly unavailable (dispatch_queue_full); retry in a few seconds.");
+    assert_eq!(answer.data["message"], "bot writes from background commands are briefly unavailable (dispatch_queue_full); retry in a few seconds.");
     let conn = fixture.service.store.connect().unwrap();
-    let queued: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM gh_speech_legacy_dispatch WHERE request_nonce='full-bound'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
     let prepared: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM gh_speech_requests WHERE request_nonce='full-bound'",
@@ -1016,20 +996,15 @@ async fn bound_queue_full_is_retryable_and_rolls_back_the_dispatch_record() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!((queued, prepared), (0, 1));
+    assert_eq!(prepared, 0);
     assert_eq!(fixture.plex.state.lock().unwrap().sends, 0);
-    drop(held);
 }
 
 #[tokio::test]
-async fn lost_bound_consumer_after_commit_is_unknown_and_cannot_resend() {
+async fn historical_legacy_dispatch_cannot_be_resent_by_the_relay() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(false).await;
-    fixture.partners(|partners| {
-        partners.after_bound_commit = Some(Arc::new(|| false));
-    });
-    let lost = fixture.post(true, "lost-consumer").await;
-    assert_eq!(lost.data["refusal_code"], "outcome_unknown");
+    seed_historical_dispatch(&fixture, "lost-consumer");
     let recovered = crate::db::gh_speech::Store::new(fixture.service.store.path());
     assert_eq!(
         recovered
@@ -1040,6 +1015,31 @@ async fn lost_bound_consumer_after_commit_is_unknown_and_cannot_resend() {
     let retry = fixture.post(true, "lost-consumer").await;
     assert_eq!(retry.data["refusal_code"], "outcome_unknown");
     assert_eq!(fixture.plex.state.lock().unwrap().sends, 0);
+}
+
+fn seed_historical_dispatch(fixture: &Fixture, nonce: &str) {
+    let store = &fixture.service.store;
+    let stored = store.get(&fixture.incarnation).unwrap();
+    let (current, _) = fixture.service.register_accepted_policy().unwrap().unwrap();
+    let policy_generation = store.advance_policy(&current).unwrap();
+    let payload = blake3::derive_key(
+        "aft-gh-bound-request-v1",
+        &serde_json::to_vec(&fixture.params["request"]).unwrap(),
+    );
+    store
+        .prepare_request(nonce, &fixture.incarnation, &payload, "legacy-bound")
+        .unwrap();
+    store
+        .final_legacy_gate(
+            &fixture.incarnation,
+            nonce,
+            stored.generation,
+            policy_generation,
+            &current,
+            "historical-forwarder",
+            || Ok(()),
+        )
+        .unwrap();
 }
 
 #[tokio::test]

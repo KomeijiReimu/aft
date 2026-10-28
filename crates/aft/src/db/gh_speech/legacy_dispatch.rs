@@ -44,6 +44,7 @@ impl Store {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn final_legacy_gate<T>(
         &self,
         incarnation: &str,
@@ -88,6 +89,7 @@ impl Store {
         Ok(queued)
     }
 
+    #[cfg(test)]
     pub(crate) fn settle_legacy_dispatch(
         &self,
         nonce: &str,

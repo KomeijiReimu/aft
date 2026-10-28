@@ -47,8 +47,6 @@ pub(crate) struct TestPartners {
             + Sync,
     >,
     pub(crate) before_final_gate: Option<Arc<dyn Fn() + Send + Sync>>,
-    pub(crate) on_bound_enqueue: Option<Arc<dyn Fn() + Send + Sync>>,
-    pub(crate) after_bound_commit: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 static RUN: OnceLock<Option<String>> = OnceLock::new();
@@ -129,7 +127,6 @@ pub(crate) struct Service {
     lease: Mutex<Option<Arc<crate::root_cache::SpeechServingLease>>>,
     pending_tasks: Mutex<HashSet<String>>,
     pending_ids: Mutex<HashSet<(String, String)>>,
-    legacy_slots: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     test_partners: Mutex<Option<Arc<TestPartners>>>,
     pending_scopes: Mutex<HashSet<ScopeKey>>,
@@ -185,7 +182,6 @@ pub(crate) fn start(
                 lease: Mutex::new(None),
                 pending_tasks: Mutex::new(HashSet::new()),
                 pending_ids: Mutex::new(HashSet::new()),
-                legacy_slots: Arc::new(tokio::sync::Semaphore::new(16)),
                 #[cfg(test)]
                 test_partners: Mutex::new(None),
                 pending_scopes: Mutex::new(HashSet::new()),
@@ -243,11 +239,6 @@ impl Service {
         held.is_some()
     }
 
-    pub(crate) fn try_legacy_slot(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Refusal> {
-        Arc::clone(&self.legacy_slots)
-            .try_acquire_owned()
-            .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "dispatch_queue_full"))
-    }
     pub(crate) fn set_end_notice(&self, notice: EndNotice) {
         *self
             .on_end
@@ -879,7 +870,6 @@ pub(crate) fn record_service(root: &Path) -> Arc<Service> {
                 lease: Mutex::new(None),
                 pending_tasks: Mutex::new(HashSet::new()),
                 pending_ids: Mutex::new(HashSet::new()),
-                legacy_slots: Arc::new(tokio::sync::Semaphore::new(16)),
                 #[cfg(test)]
                 test_partners: Mutex::new(None),
                 pending_scopes: Mutex::new(HashSet::new()),
@@ -1059,22 +1049,6 @@ impl Service {
     pub(crate) fn test_before_final_gate(&self) {
         if let Some(partners) = self.test_partners() {
             if let Some(hook) = &partners.before_final_gate {
-                hook();
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_after_bound_commit(&self) -> bool {
-        self.test_partners()
-            .and_then(|partners| partners.after_bound_commit.clone())
-            .is_none_or(|hook| hook())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_bound_enqueued(&self) {
-        if let Some(partners) = self.test_partners() {
-            if let Some(hook) = &partners.on_bound_enqueue {
                 hook();
             }
         }

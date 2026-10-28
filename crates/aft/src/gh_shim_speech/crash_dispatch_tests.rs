@@ -17,15 +17,12 @@ async fn crash_after_bound_commit_child() {
         json!({"root":root,"head":fixture.head,"task":fixture.task,"session":fixture.session,"params":params})
     );
     std::io::Write::flush(&mut std::io::stdout()).unwrap();
-    fixture.partners(|partners| {
-        partners.after_bound_commit = Some(Arc::new(|| {
-            println!("CRASH_AFTER_BOUND_COMMIT");
-            std::io::Write::flush(&mut std::io::stdout()).unwrap();
-            std::process::exit(99)
-        }));
-    });
-    let _ = fixture.post(true, "crash-committed").await;
-    panic!("the committed dispatch never reached its crash checkpoint");
+    // Seed an old gh_speech_legacy_dispatch row; production no longer creates
+    // these records, but a restart must still refuse to resend them.
+    seed_historical_dispatch(&fixture, "crash-committed");
+    println!("CRASH_AFTER_BOUND_COMMIT");
+    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    std::process::exit(99);
 }
 
 struct NoSend;
@@ -63,7 +60,7 @@ impl Drop for Cleanup {
 }
 
 #[tokio::test]
-async fn process_crash_between_bound_commit_and_send_recovers_as_unknown_not_success() {
+async fn historical_mailbox_after_process_crash_recovers_as_unknown_not_success() {
     let _lock = crate::test_env::process_env_lock();
     let output = tokio::task::spawn_blocking(|| {
         std::process::Command::new(std::env::current_exe().unwrap())
