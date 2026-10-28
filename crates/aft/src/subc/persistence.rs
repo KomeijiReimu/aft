@@ -8,6 +8,21 @@ pub(super) const WAIT_BUDGET: Duration = Duration::from_secs(10);
 const MAX_WAITERS: usize = 256;
 const MAX_CONFINEMENT_READS: usize = 8;
 
+fn carrier_precheck_failed(identity: &RouteIdentity, body: &Value) -> bool {
+    super::occipital_route(identity)
+        && super::route_request_is_tool_call(body)
+        && (super::occipital_session_refusal(identity, body).is_some()
+            || super::carrier_read_only::admit(identity, body)
+                .and_then(|()| {
+                    super::carrier_read_only::admit_operation(
+                        identity,
+                        body["name"].as_str().unwrap_or(""),
+                        body.get("arguments").unwrap_or(&Value::Null),
+                    )
+                })
+                .is_err())
+}
+
 pub(super) struct DatabaseWaits {
     tasks: tokio::task::JoinSet<DecodedFrame>,
     pending: HashMap<(RouteChannel, u64), (tokio::task::AbortHandle, AdmissionWait)>,
@@ -227,17 +242,8 @@ impl DatabaseWaits {
         };
         // Structural carrier refusals precede all policy/database waits, for
         // both the bare request and explicit tool.call forms.
-        if super::occipital_route(identity) && super::route_request_is_tool_call(body) {
-            let admitted = super::carrier_read_only::admit(identity, body).and_then(|()| {
-                super::carrier_read_only::admit_operation(
-                    identity,
-                    body["name"].as_str().unwrap_or(""),
-                    body.get("arguments").unwrap_or(&Value::Null),
-                )
-            });
-            if super::occipital_session_refusal(identity, body).is_some() || admitted.is_err() {
-                return Err(decoded);
-            }
+        if carrier_precheck_failed(identity, body) {
+            return Err(decoded);
         }
         // A scoped worker's saved confinement lives in aft.db, and the bind
         // reply goes out while that database may still be opening. Its
@@ -367,6 +373,9 @@ impl DatabaseWaits {
         let Ok(body) = decoded.body() else {
             return Err(decoded);
         };
+        if carrier_precheck_failed(identity, body) {
+            return Err(decoded);
+        }
         // Catalog fetches and the other provider operations run on the
         // executor and read the policy there; only tool calls are checked
         // against it on the frame loop.

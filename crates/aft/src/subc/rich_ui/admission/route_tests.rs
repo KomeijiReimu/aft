@@ -186,7 +186,7 @@ fn custodian_snapshot(conn: &rusqlite::Connection, owner: &str) -> (i64, i64, Ve
         .unwrap();
     let count = conn
         .query_row(
-            "SELECT count(*) FROM call_ledger WHERE custodian=?1 AND acked=0",
+            "SELECT count(*) FROM call_ledger WHERE custodian=?1 AND state='Settled' AND acked=0",
             [owner],
             |row| row.get(0),
         )
@@ -203,6 +203,70 @@ fn custodian_snapshot(conn: &rusqlite::Connection, owner: &str) -> (i64, i64, Ve
     .unwrap()
     .unwrap();
     (seq, count, feed)
+}
+
+#[test]
+fn operation_ledger_namespace_preserves_unsigned_epoch() {
+    let (_dir, root) = test_support::test_root("operation-namespace");
+    for epoch in [i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
+        let mut identity = occipital_identity(&root, RouteRole::ToolProviderV1);
+        let scope = Arc::get_mut(&mut identity.0)
+            .unwrap()
+            .scope
+            .as_mut()
+            .unwrap();
+        scope.owner = subc_protocol::Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        };
+        scope.scope_ref = "session\"ref".into();
+        scope.scope_epoch = epoch;
+        assert_eq!(
+            LedgerEdge::key(&identity, "frame-key").carrier,
+            format!(
+                "reserved:occipital#[\"reserved:prefrontal-core\",\"session\\\"ref\",\"{epoch}\"]"
+            )
+        );
+    }
+}
+
+#[tokio::test]
+async fn operation_structural_refusals_do_not_wait_for_database_or_confinement() {
+    let _manifest = chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let (_dir, root) = test_support::test_root("operation-precheck");
+    let ctx = test_support::test_ctx();
+    ctx.mark_database_runtime_initializing_for_test();
+    let executor = Executor::new();
+    executor.register_actor(root.clone(), ctx);
+    let routes = HashMap::from([(
+        route_key(41, 1),
+        occipital_identity(&root, RouteRole::ToolProviderV1),
+    )]);
+    let mut waits = DatabaseWaits::default();
+    for explicit in [false, true] {
+        let mut request = decoded(10, "frame-key");
+        let mut body = json!({"name":"read","preset":"worker","arguments":{"rich_ui_op":"garbled","path":"x"}});
+        if explicit {
+            body["op"] = json!("tool.call");
+        }
+        request.frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            41,
+            1,
+            10,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap();
+        let request = waits
+            .restore_launch(request, &routes, &executor)
+            .expect_err("carrier preset ignored");
+        let request = waits
+            .defer(request, &routes, &executor)
+            .expect_err("operation refusal must not wait");
+        assert!(waits.read_confinement(request, &routes, &executor).is_err());
+        assert!(waits.is_empty());
+    }
+    executor.remove_actor(&root);
 }
 
 #[tokio::test]
