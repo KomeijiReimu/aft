@@ -1,1 +1,0 @@
-- The aft CLI keeps a native command's exit code, picks the cached binary that matches its own version, and Pi retries session notifications it could not deliver.

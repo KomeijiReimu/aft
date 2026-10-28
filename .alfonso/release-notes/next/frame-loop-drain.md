@@ -1,1 +1,0 @@
-- Fixed brief pauses in every session's tool replies when AFT handed off a running command during a restart while that command's state was busy.

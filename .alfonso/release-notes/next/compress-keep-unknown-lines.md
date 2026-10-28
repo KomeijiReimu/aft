@@ -1,1 +1,0 @@
-- Compressed `bash` output no longer hides lines the cargo summaries don't recognise: another check's verdict printed alongside cargo test, build, check or clippy output (such as `fmt-ok` or `win-check rc=101`) now stays visible, in order, and cargo output of 1 KiB or less is shown exactly as printed.

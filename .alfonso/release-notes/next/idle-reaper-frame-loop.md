@@ -1,1 +1,0 @@
-- Tool calls no longer slow down when many idle projects have pending file changes: the idle-project check now puts an unchanged set of changes back in one step instead of re-adding each file.

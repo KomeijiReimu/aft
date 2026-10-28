@@ -1,1 +1,0 @@
-- View publication log lines now show how many bytes each index store wrote and why the publication was scheduled, so write volume can be traced to its cause.

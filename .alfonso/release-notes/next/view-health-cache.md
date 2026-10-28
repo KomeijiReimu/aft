@@ -1,1 +1,0 @@
-- The daemon's health summary no longer reopens view status databases on every tick when AFT itself made the change, cutting its per-tick cost during busy periods by about 75x.

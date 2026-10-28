@@ -1,1 +1,0 @@
-- Reduced watcher CPU during build-output bursts: macOS callbacks hand off whole event batches, topology checks share directory probes and stop at already-installed exclusions, and root-deletion polling no longer stats the root for every event. Ignore rules, reported paths, and independent symlink/device traversal checks are unchanged.

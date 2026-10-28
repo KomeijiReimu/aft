@@ -1,1 +1,0 @@
-- Watcher bursts no longer probe file paths while holding the LSP manager lock when no language servers are running.

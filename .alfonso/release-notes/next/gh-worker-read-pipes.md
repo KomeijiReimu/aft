@@ -1,1 +1,0 @@
-- Worker GitHub reads: piping gh output into head no longer reports a broken pipe error, and large pull request diffs read in full instead of failing with 'reply unavailable'.

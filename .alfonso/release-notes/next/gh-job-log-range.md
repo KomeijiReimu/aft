@@ -1,1 +1,0 @@
-- Worker `gh run view --log` no longer fails when the log contains color codes or non-ASCII text.

@@ -1,1 +1,0 @@
-- The lease heartbeat keeps its lock files open between beats instead of reopening them each time, cutting its CPU use, and no longer warns about leases this process owns.

@@ -1,1 +1,0 @@
-- Creating, renaming or deleting ordinary source files no longer makes language-server detection rescan the whole project.

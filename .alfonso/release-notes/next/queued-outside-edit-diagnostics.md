@@ -1,1 +1,0 @@
-- `aft_inspect` no longer reports Rust files as clean right after another program changes them while AFT's language-server connection is busy; it now waits for the `cargo check` that change needs, or says the check is still running.

@@ -1,1 +1,0 @@
-- aft_search now says its results came from a capped file walk when the text index finished loading during the search, instead of reporting the index as ready.

@@ -1,1 +1,0 @@
-- On macOS, sandboxed shell commands start faster: Git hook and config policy is now reused between commands instead of being re-read from Git each time.

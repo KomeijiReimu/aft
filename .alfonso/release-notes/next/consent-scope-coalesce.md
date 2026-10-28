@@ -1,1 +1,0 @@
-- Approving read access for a whole folder now covers every read tool in that folder at once, instead of the next read tool asking again.

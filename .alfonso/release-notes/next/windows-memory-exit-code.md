@@ -1,1 +1,0 @@
-- On Windows, a command stopped by its memory cap now always reports exit code 137, even when its terminal window closes first.

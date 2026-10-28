@@ -1,1 +1,0 @@
-- gh shim: a governed command given an issue or pull request URL (such as `gh issue comment https://github.com/<owner>/<repo>/issues/513 --body hello`) now routes the bare thread number instead of failing at the route holder.

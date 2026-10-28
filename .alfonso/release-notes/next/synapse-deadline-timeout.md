@@ -1,1 +1,0 @@
-- Synapse request attempts that expire while waiting to send now report a timeout and count toward the circuit breaker just like attempts that time out waiting for a reply. Retries within one call still count as only one timeout, and a healthy shared connection is kept open.

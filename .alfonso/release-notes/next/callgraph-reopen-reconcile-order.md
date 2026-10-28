@@ -1,1 +1,0 @@
-- A call-graph query right after a project rebinds no longer reports busy.

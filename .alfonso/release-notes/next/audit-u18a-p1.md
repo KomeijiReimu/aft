@@ -1,1 +1,0 @@
-- aft-cli: doctor's binary cleanup keeps installed and pinned plugin versions and leaves the cache untouched when the plugin version can't be read; config writes keep comments and file links; language-server installs from npm keep a publication-age cutoff and skip install scripts.
