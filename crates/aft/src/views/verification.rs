@@ -35,6 +35,16 @@ pub(crate) fn known_attribute_sources_for_test(root: &Path) -> AttributeSourcesG
 }
 use crate::blob_store::v2::{ContentHash, FamilyKey, FamilyPlane};
 
+#[cfg(test)]
+thread_local! {
+    static POLICY_INPUT_VISITS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_policy_input_visits_for_test() -> (usize, usize) {
+    POLICY_INPUT_VISITS.with(|counts| counts.replace((0, 0)))
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum FileIdentity {
     Unix {
@@ -455,27 +465,35 @@ pub(crate) fn now_ns() -> u128 {
 
 /// Enumerate policy inputs with metadata only. Source files are never opened.
 pub(crate) fn policy_inputs(root: &Path) -> io::Result<Vec<PathBuf>> {
-    fn walk(root: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
-        for name in [".gitattributes", ".gitignore", ".ignore", ".aftignore"] {
-            out.push(root.join(name));
-        }
-        for entry in fs::read_dir(root).map_err(|e| at("listing policy directory", root, e))? {
-            let entry = entry.map_err(|e| at("reading policy directory entry", root, e))?;
-            let kind = entry
-                .file_type()
-                .map_err(|e| at("reading policy entry type", &entry.path(), e))?;
-            let name = entry.file_name();
-            if name == ".git" {
-                continue;
-            }
-            if kind.is_dir() {
-                walk(&entry.path(), out)?;
-            }
-        }
-        Ok(())
-    }
     let mut paths = Vec::new();
-    walk(root, &mut paths)?;
+    // Policy files below an excluded parent cannot affect checkout membership.
+    // Use the membership walker so ignore negations and directory admission
+    // agree, but retain all four candidate names even when a name is ignored.
+    for result in crate::search_index::project_walk_builder(root).build() {
+        let entry =
+            result.map_err(|e| at("enumerating policy inputs in", root, io::Error::other(e)))?;
+        if let Some(error) = entry.error() {
+            return Err(at(
+                "enumerating policy directory",
+                entry.path(),
+                io::Error::other(error.to_string()),
+            ));
+        }
+        let directory = entry.file_type().is_some_and(|kind| kind.is_dir());
+        #[cfg(test)]
+        POLICY_INPUT_VISITS.with(|counts| {
+            let (directories, entries) = counts.get();
+            counts.set((
+                directories + usize::from(directory),
+                entries + usize::from(entry.depth() != 0),
+            ));
+        });
+        if directory {
+            for name in [".gitattributes", ".gitignore", ".ignore", ".aftignore"] {
+                paths.push(entry.path().join(name));
+            }
+        }
+    }
     let marker = root.join(".git");
     let gitdir = if marker.is_dir() {
         Some(marker)
@@ -1212,6 +1230,34 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn policy_inputs_prunes_large_ignored_tree() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q"]);
+        fs::write(root.path().join(".gitignore"), b"excluded/\n").unwrap();
+        fs::create_dir(root.path().join("visible")).unwrap();
+        fs::write(root.path().join("visible/source.rs"), b"fn visible() {}\n").unwrap();
+        for directory in 0..128 {
+            let path = root
+                .path()
+                .join("excluded")
+                .join(format!("child-{directory}"));
+            fs::create_dir_all(&path).unwrap();
+            for file in 0..16 {
+                fs::write(path.join(format!("file-{file}.rs")), b"fn excluded() {}\n").unwrap();
+            }
+        }
+        take_policy_input_visits_for_test();
+        let paths = policy_inputs(root.path()).unwrap();
+        let (directories, entries) = take_policy_input_visits_for_test();
+        println!("policy_inputs visits: {directories} directories, {entries} entries");
+        assert_eq!((directories, entries), (2, 3));
+        assert!(paths.contains(&root.path().join("visible").join(".gitignore")));
+        assert!(!paths
+            .iter()
+            .any(|path| path.starts_with(root.path().join("excluded"))));
     }
 
     #[test]

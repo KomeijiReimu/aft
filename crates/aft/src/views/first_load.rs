@@ -6612,6 +6612,38 @@ mod v3_bootstrap_tests {
     }
 
     #[test]
+    fn checkout_driver_reconcile_never_visits_policy_below_an_ignored_parent() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let _attributes = super::super::verification::known_attribute_sources_for_test(root.path());
+        let mut command = std::process::Command::new("git");
+        command.current_dir(root.path()).args(["init", "-q"]);
+        crate::test_env::apply_hermetic_git_env(&mut command);
+        assert!(command.output().unwrap().status.success());
+        std::fs::write(
+            root.path().join(".gitignore"),
+            b"excluded/\n!excluded/keep.rs\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("excluded/nested/.ignore")).unwrap();
+        std::fs::write(root.path().join("excluded/keep.rs"), b"fn excluded() {}\n").unwrap();
+        std::fs::write(root.path().join("keep.rs"), b"fn keep() {}\n").unwrap();
+        let driver = trigram_driver(root.path(), storage.path());
+        super::super::verification::take_policy_input_visits_for_test();
+        let reconciled = driver.reconcile(&driver.access()).unwrap();
+        let (directories, _) = super::super::verification::take_policy_input_visits_for_test();
+        assert_eq!(directories, 1);
+        assert!(reconciled
+            .entries
+            .contains_key(&RelPath::new(b"keep.rs".to_vec()).unwrap()));
+        assert!(!reconciled
+            .entries
+            .keys()
+            .any(|path| path.as_bytes().starts_with(b"excluded/")));
+    }
+
+    #[test]
     fn checkout_driver_directory_git_index_error_names_operation_and_path() {
         let _serial = crate::blob_store::v3::serial_for_test();
         let root = tempfile::tempdir().unwrap();
