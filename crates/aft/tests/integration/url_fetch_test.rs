@@ -225,8 +225,8 @@ fn outline_url_array_skips_unfetchable_url_with_its_fetch_reason() {
     assert_eq!(skipped.len(), 1, "{response:#}");
     assert_eq!(skipped[0]["file"], url, "{response:#}");
     let reason = skipped[0]["reason"].as_str().unwrap();
-    assert!(reason.contains("404"), "{response:#}");
-    assert!(!reason.contains("file_not_found"), "{response:#}");
+    let fetch_message = format!("HTTP 404 Not Found fetching {url}");
+    assert_eq!(reason, format!("url_fetch_failed: {fetch_message}"));
     let single = translated_outline(&mut aft, project.path(), json!(url));
     assert_eq!(single["success"], false, "{single:#}");
     assert!(
@@ -234,8 +234,11 @@ fn outline_url_array_skips_unfetchable_url_with_its_fetch_reason() {
         "{response:#}"
     );
     assert!(
-        reason.contains(single["message"].as_str().unwrap()),
-        "{response:#}"
+        single["message"]
+            .as_str()
+            .unwrap()
+            .starts_with(&fetch_message),
+        "{single:#}"
     );
     assert!(aft.shutdown().success());
 }
