@@ -489,6 +489,33 @@ fn bash_progress_requires_transport_opt_in() {
 }
 
 #[test]
+fn bash_progress_opt_in_is_cleared_after_reply_before_id_reuse() {
+    let mut aft = AftProcess::spawn();
+    let frames = aft.send_until(
+        r#"{"id":"bash-reused","method":"bash","handles_progress":true,"params":{"command":"echo first; sleep 1","foreground_orchestrate":true,"wait":true}}"#,
+        |frame| frame["id"] == "bash-reused",
+    );
+    assert_eq!(frames.last().unwrap()["success"], true);
+    assert!(
+        frames[..frames.len() - 1]
+            .iter()
+            .any(|frame| frame["type"] == "progress" && frame["request_id"] == "bash-reused"),
+        "missing progress for the opted-in call: {frames:?}"
+    );
+
+    let frames = aft.send_until(
+        r#"{"id":"bash-reused","method":"bash","params":{"command":"echo second; sleep 1","foreground_orchestrate":true,"wait":true}}"#,
+        |frame| frame["id"] == "bash-reused",
+    );
+    assert_eq!(frames.last().unwrap()["success"], true);
+    assert!(
+        frames.iter().all(|frame| frame["type"] != "progress"),
+        "a completed call must not opt a reused ID into progress: {frames:?}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn bash_progress_masks_environment_secrets() {
     let mut aft = AftProcess::spawn();
     let secret = "progress-secret-1052-very-sensitive-value";
