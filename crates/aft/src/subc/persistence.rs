@@ -9,7 +9,8 @@ const MAX_WAITERS: usize = 256;
 const MAX_CONFINEMENT_READS: usize = 8;
 
 fn carrier_precheck_failed(identity: &RouteIdentity, body: &Value) -> bool {
-    super::occipital_route(identity)
+    identity.role == tool_provider::RouteRole::ToolProviderV1
+        && super::occipital_route(identity)
         && super::route_request_is_tool_call(body)
         && (super::occipital_session_refusal(identity, body).is_some()
             || super::carrier_read_only::admit(identity, body)
@@ -134,7 +135,10 @@ impl DatabaseWaits {
             return Err(decoded);
         };
         // A carrier-supplied preset must never restore worker launch authority.
-        if super::occipital_route(identity) && super::route_request_is_tool_call(body) {
+        if identity.role == tool_provider::RouteRole::ToolProviderV1
+            && super::occipital_route(identity)
+            && super::route_request_is_tool_call(body)
+        {
             return Err(decoded);
         }
         let name = body.get("name").and_then(Value::as_str).unwrap_or("");

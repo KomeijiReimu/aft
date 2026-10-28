@@ -243,7 +243,13 @@ async fn run_case(case: &Case, role: RouteRole) -> Value {
     )
     .await;
     if role == RouteRole::ToolProviderV1 && case.error != Some("carrier_read_only") {
-        assert_eq!(reply.header.ty, FrameType::Response, "{}", case.name);
+        assert_eq!(
+            reply.header.ty,
+            FrameType::Response,
+            "{}: {:?}",
+            case.name,
+            String::from_utf8_lossy(&reply.body)
+        );
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(
             body,
