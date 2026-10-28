@@ -223,7 +223,7 @@ impl Session {
 /// Resolve and execute off the frame loop: neither preset nor confinement
 /// SELECTs may hold health checks or unrelated routes behind the database lock.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn submit(
+pub(in crate::subc) async fn submit(
     tx: &WriterSender,
     frame: &Frame,
     carrier: RouteIdentity,
