@@ -27022,11 +27022,12 @@ mod tests {
 
     /// Scan until a replayed watch delivers its pending match.
     ///
-    /// A scan that cannot open an artifact (or loses a lock race) returns
-    /// without emitting and without advancing cursors, so production retries
-    /// the same bytes on a later pass; a test that scans exactly once turns
-    /// that transient skip into a false negative. Retry briefly: a watch
-    /// that never delivers still fails, with the scan state attached.
+    /// Right after a replay a scan can return without emitting and without
+    /// advancing the cursors (its early returns never persist a cursor), and
+    /// production's watchdog then rescans the same bytes on its next pass. A
+    /// test that scans exactly once turns that delay into a false negative.
+    /// Retry briefly: a watch that never delivers still fails, with the scan
+    /// state attached.
     fn scan_until_new_match(
         live: &BgTaskRegistry,
         live_task: &Arc<BgTask>,
