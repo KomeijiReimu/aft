@@ -2381,6 +2381,59 @@ fn wait_for_fill_queue(limiter: &crate::cold_build_limiter::ColdBuildLimiter) ->
 }
 
 #[test]
+fn semantic_fill_releases_cold_slot_during_model_call_and_readmits_before_store() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), &[("file.rs", "pub fn delayed_vector() {}\n")]);
+    let (slot, epoch, _wake, runtime) = served_lane(storage.path(), root.path());
+    let schedule = fast_schedule(root.path());
+    let limiter = Arc::clone(&schedule.limiter);
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let runtime = Arc::clone(&runtime);
+        std::thread::spawn(move || {
+            catch_up(
+                &weak,
+                epoch,
+                &runtime,
+                &schedule,
+                FillBudget::default(),
+                &mut |texts| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Model::default().embed(texts)
+                },
+            )
+        })
+    };
+    entered_rx.recv().unwrap();
+    let non_semantic = limiter.try_acquire();
+    let admitted_during_model_call = non_semantic.is_some();
+    let pending_during_call = query(&runtime, "delayed vector").pending.len();
+    release_tx.send(()).unwrap();
+    let (readmitted, pending_before_store) = if admitted_during_model_call {
+        (
+            wait_for_fill_queue(&limiter),
+            query(&runtime, "delayed vector").pending.len(),
+        )
+    } else {
+        (false, 0)
+    };
+    drop(non_semantic);
+    assert!(matches!(worker.join().unwrap(), FillOutcome::Settled));
+    assert!(
+        admitted_during_model_call,
+        "non-semantic cold build was blocked by an embedding wait"
+    );
+    assert_eq!(pending_during_call, 1, "embedding wait was reported ready");
+    assert!(readmitted, "fill stored vectors without local-work admission");
+    assert_eq!(pending_before_store, 1);
+    assert!(query(&runtime, "delayed vector").complete());
+}
+
+#[test]
 fn small_missing_vectors_wait_for_cold_slot_and_stay_pending() {
     let storage = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
