@@ -286,7 +286,6 @@ pub struct RelayCall<'a> {
     pub route_scopes: &'a RouteScopes,
 }
 
-mod bound;
 mod reservation;
 
 /// How a call reached plexus, for the relay log line: under the session's
@@ -406,7 +405,7 @@ async fn relay_inner<T: RelayTransport>(
                     &serde_json::to_vec(request).expect("a JSON value serializes"),
                 );
                 match service.store.legacy_replay_for_digest(&digest, nonce, &payload) {
-                    Ok(true) => break 'reply bound::unknown(),
+                    Ok(true) => break 'reply RelayReply::refused("outcome_unknown", "plexus", "this GitHub write was already queued and its outcome cannot be confirmed; do not repeat it with a new request key"),
                     Ok(false) => {},
                     Err(_) => break 'reply RelayReply::refused("outcome_unknown", "plexus", "AFT could not check this GitHub write's prior dispatch state; do not repeat it with a new request key"),
                 }
@@ -469,13 +468,45 @@ async fn relay_inner<T: RelayTransport>(
                 bindings_read(transport, &redeemed).await
             }
             BOT_REQUEST_OPERATION => {
-                let captured_background =
-                    needs_captured_background(&redeemed, ticket, call.route_scopes);
+                let captured_background = needs_captured_background(&redeemed, ticket);
                 let stamp = if captured_background {
                     bot_authority(&redeemed, call.route_scopes)
+                } else if let Some(launch) = redeemed.launch.as_ref().filter(|launch| {
+                    launch.run.is_some()
+                        && launch.required_scopes().into_iter().all(|(role, scope)| {
+                            let origin = if role == crate::gh_shim_speech::ScopeRole::Head {
+                                launch.head_origin.as_ref()
+                            } else {
+                                launch.origin.as_ref()
+                            };
+                            call.route_scopes.origin_live(origin, scope)
+                        })
+                }) {
+                    Some(launch.authority.clone())
                 } else {
                     call.route_scopes.for_session(&redeemed.session_id).cloned()
                 };
+                // A route can prove the launching authority is still present,
+                // but it cannot replace the authority captured in the ticket.
+                let check_launch =
+                    !captured_background && !worker_write_refused(&redeemed, stamp.as_ref());
+                #[cfg(test)]
+                let check_launch = check_launch && wire_fixture.is_none();
+                if check_launch {
+                    use crate::gh_shim_speech::{Code, Refusal};
+                    let Some(launch) = &redeemed.launch else {
+                        break 'reply RelayReply::task_refused(Refusal::new(
+                            Code::AuthorityUnavailable,
+                            "owner_unresolved",
+                        ));
+                    };
+                    if stamp.as_ref() != Some(&launch.authority) {
+                        break 'reply RelayReply::task_refused(Refusal::new(
+                            Code::IdentityConflict,
+                            "request_mismatch",
+                        ));
+                    }
+                }
                 #[cfg(test)]
                 let stamp = wire_fixture.clone().unwrap_or(stamp);
                 let (reply, taken) = bot_request(
@@ -484,7 +515,8 @@ async fn relay_inner<T: RelayTransport>(
                     stamp.as_ref(),
                     params,
                     call.route_scopes,
-                    captured_background,
+                    #[cfg(test)]
+                    wire_fixture.is_some(),
                 )
                 .await;
                 path = taken;
@@ -508,26 +540,15 @@ async fn relay_inner<T: RelayTransport>(
     reply
 }
 
-fn needs_captured_background(
-    redeemed: &crate::gh_shim_ticket::Redeemed,
-    ticket: &str,
-    routes: &RouteScopes,
-) -> bool {
-    let Some(launch) = redeemed.launch.as_ref() else {
+fn needs_captured_background(redeemed: &crate::gh_shim_ticket::Redeemed, ticket: &str) -> bool {
+    if redeemed.launch.is_none() {
         return false;
-    };
-    let background = crate::gh_shim_ticket::speech_for_ticket(ticket)
+    }
+    // Route presence is a liveness shortcut, never permission to omit the
+    // expected bot binding or captured codemode run guard on a mutation.
+    crate::gh_shim_ticket::speech_for_ticket(ticket)
         .map(|speech| speech.background.load(std::sync::atomic::Ordering::SeqCst))
-        .unwrap_or_else(|| crate::gh_shim_ticket::redeem(ticket).is_none());
-    background
-        && launch.required_scopes().into_iter().any(|(role, scope)| {
-            let origin = if role == crate::gh_shim_speech::ScopeRole::Head {
-                launch.head_origin.as_ref()
-            } else {
-                launch.origin.as_ref()
-            };
-            !routes.origin_live(origin, scope)
-        })
+        .unwrap_or_else(|| crate::gh_shim_ticket::redeem(ticket).is_none())
 }
 
 fn bot_authority(
@@ -728,7 +749,7 @@ async fn bot_request<T: RelayTransport>(
     stamp: Option<&ScopeStamp>,
     params: &Value,
     routes: &RouteScopes,
-    captured_background: bool,
+    #[cfg(test)] wire_contract: bool,
 ) -> (RelayReply, &'static str) {
     if worker_write_refused(redeemed, stamp) {
         return (
@@ -775,7 +796,6 @@ async fn bot_request<T: RelayTransport>(
             "-",
         );
     };
-    let session = redeemed.session_id.as_str();
 
     // The session's scope must let plexus act as its agent, and the route to
     // plexus must be opened under that scope so plexus sees it. Otherwise the
@@ -817,28 +837,11 @@ async fn bot_request<T: RelayTransport>(
             PATH_STAMP,
         );
     }
-    let _ = session;
-    // Foreground and still-bound tasks retain today's admission and forwarding.
-    // Applying the partner guards to foreground speech is a separate rollout
-    // after those guards are deployed, not a prerequisite for existing writes.
-    if !captured_background {
-        if redeemed.launch.is_some()
-            && params
-                .get("ticket")
-                .and_then(Value::as_str)
-                .and_then(crate::gh_shim_ticket::speech_for_ticket)
-                .is_some_and(|speech| speech.background.load(std::sync::atomic::Ordering::SeqCst))
-        {
-            let reply = match bound::post_bound_background(
-                transport, redeemed, _stamp, params, routes, nonce, request,
-            )
-            .await
-            {
-                Ok(reply) => reply,
-                Err(error) => RelayReply::task_refused(error),
-            };
-            return (reply, PATH_STAMP);
-        }
+    // Protocol fixtures deliberately omit authority capture. Production writes
+    // of every ticket kind use the captured policy and repository ceiling below.
+    #[cfg(test)]
+    if wire_contract {
+        let session = redeemed.session_id.as_str();
         let selector = scope_selector(_stamp);
         let body = github_call(json!({"op":"bot_request","request_nonce":nonce,"request":request}));
         let response_generation = routes.speech.as_ref().map(|service| service.generation());
