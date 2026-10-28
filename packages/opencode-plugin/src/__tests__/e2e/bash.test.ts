@@ -157,8 +157,10 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
       directory: options.directory ?? h.tempDir,
       worktree: options.worktree ?? h.tempDir,
       abort: new AbortController().signal,
-      metadata: (data: Record<string, unknown>) => {
-        lastMetadata = data;
+      // OpenCode 1's ctx.metadata takes { title?, metadata? }; keep the
+      // metadata part the way the host would show it.
+      metadata: (update: { metadata?: Record<string, unknown> }) => {
+        lastMetadata = update.metadata ?? {};
       },
       ask: options.ask ?? noopAsk,
       callID: `call-${Date.now()}`,
@@ -396,8 +398,8 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
       directory: h.tempDir,
       worktree: h.tempDir,
       abort: new AbortController().signal,
-      metadata: (data: Record<string, unknown>) => {
-        metadata = data;
+      metadata: (update: { metadata?: Record<string, unknown> }) => {
+        metadata = update.metadata ?? {};
       },
       ask: noopAsk,
       callID: "call-watch",

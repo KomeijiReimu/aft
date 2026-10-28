@@ -581,6 +581,14 @@ pub fn build_bash_outcome(
     let task_id_for_poll = task_id.clone();
     let request_id_for_poll = request_id.clone();
     let session_id_for_poll = session_id.clone();
+    let mut progress = ctx.request_handles_progress(&req.id).then(|| {
+        crate::bash_background::progress::BashProgressPump::new(
+            ctx,
+            task_id.clone(),
+            session_id.clone(),
+            request_id.clone(),
+        )
+    });
 
     let mut poll: PendingResponsePoll = Box::new(move |ctx| {
         let _keep_flush_budget = &flush_budget;
@@ -680,6 +688,9 @@ pub fn build_bash_outcome(
 
         if response.is_some() {
             wait_registration.take();
+        }
+        if let Some(progress) = &mut progress {
+            progress.poll(response.is_some(), &mut |frame| ctx.emit_progress(frame));
         }
         response
     });
