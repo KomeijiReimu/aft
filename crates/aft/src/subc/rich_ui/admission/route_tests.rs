@@ -1,7 +1,7 @@
 use super::*;
 use crate::subc::rich_ui::{carrier, chunks};
 
-const MANIFEST: &[u8] = include_bytes!("../../../../../tests/fixtures/rich_ui/manifest.jcs.json");
+const MANIFEST: &[u8] = include_bytes!("../../../../tests/fixtures/rich_ui/manifest.jcs.json");
 
 #[tokio::test]
 async fn operation_route_gate_and_admission_precedence() {

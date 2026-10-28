@@ -3,7 +3,7 @@ use serde_json::json;
 
 fn manifest() -> Value {
     serde_json::from_slice(include_bytes!(
-        "../../../../../tests/fixtures/rich_ui/manifest.jcs.json"
+        "../../../../tests/fixtures/rich_ui/manifest.jcs.json"
     ))
     .unwrap()
 }
