@@ -224,6 +224,9 @@ impl FakePlex {
     }
 
     fn reserve(&self, scope: &ScopeStamp, body: Value) -> Result<ReservedBotRequest, Refusal> {
+        if self.state.lock().unwrap().route_open_ended {
+            return Err(Refusal::new(Code::ScopeEnded, "ended"));
+        }
         let slot = self
             .slots
             .clone()
@@ -591,7 +594,7 @@ impl Fixture {
                 (task, Some(error))
             }
         };
-        if startup_error.is_none() && options.seal_failure.is_none() {
+        if startup_error.is_none() && options.seal_failure.is_none() && !options.foreground {
             let warm = crate::gh_shim_ticket::speech_for_ticket(&ticket).unwrap();
             assert!(
                 warm.active.load(std::sync::atomic::Ordering::SeqCst),

@@ -1,20 +1,26 @@
 use super::*;
 
-fn call_ticket(fixture: &Fixture) -> crate::gh_shim_ticket::ScopedTicket {
+async fn call_ticket(fixture: &Fixture) -> crate::gh_shim_ticket::ScopedTicket {
     let speech =
         crate::gh_shim_ticket::speech_for_ticket(fixture.params["ticket"].as_str().unwrap())
             .unwrap();
-    crate::gh_shim_speech::service::with_launch(
-        Some(speech.prepared.context.seed.clone()),
-        fixture.service.store.path().parent().unwrap(),
-        || {
-            crate::gh_shim_ticket::ScopedTicket::issue(
-                &fixture.session,
-                "foreground",
-                &speech.prepared.context.seed.project_root,
-            )
-        },
-    )
+    let seed = speech.prepared.context.seed.clone();
+    let root = fixture.service.store.path().parent().unwrap().to_path_buf();
+    let session = fixture.session.clone();
+    let project = seed.project_root.clone();
+    // Ticket capture obtains authenticated bindings on a plain executor thread,
+    // not while a Tokio runtime is entered on the calling thread.
+    tokio::task::spawn_blocking(move || {
+        std::thread::spawn(move || {
+            crate::gh_shim_speech::service::with_launch(Some(seed), &root, || {
+                crate::gh_shim_ticket::ScopedTicket::issue(&session, "foreground", &project)
+            })
+        })
+        .join()
+        .unwrap()
+    })
+    .await
+    .unwrap()
 }
 
 async fn post_params(fixture: &Fixture, params: &Value, routes: &RouteScopes) -> RelayReply {
@@ -70,7 +76,7 @@ async fn foreground_calls_and_unpromoted_tasks_use_captured_guards() {
             .is_none());
         let answer = fixture.post(true, "unpromoted-guarded").await;
         assert!(answer.ok, "{:?}", answer.data);
-        let ticket = call_ticket(&fixture);
+        let ticket = call_ticket(&fixture).await;
         let mut params = fixture.params.clone();
         params["ticket"] = json!(ticket.value().unwrap());
         params["request_nonce"] = json!("call-guarded");
@@ -93,7 +99,7 @@ async fn foreground_calls_and_unpromoted_tasks_use_captured_guards() {
 async fn foreground_call_rejects_each_rebound_launch_identity_field() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(false).await;
-    let ticket = call_ticket(&fixture);
+    let ticket = call_ticket(&fixture).await;
     let mut params = fixture.params.clone();
     params["ticket"] = json!(ticket.value().unwrap());
     for field in ["owner", "ref", "epoch", "agent"] {
@@ -137,6 +143,7 @@ async fn current_policy_withdrawal_is_enforced_by_the_production_relay() {
     for rows in current.tiers.values_mut() {
         rows.retain(|row| row.tuple() != "issue comment");
     }
+    current.canonicalization.remove("issue comment");
     let paths = StatePaths::from_root(fixture._dir.path().join("shim"));
     super::super::tests::write_signed_manifest(&paths, current, unix_seconds());
     load_manifest(&paths, unix_seconds()).unwrap();
@@ -203,7 +210,7 @@ async fn production_relay_rejects_malformed_and_oversized_invocations_before_sen
 async fn foreground_call_cannot_acquire_a_current_only_repository() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(false).await;
-    let ticket = call_ticket(&fixture);
+    let ticket = call_ticket(&fixture).await;
     let mut current = super::super::tests::fixture_manifest();
     let agent = current.bindings.values().next().unwrap().clone();
     current.bindings.insert("new-owner/new-repo".into(), agent);

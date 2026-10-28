@@ -2327,7 +2327,7 @@ async fn validated_head_codemode_is_not_a_worker_write_but_invalid_head_is() {
             Some(&head),
             &params,
             &RouteScopes::default(),
-            false,
+            true,
         )
         .await;
         if valid {
