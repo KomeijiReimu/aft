@@ -4906,6 +4906,8 @@ impl CompositePlane for CallgraphBridge {
             plane: Some(FamilyPlane::Callgraph),
             reason,
         };
+        #[cfg(test)]
+        let _profile = crate::blob_store::v3::work_profile::span("callgraph_materialize");
         let mut attachments = Vec::new();
         for (path, entry) in observed {
             if entry.disk == super::snapshot::DiskState::Absent || !self.applies_to(path) {

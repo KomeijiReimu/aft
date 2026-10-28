@@ -264,6 +264,10 @@ impl CheckoutSemantic {
     /// itself repeats the check, which is a no-op only on a checkout already
     /// marked overflowed.
     fn bind(&self) -> Result<Snapshot, String> {
+        #[cfg(test)]
+        let _profile = crate::blob_store::v3::work_profile::span("semantic_bind");
+        #[cfg(test)]
+        let seed_profile = crate::blob_store::v3::work_profile::span("bind_seed");
         let installed = self.driver.installed_snapshot();
         let seed = match super::base_refs::open_foreign_v3(
             &self.storage,
@@ -281,11 +285,19 @@ impl CheckoutSemantic {
                 installed.generation().clone()
             }
         };
+        #[cfg(test)]
+        drop(seed_profile);
+        #[cfg(test)]
+        let verify_profile = crate::blob_store::v3::work_profile::span("bind_verify");
         let (mut snapshot, revision) = self
             .driver
             .verified_bind(&self.access, seed)
             .map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        drop(verify_profile);
         if super::callgraph::has_unpublished_changes(&snapshot) {
+            #[cfg(test)]
+            let _profile = crate::blob_store::v3::work_profile::span("bind_own_generation");
             let own = self
                 .driver
                 .build_own_generation(
@@ -332,6 +344,8 @@ impl CheckoutSemantic {
     /// the installed cut without it. An edit recorded since the cut still
     /// refuses the install, and the refresh retries the fold.
     fn fold(&self) -> Result<(), String> {
+        #[cfg(test)]
+        let _profile = crate::blob_store::v3::work_profile::span("semantic_fold");
         let (snapshot, revision) = self.driver.installed_cut();
         self.driver
             .validate_cut(&self.access, &snapshot, revision)

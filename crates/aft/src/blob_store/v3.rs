@@ -1088,6 +1088,8 @@ impl<'a> RegistryWriter<'a> {
         &mut self,
         body: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
+        #[cfg(test)]
+        let _profile = work_profile::span("registry_barrier");
         self.lock.verify(&self.lock.storage)?;
         let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
