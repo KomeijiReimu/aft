@@ -4021,6 +4021,10 @@ fn identity_census_is_read_only_and_bounded() {
     fs::create_dir(&child).unwrap();
     let artifact = child.join("task.json");
     fs::write(&artifact, b"finished task").unwrap();
+    let original_permissions = fs::metadata(&child).unwrap().permissions();
+    let mut read_only = original_permissions.clone();
+    read_only.set_readonly(true);
+    fs::set_permissions(&child, read_only.clone()).unwrap();
     let before = fs::metadata(&child).unwrap().modified().unwrap();
     let artifact_before = fs::metadata(&artifact).unwrap().modified().unwrap();
     let pinned = PinnedDir::open(temp.path()).unwrap();
@@ -4034,6 +4038,7 @@ fn identity_census_is_read_only_and_bounded() {
     assert_eq!(examined.entries, 2);
     assert_eq!(fs::read(&artifact).unwrap(), b"finished task");
     assert_eq!(fs::metadata(&child).unwrap().modified().unwrap(), before);
+    assert_eq!(fs::metadata(&child).unwrap().permissions(), read_only);
     assert_eq!(
         fs::metadata(&artifact).unwrap().modified().unwrap(),
         artifact_before
@@ -4050,6 +4055,7 @@ fn identity_census_is_read_only_and_bounded() {
         .expect_err("a partial census must not authorize deletion");
     assert!(is_repair_budget_stop(&error));
     assert!(artifact.exists());
+    fs::set_permissions(&child, original_permissions).unwrap();
 }
 
 /// Live storage creates and removes files all the time (atomic-write
