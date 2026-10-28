@@ -304,7 +304,21 @@ pub fn allocated_bytes_until(path: &Path, deadline: Option<Instant>) -> Result<O
             }
         });
         let entry = entry?;
-        let meta = fs::symlink_metadata(entry.path())?;
+        let path = entry.path();
+        #[cfg(test)]
+        WALK_BEFORE_STAT.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(&path);
+            }
+        });
+        // SQLite can remove sidecars while the namespace is being measured,
+        // even under the publication lock. A vanished entry occupies no bytes;
+        // other stat errors still leave accounting unknown and must refuse it.
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
         if meta.is_dir() {
             let Some(bytes) = allocated_bytes_until(&entry.path(), deadline)? else {
                 return Ok(None);
@@ -348,6 +362,7 @@ fn registry_allocated(dir: &Path) -> Result<u64> {
 #[cfg(test)]
 thread_local! {
     static WALK_DELAY: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+    static WALK_BEFORE_STAT: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> = const { std::cell::RefCell::new(None) };
 }
 /// Test seam: every namespace walk on this thread sleeps this long per entry.
 /// Its only caller is a unix-only test.
