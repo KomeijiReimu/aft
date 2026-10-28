@@ -206,6 +206,28 @@ impl Wire {
         )
     }
 
+    /// A database lookup that retries `database_busy`. The module's own
+    /// maintenance timer briefly holds aft.db, and a chunk lookup reports that
+    /// as busy instead of waiting. Tests that are not about busy replies must
+    /// not fail on that timing. Each attempt takes a fresh correlation id.
+    async fn request_unbusy(
+        &mut self,
+        channel: u16,
+        corr: &mut u64,
+        body: Value,
+    ) -> (FrameType, Value) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            *corr += 1;
+            let reply = self.request(channel, *corr, body.clone()).await;
+            let busy = reply.0 == FrameType::Error && reply.1["code"] == "database_busy";
+            if !busy || std::time::Instant::now() >= deadline {
+                return reply;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     async fn stop(mut self) {
         self.send(FrameType::Goodbye, 0, 9_999, json!({})).await;
         self.module.take().unwrap().join().unwrap().unwrap();
@@ -307,11 +329,10 @@ async fn chunk_queries_answer_occipital_on_every_route_shape_and_refuse_others()
     for channel in [UNSCOPED, SELF_OWNED, CARRIED] {
         let mut replies = Vec::new();
         for index in 0..3u64 {
-            corr += 1;
             let (ty, reply) = wire
-                .request(
+                .request_unbusy(
                     channel,
-                    corr,
+                    &mut corr,
                     json!({"op": "rich_ui.template_chunk", "templateDigest": template_digest, "index": index}),
                 )
                 .await;
@@ -353,32 +374,29 @@ async fn chunk_queries_answer_occipital_on_every_route_shape_and_refuse_others()
         assert_eq!(joined, GOLDEN_MANIFEST);
 
         // The bare form names the query in `name` with an `arguments` body.
-        corr += 1;
         let (ty, reply) = wire
-            .request(
+            .request_unbusy(
                 channel,
-                corr,
+                &mut corr,
                 json!({"name": "rich_ui.template_chunk", "arguments": {"templateDigest": template_digest, "index": 2}}),
             )
             .await;
         assert_eq!(ty, FrameType::Response, "{reply}");
         assert_eq!(reply["index"], 2);
 
-        corr += 1;
         assert_refusal(
-            wire.request(
+            wire.request_unbusy(
                 channel,
-                corr,
+                &mut corr,
                 json!({"op": "rich_ui.template_chunk", "templateDigest": template_digest, "index": 3}),
             )
             .await,
             "chunk_index_out_of_range",
         );
-        corr += 1;
         assert_refusal(
-            wire.request(
+            wire.request_unbusy(
                 channel,
-                corr,
+                &mut corr,
                 json!({"op": "rich_ui.template_chunk", "templateDigest": sha256(b"missing"), "index": 0}),
             )
             .await,
