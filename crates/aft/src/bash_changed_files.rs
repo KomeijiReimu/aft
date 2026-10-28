@@ -35,6 +35,12 @@ const GIT_UNAVAILABLE: &str = "No diffs: git before-images could not be captured
 const OVERFLOW: &str = "Incomplete: the file watcher overflowed, so some changes may be missing.";
 pub(crate) const NOT_CAUGHT_UP: &str = "Incomplete: the file watcher had not caught up when the command ended, so some changes may be missing.";
 const NOT_SHOWN: &str = "not shown: file is denied or could not be safely opened";
+// Git answering "no such path" and Git being killed at the deadline look the
+// same to the caller, so a missing answer after the deadline must never be
+// reported as a missing before-image.
+const NO_BEFORE_IMAGE: &str =
+    "no diff: no clean git before-image is available (untracked, unreadable or too large)";
+const DIFF_BUDGET_SPENT: &str = "no diff: the diff time budget ran out";
 
 fn comparison_path(path: &Path) -> Cow<'_, Path> {
     // Git and canonicalize can spell the same Windows path differently.
@@ -210,6 +216,11 @@ pub(crate) struct Capture {
     report: OnceLock<Report>,
     #[cfg(test)]
     diff_delay_for_test: Duration,
+    /// Replaces `MAX_RENDER_TIME` so tests that check report content are not
+    /// at the mercy of Git process startup time on a loaded runner. Tests of
+    /// deadline behaviour set an explicit call deadline instead.
+    #[cfg(test)]
+    render_time_for_test: Duration,
 }
 #[derive(Debug)]
 struct GitStart {
@@ -279,6 +290,26 @@ impl ReadPolicy {
 thread_local! { static CURRENT: RefCell<Option<Arc<Capture>>> = const { RefCell::new(None) }; }
 #[cfg(test)]
 thread_local! { static READ_AFTER_CHECK_FOR_TEST: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) }; }
+#[cfg(test)]
+type GitForTest = Box<dyn FnMut(&[&str], Instant) -> Option<Vec<u8>>>;
+#[cfg(test)]
+thread_local! {
+    /// Stands in for the Git processes a diff starts, so a test can make one
+    /// run out of time without depending on real process timing.
+    static GIT_FOR_TEST: RefCell<Option<GitForTest>> = const { RefCell::new(None) };
+}
+
+/// One bounded Git read for a diff. `None` covers both a failed command and
+/// one stopped at the deadline; callers check the deadline to tell them apart.
+fn git_bytes(directory: &Path, args: &[&str], deadline: Instant, limit: usize) -> Option<Vec<u8>> {
+    #[cfg(test)]
+    if let Some(result) =
+        GIT_FOR_TEST.with(|hook| hook.borrow_mut().as_mut().map(|run| run(args, deadline)))
+    {
+        return result;
+    }
+    crate::revision_read::bounded_git_bytes(directory, args, deadline, limit)
+}
 pub(crate) struct Scope(Option<Arc<Capture>>);
 pub(crate) type SharedCallDeadline = Arc<Mutex<Option<Instant>>>;
 pub(crate) struct BudgetGuard(SharedCallDeadline);
@@ -387,17 +418,23 @@ impl Capture {
             report: OnceLock::new(),
             #[cfg(test)]
             diff_delay_for_test: Duration::ZERO,
+            #[cfg(test)]
+            render_time_for_test: MAX_RENDER_TIME,
         })
     }
     pub(crate) fn finish(&self) -> &Report {
         self.report.get_or_init(|| {
             let started = Instant::now();
+            #[cfg(not(test))]
+            let render_time = MAX_RENDER_TIME;
+            #[cfg(test)]
+            let render_time = self.render_time_for_test;
             let deadline = self
                 .call_deadline
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .map_or(started + MAX_RENDER_TIME, |call| {
-                    call.min(started + MAX_RENDER_TIME)
+                .map_or(started + render_time, |call| {
+                    call.min(started + render_time)
                 });
             let flush_deadline =
                 deadline.min(started + crate::watcher_backend::flush::BASH_FLUSH_LIMIT);
@@ -518,9 +555,17 @@ impl Capture {
         }
         for (index, (path, created, exists, _)) in pending.into_iter().enumerate() {
             let file = &mut files[index];
-            if self.mode == BashChangedFiles::Diff && Instant::now() < diff_deadline {
+            if self.mode == BashChangedFiles::Diff {
                 if let Some(git) = &self.git {
-                    self.diff_file(git, &path, created, exists, diff_deadline, file);
+                    if Instant::now() < diff_deadline {
+                        self.diff_file(git, &path, created, exists, diff_deadline, file);
+                    }
+                    // Every finished diff attempt leaves a diff or a reason;
+                    // only the deadline stops one without either. Say so
+                    // rather than leave the file looking diffable.
+                    if file.diff.is_none() && file.reason.is_none() {
+                        file.reason = Some(DIFF_BUDGET_SPENT.into());
+                    }
                 }
             }
             if report_body_bytes(&files) > MAX_REPORT_BYTES - 2048 {
@@ -697,12 +742,7 @@ impl Capture {
         };
         let git_path = relative_path_text(relative);
         let spec = format!("{}:{}", git.head, git_path);
-        let before = crate::revision_read::bounded_git_bytes(
-            &git.directory,
-            &["show", &spec],
-            deadline,
-            MAX_FILE_BYTES,
-        );
+        let before = git_bytes(&git.directory, &["show", &spec], deadline, MAX_FILE_BYTES);
         if Instant::now() >= deadline {
             return;
         }
@@ -711,20 +751,24 @@ impl Capture {
                 file.status = if exists { "modified" } else { "deleted" };
                 before
             }
-            None if crate::revision_read::bounded_git_bytes(
-                &git.directory,
-                &["ls-tree", "-z", &git.head, "--", &git_path],
-                deadline,
-                4096,
-            )
-            .is_some_and(|entry| entry.is_empty()) =>
-            {
+            None => {
+                // `git show` also fails for a path HEAD does not have. An empty
+                // tree listing tells that new file apart from an unreadable one.
+                let entry = git_bytes(
+                    &git.directory,
+                    &["ls-tree", "-z", &git.head, "--", &git_path],
+                    deadline,
+                    4096,
+                );
+                if Instant::now() >= deadline {
+                    return;
+                }
+                if !entry.is_some_and(|entry| entry.is_empty()) {
+                    file.reason = Some(NO_BEFORE_IMAGE.into());
+                    return;
+                }
                 file.status = if exists { "added" } else { "deleted" };
                 Vec::new()
-            }
-            None => {
-                file.reason = Some("no diff: no clean git before-image is available (untracked, unreadable or too large)".into());
-                return;
             }
         };
         if !before.is_empty() {

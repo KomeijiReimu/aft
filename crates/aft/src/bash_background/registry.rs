@@ -7957,6 +7957,16 @@ impl BgTaskRegistry {
         // contended running scan still yields after one chunk.
         let mut bytes_read = 0;
         let mut matches = Vec::new();
+        // The capture file a withheld watch preview names, so the agent can
+        // read the matched output itself.
+        let output_file =
+            self.task(task_id)
+                .and_then(|task| match cursor_key.rsplit(':').next()? {
+                    "stdout" => Some(task.paths.stdout.clone()),
+                    "stderr" => Some(task.paths.stderr.clone()),
+                    "pty" => Some(task.paths.pty.clone()),
+                    _ => None,
+                });
         loop {
             if !drain && bytes_read >= CHUNK as usize {
                 break;
@@ -8022,6 +8032,7 @@ impl BgTaskRegistry {
                                     ..range.end as usize - source.start,
                                 source.start == 0,
                                 source.end == len as usize,
+                                output_file.as_deref(),
                             )
                         })
                     })
@@ -8031,7 +8042,11 @@ impl BgTaskRegistry {
                             completion_preview::TRUNCATED_PREVIEW_WITHHELD.to_string(),
                         )
                     });
-                (matched.match_text, matched.context) = rendered;
+                let (match_text, context) = rendered;
+                matched.context = context;
+                if !matched.literal_pattern {
+                    matched.match_text = match_text;
+                }
             }
             matches.extend(found);
             if len < CHUNK as usize {
@@ -8214,13 +8229,25 @@ impl BgTaskRegistry {
     }
 
     fn take_watch_line_batches(&self, task_id: &str, terminal: bool) -> Vec<PatternMatch> {
+        // Each substring watch's own pattern, read before taking batches
+        // because a once watch is unregistered as its batch is taken.
+        let mut needles = HashMap::new();
         let mut batches = self
             .inner
             .watch_registry
             .lock()
-            .map(|mut registry| registry.take_line_batches(task_id, terminal))
+            .map(|mut registry| {
+                for spec in registry.watch_specs(task_id) {
+                    if let WatchPattern::Substring(needle) = spec.pattern {
+                        needles.insert(spec.watch_id, needle);
+                    }
+                }
+                registry.take_line_batches(task_id, terminal)
+            })
             .unwrap_or_default();
+        let task = self.task(task_id);
         for matched in &mut batches {
+            let needle = needles.get(&matched.watch_id);
             if let Some(batch) = matched.batch.as_mut() {
                 for line in &mut batch.lines {
                     let artifact = match line.stream.as_str() {
@@ -8236,13 +8263,30 @@ impl BgTaskRegistry {
                         line.offset,
                         line.end_offset,
                     ) {
-                        Ok(text) => line.text = text.trim_end_matches('\n').to_string(),
+                        Ok(text) => {
+                            let masked = text.trim_end_matches('\n');
+                            // The row still holds the raw line it was matched on.
+                            line.text = match needle {
+                                Some(needle) => completion_preview::keep_pattern_visible(
+                                    &line.text, masked, needle,
+                                ),
+                                None => masked.to_string(),
+                            };
+                        }
                         Err(unavailable) if unavailable.line_limit => {
                             line.unavailable = true;
                             let limit = completion_preview::WATCH_PREVIEW_LINE_CAP_BYTES;
                             batch.masking_limit_bytes = Some(limit as u64);
                             line.text =
                                 super::watch_lines::unavailable_match_text(line.count, limit);
+                        }
+                        Err(unavailable) if unavailable.restart => {
+                            let output_file = task.as_ref().map(|task| match artifact {
+                                TaskArtifact::Stderr => task.paths.stderr.as_path(),
+                                TaskArtifact::Pty => task.paths.pty.as_path(),
+                                _ => task.paths.stdout.as_path(),
+                            });
+                            line.text = completion_preview::restart_watch_notice(output_file);
                         }
                         Err(unavailable) => line.text = unavailable.reason.to_string(),
                     }
@@ -12483,6 +12527,9 @@ impl BgTaskRegistry {
                                 .match_batch
                                 .as_deref()
                                 .and_then(|batch| serde_json::from_str(batch).ok()),
+                            // The saved match text and context were rendered
+                            // before this row was reloaded.
+                            literal_pattern: false,
                         });
                     }
                 }
@@ -27510,6 +27557,100 @@ mod tests {
         }
     }
 
+    /// A running task with an each-line watch is reloaded by a fresh registry
+    /// from disk, as after a daemon restart. A task recorded at launch with no
+    /// secret values previews its rows; one recorded with secret values names
+    /// the output file in each row instead.
+    #[test]
+    fn each_line_rows_after_restart_preview_or_name_the_output_file() {
+        for secrets in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (registry, task, _, watch) = each_line_running_fixture(dir.path());
+            let _reap = KillTasksOnDrop(registry.clone());
+            let metadata = {
+                let mut state = task.lock_state().unwrap();
+                state.metadata.completion_has_env_secrets = Some(secrets);
+                state.metadata.completion_has_non_ticket_env_secrets = Some(secrets);
+                state.metadata.completion_ticket_digest = None;
+                state.metadata.clone()
+            };
+            // Both the task file and its aft.db row carry the launch record.
+            registry.persist_task(&task.paths, &metadata).unwrap();
+            registry.clear_task_watch_state(&task.task_id);
+            let (replayed, _, frames) = registry_with_db_and_frames(dir.path());
+            replayed
+                .replay_session_inner(dir.path(), "session", None)
+                .unwrap();
+            replayed
+                .inner
+                .shutdown
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let _reap_replayed = KillTasksOnDrop(replayed.clone());
+            append_each_line_output(&task.paths.stdout, b"READY 03b92ca085 failed\n");
+            let reloaded = replayed.task_for_session(&task.task_id, "session").unwrap();
+            let matched = scan_until_new_match(&replayed, &reloaded, &frames);
+            assert_eq!(matched.watch_id, watch, "secrets={secrets}");
+            let row = &matched.batch.as_ref().unwrap().lines[0];
+            if secrets {
+                assert_eq!(
+                    row.text,
+                    format!(
+                        "{}\nOutput file: {}",
+                        completion_preview::RESTART_WATCH_PREVIEW_WITHHELD,
+                        task.paths.stdout.display()
+                    )
+                );
+                assert!(!matched.context.contains("03b92ca085"));
+            } else {
+                assert_eq!(row.text, "READY 03b92ca085 failed");
+            }
+        }
+    }
+
+    #[test]
+    fn each_line_rows_never_mask_the_watch_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, task, frames, _) = each_line_running_fixture(dir.path());
+        let _reap = KillTasksOnDrop(registry.clone());
+        let token = format!("ghp_{}", "Q".repeat(36));
+        let prefix_watch = registry
+            .register_watch_delivery(
+                task.task_id.clone(),
+                WatchPattern::Substring("ghp_".into()),
+                false,
+                true,
+            )
+            .unwrap();
+        let token_watch = registry
+            .register_watch_delivery(
+                task.task_id.clone(),
+                WatchPattern::Substring(token.clone()),
+                false,
+                true,
+            )
+            .unwrap();
+        append_each_line_output(&task.paths.stdout, format!("auth {token} ok\n").as_bytes());
+        registry.scan_task_watch_output(&task);
+        let row = |watch: &str| {
+            pattern_match_frames(&frames)
+                .into_iter()
+                .find(|frame| frame.watch_id == watch)
+                .unwrap_or_else(|| panic!("no batch for {watch}"))
+                .batch
+                .unwrap()
+                .lines[0]
+                .text
+                .clone()
+        };
+        // The rest of the credential stays masked.
+        assert_eq!(
+            row(&prefix_watch),
+            format!("auth ghp_{} ok", crate::log_redact::SECRET_PLACEHOLDER)
+        );
+        // A pattern that is the whole credential is the agent's own text.
+        assert_eq!(row(&token_watch), format!("auth {token} ok"));
+    }
+
     #[test]
     fn each_line_once_warning_stays_armed_through_ack_and_restart() {
         for restart in [false, true] {
@@ -27834,6 +27975,7 @@ mod tests {
                 context: "READY".into(),
                 once: false,
                 batch: None,
+                literal_pattern: false,
             },
         );
         assert_eq!(
@@ -27871,6 +28013,7 @@ mod tests {
                 context: "ignored".into(),
                 once: false,
                 batch: Some(batch),
+                literal_pattern: false,
             },
         );
         let mut frames = pattern_match_frames(&frames);

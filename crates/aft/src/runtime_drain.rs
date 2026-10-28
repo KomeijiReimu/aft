@@ -6614,10 +6614,18 @@ mod tests {
         drain.join().unwrap();
 
         ctx.mark_subc_bound();
-        let mut guard = 0;
+        // The replay must finish: the manual dispatch channel holds no
+        // platform watcher, so `has_more` can only come from the retained
+        // Apply continuation. A bound replay advances every slice; the only
+        // zero-progress park is transient LSP contention from the
+        // applicability worker spawned by the initial batch. Yield between
+        // slices so that worker can release the manager, and bound the wait
+        // by time rather than a fixed slice count, which is brittle under
+        // CI load.
+        let deadline = Instant::now() + Duration::from_secs(30);
         while drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {
-            guard += 1;
-            assert!(guard < 32, "rebased replay must finish");
+            assert!(Instant::now() < deadline, "rebased replay must finish");
+            std::thread::yield_now();
         }
         let search = ctx
             .search_index()

@@ -454,6 +454,25 @@ fn audit_unattributed_jailed_worker_never_gets_operator_gh() {
     }
 }
 
+#[test]
+fn audit_jailed_shell_without_ticket_names_the_worker_read_rule() {
+    // `gh --version` or `gh api rate_limit` from a worker shell reaches this
+    // refusal; the text must say what a worker can run, not blame a ticket.
+    let error = native_guard::permission_with(
+        &relay(None),
+        native_guard::ShellSignals {
+            sandboxed: true,
+            worker_marked: false,
+        },
+        |_| panic!("a missing ticket cannot be looked up"),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        "in a worker shell, gh runs only reads of a repository; this command is not one"
+    );
+}
+
 /// Run the probe child in a fresh process, as a shell would run the shim:
 /// `mode` picks what confines it, and `clear_all` mimics `env -i`.
 ///
@@ -679,7 +698,7 @@ fn stripped_worker_probe_child() {
         .unwrap_err();
         assert_eq!(
             error,
-            "no gh-shim ticket inside a sandboxed agent shell; operator gh is not available here"
+            "in a worker shell, gh runs only reads of a repository; this command is not one"
         );
         let status = native_guard::dispatch_with(
             &args(&["api", "repos/cortexkit/aft/issues"]),

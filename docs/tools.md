@@ -333,7 +333,7 @@ running under the 30-minute (or explicit `timeout`) kill cap. `bash({ timeout: 2
 briefly then hard-kills at 2s. `background: true` skips polling entirely.
 
 Completion previews in notices and wakes have common credential formats and secret-named child environment values masked; stdout/stderr files and `bash_status` tool results remain unchanged.
-After a daemon restart, a masked preview saved before the restart is replayed unchanged. A preview not yet saved is built from the output files only when the task was recorded as having no secret-named environment values; otherwise its preview is withheld because the secret values are no longer in memory to mask it, and `bash_status` reads the output.
+After a daemon restart, a masked preview saved before the restart is replayed unchanged. A preview not yet saved is built from the output files only when the task was recorded as having no secret-named environment values; otherwise its preview is withheld because the secret values are no longer in memory to mask it, and `bash_status` reads the output. A watch match or `each_line` row withheld this way names the output file it was found in, since `bash_status` shows no output while the task runs. A substring watch always reports its own pattern as the matched text, and its `each_line` rows show the pattern even where it is part of a masked credential (the rest of the credential stays masked).
 
 **Foreground example:**
 
