@@ -1,5 +1,5 @@
 //! Byte-faithful command output pages. Cursors contain offsets and a read
-//! sequence; the MAC binds them to the policy route and the resolved task.
+//! sequence; the MAC binds them to the harness, session and resolved task.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde_json::{json, Value};
@@ -30,8 +30,8 @@ struct Cursor<'a> {
 
 impl Cursor<'_> {
     fn mac(&self, payload: &[u8]) -> [u8; 32] {
-        // HMAC-SHA256 with a fixed 32-byte database key. Length-delimited JSON
-        // identity prevents ambiguities between labels containing separators.
+        // HMAC-SHA256 with a fixed 32-byte database key. The JSON tuple keeps
+        // identity fields unambiguous even when labels contain separators.
         let mut inner_pad = [0x36; 64];
         let mut outer_pad = [0x5c; 64];
         for (i, byte) in self.key.iter().enumerate() {
@@ -232,7 +232,8 @@ fn page(
 }
 
 fn envelope(cursor: &Cursor<'_>, mut offsets: Offsets, items: Vec<Value>, drained: bool) -> Value {
-    // Even an empty running read gets a fresh cursor, distinct from a frame retry.
+    // Advance the read sequence even when a running task has no new output,
+    // so each read gets a distinct cursor.
     offsets.read_sequence = offsets.read_sequence.wrapping_add(1);
     json!({"items":items, "next":if drained { None } else { Some(cursor.encode(offsets)) }})
 }

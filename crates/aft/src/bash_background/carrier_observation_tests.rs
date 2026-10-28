@@ -1,4 +1,5 @@
 use super::*;
+use crate::bash_background::persistence::create_task_layout;
 use crate::{context::AppContext, protocol::RawRequest};
 
 fn request(task: &str, session: &str) -> RawRequest {
