@@ -54,6 +54,7 @@ pub struct PhaseTrace {
     waiting_on: WaitingOn,
     waiting_on_build_id: Option<String>,
     wait_ms: u64,
+    intentional_wait: bool,
     arg_shape: Option<String>,
     edit_phases: Option<String>,
 }
@@ -150,6 +151,8 @@ pub struct ToolCallPhaseDurations {
     pub waiting_on: WaitingOn,
     pub waiting_on_build_id: Option<String>,
     pub wait_ms: u64,
+    /// Execution includes a requested wait, not just AFT's own work.
+    pub intentional_wait: bool,
     /// What the call was asked to do, without any content: the target kind
     /// and, for edits, the match and replacement sizes and the outcome code.
     /// See [`tool_call_arg_shape`].
@@ -186,6 +189,7 @@ impl PhaseTrace {
             waiting_on: WaitingOn::None,
             waiting_on_build_id: None,
             wait_ms: 0,
+            intentional_wait: false,
             arg_shape: None,
             edit_phases: None,
         }
@@ -314,6 +318,7 @@ impl PhaseTrace {
             waiting_on: self.waiting_on,
             waiting_on_build_id: self.waiting_on_build_id,
             wait_ms: self.wait_ms,
+            intentional_wait: self.intentional_wait,
             arg_shape: self.arg_shape,
             edit_phases: self.edit_phases,
         })
@@ -579,6 +584,7 @@ pub(crate) fn prepare_tool_call(
         }
     };
     if let Some(trace) = phase_trace.as_mut() {
+        trace.intentional_wait = tool_call_intentionally_waits(&request);
         trace.mark_translate_done();
     }
 
@@ -825,6 +831,16 @@ pub fn run_tool_call(
 
     crate::response_finalize::enforce_reply_ceiling(bare_name, &mut result.text);
     ToolCallOutcome::Unary(result)
+}
+
+fn tool_call_intentionally_waits(request: &RawRequest) -> bool {
+    match request.command.as_str() {
+        "bash_watch" => true,
+        "bash" | "powershell" => ["wait", "block_to_completion"]
+            .iter()
+            .any(|key| request.params.get(*key).and_then(Value::as_bool) == Some(true)),
+        _ => false,
+    }
 }
 
 /// Commands that change files, whose slow-call line also reports the outcome.
@@ -1585,6 +1601,7 @@ mod tests {
             waiting_on: WaitingOn::None,
             waiting_on_build_id: None,
             wait_ms: 0,
+            intentional_wait: false,
             arg_shape: None,
             edit_phases: None,
         };
@@ -1710,6 +1727,68 @@ mod tests {
                 disabled_tools: None,
                 worker_session: false,
                 host_tool_names: None,
+            }
+        }
+
+        #[test]
+        fn intentional_wait_is_classified_before_deferred_execution() {
+            let app = AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config::default(),
+            );
+            let mut ctx = context(false);
+            ctx.standard_edit_grammar = true;
+            for (name, args, expected) in [
+                ("bash_watch", json!({"taskId": "task-test"}), true),
+                ("bash", json!({"command": "echo ready", "wait": true}), true),
+                (
+                    "bash",
+                    json!({"command": "echo ready", "wait": "true"}),
+                    true,
+                ),
+                (
+                    "bash",
+                    json!({"command": "echo ready", "block_to_completion": true}),
+                    true,
+                ),
+                (
+                    "powershell",
+                    json!({"command": "echo ready", "wait": true}),
+                    true,
+                ),
+                (
+                    "bash",
+                    json!({"command": "echo ready", "wait": false}),
+                    false,
+                ),
+                ("bash", json!({"command": "echo ready"}), false),
+                (
+                    "bash",
+                    json!({"command": "echo ready", "background": true}),
+                    false,
+                ),
+                ("bash_status", json!({"taskId": "task-test"}), false),
+                ("read", json!({"path": "example.rs", "wait": true}), false),
+            ] {
+                let mut trace = PhaseTrace::new(Instant::now());
+                trace.mark_executor_submitted();
+                trace.mark_job_admitted();
+                let prepared = prepare_tool_call(
+                    name,
+                    args,
+                    &crate::subc_format::FormatContext::default(),
+                    &ctx,
+                    &app,
+                    Some(&mut trace),
+                )
+                .unwrap_or_else(|result| panic!("{name}: {:?}", result.response));
+                assert_eq!(
+                    trace.intentional_wait, expected,
+                    "{name}: {:?}",
+                    prepared.request
+                );
+                let phases = finish_cpu_phase(trace);
+                assert_eq!(phases.intentional_wait, expected, "{name}");
             }
         }
 

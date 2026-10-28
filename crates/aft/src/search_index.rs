@@ -2096,7 +2096,7 @@ impl SearchIndex {
         let chunk_size = pool_size.saturating_mul(4).clamp(1, 32);
         let pool = match rayon::ThreadPoolBuilder::new()
             .num_threads(pool_size)
-            .thread_name(|index| format!("aft-search-build-{index}"))
+            .thread_name(|index| format!("aft-rayon-search-build-{index}"))
             .stack_size(8 * 1024 * 1024)
             .build()
         {
@@ -5161,7 +5161,7 @@ fn build_streaming_index(
     let chunk_size = pool_size.saturating_mul(4).clamp(1, 32);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(pool_size)
-        .thread_name(|index| format!("aft-search-build-{index}"))
+        .thread_name(|index| format!("aft-rayon-search-build-{index}"))
         .stack_size(8 * 1024 * 1024)
         .build()
         .ok();

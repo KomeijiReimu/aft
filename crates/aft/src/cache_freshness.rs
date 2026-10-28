@@ -456,7 +456,7 @@ fn build_strict_verify_pool() -> Option<rayon::ThreadPool> {
     STRICT_VERIFY_POOL_BUILDS.fetch_add(1, Ordering::Relaxed);
     rayon::ThreadPoolBuilder::new()
         .num_threads(strict_verify_pool_size())
-        .thread_name(|index| format!("aft-semantic-verify-{index}"))
+        .thread_name(|index| format!("aft-rayon-semantic-verify-{index}"))
         .build()
         .ok()
 }
@@ -580,6 +580,7 @@ pub(crate) fn watch_verify_stats(root: &Path, schedule: VerifyScheduleForTest) -
     let probe = std::sync::Arc::new(VerifyStatProbe {
         pool: rayon::ThreadPoolBuilder::new()
             .num_threads(2)
+            .thread_name(|index| format!("aft-rayon-verify-test-{index}"))
             .build()
             .expect("two-worker verification test pool"),
         schedule,

@@ -2803,6 +2803,7 @@ mod tests {
     fn ten_thousand_file_grep_uses_directory_probes_not_per_file_helpers() {
         let (_fixture, ctx) = grep_io_fixture();
         let pool = rayon::ThreadPoolBuilder::new()
+            .thread_name(|index| format!("aft-rayon-grep-test-{index}"))
             .num_threads(4)
             .build()
             .unwrap();
@@ -2856,6 +2857,7 @@ mod tests {
         let (_fixture, ctx) = grep_io_fixture();
         let root = project_root(&ctx);
         let pool = rayon::ThreadPoolBuilder::new()
+            .thread_name(|index| format!("aft-rayon-grep-test-{index}"))
             .num_threads(4)
             .build()
             .unwrap();
@@ -2910,6 +2912,7 @@ mod tests {
     fn grep_io_10k_measurement() {
         let (_fixture, ctx) = grep_io_fixture();
         let pool = rayon::ThreadPoolBuilder::new()
+            .thread_name(|index| format!("aft-rayon-grep-test-{index}"))
             .num_threads(4)
             .build()
             .unwrap();
