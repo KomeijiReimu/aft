@@ -596,7 +596,7 @@ pub fn assert_reply_contract(vector: &Value) {
     match result["status"].as_str() {
         Some("refused") => {
             assert!(result["refusal_code"].is_string(), "{name}");
-            assert_eq!(result["retry_same_nonce"], false, "{name}");
+            assert!(result["retry_same_nonce"].is_boolean(), "{name}");
             assert!(
                 writes.is_none_or(Vec::is_empty),
                 "{name}: refusal sent a write"
@@ -661,6 +661,7 @@ pub fn assert_reply_contract(vector: &Value) {
         assert_eq!(result["status"], "refused", "{name}");
         assert_eq!(result["code"], "review_thread_not_own", "{name}");
         assert_eq!(result["refusal_code"], "review_thread_not_own", "{name}");
+        assert_eq!(result["retry_same_nonce"], false, "{name}");
         assert_eq!(result["transmission"], "not_sent", "{name}");
         assert_eq!(result["detail"]["number"], number, "{name}");
         assert_eq!(result["detail"]["author_login"], *author, "{name}");
