@@ -6595,7 +6595,7 @@ mod v3_bootstrap_tests {
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let _attributes = super::super::verification::known_attribute_sources_for_test(root.path());
-        let policy_path = root.path().join("nested/.gitignore");
+        let policy_path = root.path().join("nested").join(".gitignore");
         std::fs::create_dir_all(&policy_path).unwrap();
         let driver = trigram_driver(root.path(), storage.path());
         let error = match driver.reconcile(&driver.access()) {
@@ -6617,7 +6617,7 @@ mod v3_bootstrap_tests {
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let _attributes = super::super::verification::known_attribute_sources_for_test(root.path());
-        let index_path = root.path().join(".git/index");
+        let index_path = root.path().join(".git").join("index");
         std::fs::create_dir_all(&index_path).unwrap();
         let driver = trigram_driver(root.path(), storage.path());
         let error = match driver.reconcile(&driver.access()) {

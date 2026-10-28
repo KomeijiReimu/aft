@@ -1150,7 +1150,7 @@ mod io_tests {
     #[test]
     fn directory_head_error_names_operation_and_path() {
         let root = tempfile::tempdir().unwrap();
-        let head = root.path().join(".git/HEAD");
+        let head = root.path().join(".git").join("HEAD");
         fs::create_dir_all(&head).unwrap();
         let error = capture_git_head_metadata(root.path(), None)
             .unwrap_err()

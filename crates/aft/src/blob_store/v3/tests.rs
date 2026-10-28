@@ -26,7 +26,7 @@ fn seed(storage: &Path, family: &str) {
 #[test]
 fn directory_reservation_lock_error_names_operation_and_path() {
     let storage = tempdir().unwrap();
-    let path = storage.path().join("blobs/v3/reservations.lock");
+    let path = storage.path().join("blobs/v3").join("reservations.lock");
     fs::create_dir_all(&path).unwrap();
     let error = match ReservationLock::acquire_until(storage.path(), Instant::now()) {
         Ok(_) => panic!("directory lock must not be accepted"),

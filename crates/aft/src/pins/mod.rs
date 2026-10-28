@@ -485,7 +485,7 @@ mod tests {
                     .register_view_with_storage(storage.path(), "worker", root.path())
                     .unwrap()
             };
-            let path = owner.view_dir().join("pins/generation.keys");
+            let path = owner.view_dir().join("pins").join("generation.keys");
             fs::create_dir_all(&path).unwrap();
             let error = AssemblyPin::create_v2(&owner, "generation", &[])
                 .unwrap_err()
