@@ -81,7 +81,11 @@ function durableBridge() {
   };
 }
 
-async function rig(parentID: string | undefined = "parent", durable = durableBridge()) {
+async function rig(
+  parentID: string | undefined = "parent",
+  durable = durableBridge(),
+  wakeAllowed = true,
+) {
   const bus = await Effect.runPromise(
     PubSub.unbounded<{ type: string; data: { sessionID: string; reason?: string } }>(),
   );
@@ -123,7 +127,7 @@ async function rig(parentID: string | undefined = "parent", durable = durableBri
     ),
   );
   consumer.registerSession(sessionID, durable.bridge as never);
-  allowV2WatchWake(host, sessionID, taskID);
+  if (wakeAllowed) allowV2WatchWake(host, sessionID, taskID);
   return {
     consumer,
     durable,
@@ -169,7 +173,7 @@ afterEach(() => {
 });
 
 test("V2 abort settlement: a second subagent tool finishes while a drained completion is parked", async () => {
-  const r = await rig();
+  const r = await rig("parent", durableBridge(), false);
   let handling: Promise<void> | undefined;
   try {
     ({ handling } = await parkCompletion(r));
@@ -178,7 +182,13 @@ test("V2 abort settlement: a second subagent tool finishes while a drained compl
     expect(r.durable.pending.has(taskID)).toBe(true);
     await r.event("session.execution.succeeded");
     await handling;
-    expect(r.synthetic).toHaveLength(1);
+    expect(r.durable.acks).toHaveLength(0);
+    await r.event("session.execution.started");
+    const next = await r.after();
+    expect(next.result.content).toContain(taskID);
+    expect((await r.after()).result.content).not.toContain(taskID);
+    expect(r.synthetic).toHaveLength(0);
+    expect(r.durable.acks).toEqual([[taskID]]);
     expect(r.durable.pending.size).toBe(0);
   } finally {
     await r.close();
@@ -225,6 +235,7 @@ test("V2 abort settlement: a disappearing Location leaves its parked completion 
     expect(r.synthetic).toHaveLength(0);
     expect(r.durable.acks).toHaveLength(0);
     expect(r.durable.pending.has(taskID)).toBe(true);
+    releaseSessionState(sessionID);
     replacement = await rig("parent", r.durable);
     await replacement.nudge();
     await replacement.nudge();
