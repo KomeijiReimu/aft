@@ -1582,7 +1582,7 @@ mod url_tests {
                     &fixture,
                     &vault,
                     &[("api.secret.test", server.addr)],
-                    &request(command, &url, serde_json::json!({})),
+                    &request(command, &url, serde_json::json!({"symbol": "Budget"})),
                     move |_| {
                         let deadline = crate::bounded_io::current().unwrap().deadline;
                         assert!(deadline >= started + Duration::from_secs(25));
@@ -1602,7 +1602,7 @@ mod url_tests {
             let port = server.addr.port();
             let url = format!("https://api.secret.test:{port}/v1/doc.md?key={PLACEHOLDER}");
             let vault = granted_vault(rule("api.secret.test", port, "/v1"));
-            let req = request("zoom", &url, serde_json::json!({}));
+            let req = request("zoom", &url, serde_json::json!({"symbol": "Not fetched"}));
             for duration in [Duration::from_millis(2500), Duration::ZERO] {
                 let budget = crate::bounded_io::Budget::after(duration);
                 let deadline = budget.deadline;
@@ -2307,6 +2307,9 @@ mod url_tests {
             let port = server.addr.port();
             let url = format!("https://api.secret.test:{port}/v1/doc.md?key={PLACEHOLDER}");
             let vault = granted_vault(rule("api.secret.test", port, "/v1"));
+            // Keep the short call deadline this timing assertion exercises,
+            // rather than the helpers' ordinary 25s tool-call budget.
+            let _io = crate::bounded_io::enter_if_absent(Duration::from_secs(5));
             let started = std::time::Instant::now();
             let (run, documents) = run_with(
                 &fixture,
