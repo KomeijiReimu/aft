@@ -62,7 +62,16 @@ impl Candidate {
         }
         Self {
             eviction_epoch: EVICTION_EPOCH
-                .get_or_init(|| uuid::Uuid::new_v4().to_string())
+                .get_or_init(|| {
+                    format!(
+                        "{}:{}",
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos()
+                    )
+                })
                 .clone(),
             last_eviction: NEXT_EVICTION.fetch_add(1, Ordering::Relaxed),
             fingerprint,
