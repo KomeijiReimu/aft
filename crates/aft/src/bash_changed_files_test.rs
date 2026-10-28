@@ -58,6 +58,10 @@ fn capture(root: &Path, mode: BashChangedFiles) -> (Arc<Journal>, Arc<Capture>) 
         );
         Arc::get_mut(&mut capture).unwrap().read_policy = Some(ReadPolicy::new(access, None));
     }
+    // Likewise give rendering an ample budget: a loaded runner's slow Git
+    // startup must not turn a content check into a deadline check. Tests of
+    // deadline behaviour set a call deadline with `Capture::budget`.
+    Arc::get_mut(&mut capture).unwrap().render_time_for_test = Duration::from_secs(30);
     (journal, capture)
 }
 #[test]
@@ -238,6 +242,94 @@ fn bash_changed_files_git_aliases_preserve_dirty_untracked_and_deleted_paths() {
     assert_eq!(capture.root, capture_root);
     assert_eq!(capture.git.as_ref().unwrap().directory, original_directory);
     assert_eq!(capture.git.as_ref().unwrap().dirty, original_dirty);
+}
+
+#[test]
+fn bash_changed_files_diff_deadline_is_not_reported_as_missing_before_image() {
+    // `show` fails fast because HEAD lacks the new file; `ls-tree` then either
+    // answers, fails, or is stopped at the deadline. Only a real answer may
+    // decide between "added" and "no before-image".
+    for (ls_tree, expected) in [
+        ("empty", None),
+        ("fails", Some(NO_BEFORE_IMAGE)),
+        ("times out", Some(DIFF_BUDGET_SPENT)),
+    ] {
+        let root = repo();
+        let (journal, capture) = capture(root.path(), BashChangedFiles::Diff);
+        std::fs::write(root.path().join("new.txt"), "new file\n").unwrap();
+        event(
+            &journal,
+            root.path(),
+            "new.txt",
+            notify::EventKind::Modify(ModifyKind::Any),
+        );
+        GIT_FOR_TEST.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |args, deadline| match args[0] {
+                "show" => None,
+                "ls-tree" => match ls_tree {
+                    "empty" => Some(Vec::new()),
+                    "fails" => None,
+                    _ => {
+                        // Like `bounded_git_bytes`, give up only once the
+                        // deadline has passed.
+                        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                        None
+                    }
+                },
+                other => panic!("unexpected git {other}"),
+            }));
+        });
+        let _budget = capture.budget(Some(Instant::now() + Duration::from_millis(500)));
+        let report = capture.finish();
+        GIT_FOR_TEST.with(|hook| *hook.borrow_mut() = None);
+        let file = &report.files[0];
+        assert_eq!(file.path, "new.txt");
+        assert_eq!(
+            file.reason.as_deref(),
+            expected,
+            "ls-tree {ls_tree}: {report:?}"
+        );
+        if expected.is_none() {
+            assert_eq!(file.status, "added", "{report:?}");
+            assert!(
+                file.diff.as_ref().is_some_and(
+                    |diff| diff.contains("--- /dev/null") && diff.contains("+new file")
+                ),
+                "{report:?}"
+            );
+        } else {
+            assert!(file.diff.is_none(), "{report:?}");
+        }
+    }
+}
+
+#[test]
+fn bash_changed_files_skipped_diffs_say_the_budget_ran_out() {
+    let root = repo();
+    let (journal, mut capture) = capture(root.path(), BashChangedFiles::Diff);
+    Arc::get_mut(&mut capture).unwrap().diff_delay_for_test = Duration::from_secs(5);
+    for name in ["clean.txt", "new.txt"] {
+        std::fs::write(root.path().join(name), "changed\n").unwrap();
+        event(
+            &journal,
+            root.path(),
+            name,
+            notify::EventKind::Modify(ModifyKind::Any),
+        );
+    }
+    // The first diff sleeps through the whole budget; the second is never
+    // attempted. Neither may look like a file that simply has no diff.
+    let _budget = capture.budget(Some(Instant::now() + Duration::from_millis(200)));
+    let report = capture.finish();
+    assert_eq!(report.files.len(), 2, "{report:?}");
+    for file in &report.files {
+        assert!(file.diff.is_none(), "{report:?}");
+        assert_eq!(
+            file.reason.as_deref(),
+            Some(DIFF_BUDGET_SPENT),
+            "{report:?}"
+        );
+    }
 }
 
 #[test]
