@@ -1654,12 +1654,13 @@ fn candidates_and_durable_with_budget(
 }
 
 pub(crate) fn deletion_protections(paths: &[PathBuf]) -> io::Result<Vec<(u64, u64)>> {
-    deletion_protections_with_budget(paths, &mut RepairBudget::new())
+    deletion_protections_with_budget(paths, &mut RepairBudget::new(), &mut Default::default())
 }
 
 fn deletion_protections_with_budget(
     paths: &[PathBuf],
     budget: &mut RepairBudget,
+    examined: &mut crate::bash_background::persistence::IdentityCensus,
 ) -> io::Result<Vec<(u64, u64)>> {
     let mut protected = Vec::new();
     for path in paths {
@@ -1676,15 +1677,15 @@ fn deletion_protections_with_budget(
         };
         if canonical.is_dir() {
             match PinnedDir::open(&canonical) {
-                Ok(pinned) => pinned.repair_directory_identities(&mut protected, budget)?,
+                Ok(pinned) => pinned.directory_identities(&mut protected, budget, examined)?,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
         }
         for ancestor in canonical.ancestors() {
-            if let Ok(id) = identity(ancestor) {
-                protected.push((id.device, id.inode));
-            }
+            budget.entry()?;
+            let id = identity(ancestor)?;
+            protected.push((id.device, id.inode));
         }
     }
     Ok(protected)
@@ -1696,9 +1697,12 @@ pub(crate) fn retention_protections(storage: &StoragePaths) -> io::Result<Vec<(u
 pub(crate) fn retention_protections_with_budget(
     storage: &StoragePaths,
     budget: &mut RepairBudget,
+    examined: &mut crate::bash_background::persistence::IdentityCensus,
 ) -> io::Result<Vec<(u64, u64)>> {
+    #[cfg(test)]
+    crate::storage_retention::test_hook(&storage.artifacts, "protection-census");
     let (_, durable) = candidates_and_durable_with_budget(&storage.durable, budget)?;
-    deletion_protections_with_budget(&durable, budget)
+    deletion_protections_with_budget(&durable, budget, examined)
 }
 /// Register an explicitly supplied owner, never infer durable state from a
 /// cache pathname. Split roots also need their persisted namespace marker.

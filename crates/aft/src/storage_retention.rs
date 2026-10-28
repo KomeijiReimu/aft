@@ -129,13 +129,44 @@ pub(crate) struct TrashReport {
     pub incomplete: bool,
     /// Counts kept entries, or deferred containers when admission or census failed.
     pub kept_by_reason: BTreeMap<String, usize>,
+    /// Work examined by the pass's read-only durable-directory census.
+    pub protection_census: crate::bash_background::persistence::IdentityCensus,
+    pub protection_failure: Option<ProtectionFailure>,
     /// The durable-storage census (directory identities no trash removal may
     /// touch), taken at most once per reaper pass and shared by every trash
     /// container that pass visits. Taking it again for each container spent
     /// the pass budget before later domains (`inspect` and after) were
     /// reached. Not part of the published report.
     #[serde(skip)]
-    pub(crate) protections: Option<Result<Arc<Vec<(u64, u64)>>, String>>,
+    pub(crate) protections: Option<Result<Arc<Vec<(u64, u64)>>, Arc<io::Error>>>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProtectionFailure {
+    Budget,
+    Cancelled,
+    Unavailable,
+}
+
+impl ProtectionFailure {
+    fn from_error(error: &io::Error) -> Self {
+        if error.kind() == io::ErrorKind::Interrupted {
+            Self::Cancelled
+        } else if crate::bash_background::persistence::is_repair_budget_stop(error) {
+            Self::Budget
+        } else {
+            Self::Unavailable
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Budget => "protections_budget",
+            Self::Cancelled => "protections_cancelled",
+            Self::Unavailable => "protections_unavailable",
+        }
+    }
 }
 
 impl TrashReport {
@@ -3123,11 +3154,29 @@ fn reap_trash_with_cursor(
     let protected = report
         .protections
         .get_or_insert_with(|| {
-            crate::root_cache::retention_protections_with_budget(storage, budget)
-                .map(Arc::new)
-                .map_err(|error| error.to_string())
+            crate::root_cache::retention_protections_with_budget(
+                storage,
+                budget,
+                &mut report.protection_census,
+            )
+            .map(Arc::new)
+            .map_err(Arc::new)
         })
         .clone();
+    let protected = match protected {
+        Ok(protected) => protected,
+        Err(error) => {
+            let reason = ProtectionFailure::from_error(&error);
+            report.protection_failure = Some(reason);
+            report.incomplete = true;
+            report.entries += entries.len();
+            report.keep(trash, reason.reason(), error);
+            // An incomplete census authorizes no unlink or tree walk. Retry the
+            // prefetched entries with fresh protections on the next pass.
+            cursor.as_mut().unwrap().deferred.extend(entries);
+            return Ok(true);
+        }
+    };
     let parent = crate::bash_background::persistence::PinnedDir::repair_open_path(
         trash
             .parent()
@@ -3208,9 +3257,6 @@ fn reap_trash_with_cursor(
                 .map_err(|error| ("identity", error))?;
             verify_retirement_proof(storage, &child, &name["retired-".len()..], budget)
                 .map_err(|error| ("witness", error))?;
-            let protected = protected
-                .as_ref()
-                .map_err(|error| ("protections", io::Error::other(error.to_string())))?;
             #[cfg(test)]
             test_hook(&storage.artifacts, "reap-root");
             let mut warnings = Vec::new();
@@ -3219,7 +3265,7 @@ fn reap_trash_with_cursor(
                 parent.repair_remove_regular_child_with_budget(
                     entry.file_name().as_os_str(),
                     expected,
-                    protected,
+                    &protected,
                     &mut removed,
                     &mut warnings,
                     budget,
@@ -3228,7 +3274,7 @@ fn reap_trash_with_cursor(
                 parent.repair_remove_child_with_budget(
                     entry.file_name().as_os_str(),
                     expected,
-                    protected,
+                    &protected,
                     &mut removed,
                     &mut warnings,
                     budget,
@@ -5642,6 +5688,266 @@ fn record_v3_removal(domain: &mut DomainReport, bytes: Option<u64>) {
 
 #[cfg(test)]
 mod storage_retention_tests {
+    #[test]
+    fn retention_protection_large_task_store_fixture() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StoragePaths::same(temp.path());
+        fs::create_dir_all(temp.path().join("retention/bindings")).unwrap();
+        for root in 0..200 {
+            fs::write(
+                temp.path()
+                    .join(format!("retention/bindings/{root:016x}.json")),
+                b"{}",
+            )
+            .unwrap();
+        }
+        for task in 0..5_000 {
+            let directory = temp.path().join(format!("tasks/session/{task:032x}"));
+            fs::create_dir_all(directory.join("control")).unwrap();
+            fs::create_dir_all(directory.join("io")).unwrap();
+            for name in crate::bash_background::persistence::readable_task_file_names(
+                crate::bash_background::persistence::TaskLayout::Directory,
+            ) {
+                fs::write(directory.join(name), b"finished task artifact").unwrap();
+            }
+        }
+        for entry in 0..50 {
+            let domain = if entry % 2 == 0 { "index" } else { "inspect" };
+            let source = temp.path().join(format!("{domain}/{entry:016x}"));
+            fs::create_dir_all(&source).unwrap();
+            fs::write(source.join("payload"), b"retired cache").unwrap();
+            retire_directory(temp.path(), &source).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut budget = crate::bash_background::persistence::RepairBudget::new();
+        let mut report = TrashReport::default();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let _hook = observe_test_hook(
+            temp.path(),
+            Arc::new(move |step| {
+                if step == "protection-census" {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }),
+        );
+        let started = Instant::now();
+        for domain in ["index", "inspect"] {
+            reap_trash_with_snapshot_budget(
+                &storage,
+                &temp.path().join(domain).join(".retention-trash"),
+                false,
+                deadline,
+                &mut budget,
+                &mut report,
+                NO_TIME_BOUND,
+            )
+            .unwrap();
+        }
+        eprintln!(
+            "retention fixture: roots=200 finished_tasks=5000 trash=50 elapsed_ms={:.3} report={}",
+            started.elapsed().as_secs_f64() * 1_000.0,
+            serde_json::to_string(&report).unwrap(),
+        );
+        assert_eq!(report.removed_entries, 50, "{report:?}");
+        assert!(!report.incomplete, "{report:?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!((15_000..15_010).contains(&report.protection_census.directories));
+    }
+
+    #[test]
+    fn retention_protection_cancelled_defers_without_deleting() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let (temp, entries) = followup_trash_fixture(3);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = cancelled.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let _hook = observe_test_hook(
+            temp.path(),
+            Arc::new(move |step| {
+                if step == "protection-census" {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    signal.store(true, Ordering::SeqCst);
+                }
+            }),
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut budget = crate::bash_background::persistence::RepairBudget::until(
+            deadline,
+            Arc::new(move || cancelled.load(Ordering::SeqCst)),
+        );
+        let mut report = TrashReport::default();
+        assert!(reap_trash_with_snapshot_budget(
+            &StoragePaths::same(temp.path()),
+            entries[0].parent().unwrap(),
+            false,
+            deadline,
+            &mut budget,
+            &mut report,
+            NO_TIME_BOUND,
+        )
+        .unwrap());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            report.protection_failure,
+            Some(ProtectionFailure::Cancelled)
+        );
+        assert_eq!(report.kept_by_reason.get("protections_cancelled"), Some(&1));
+        assert_eq!(report.removed_entries, 0);
+        assert!(report.incomplete);
+        for entry in &entries {
+            assert!(entry.join("payload").exists());
+        }
+    }
+
+    #[test]
+    fn retention_protection_entry_budget_defers_without_deleting() {
+        let (temp, entries) = followup_trash_fixture(3);
+        // Three entries plus iterator exhaustion consume the snapshot budget;
+        // no allowance remains for a complete protection census.
+        let mut budget = crate::bash_background::persistence::RepairBudget::with_entries(4);
+        let mut report = TrashReport::default();
+        assert!(reap_trash_with_snapshot_budget(
+            &StoragePaths::same(temp.path()),
+            entries[0].parent().unwrap(),
+            false,
+            Instant::now() + Duration::from_secs(60),
+            &mut budget,
+            &mut report,
+            NO_TIME_BOUND,
+        )
+        .unwrap());
+        assert_eq!(report.protection_failure, Some(ProtectionFailure::Budget));
+        assert_eq!(report.kept_by_reason.get("protections_budget"), Some(&1));
+        assert_eq!(report.removed_entries, 0);
+        assert!(report.incomplete);
+        for entry in entries {
+            assert!(entry.join("payload").exists());
+        }
+    }
+
+    #[test]
+    fn retention_protection_unavailable_is_cached_across_containers() {
+        let (temp, mut entries) = followup_trash_fixture(2);
+        let source = temp.path().join("inspect/0123456789abcdef");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("payload"), b"retired inspect").unwrap();
+        retire_directory(temp.path(), &source).unwrap();
+        entries.extend(
+            fs::read_dir(temp.path().join("inspect/.retention-trash"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path()),
+        );
+        let mut deep = temp.path().join("durable");
+        for _ in 0..66 {
+            deep.push("d");
+        }
+        fs::create_dir_all(deep).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let _hook = observe_test_hook(
+            temp.path(),
+            Arc::new(move |step| {
+                if step == "protection-census" {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }),
+        );
+        let mut report = TrashReport::default();
+        let mut budget = crate::bash_background::persistence::RepairBudget::new();
+        for domain in ["views", "inspect"] {
+            assert!(reap_trash_with_snapshot_budget(
+                &StoragePaths::same(temp.path()),
+                &temp.path().join(domain).join(".retention-trash"),
+                false,
+                Instant::now() + Duration::from_secs(60),
+                &mut budget,
+                &mut report,
+                NO_TIME_BOUND,
+            )
+            .unwrap());
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            report.protection_failure,
+            Some(ProtectionFailure::Unavailable)
+        );
+        assert_eq!(
+            report.kept_by_reason.get("protections_unavailable"),
+            Some(&2)
+        );
+        assert!(report.protection_census.directories > 0);
+        assert_eq!(report.removed_entries, 0);
+        assert!(report.incomplete);
+        for entry in entries {
+            assert!(entry.join("payload").exists());
+        }
+    }
+
+    #[test]
+    fn retention_protection_keeps_a_nested_live_task_alias() {
+        use crate::bash_background::persistence::{PinnedDir, REPAIR_IDENTITIES};
+        let temp = tempfile::tempdir().unwrap();
+        let task = temp.path().join("tasks/session/live-task");
+        fs::create_dir_all(&task).unwrap();
+        fs::write(task.join("task.json"), b"running task").unwrap();
+        let source = temp.path().join("views/0123456789abcdef");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("nested/output"), b"task output").unwrap();
+        retire_directory(temp.path(), &source).unwrap();
+        let trash = temp.path().join("views/.retention-trash");
+        let entry = fs::read_dir(&trash)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        // The identity seam is keyed by path, and the census may see the
+        // alias in its plain or canonical form (macOS /private/var, Windows
+        // verbatim prefixes), so the injected identity covers both.
+        let aliases = [
+            entry.join("nested"),
+            fs::canonicalize(entry.join("nested")).unwrap(),
+        ];
+        let task_id = PinnedDir::open(&task)
+            .unwrap()
+            .directory_identity()
+            .unwrap();
+        REPAIR_IDENTITIES.with(|ids| {
+            for alias in &aliases {
+                ids.borrow_mut().insert(alias.clone(), task_id);
+            }
+        });
+        let mut report = TrashReport::default();
+        let result = reap_trash_with_snapshot_budget(
+            &StoragePaths::same(temp.path()),
+            &trash,
+            false,
+            Instant::now() + Duration::from_secs(60),
+            &mut crate::bash_background::persistence::RepairBudget::new(),
+            &mut report,
+            NO_TIME_BOUND,
+        );
+        REPAIR_IDENTITIES.with(|ids| {
+            for alias in &aliases {
+                ids.borrow_mut().remove(alias);
+            }
+        });
+        assert!(result.unwrap());
+        assert_eq!(report.removed_entries, 0, "{report:?}");
+        assert_eq!(
+            report.kept_by_reason.get("unlink_guard"),
+            Some(&1),
+            "{report:?}"
+        );
+        assert_eq!(
+            fs::read(entry.join("nested/output")).unwrap(),
+            b"task output"
+        );
+        assert_eq!(fs::read(task.join("task.json")).unwrap(), b"running task");
+    }
+
     fn followup_trash_fixture(count: usize) -> (tempfile::TempDir, Vec<PathBuf>) {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir_all(temp.path().join("retention")).unwrap();
