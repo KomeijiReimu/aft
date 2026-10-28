@@ -5642,6 +5642,60 @@ fn record_v3_removal(domain: &mut DomainReport, bytes: Option<u64>) {
 
 #[cfg(test)]
 mod storage_retention_tests {
+    #[test]
+    fn retention_protection_large_task_store_fixture() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StoragePaths::same(temp.path());
+        fs::create_dir_all(temp.path().join("retention/bindings")).unwrap();
+        for root in 0..200 {
+            fs::write(
+                temp.path().join(format!("retention/bindings/{root:016x}.json")),
+                b"{}",
+            )
+            .unwrap();
+        }
+        for task in 0..5_000 {
+            let directory = temp.path().join(format!("tasks/session/{task:032x}"));
+            fs::create_dir_all(directory.join("control")).unwrap();
+            fs::create_dir_all(directory.join("io")).unwrap();
+            for name in crate::bash_background::persistence::readable_task_file_names(
+                crate::bash_background::persistence::TaskLayout::Directory,
+            ) {
+                fs::write(directory.join(name), b"finished task artifact").unwrap();
+            }
+        }
+        for entry in 0..50 {
+            let domain = if entry % 2 == 0 { "index" } else { "inspect" };
+            let source = temp.path().join(format!("{domain}/{entry:016x}"));
+            fs::create_dir_all(&source).unwrap();
+            fs::write(source.join("payload"), b"retired cache").unwrap();
+            retire_directory(temp.path(), &source).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut budget = crate::bash_background::persistence::RepairBudget::new();
+        let mut report = TrashReport::default();
+        let started = Instant::now();
+        for domain in ["index", "inspect"] {
+            reap_trash_with_snapshot_budget(
+                &storage,
+                &temp.path().join(domain).join(".retention-trash"),
+                false,
+                deadline,
+                &mut budget,
+                &mut report,
+                NO_TIME_BOUND,
+            )
+            .unwrap();
+        }
+        eprintln!(
+            "retention fixture: roots=200 finished_tasks=5000 trash=50 elapsed_ms={:.3} report={}",
+            started.elapsed().as_secs_f64() * 1_000.0,
+            serde_json::to_string(&report).unwrap(),
+        );
+        assert_eq!(report.removed_entries, 50, "{report:?}");
+        assert!(!report.incomplete, "{report:?}");
+    }
+
     fn followup_trash_fixture(count: usize) -> (tempfile::TempDir, Vec<PathBuf>) {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir_all(temp.path().join("retention")).unwrap();
