@@ -384,6 +384,8 @@ impl CheckoutSemantic {
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
     {
+        #[cfg(test)]
+        let _profile = crate::blob_store::v3::work_profile::span("base_fill");
         let snapshot = self.installed();
         let Some(header) = snapshot.generation().base_header().cloned() else {
             return Ok(FillReport::default());
@@ -458,6 +460,8 @@ impl CheckoutSemantic {
                 .completed_keys(&self.owner, &draft, &pending)
                 .map_err(|error| RefreshError::classify(error.to_string()))?;
             if !keys.is_empty() {
+                #[cfg(test)]
+                let _profile = crate::blob_store::v3::work_profile::span("base_successor");
                 super::base_builder::publish_successor(
                     &claim,
                     |manifest| {
@@ -493,6 +497,8 @@ impl CheckoutSemantic {
         let (report, published) = result?;
         released.map_err(|error| RefreshError::classify(error.to_string()))?;
         if published {
+            #[cfg(test)]
+            let _profile = crate::blob_store::v3::work_profile::span("base_rebind");
             self.bind().map_err(RefreshError::classify)?;
         }
         Ok(report)

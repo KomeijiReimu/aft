@@ -203,6 +203,8 @@ pub fn raise(
     storage_root: &Path,
     requirements: &[(PersistedStore, u32)],
 ) -> Result<ReaderFloor, FloorError> {
+    #[cfg(test)]
+    let _profile = crate::blob_store::v3::work_profile::span("floor_raise");
     crate::persisted_format::register_storage_root(storage_root);
     crate::production_storage::refuse_write(storage_root).map_err(|error| FloorError::Io {
         path: storage_root.to_path_buf(),
@@ -321,6 +323,8 @@ fn write_atomic(path: &Path, floor: &ReaderFloor, strict: bool) -> Result<(), Fl
 }
 
 fn sync_dir(dir: &Path, strict: bool) -> io::Result<()> {
+    #[cfg(test)]
+    let _profile = crate::blob_store::v3::work_profile::span("floor_sync_dir");
     let result = crate::durability::sync_dir(dir);
     // Legacy floor writers ignore every directory-sync error. Only v3 writers
     // require directory durability before their publication closure may run.

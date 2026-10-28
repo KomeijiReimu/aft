@@ -1286,6 +1286,8 @@ pub fn publish<T>(
     observer: Option<&dyn DurabilityObserver>,
     body: impl FnOnce(&mut Publication<'_, '_>) -> Result<T>,
 ) -> Result<T> {
+    #[cfg(test)]
+    let _profile = work_profile::span("publication");
     family_dir(storage, family)?;
     preflight_floor(storage, request)?;
     crate::reader_floor::publish_v3_with_floor(storage, FORMAT_VERSION, FORMAT_VERSION, || {
@@ -1501,20 +1503,34 @@ fn publish_under_lock<T>(
     observer: Option<&dyn DurabilityObserver>,
     body: impl FnOnce(&mut Publication<'_, '_>) -> Result<T>,
 ) -> Result<T> {
+    #[cfg(test)]
+    let recovery_profile = work_profile::span("recovery");
     recover_ledgers(storage, lock)?;
+    #[cfg(test)]
+    drop(recovery_profile);
+    #[cfg(test)]
+    let reserve_profile = work_profile::span("reserve");
     let mut registry = RegistryWriter::open(storage, family, lock, true)?;
     let reservation = registry.reserve(request)?;
+    #[cfg(test)]
+    drop(reserve_profile);
     let Reservation { id, before, .. } = reservation;
     let mut publication = Publication {
         registry: &mut registry,
         planes: Vec::new(),
         payload_bytes: 0,
     };
+    #[cfg(test)]
+    let body_profile = work_profile::span("body_and_flush");
     let outcome = body(&mut publication).and_then(|result| {
         publication.flush()?;
         observe(observer, DurabilityStep::ClosureFlushed);
         Ok(result)
     });
+    #[cfg(test)]
+    drop(body_profile);
+    #[cfg(test)]
+    let _finish_profile = work_profile::span("ledger_finish");
     let payload_bytes = publication.payload_bytes;
     drop(publication);
     let finished = outcome.and_then(|result| {
@@ -1637,6 +1653,8 @@ impl Publication<'_, '_> {
     /// a plane store. The caller protects every key (a pin or live pin) before
     /// touching it, so a sweep either marks it or sees the new epoch.
     pub fn touch(&mut self, keys: &[FamilyKey]) -> Result<Vec<FamilyKey>> {
+        #[cfg(test)]
+        let _profile = work_profile::span("touch");
         let mut missing = Vec::new();
         for key in keys {
             let Some(mut c) = self.plane_with(key.plane(), false)? else {
@@ -1644,6 +1662,8 @@ impl Publication<'_, '_> {
                 continue;
             };
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            #[cfg(test)]
+            let _transaction = work_profile::span("touch_transaction");
             let sql = if plane_layout(&tx)? == 1 {
                 "UPDATE blob_payloads SET ref_epoch=(SELECT gc_epoch FROM store_meta) WHERE full_key=?1"
             } else {
@@ -1658,6 +1678,8 @@ impl Publication<'_, '_> {
     }
     /// Inserts the row, or touches an equal existing one. `true` means inserted.
     fn put_row(&mut self, key: &FamilyKey, payload: &[u8], payload_schema: u32) -> Result<bool> {
+        #[cfg(test)]
+        let _profile = work_profile::span("put_transaction");
         let mut c = self.plane(key.plane())?;
         #[cfg(test)]
         if replay::unflushed_closure() {
@@ -1712,6 +1734,50 @@ impl Publication<'_, '_> {
         }
         crate::durability::sync_dir(&self.registry.dir)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod work_profile {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
+
+    thread_local! {
+        static WORK: RefCell<BTreeMap<&'static str, (usize, Duration)>> = const { RefCell::new(BTreeMap::new()) };
+    }
+
+    pub(crate) struct Span(&'static str, Instant);
+
+    pub(crate) fn span(name: &'static str) -> Span {
+        Span(name, Instant::now())
+    }
+
+    impl Drop for Span {
+        fn drop(&mut self) {
+            WORK.with_borrow_mut(|work| {
+                let entry = work.entry(self.0).or_default();
+                entry.0 += 1;
+                entry.1 += self.1.elapsed();
+            });
+        }
+    }
+
+    pub(crate) fn take() -> BTreeMap<&'static str, (usize, Duration)> {
+        WORK.with_borrow_mut(std::mem::take)
+    }
+
+    pub(crate) struct Report;
+
+    impl Drop for Report {
+        fn drop(&mut self) {
+            for (phase, (calls, time)) in take() {
+                eprintln!(
+                    "v3 profile: {phase} calls={calls} elapsed_ms={:.3}",
+                    time.as_secs_f64() * 1000.0
+                );
+            }
+        }
     }
 }
 

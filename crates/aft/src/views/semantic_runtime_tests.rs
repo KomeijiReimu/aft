@@ -1323,6 +1323,7 @@ fn completed_embedding_batches_survive_a_later_batch_failure() {
 
 #[test]
 fn repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_texts() {
+    let _profile = crate::blob_store::v3::work_profile::Report;
     // Eight 64-text batches still cross the seventh-call failure boundary;
     // keep all three siblings and eight edit rounds in both workloads.
     let stress = std::env::var("AFT_STRESS").as_deref() == Ok("1");
@@ -1456,6 +1457,7 @@ fn repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_te
 
 #[test]
 fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admission() {
+    let _profile = crate::blob_store::v3::work_profile::Report;
     // Two batches retain cross-batch reuse in the default run. Nightly stress
     // keeps the original 32-batch workload; siblings and edit rounds are equal.
     let files = if std::env::var("AFT_STRESS").as_deref() == Ok("1") {
@@ -1760,6 +1762,7 @@ fn large_own_pin_fixture() -> (tempfile::TempDir, tempfile::TempDir, CheckoutSem
 
 #[test]
 fn large_semantic_materialization_batches_pins_and_touches() {
+    let _profile = crate::blob_store::v3::work_profile::Report;
     use crate::pins::work_counters::{key_file_bytes, key_file_work};
     let (_storage, root, runtime) = large_own_pin_fixture();
     fill_large(&runtime);
@@ -2176,6 +2179,7 @@ fn unreconciled_reuse_only_edit_completes_with_cold_cap_held() {
 /// cold-build slot before the reconcile starts, as a first load does.
 #[test]
 fn many_unreconciled_edits_take_cold_slot_before_reconciling() {
+    let _profile = crate::blob_store::v3::work_profile::Report;
     let storage = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let files: Vec<(std::path::PathBuf, String)> = (0..=SMALL_PREPARATION_FILES)
