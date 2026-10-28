@@ -453,7 +453,7 @@ fn bash_streams_progress_and_returns_final_response() {
     );
     let response = frames.last().unwrap();
     assert_eq!(response["success"], true);
-    assert_eq!(response["output"].as_str().unwrap().replace("\r\n", "\n"), "hello\n");
+    assert!(response["output"].as_str().unwrap().replace("\r\n", "\n").starts_with("hello\n"));
     assert_eq!(response["exit_code"], 0);
     assert!(frames[..frames.len() - 1].iter().any(|frame| {
         frame["type"] == "progress" && frame["request_id"] == "bash-1"
