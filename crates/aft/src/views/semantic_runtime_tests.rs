@@ -2513,6 +2513,7 @@ fn semantic_fill_inflight_memory_is_bounded_before_large_source_preparation() {
         let active = Arc::clone(&active);
         let peak = Arc::clone(&peak);
         workers.push(std::thread::spawn(move || {
+            let mut first_batch = true;
             catch_up_with_limiters(
                 &weak,
                 epoch,
@@ -2526,8 +2527,11 @@ fn semantic_fill_inflight_memory_is_bounded_before_large_source_preparation() {
                     assert_eq!(texts.len(), 1, "model request exceeded batch bound");
                     let count = active.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(count, Ordering::SeqCst);
-                    entered.send(i).unwrap();
-                    release.recv().unwrap();
+                    if first_batch {
+                        first_batch = false;
+                        entered.send(i).unwrap();
+                        release.recv().unwrap();
+                    }
                     let result = Model::default().embed(texts);
                     active.fetch_sub(1, Ordering::SeqCst);
                     result
@@ -2558,8 +2562,9 @@ fn semantic_fill_inflight_memory_is_bounded_before_large_source_preparation() {
         assert_eq!(reads.len(), if first.contains(&i) { 33 } else { 0 });
         assert_eq!(query(runtime, "root").pending.len(), 33);
     }
-    // The two distinct contents per root require two one-text model batches.
-    for _ in 0..ROOTS * 2 {
+    // Only each root's first call is blocked; later batches still count toward
+    // the peak while the same refresh retains its memory admission.
+    for _ in 0..ROOTS {
         release_tx.send(()).unwrap();
     }
     for worker in workers {
@@ -2597,7 +2602,7 @@ fn semantic_fill_waiter_yields_cold_slot(shared_content: bool) {
             write_tree(
                 root.path(),
                 &[(
-                    &format!("file_{i}_{file}.rs"),
+                    &format!("file_{file}.rs"),
                     &format!(
                         "pub fn sibling_{}() {{}}\n",
                         if shared_content { 0 } else { i }
@@ -2656,6 +2661,7 @@ fn semantic_fill_waiter_yields_cold_slot(shared_content: bool) {
         }
         std::thread::sleep(Duration::from_millis(5));
     };
+    let both_waiting = done_rx.is_empty();
     release_tx.send(()).unwrap();
     let first_done = done_rx.recv_timeout(Duration::from_secs(10));
     let second_done = done_rx.recv_timeout(Duration::from_secs(10));
@@ -2668,6 +2674,7 @@ fn semantic_fill_waiter_yields_cold_slot(shared_content: bool) {
         worker.join().unwrap();
     }
     assert!(yielded, "shared-work waiter retained the only cold slot");
+    assert!(both_waiting, "sibling did not wait for the in-flight work");
     assert_eq!(first_done.unwrap(), true);
     assert_eq!(second_done.unwrap(), true);
     assert!(lanes
@@ -2683,6 +2690,7 @@ fn semantic_fill_cold_slot_fixed_delay_measurement() {
     const DELAY: Duration = Duration::from_millis(150);
     let cold = crate::cold_build_limiter::isolated_limiter(2);
     let preparation = crate::cold_build_limiter::isolated_limiter(PREPARATION_LIMIT);
+    let inflight = crate::cold_build_limiter::isolated_limiter(INFLIGHT_FILL_LIMIT);
     let storage: Vec<_> = (0..ROOTS).map(|_| tempfile::tempdir().unwrap()).collect();
     let roots: Vec<_> = (0..ROOTS).map(|_| tempfile::tempdir().unwrap()).collect();
     let graph_storage: Vec<_> = (0..GRAPHS).map(|_| tempfile::tempdir().unwrap()).collect();
@@ -2723,13 +2731,14 @@ fn semantic_fill_cold_slot_fixed_delay_measurement() {
         let mut schedule = fast_schedule(roots[i].path());
         schedule.limiter = Arc::clone(&cold);
         let preparation = Arc::clone(&preparation);
+        let inflight = Arc::clone(&inflight);
         let barrier = Arc::clone(&barrier);
         let calls = Arc::clone(&calls);
         let entered = entered_tx.clone();
         fills.push(std::thread::spawn(move || {
             barrier.wait();
             let started = Instant::now();
-            let outcome = catch_up_with_preparation_limiter(
+            let outcome = catch_up_with_limiters(
                 &weak,
                 epoch,
                 &runtime,
@@ -2746,6 +2755,7 @@ fn semantic_fill_cold_slot_fixed_delay_measurement() {
                     Model::default().embed(texts)
                 },
                 &preparation,
+                &inflight,
             );
             assert!(matches!(outcome, FillOutcome::Settled));
             assert!(query(&runtime, "root file").complete());
@@ -3614,7 +3624,7 @@ fn live_view_fill_progress_is_visible_before_each_model_call() {
                 .find(|job| job.root == root.path().to_string_lossy())
                 .unwrap();
             assert_eq!(job.kind, "semantic view fill");
-            assert_eq!(job.phase, "embedding");
+            assert_eq!(job.phase, "waiting for embedding backend");
             assert_eq!(job.total, Some(3));
             if calls > 1 {
                 assert_eq!(job.chunks_embedded, Some((calls - 1) as u64));

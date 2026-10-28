@@ -1350,7 +1350,15 @@ const INFLIGHT_FILL_LIMIT: usize = 2;
 
 fn inflight_fill_limiter() -> &'static Arc<crate::cold_build_limiter::ColdBuildLimiter> {
     static LIMITER: OnceLock<Arc<crate::cold_build_limiter::ColdBuildLimiter>> = OnceLock::new();
-    LIMITER.get_or_init(|| crate::cold_build_limiter::isolated_limiter(INFLIGHT_FILL_LIMIT))
+    // Parallel unit tests have independent roots and admission deadlines. Like
+    // the global cold limiter, leave their shared default unconstrained; tests
+    // of the memory bound inject the production limit explicitly.
+    let limit = if cfg!(test) {
+        1024
+    } else {
+        INFLIGHT_FILL_LIMIT
+    };
+    LIMITER.get_or_init(|| crate::cold_build_limiter::isolated_limiter(limit))
 }
 
 /// Lets a lane's driver publish its checkout's view only while the lane's
