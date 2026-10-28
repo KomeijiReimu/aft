@@ -12543,7 +12543,7 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 ///   completion does not duplicate documented methods.
 /// - v13: known interface contracts and their implementation fan-out retain
 ///   exact/dispatch provenance; a concrete trait call has only its actual target.
-const BUILD_OUTPUT_VERSION: &str = "v20-callback-constructor-inline-test-items";
+const BUILD_OUTPUT_VERSION: &str = "v21-rust-module-paths-and-function-references";
 
 fn staging_file_name(project_key: &str) -> String {
     format!("{project_key}.{BUILD_OUTPUT_VERSION}.staging.sqlite.tmp.resume")
@@ -16401,6 +16401,27 @@ fn resolve_rust_target<I: ResolverIndex>(
         }
     }
     if full_ref.contains("::") {
+        // Self names the enclosing impl or trait, not a module on disk. Keep
+        // private associated helpers in the same graph as their public callers.
+        if let Some(member) = full_ref.strip_prefix("Self::") {
+            if let Some(caller) = raw.caller_symbol.as_deref().filter(|caller| {
+                caller_data
+                    .symbol_metadata
+                    .get(*caller)
+                    .is_some_and(|meta| meta.kind == SymbolKind::Method)
+            }) {
+                if let Some((owner, _)) = caller.rsplit_once("::") {
+                    let symbol = format!("{owner}::{member}");
+                    if index.node_for_symbol(caller_file, &symbol).is_some() {
+                        return Some((
+                            "resolved_local".to_string(),
+                            caller_file.to_string(),
+                            symbol,
+                        ));
+                    }
+                }
+            }
+        }
         if let Some((target_file, target_symbol)) =
             rust_target_for_qualified(index, caller_file, full_ref, short_name, caller_data, raw)
         {
@@ -16520,9 +16541,10 @@ fn rust_target_for_qualified<I: ResolverIndex>(
 
         // A path that does not resolve under one reading may under another, and
         // a later alias candidate may still match, so try them all in order.
-        for module_segments in
-            rust_resolve_segment_candidates_with_index(index, caller_file, &path_refs)
-        {
+        for module_segments in rust_resolve_segment_candidates_from(
+            rust_reference_module_segments(index, caller_file, caller_data, raw),
+            &path_refs,
+        ) {
             if let Some(target) =
                 rust_inline_scoped_target(index, caller_file, &module_segments, &requested_symbol)
             {
@@ -16987,16 +17009,45 @@ fn rust_caller_module_segments<I: ResolverIndex>(index: &I, caller_file: &str) -
     }
 }
 
-/// Module paths a path's leading segments can denote, most likely first. A
-/// bare first segment (`registry::f()` inside `bash_background/mod.rs`) is, in
-/// Rust 2018, relative to the current module, so a child module is tried
-/// before the crate-relative sibling reading `rust_resolve_segments_from` uses.
-fn rust_resolve_segment_candidates_with_index<I: ResolverIndex>(
+fn rust_reference_module_segments<I: ResolverIndex>(
     index: &I,
     caller_file: &str,
+    caller_data: &FileCallData,
+    raw: &RawRef,
+) -> Vec<String> {
+    let mut modules = rust_caller_module_segments(index, caller_file);
+    let Some(caller) = raw.caller_symbol.as_deref() else {
+        return modules;
+    };
+    let mut scope = caller.split("::").collect::<Vec<_>>();
+    scope.pop();
+    if caller_data
+        .symbol_metadata
+        .get(caller)
+        .is_some_and(|meta| meta.kind == SymbolKind::Method)
+    {
+        scope.pop();
+    }
+    // Scoped names include inline modules as well as enclosing functions and
+    // impl owners. Only the module prefix changes the meaning of self/super.
+    for (position, segment) in scope.iter().enumerate() {
+        if caller_data
+            .symbol_metadata
+            .contains_key(&scope[..=position].join("::"))
+        {
+            break;
+        }
+        modules.push((*segment).to_string());
+    }
+    modules
+}
+
+/// A bare path is relative to the current module; try its child modules before
+/// the sibling-module interpretation retained for imported paths.
+fn rust_resolve_segment_candidates_from(
+    caller_segments: Vec<String>,
     segments: &[&str],
 ) -> Vec<Vec<String>> {
-    let caller_segments = rust_caller_module_segments(index, caller_file);
     let mut candidates = Vec::new();
     if segments
         .first()
@@ -17032,8 +17083,14 @@ fn rust_resolve_segments_from(
         }
         "super" => {
             let mut resolved = caller_segments;
-            resolved.pop();
-            resolved.extend(segments[1..].iter().map(|item| item.to_string()));
+            let parents = segments
+                .iter()
+                .take_while(|segment| **segment == "super")
+                .count();
+            for _ in 0..parents {
+                resolved.pop()?;
+            }
+            resolved.extend(segments[parents..].iter().map(|item| item.to_string()));
             Some(resolved)
         }
         _ => {

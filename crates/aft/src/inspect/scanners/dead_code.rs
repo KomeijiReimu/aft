@@ -8731,9 +8731,17 @@ mod tests {
 mod checks;
 struct Handler { draw: fn() }
 impl Handler {
-    fn new() -> Self { Self { draw: checks::draw } }
-    fn register(&self) { checks::check(); }
+    fn new() -> Self { Self::with_draw() }
+    fn with_draw() -> Self { Self { draw: checks::draw } }
+    fn register(&self) { Self::register_in(); }
+    fn register_in() {
+        checks::check();
+        let callback = checks::assigned;
+        let callbacks = [checks::arrayed];
+        consume(checks::argument);
+    }
 }
+fn consume(_: fn()) {}
 fn main() { let handler = Handler::new(); handler.register(); }
 "#,
             ),
@@ -8742,6 +8750,9 @@ fn main() { let handler = Handler::new(); handler.register(); }
                 r#"
 pub(crate) fn check() {}
 pub(crate) fn draw() {}
+pub(crate) fn assigned() {}
+pub(crate) fn arrayed() {}
+pub(crate) fn argument() {}
 pub(crate) fn planted_dead() {}
 #[cfg(test)]
 mod tests {
@@ -8766,14 +8777,120 @@ mod tests {
             "{aggregate:#}"
         );
         assert_eq!(aggregate["test_only_count"], 0, "{aggregate:#}");
-        for symbol in ["check", "draw"] {
+        for (helper, caller) in [
+            ("Handler::with_draw", "Handler::new"),
+            ("Handler::register_in", "Handler::register"),
+        ] {
+            let sites = store
+                .direct_callers_of(Path::new("src/main.rs"), helper)
+                .unwrap();
+            assert_eq!(sites.len(), 1, "{helper}: {sites:#?}");
+            assert_eq!(sites[0].caller.symbol, caller);
+            assert_eq!(sites[0].kind, "call");
+        }
+        let tree = store
+            .call_tree(Path::new("src/main.rs"), "Handler::with_draw", 1)
+            .unwrap();
+        assert!(
+            tree.children.is_empty(),
+            "function values are not executed: {tree:#?}"
+        );
+        for symbol in ["check", "draw", "assigned", "arrayed", "argument"] {
             let callers = store
                 .direct_callers_of(Path::new("src/checks.rs"), symbol)
                 .unwrap();
+            let caller = callers
+                .iter()
+                .find(|caller| caller.caller.file == "src/main.rs")
+                .unwrap_or_else(|| panic!("{symbol}: {callers:#?}"));
+            assert_eq!(
+                caller.kind,
+                if symbol == "check" {
+                    "call"
+                } else {
+                    "callback_ref"
+                }
+            );
+            let source = fs::read_to_string(root.join("src/main.rs")).unwrap();
+            let written = &source[caller.byte_start..caller.byte_end];
+            assert!(
+                written.contains(&format!("checks::{symbol}")),
+                "{symbol}: {written}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_qualified_paths_resolve_from_the_enclosing_module() {
+        let (temp, root, paths) = canonical_fixture(&[
+            (
+                "src/main.rs",
+                "mod driver; mod targets; fn main() { driver::run(); }",
+            ),
+            (
+                "src/driver.rs",
+                r#"
+pub fn run() { outer::run(); }
+pub(crate) fn via_super() {}
+mod outer {
+    use crate::targets as alias;
+    pub fn run() {
+        child::plain();
+        self::child::via_self();
+        super::via_super();
+        crate::targets::via_crate();
+        alias::via_alias();
+        child::deep::run();
+    }
+    pub(crate) mod child {
+        pub(crate) fn plain() {}
+        pub(crate) fn via_self() {}
+        pub(crate) mod deep {
+            pub fn run() { super::super::super::via_super(); }
+        }
+    }
+}
+#[cfg(test)]
+mod tests { #[test] fn checks() { super::outer::child::plain(); } }
+"#,
+            ),
+            (
+                "src/targets.rs",
+                r#"
+pub(crate) fn via_crate() {}
+pub(crate) fn via_alias() {}
+pub(crate) fn planted_dead() {}
+"#,
+            ),
+        ]);
+        let store = crate::callgraph_store::CallGraphStore::open(
+            temp.path().join("callgraph-store"),
+            root.clone(),
+        )
+        .unwrap();
+        store.cold_build(&paths).unwrap();
+        let snapshot =
+            crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path()).unwrap();
+        let aggregate = scan(job(&root, paths, snapshot));
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/targets.rs::planted_dead"],
+            "{aggregate:#}"
+        );
+        assert_eq!(aggregate["test_only_count"], 0, "{aggregate:#}");
+        for (file, symbol, expected_count) in [
+            ("src/driver.rs", "outer::child::plain", 2),
+            ("src/driver.rs", "outer::child::via_self", 1),
+            ("src/driver.rs", "via_super", 2),
+            ("src/targets.rs", "via_crate", 1),
+            ("src/targets.rs", "via_alias", 1),
+        ] {
+            let callers = store.direct_callers_of(Path::new(file), symbol).unwrap();
+            assert_eq!(callers.len(), expected_count, "{symbol}: {callers:#?}");
             assert!(
                 callers
                     .iter()
-                    .any(|caller| caller.caller.file == "src/main.rs"),
+                    .all(|caller| caller.kind == "call" && caller.resolved),
                 "{symbol}: {callers:#?}"
             );
         }
