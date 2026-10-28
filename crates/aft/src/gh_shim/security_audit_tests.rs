@@ -1361,7 +1361,12 @@ fn audit_head_write_still_routes_through_the_relay() {
         },
         worker_reads::identity_for_command,
     );
-    assert_eq!(status, 0);
+    assert_eq!(
+        status,
+        0,
+        "a head write was refused instead of routed: {:?}",
+        refusals.lock().unwrap()
+    );
     assert!(
         refusals.lock().unwrap().is_empty(),
         "a routed head write must refuse nothing"
