@@ -1,1 +1,0 @@
-- Reduced retention cleanup filesystem work by resolving each distinct checkout root only once per pass, without changing which caches are protected.

@@ -1,1 +1,0 @@
-- Formatters and type checkers that AFT runs after an edit now use the same sandbox and session grants as that session's shell commands.

@@ -1,1 +1,0 @@
-- Cleanup of finished background commands now visits only the records whose retention period has ended, instead of rescanning every saved task, so it uses far less CPU on machines with thousands of finished commands. Retention rules are unchanged.

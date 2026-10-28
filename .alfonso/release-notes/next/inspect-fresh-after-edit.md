@@ -1,1 +1,0 @@
-- Scoped `aft_inspect` no longer reports a fixed error as authoritative after you edit a file with AFT or change it on disk, including files outside the project: pull-based servers such as the TypeScript 7 native server are asked again, and a file whose current text cannot be sent is reported unknown.

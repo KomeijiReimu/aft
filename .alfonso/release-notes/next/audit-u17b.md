@@ -1,1 +1,0 @@
-- OpenCode: a background completion notice the host was slow to accept is delivered exactly once instead of being lost or sent twice, and plugin RPC calls keep their cancellation, deadline and size limits while reading a reply.

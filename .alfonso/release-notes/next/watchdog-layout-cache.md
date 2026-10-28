@@ -1,1 +1,0 @@
-- Background task monitoring uses less CPU while finished commands wait for surviving processes to release their scratch files.

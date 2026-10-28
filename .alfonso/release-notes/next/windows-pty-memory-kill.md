@@ -1,1 +1,0 @@
-- On Windows, a terminal-mode command stopped by its memory cap now finishes promptly instead of staying running.

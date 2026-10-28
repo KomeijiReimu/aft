@@ -1,1 +1,0 @@
-- The daemon log records, for each tool catalog answer, whether bash offered the build-server option and which condition stopped it.

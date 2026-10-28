@@ -1,1 +1,0 @@
-- Undo snapshots now keep file bodies on disk rather than retaining copies of every edit in daemon memory. Closing a session or evicting an idle project releases its undo-stack metadata; undo, history and checkpoints remain available from persisted backups, including after restart.

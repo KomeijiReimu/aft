@@ -1,1 +1,0 @@
-- With views on, semantic search no longer briefly answers with text matches only (while reporting the semantic lane as ready) right after new embeddings are published.

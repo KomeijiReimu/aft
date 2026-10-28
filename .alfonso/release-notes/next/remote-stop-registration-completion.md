@@ -1,1 +1,0 @@
-- Remote background tasks now reliably deliver their completion when stopping a task races with restoring its session.

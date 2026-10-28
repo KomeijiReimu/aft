@@ -1,1 +1,0 @@
-- Lower background CPU use when many projects are open: the periodic health check and storage cleanup no longer look up the same storage folders again for every project.

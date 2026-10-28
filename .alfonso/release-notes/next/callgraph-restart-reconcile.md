@@ -1,1 +1,0 @@
-- After a restart, the call graph picks up files edited while AFT wasn't running without a full rebuild; the inspect health check backs off after a lost lock instead of retrying every 30 seconds; and the log says why a call graph was rebuilt from scratch (#746, thanks @moynzzz).

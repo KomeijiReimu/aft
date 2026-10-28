@@ -1,1 +1,0 @@
-- On macOS, a checkout whose content matches an existing one now copies its call-graph database with a file-system clone instead of rebuilding it, cutting the disk writes for that step from gigabytes to megabytes.

@@ -1,1 +1,0 @@
-A steady stream of file changes can no longer stall the indexing of earlier changes: each watcher pass now applies at least one queued change even when receiving new events used its whole time budget.

@@ -1,1 +1,0 @@
-- Trusted projects can set `bash.env` in their own `.cortexkit/aft.jsonc`, so a repository's tools get the variables they need while your own values still win on any name you both set.
