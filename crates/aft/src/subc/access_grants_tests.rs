@@ -247,6 +247,7 @@ fn saved_scope_grants_rich_ui_and_unknown_carriers_lose_grants() {
         "reserved:occipital",
         "reserved:unknown-runner",
         "reserved:plexus",
+        "reserved:basal",
     ] {
         for route in [&head, &worker] {
             assert_saved_scope_grants(
@@ -270,6 +271,24 @@ fn saved_scope_grants_unknown_scope_kind_fails_closed_with_typed_reason() {
     assert_saved_scope_grants(
         &ctx,
         &unknown,
+        &outside,
+        Some(crate::access_policy::ScopeGrantsDenial::UnknownScopeKind),
+    );
+    let mut parentless = copied_identity(&unknown);
+    parentless.scope.as_mut().unwrap().parent = None;
+    assert_saved_scope_grants(
+        &ctx,
+        &RouteIdentity(Arc::new(parentless)),
+        &outside,
+        Some(crate::access_policy::ScopeGrantsDenial::UnknownScopeKind),
+    );
+    let mut missing = copied_identity(&worker);
+    missing.scope = None;
+    let missing = RouteIdentity(Arc::new(missing));
+    register(&missing, &ctx).unwrap();
+    assert_saved_scope_grants(
+        &ctx,
+        &missing,
         &outside,
         Some(crate::access_policy::ScopeGrantsDenial::UnknownScopeKind),
     );

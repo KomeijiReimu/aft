@@ -37,6 +37,7 @@ fn same_scope(a: &ScopeStamp, b: &ScopeStamp) -> bool {
 pub(super) struct Session {
     pub(super) identity: RouteIdentity,
     pub(super) role: tool_provider::CallerRole,
+    scope_grants_denial: Option<crate::access_policy::ScopeGrantsDenial>,
 }
 
 /// Read catalog-preset rows without refreshing their retention timestamps.
@@ -140,6 +141,9 @@ pub(super) fn resolve(
     Ok(Session {
         identity: effective_identity(carrier, policy)?,
         role,
+        // The sandbox principal belongs to the policy route, not the carrier
+        // requesting the reads. Retain the authenticated carrier's decision.
+        scope_grants_denial: access_grants::scope_grants_denial(carrier),
     })
 }
 
@@ -210,6 +214,7 @@ impl Session {
         crate::sandbox_spawn::with_authenticated_principal(
             self.identity.spawn_principal.clone(),
             || {
+                let _grants = crate::access_policy::scope_grants_guard(self.scope_grants_denial);
                 call_policy::with_tool_call_policy(
                     ctx,
                     &self.identity,

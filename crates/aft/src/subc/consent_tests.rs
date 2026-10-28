@@ -828,7 +828,7 @@ async fn consent_nonhost_carrier_cannot_save_agent_scope_grants() {
         &grant,
     )
     .unwrap();
-    let arguments = json!({"filePath": grant.path});
+    let arguments = json!({"path": grant.path});
     for principal in [
         "reserved:unrecognized-carrier",
         "reserved:occipital",
@@ -968,7 +968,7 @@ async fn consent_qualifying_hosts_and_codemode_runs_can_save_scope_grants() {
             &f.ctx,
             route,
             "read",
-            &json!({"filePath": grant.path}),
+            &json!({"path": grant.path}),
             &grant,
             &grant,
             None,
