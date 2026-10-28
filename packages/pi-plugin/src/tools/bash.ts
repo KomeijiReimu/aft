@@ -1455,7 +1455,10 @@ export function createBashKillTool(ctx: PluginContext) {
         );
       }
       const cancel = details.remote_cancel ? ` · ${details.remote_cancel}` : "";
-      return bashKillResult(`Task ${params.task_id}: ${details.status}${cancel}${warning}`, details);
+      return bashKillResult(
+        `Task ${params.task_id}: ${details.status}${cancel}${warning}`,
+        details,
+      );
     },
   };
 }
