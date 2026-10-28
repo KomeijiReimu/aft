@@ -2845,6 +2845,18 @@ for (const route of ["push", "forced-drain", "restart-replay"] as const) {
     }
     expect(promptAsync).not.toHaveBeenCalled();
     expect(acks).toEqual([]);
+    expect(sessionBgStates.get(sessionID)?.pendingPatternMatches).toMatchObject([
+      {
+        match_offset: 36,
+        batch: {
+          lines: [
+            { offset: 0, text: "LIVECHECK3 line 1", count: 1 },
+            { offset: 18, text: "LIVECHECK3 line 2", count: 1 },
+            { offset: 36, text: "LIVECHECK3 line 3", count: 1 },
+          ],
+        },
+      },
+    ]);
     const output = { output: "foreground result" };
     await appendInTurnBgCompletions(context, output);
     expect(output.output.split("\n").filter((line) => line.includes("stdout byte"))).toEqual([
