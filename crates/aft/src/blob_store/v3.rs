@@ -540,25 +540,50 @@ fn schema_rows(c: &Connection) -> rusqlite::Result<Vec<SchemaRow>> {
     c.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE substr(name,1,7) != 'sqlite_' ORDER BY type,name,tbl_name,sql")?
         .query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect()
 }
+fn format_read<T>(
+    result: rusqlite::Result<T>,
+    path: &Path,
+    operation: &'static str,
+) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) => {
+            let error = Error::Sqlite(error);
+            // A locked format table is not evidence of a missing or corrupt
+            // schema. Other read failures retain the format-drift checks.
+            if error.is_busy() {
+                Err(Error::ledger(path, operation, error))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
 fn validate(c: &Connection, path: &Path, kind: Kind) -> Result<()> {
     #[cfg(test)]
     let _profile = work_profile::span("validate_database");
-    let version = c
-        .query_row(
+    let version = format_read(
+        c.query_row(
             "SELECT format_version FROM format_meta WHERE singleton=1",
             [],
             |r| r.get::<_, u64>(0),
-        )
-        .unwrap_or(0);
+        ),
+        path,
+        "read format version",
+    )?
+    .unwrap_or(0);
     let displayed = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     persisted_format::gate(kind.store(), &displayed, path, Some(version))
         .map_err(Error::Incompatible)?;
     if version == 0 {
         return Err(incompatible(kind, path, 0, IncompatibleReason::SchemaDrift));
     }
-    let app = c
-        .query_row("PRAGMA application_id", [], |r| r.get::<_, i64>(0))
-        .unwrap_or(0);
+    let app = format_read(
+        c.query_row("PRAGMA application_id", [], |r| r.get::<_, i64>(0)),
+        path,
+        "read application id",
+    )?
+    .unwrap_or(0);
     if app != kind.app_id() {
         return Err(incompatible(
             kind,
@@ -567,13 +592,16 @@ fn validate(c: &Connection, path: &Path, kind: Kind) -> Result<()> {
             IncompatibleReason::ApplicationId,
         ));
     }
-    let (schema, layout, text): (u32, u32, String) = c
-        .query_row(
+    let (schema, layout, text): (u32, u32, String) = format_read(
+        c.query_row(
             "SELECT schema_version,layout_tag,schema_text FROM format_meta WHERE singleton=1",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .map_err(|_| incompatible(kind, path, version, IncompatibleReason::SchemaDrift))?;
+        ),
+        path,
+        "read format schema",
+    )?
+    .ok_or_else(|| incompatible(kind, path, version, IncompatibleReason::SchemaDrift))?;
     let compiled_schema = match (kind, version, schema) {
         // A registry of the base-reference protocol carries its own exact
         // text; any other version/schema pair falls through to the drift check.
@@ -610,8 +638,9 @@ fn validate(c: &Connection, path: &Path, kind: Kind) -> Result<()> {
     };
     if !known_version
         || text != format!("{META}{compiled_schema}")
-        || schema_rows(c).ok() != Some(schema_rows(&expected)?)
-        || !initialization::has_seed(c, kind)
+        || format_read(schema_rows(c), path, "read schema objects")?
+            != Some(schema_rows(&expected)?)
+        || !format_read(initialization::has_seed(c, kind), path, "read seed")?.unwrap_or(false)
     {
         return Err(incompatible(
             kind,

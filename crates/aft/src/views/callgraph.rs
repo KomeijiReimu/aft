@@ -393,6 +393,9 @@ impl From<PlaneError> for CallgraphViewError {
             .reason
             .strip_prefix("[driver]: ")
             .unwrap_or(&error.reason);
+        let reason = reason
+            .strip_prefix("family registry I/O error: ")
+            .unwrap_or(reason);
         Self {
             busy: reason.starts_with(DERIVED_STORE_BUSY)
                 || reason.starts_with(V3_STORE_BUSY)

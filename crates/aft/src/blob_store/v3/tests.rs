@@ -182,6 +182,43 @@ fn checkpoint_contention_is_busy_and_preserves_sqlite_cause() {
 }
 
 #[test]
+fn busy_validation_is_not_persisted_as_schema_drift() {
+    let _guard = serial();
+    let root = tempdir().unwrap();
+    seed(root.path(), A);
+    let path = db(root.path(), A);
+    let blocker = IdentityConnection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE,
+        "v3-validation-blocker",
+    )
+    .unwrap();
+    blocker.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; UPDATE accounting SET watermark=watermark+1;").unwrap();
+    let error = match LedgerReader::open_existing(root.path(), A) {
+        Ok(_) => panic!("an exclusively held ledger must not validate through another connection"),
+        Err(error) => error,
+    };
+    assert!(error.is_busy(), "{error}");
+    let detail = error.to_string();
+    assert!(
+        detail.starts_with("reservation_ledger_busy: read format version"),
+        "{detail}"
+    );
+    assert!(detail.contains("members.sqlite"), "{detail}");
+    assert!(detail.contains("database is locked"), "{detail}");
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+    assert_eq!(
+        LedgerReader::open_existing(root.path(), A)
+            .unwrap()
+            .accounting()
+            .unwrap()
+            .reserved_bytes,
+        0
+    );
+}
+
+#[test]
 fn changing_derived_database_reports_busy_then_measurement_recovers() {
     let _guard = serial();
     let root = tempdir().unwrap();
