@@ -27020,6 +27020,40 @@ mod tests {
             .unwrap();
     }
 
+    /// Scan until a replayed watch delivers its pending match.
+    ///
+    /// Right after a replay a scan can return without emitting and without
+    /// advancing the cursors (its early returns never persist a cursor), and
+    /// production's watchdog then rescans the same bytes on its next pass. A
+    /// test that scans exactly once turns that delay into a false negative.
+    /// Retry briefly: a watch that never delivers still fails, with the scan
+    /// state attached.
+    fn scan_until_new_match(
+        live: &BgTaskRegistry,
+        live_task: &Arc<BgTask>,
+        live_frames: &Mutex<Vec<PushFrame>>,
+    ) -> BashPatternMatchFrame {
+        let seen = pattern_match_frames(live_frames).len();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            live.scan_task_watch_output(live_task);
+            let mut current = pattern_match_frames(live_frames);
+            if current.len() > seen {
+                return current.pop().unwrap();
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "replayed watch delivered no match: active={} running={} cursors={:?} frames={}",
+                    live.active_watch_count(&live_task.task_id),
+                    live_task.is_running(),
+                    live.watch_stream_cursors(&live_task.task_id),
+                    pattern_match_frames(live_frames).len(),
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
     #[test]
     fn each_line_once_warning_stays_armed_through_ack_and_restart() {
         for restart in [false, true] {
@@ -27089,8 +27123,7 @@ mod tests {
                 let _reap_live = KillTasksOnDrop(live.clone());
                 append_each_line_output(&task.paths.stdout, b"READY after warning\n");
                 let live_task = live.task_for_session(&task.task_id, "session").unwrap();
-                live.scan_task_watch_output(&live_task);
-                let matched = pattern_match_frames(&live_frames).pop().unwrap();
+                let matched = scan_until_new_match(&live, &live_task, &live_frames);
                 assert_eq!(
                     matched.batch.as_ref().unwrap().lines[0].text,
                     "READY after warning"
@@ -27303,8 +27336,7 @@ mod tests {
             }
             let replayed_task = replayed.task_for_session(&task.task_id, "session").unwrap();
             append_each_line_output(&task.paths.stderr, b"READY b\n");
-            replayed.scan_task_watch_output(&replayed_task);
-            let newest = pattern_match_frames(&replay_frames).pop().unwrap();
+            let newest = scan_until_new_match(&replayed, &replayed_task, &replay_frames);
             assert!(
                 newest.match_offset > first.match_offset,
                 "acknowledged first: {acknowledge_first}"
