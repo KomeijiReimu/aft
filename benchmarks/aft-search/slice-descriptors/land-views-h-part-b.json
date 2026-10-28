@@ -1,12 +1,12 @@
 {
-  "slice_class": "non_ranking",
+  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "harness-goldens"
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
   "slices": [
-    "views-h-part-b"
+    "views-h-part-b-regressions"
   ],
-  "note": "Views step H part B: the semantic member moves to the v3 route with base-owner fills; views are default-off and no changed path matches RANKING_FENCE_PREFIXES."
+  "note": "Ports readiness, rollback-floor and eviction regression coverage to the v3 semantic route and skips legacy eviction for v3-only registries. The fenced semantic_search/mod.rs edit changes only a test; search ranking and routing are unchanged."
 }
