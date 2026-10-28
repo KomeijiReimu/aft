@@ -1593,26 +1593,29 @@ fn speech_launch_seed(
     };
     let launch = if let Some(owner) = &identity.run_owner {
         if owner.kind == codemode::RunKind::Worker {
-            Err(crate::gh_shim_speech::Refusal::new(crate::gh_shim_speech::Code::AuthorityUnavailable, "owner_unresolved"))
+            Err(crate::gh_shim_speech::Refusal::new(
+                crate::gh_shim_speech::Code::AuthorityUnavailable,
+                "owner_unresolved",
+            ))
         } else {
-        owner
-            .owner_route
-            .scope
-            .clone()
-            .ok_or_else(|| {
-                crate::gh_shim_speech::Refusal::new(
-                    crate::gh_shim_speech::Code::AuthorityUnavailable,
-                    "owner_unresolved",
-                )
-            })
-            .and_then(|head| {
-                LaunchAuthority::codemode(
-                    head,
-                    lifecycle.clone(),
-                    origin(route),
-                    origin(owner.owner_route_channel),
-                )
-            })
+            owner
+                .owner_route
+                .scope
+                .clone()
+                .ok_or_else(|| {
+                    crate::gh_shim_speech::Refusal::new(
+                        crate::gh_shim_speech::Code::AuthorityUnavailable,
+                        "owner_unresolved",
+                    )
+                })
+                .and_then(|head| {
+                    LaunchAuthority::codemode(
+                        head,
+                        lifecycle.clone(),
+                        origin(route),
+                        origin(owner.owner_route_channel),
+                    )
+                })
         }
     } else {
         LaunchAuthority::classic(lifecycle.clone(), origin(route))
@@ -10019,7 +10022,9 @@ impl PlainToolRun {
                                     let dispatch = |request: RawRequest, ctx: &AppContext| {
                                         if observation_only && bare_name == "bash_status" {
                                             crate::commands::bash_status::handle_with_observation_only(&request,ctx,observation_only)
-                                        } else { dispatch(request,ctx) }
+                                        } else {
+                                            dispatch(request, ctx)
+                                        }
                                     };
                                     run_tool_call(
                                         &bare_name,

@@ -2281,3 +2281,54 @@ async fn validated_head_codemode_is_not_a_worker_write_but_invalid_head_is() {
         }
     }
 }
+
+#[tokio::test]
+async fn published_sdk_reservation_does_not_send_until_committed_and_releases_on_drop() {
+    let daemon = fake_daemon(DaemonScript::default()).await;
+    let relay = GhRelay {
+        transport: daemon.transport().await,
+    };
+    let body = github_call(
+        json!({"op":"bot_request","request_nonce":"reserved-before-send","request":{"action":"issue comment"}}),
+    );
+    let reservation = relay
+        .reserve_bot("/project", "reserved-session", &delegating_stamp(), body)
+        .await
+        .expect("published SUBC 0.32.7 must reserve rather than return guard_unsupported");
+    assert!(
+        daemon.requests().is_empty(),
+        "reserving a writer slot must not enqueue the mutation"
+    );
+    assert_eq!(daemon.opens()[0]["scope"]["scope_epoch"], 7);
+    drop(reservation);
+    assert_eq!(daemon.closes(1).await.len(), 1);
+    assert!(daemon.requests().is_empty());
+}
+
+#[tokio::test]
+async fn published_sdk_reservation_names_scoped_route_end_before_any_send() {
+    let daemon = fake_daemon(DaemonScript {
+        refuse_scoped_opens: Some(subc_protocol::error_codes::SCOPE_ENDED.into()),
+        ..Default::default()
+    })
+    .await;
+    let relay = GhRelay {
+        transport: daemon.transport().await,
+    };
+    let error = relay
+        .reserve_bot(
+            "/project",
+            "reserved-ended",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request","request_nonce":"reserved-ended"})),
+        )
+        .await
+        .err()
+        .expect("an ended epoch-pinned route cannot reserve a mutation");
+    assert_eq!(
+        (error.code, error.reason.as_str()),
+        (crate::gh_shim_speech::Code::ScopeEnded, "ended")
+    );
+    assert!(daemon.requests().is_empty());
+    assert!(daemon.opens().iter().all(|open| !open["scope"].is_null()));
+}

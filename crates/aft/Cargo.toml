@@ -231,7 +231,7 @@ cortexkit-agent-identity = "=0.1.1"
 jsonschema = { version = "0.33", default-features = false }
 subc-protocol = "=0.33.3"
 subc-transport = "=0.14.0"
-subc-client-rs = "=0.31.0"
+subc-client-rs = "=0.32.7"
 # The one reader of the daemon's launch nonce (pipe first, environment copy
 # second). subc-client-rs reads through the same cached accessor, so this pin
 # must match the version subc-client-rs depends on.

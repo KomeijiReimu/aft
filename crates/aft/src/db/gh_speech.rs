@@ -191,7 +191,7 @@ impl Store {
         let mode: String = conn
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .map_err(db_error)?;
-        if mode != "wal" || super::current_schema_version(&conn).map_err(db_error)? < 21 {
+        if mode != "wal" || super::current_schema_version(&conn).map_err(db_error)? < 22 {
             return Err(unavailable());
         }
         Ok(conn)

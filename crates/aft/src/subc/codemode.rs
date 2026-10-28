@@ -417,7 +417,12 @@ fn resolve_owner(
         }
     }
     Ok(Admission::Owner(effective_identity(
-        run, owner, kind, run_id, route, **owner_channel,
+        run,
+        owner,
+        kind,
+        run_id,
+        route,
+        **owner_channel,
     )))
 }
 

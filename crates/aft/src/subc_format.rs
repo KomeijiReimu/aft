@@ -1320,7 +1320,9 @@ fn format_bash_kill(data: &Value) -> String {
             .unwrap_or("killed");
         if let Some(cancel) = data.get("remote_cancel").and_then(Value::as_str) {
             format!("Task {task_id}: {status} · {cancel}")
-        } else { format!("Task {task_id}: {status}") }
+        } else {
+            format!("Task {task_id}: {status}")
+        }
     };
     match data
         .get("bot_write_revocation_warning")
