@@ -1029,17 +1029,31 @@ pub fn is_secret_environment_key(key: &str) -> bool {
     {
         return false;
     }
-    [
-        "TOKEN",
-        "SECRET",
-        "KEY",
-        "PASSWORD",
-        "PASSWD",
-        "CREDENTIAL",
-        "AUTH",
-    ]
-    .iter()
-    .any(|part| contains_ignore_ascii_case(key, part))
+    ["TOKEN", "SECRET", "KEY", "PASSWORD", "PASSWD", "CREDENTIAL"]
+        .iter()
+        .any(|part| contains_ignore_ascii_case(key, part))
+        || names_auth(key)
+}
+
+/// Whether `key` contains "AUTH" other than as the word AUTHOR, which names a
+/// person rather than a credential: GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL, and
+/// AFT_GIT_CO_AUTHOR, the co-author trailer AFT itself gives every governed
+/// child. Counting those made every such child look like it carried a secret,
+/// so its output previews were withheld after a daemon restart. AUTHOR counts
+/// as a word only at the end of the name or before an underscore; AUTHORITY,
+/// AUTHORIZATION, AUTH_TOKEN and NPM_AUTH still count.
+fn names_auth(key: &str) -> bool {
+    let key = key.as_bytes();
+    (0..key.len()).any(|at| {
+        let rest = &key[at..];
+        if rest.len() < 4 || !rest[..4].eq_ignore_ascii_case(b"AUTH") {
+            return false;
+        }
+        let author_word = rest.len() >= 6
+            && rest[4..6].eq_ignore_ascii_case(b"OR")
+            && matches!(rest.get(6), None | Some(b'_'));
+        !author_word
+    })
 }
 
 impl SecretValues {
@@ -2192,6 +2206,30 @@ mod tests {
             "NPM_AUTH",
             "AWS_SECRET_ACCESS_KEY",
             "API_KEY",
+        ] {
+            assert!(is_secret_environment_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn author_names_are_not_secret_names() {
+        for key in [
+            "AFT_GIT_CO_AUTHOR",
+            "GIT_AUTHOR_NAME",
+            "git_author_email",
+            "AUTHOR",
+        ] {
+            assert!(!is_secret_environment_key(key), "{key}");
+        }
+        for key in [
+            "AUTH",
+            "NPM_AUTH",
+            "AUTH_HEADER",
+            "HTTP_AUTHORIZATION",
+            "XAUTHORITY",
+            "AUTHORS_FILE",
+            "GIT_AUTHOR_TOKEN",
+            "AUTHOR_AUTH",
         ] {
             assert!(is_secret_environment_key(key), "{key}");
         }

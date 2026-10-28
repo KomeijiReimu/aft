@@ -1,0 +1,1 @@
+- A worker shell that runs a gh command other than a repository read, such as `gh --version`, now says that worker shells run only repository reads, instead of blaming a missing ticket.

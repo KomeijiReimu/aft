@@ -431,9 +431,11 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     // detach (the token is stripped before the model sees the message).
     "detach_on_user_message": true,
     // Read-only schema trailers after missing-table/column errors. Default true;
-    // user and project tiers. SQLite on Unix; literal paths only (no variables,
-    // globs or memory databases; file: URIs require mode=ro, and startup -cmd/
-    // -init flags are skipped because they may change the connection).
+    // user and project tiers. SQLite on Unix; literal paths, a leading `~`,
+    // or an in-command `VAR=value` assignment referenced as `$VAR` (no globs,
+    // command substitution or memory databases; file: URIs require mode=ro,
+    // and startup -cmd/ -init flags are skipped because they may change
+    // the connection).
     // Finished commands only, including
     // background completions, independent of compression. Probe: same launch
     // sandbox, 1.5s timeout, 256 KiB output cap; trailer: 2 KiB with omissions.

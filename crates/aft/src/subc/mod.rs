@@ -9504,10 +9504,11 @@ fn occipital_route(identity: &RouteIdentity) -> bool {
 /// scoped, and its stamp's owner is not Occipital itself. Only such a route
 /// may take session calls.
 fn occipital_carrier_route(identity: &RouteIdentity) -> bool {
-    identity.scope.as_ref().is_some_and(|scope| {
-        principal_id(&Some(scope.owner.clone())).as_deref()
-            != Some(rich_ui::chunks::OCCIPITAL_PRINCIPAL)
-    })
+    occipital_route(identity)
+        && identity.scope.as_ref().is_some_and(|scope| {
+            principal_id(&Some(scope.owner.clone())).as_deref()
+                != Some(rich_ui::chunks::OCCIPITAL_PRINCIPAL)
+        })
 }
 
 /// Whether a route request is a tool call: either `op: "tool.call"`, or the
@@ -10405,6 +10406,34 @@ async fn handle_tool_call(
                 .await
             }
         };
+        match carrier_read_only::admit_operation(&identity, &call.name, &call.arguments) {
+            Err(error) => {
+                let response = wire::build_carrier_response_frame(
+                    frame,
+                    None,
+                    rich_ui::carrier::error_body(&error.code),
+                )?;
+                return send_reliable_writer_frame(
+                    tx,
+                    metrics,
+                    response,
+                    "carrier admission refusal",
+                )
+                .await;
+            }
+            Ok(Some(_operation)) => {
+                // A published operation alone grants no access to a session.
+                // Refuse rather than dispatch without a proven session policy.
+                return send_provider_error(
+                    tx,
+                    metrics,
+                    frame,
+                    rich_ui::chunks::refusal("session_not_bound"),
+                )
+                .await;
+            }
+            Ok(None) => {}
+        }
         if let Some(error) = tool_provider::shell_capability_refusal(
             &call.name,
             tool_provider::admission_trusted(&identity, &call),
@@ -10420,6 +10449,9 @@ async fn handle_tool_call(
             return send_provider_error(tx, metrics, frame, error).await;
         }
         if let Err(error) = tool_provider::admit_call_mode(&call.name, &identity.call_mode) {
+            return send_provider_error(tx, metrics, frame, error).await;
+        }
+        if let Err(error) = rich_ui::admission::reject_non_carrier(&call.arguments) {
             return send_provider_error(tx, metrics, frame, error).await;
         }
         // Plugin approvals are host transport metadata, not model-facing tool

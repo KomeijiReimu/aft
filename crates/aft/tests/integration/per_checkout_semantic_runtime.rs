@@ -916,3 +916,20 @@ fn views_on_search_after_idle_eviction_reports_the_lane_reloading() {
     assert_eq!(answer["semantic_status"], "ready", "{answer:#}");
     assert_eq!(answer["complete"], true, "{answer:#}");
 }
+
+/// A views-off root reloads its evicted semantic index on the next search,
+/// and that same search reports the lane as building with the lexical-fallback
+/// disclosure, not as the ready its evicted index left behind.
+#[test]
+fn views_off_search_after_idle_eviction_reports_the_index_reloading() {
+    let server = MockEmbedder::start();
+    let repo = repository();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = configure(&repo.main, storage.path(), &server, false);
+    wait_legacy_ready(&ctx);
+    assert!(ctx.evict_idle_artifacts(), "the root must be idle");
+    // As in the views-on test: a search would refuse while the text index is
+    // still reloading too, so reload it first and keep the check on semantic.
+    reload_trigram_after_eviction(&ctx);
+    assert_reloading_after_eviction(&search(&ctx, "read a configuration file from disk"));
+}

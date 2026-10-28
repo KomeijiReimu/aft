@@ -3980,7 +3980,15 @@ fn redaction_replay_withholds_new_secret_output() {
     drop(release_guard);
     let pattern = wait_for_pattern_frame(&mut restored, &watched);
     assert_eq!(pattern["match_text"], "<REDACTED_SECRET>");
-    assert!(pattern["context"].as_str().unwrap().contains("bash_status"));
+    // A watch usually fires while its task runs, when bash_status shows no
+    // output, so the withheld notice names the output file instead.
+    let context = pattern["context"].as_str().unwrap();
+    assert!(
+        context.contains("secret values aren't available after the daemon restarted"),
+        "{context}"
+    );
+    assert!(context.contains("Output file: "), "{context}");
+    assert!(!context.contains("bash_status"), "{context}");
     assert!(!pattern.to_string().contains(SECRET));
     wait_for_status(&mut restored, SESSION, &id, "completed");
     let drained = drain(&mut restored, SESSION);
