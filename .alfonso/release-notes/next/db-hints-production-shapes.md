@@ -1,0 +1,1 @@
+- Missing-table and missing-column errors now include the SQLite schema hint when the database path uses a variable or `~`.
