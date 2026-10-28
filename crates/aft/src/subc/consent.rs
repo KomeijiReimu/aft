@@ -1362,6 +1362,9 @@ fn prepare(
     directory_scope: &AccessGrant,
     own_holder: Option<&str>,
 ) -> Result<Prep, String> {
+    if let Some(reason) = access_grants::scope_grants_denial(identity) {
+        return Err(format!("saved scope grants unavailable: {reason:?}"));
+    }
     let worker = identity
         .scope
         .as_ref()
@@ -2561,6 +2564,9 @@ fn apply_allow(
     scope: bool,
     by_user: bool,
 ) -> Result<Applied, String> {
+    if let Some(reason) = access_grants::scope_grants_denial(identity) {
+        return Err(format!("saved scope grants unavailable: {reason:?}"));
+    }
     with_head_policy(db, ctx, identity, !by_user, |conn, head| {
         // A head may pass on only what it holds now: its authority is
         // checked again against the head's current policy and grants.

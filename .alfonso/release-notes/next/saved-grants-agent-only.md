@@ -1,0 +1,1 @@
+- Saved file-access grants now apply only to authenticated agent hosts and eligible codemode calls, never to rich UI, flow-target, or other scope carriers.

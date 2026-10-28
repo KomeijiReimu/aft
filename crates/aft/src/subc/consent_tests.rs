@@ -812,6 +812,58 @@ async fn occipital_outside_read_refuses_without_any_permission_ask() {
     assert!(text(&local).contains("local-read-marker"), "{local}");
 }
 
+#[tokio::test]
+async fn consent_nonhost_carrier_cannot_offer_or_save_agent_scope_grants() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let grant = AccessGrant {
+        path: f.head_root.join("shared.txt"),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    };
+    let db = f.ctx.db().unwrap();
+    crate::db::access_grants::insert(
+        &db.lock().unwrap(),
+        &access_grants::scope_key(&f.worker),
+        &grant,
+    )
+    .unwrap();
+    let mut carrier = identity(&f.worker.project_root, f.worker.scope.clone());
+    if let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+        &mut Arc::get_mut(&mut carrier.0).unwrap().spawn_principal
+    {
+        *principal_id = Some("reserved:unrecognized-carrier".into());
+    }
+    assert!(matches!(
+        access_grants::ask_route(&carrier),
+        crate::access_policy::AskRoute::Deny
+    ));
+    let arguments = json!({"filePath": grant.path});
+    assert!(prepare(&db, &f.ctx, &carrier, "read", &arguments, &grant, &grant, None).is_err());
+    let Prep::Ask(prep) = prepare(
+        &db, &f.ctx, &f.worker, "read", &arguments, &grant, &grant, None,
+    )
+    .unwrap() else {
+        panic!("host must be able to prepare a consent card");
+    };
+    assert!(apply_allow(
+        &db,
+        &f.ctx,
+        &carrier,
+        &prep.key,
+        &prep.call_key,
+        "carrier",
+        &grant,
+        true,
+        true,
+    )
+    .is_err());
+    assert_eq!(f.worker_grants().len(), 1);
+    let denied = f.read(&carrier, &grant.path, 803).await;
+    assert_eq!(code(&denied), "path_outside_root", "{denied}");
+    assert!(f.fake.calls("consent.request").is_empty());
+}
+
 fn text(reply: &Value) -> String {
     reply["content"]
         .as_array()

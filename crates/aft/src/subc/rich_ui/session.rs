@@ -210,7 +210,6 @@ impl Session {
         crate::sandbox_spawn::with_authenticated_principal(
             self.identity.spawn_principal.clone(),
             || {
-                let _agent_grants = crate::access_policy::suppress_scope_grants();
                 call_policy::with_tool_call_policy(
                     ctx,
                     &self.identity,

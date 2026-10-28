@@ -3502,6 +3502,11 @@ async fn handle_bash_elicitation_reply(
             let _grant_scope = crate::access_policy::scope_guard(
                 routes.get(&key.route).map(access_grants::policy_scope_key),
             );
+            let _grants = crate::access_policy::scope_grants_guard(
+                routes
+                    .get(&key.route)
+                    .and_then(access_grants::scope_grants_denial),
+            );
             let _ask_route = crate::access_policy::ask_route_guard(
                 routes.get(&key.route).map(access_grants::ask_route),
             );
@@ -11138,6 +11143,8 @@ async fn handle_tool_call_with_capabilities(
 
         let _grant_scope =
             crate::access_policy::scope_guard(Some(access_grants::policy_scope_key(&identity)));
+        let _grants =
+            crate::access_policy::scope_grants_guard(access_grants::scope_grants_denial(&identity));
         let _secret_identity = secret_consent::SecretIdentityGuard::install(identity.clone());
         let _ask_route = crate::access_policy::ask_route_guard(Some(
             access_grants::ask_route_for_call(&identity, &bare_name, &arguments),
@@ -11275,6 +11282,9 @@ async fn handle_tool_call_with_capabilities(
             let _grant_scope = crate::access_policy::scope_guard(Some(
                 access_grants::policy_scope_key(&identity_for_run),
             ));
+            let _grants = crate::access_policy::scope_grants_guard(
+                access_grants::scope_grants_denial(&identity_for_run),
+            );
             let _ask_route =
                 crate::access_policy::ask_route_guard(Some(access_grants::ask_route_for_call(
                     &identity_for_run,

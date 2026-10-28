@@ -8,29 +8,31 @@ use crate::sandbox_profile::{SandboxDataPolicy, SandboxProfile, SandboxProfileEr
 
 thread_local! {
     static REQUEST_SCOPE: std::cell::RefCell<Option<crate::db::access_grants::ScopeKey>> = const { std::cell::RefCell::new(None) };
-    static SCOPE_GRANTS_SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SCOPE_GRANTS_DENIAL: std::cell::Cell<Option<ScopeGrantsDenial>> = const { std::cell::Cell::new(None) };
 }
 
-/// A rich UI carrier is untrusted: grants approved for the agent must not widen
-/// what the phone can read. Keep its scope identity, but ignore scope grants
-/// until this thread-local guard drops, including during path traversal.
-pub(crate) fn suppress_scope_grants() -> ScopeGrantsGuard {
+/// Bind saved-grant eligibility to the authenticated caller. Nested work cannot
+/// restore authority withheld by an outer caller, including during traversal.
+pub(crate) fn scope_grants_guard(denial: Option<ScopeGrantsDenial>) -> ScopeGrantsGuard {
     ScopeGrantsGuard(
-        SCOPE_GRANTS_SUPPRESSED.with(|slot| slot.replace(true)),
+        SCOPE_GRANTS_DENIAL.with(|slot| slot.replace(slot.get().or(denial))),
         std::marker::PhantomData,
     )
 }
 
-pub(crate) struct ScopeGrantsGuard(bool, std::marker::PhantomData<*const ()>);
+pub(crate) struct ScopeGrantsGuard(
+    Option<ScopeGrantsDenial>,
+    std::marker::PhantomData<*const ()>,
+);
 
 impl Drop for ScopeGrantsGuard {
     fn drop(&mut self) {
-        SCOPE_GRANTS_SUPPRESSED.with(|slot| slot.set(self.0));
+        SCOPE_GRANTS_DENIAL.with(|slot| slot.set(self.0));
     }
 }
 
-fn scope_grants_suppressed() -> bool {
-    SCOPE_GRANTS_SUPPRESSED.with(std::cell::Cell::get)
+pub(crate) fn scope_grants_denial() -> Option<ScopeGrantsDenial> {
+    SCOPE_GRANTS_DENIAL.with(std::cell::Cell::get)
 }
 
 pub(crate) fn with_scope<R>(
@@ -454,6 +456,15 @@ pub enum AccessDenial {
     OutsideRoots,
     ReadOnly,
     UnsafeTemp,
+    ScopeGrants(ScopeGrantsDenial),
+}
+
+/// Why an authenticated connection cannot use the agent's saved scope grants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeGrantsDenial {
+    Flow,
+    UnknownScopeKind,
+    NotSessionHost,
 }
 
 /// What a route does with a path outside every one of its roots.
@@ -611,6 +622,7 @@ pub struct AccessPolicy {
     pub shell_write_floor: Vec<PathBuf>,
     pub private_stores: SandboxDataPolicy,
     pub grants: Vec<AccessGrant>,
+    pub scope_grants_denial: Option<ScopeGrantsDenial>,
     /// Shell-only configured write exceptions; they do not grant access to private stores.
     pub shell_write_allow: Vec<PathBuf>,
     /// Checkouts that live inside a private store but hold project code, not
@@ -783,6 +795,7 @@ impl AccessPolicy {
             floor_rules,
             shell_write_floor,
             grants: Vec::new(),
+            scope_grants_denial: scope_grants_denial(),
             shell_write_allow: config
                 .sandbox
                 .write_allow
@@ -813,7 +826,8 @@ impl AccessPolicy {
     ) {
         // Policies captured by a handler's off-thread work must also carry no
         // agent grants; a thread-local decision check alone would not do that.
-        if scope_grants_suppressed() {
+        self.scope_grants_denial = self.scope_grants_denial.or(scope_grants_denial());
+        if self.scope_grants_denial.is_some() {
             self.grants.clear();
             return;
         }
@@ -901,7 +915,7 @@ impl AccessPolicy {
                     .any(|root| path.starts_with(root)))
             || exceptions.iter().any(|root| path.starts_with(root))
             || (operation == AccessOperation::Read && owned_artifact)
-            || (!scope_grants_suppressed()
+            || (self.scope_grants_denial.or(scope_grants_denial()).is_none()
                 && self
                     .grants
                     .iter()
@@ -911,6 +925,11 @@ impl AccessPolicy {
         } else {
             match (self.mode, self.outside) {
                 (ApprovalMode::FullAccess, AccessDecision::Ask) => AccessDecision::Allow,
+                (_, AccessDecision::Deny(AccessDenial::OutsideRoots)) => self
+                    .scope_grants_denial
+                    .or(scope_grants_denial())
+                    .map(|reason| AccessDecision::Deny(AccessDenial::ScopeGrants(reason)))
+                    .unwrap_or(self.outside),
                 _ => self.outside,
             }
         }
@@ -1443,24 +1462,32 @@ fn resolve_policy_path(path: &Path) -> PathBuf {
 mod tests {
     #[test]
     fn carrier_scope_grants_guard_is_nested_thread_local_and_unwind_safe() {
-        assert!(!super::scope_grants_suppressed());
+        use super::{scope_grants_denial, scope_grants_guard, ScopeGrantsDenial};
+        assert_eq!(scope_grants_denial(), None);
         {
-            let _outer = super::suppress_scope_grants();
+            let _outer = scope_grants_guard(Some(ScopeGrantsDenial::NotSessionHost));
             {
-                let _inner = super::suppress_scope_grants();
-                assert!(super::scope_grants_suppressed());
+                let _inner = scope_grants_guard(None);
+                assert_eq!(
+                    scope_grants_denial(),
+                    Some(ScopeGrantsDenial::NotSessionHost)
+                );
             }
-            assert!(super::scope_grants_suppressed());
-            assert!(!std::thread::spawn(super::scope_grants_suppressed)
-                .join()
-                .unwrap());
+            assert_eq!(
+                scope_grants_denial(),
+                Some(ScopeGrantsDenial::NotSessionHost)
+            );
+            assert_eq!(
+                std::thread::spawn(scope_grants_denial).join().unwrap(),
+                None
+            );
         }
-        assert!(!super::scope_grants_suppressed());
+        assert_eq!(scope_grants_denial(), None);
         let _ = std::panic::catch_unwind(|| {
-            let _guard = super::suppress_scope_grants();
+            let _guard = scope_grants_guard(Some(ScopeGrantsDenial::NotSessionHost));
             panic!("exercise scope-grant guard unwinding");
         });
-        assert!(!super::scope_grants_suppressed());
+        assert_eq!(scope_grants_denial(), None);
     }
 
     #[test]
@@ -1468,8 +1495,11 @@ mod tests {
         use super::*;
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
+        // Callers resolve targets before deciding access; temp roots can be
+        // aliases (/var on macOS, short or verbatim paths on Windows).
+        let outside_path = policy_path(outside.path());
         let grant = AccessGrant {
-            path: policy_path(outside.path()),
+            path: outside_path.clone(),
             kind: GrantKind::Subtree,
             operation: AccessOperation::Read,
         };
@@ -1477,33 +1507,33 @@ mod tests {
         existing.outside = AccessDecision::Deny(AccessDenial::OutsideRoots);
         existing.install_scope_grants(vec![grant.clone()], false);
         assert_eq!(
-            existing.decide(AccessOperation::Read, outside.path(), false),
+            existing.decide(AccessOperation::Read, &outside_path, false),
             AccessDecision::Allow
         );
         let captured;
         {
-            let _guard = suppress_scope_grants();
+            let _guard = scope_grants_guard(Some(ScopeGrantsDenial::NotSessionHost));
             assert_eq!(
-                existing.decide(AccessOperation::Read, outside.path(), false),
-                AccessDecision::Deny(AccessDenial::OutsideRoots)
+                existing.decide(AccessOperation::Read, &outside_path, false),
+                AccessDecision::Deny(AccessDenial::ScopeGrants(ScopeGrantsDenial::NotSessionHost))
             );
             let mut policy = existing.clone();
             policy.install_scope_grants(vec![grant], false);
             captured = policy;
         }
         assert_eq!(
-            existing.decide(AccessOperation::Read, outside.path(), false),
+            existing.decide(AccessOperation::Read, &outside_path, false),
             AccessDecision::Allow
         );
         assert_eq!(
             std::thread::spawn(move || captured.decide(
                 AccessOperation::Read,
-                outside.path(),
+                &outside_path,
                 false
             ))
             .join()
             .unwrap(),
-            AccessDecision::Deny(AccessDenial::OutsideRoots)
+            AccessDecision::Deny(AccessDenial::ScopeGrants(ScopeGrantsDenial::NotSessionHost))
         );
     }
 

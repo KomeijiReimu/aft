@@ -68,6 +68,73 @@ fn principal_label_for_identity(identity: &RouteIdentity) -> Option<&str> {
     }
 }
 
+// Core's scope_carriers and worker_runner_module identify these session hosts.
+// The stamp does not carry the recorded runner module: supporting another
+// runner requires adding its authenticated principal to this explicit list.
+const SAVED_GRANT_SESSION_HOSTS: &[&str] =
+    &["direct", "reserved:broca", "reserved:thalamus-harness"];
+
+pub(super) fn scope_grants_denial(
+    identity: &RouteIdentity,
+) -> Option<crate::access_policy::ScopeGrantsDenial> {
+    scope_grants_denial_for_parent(
+        identity,
+        identity.run_owner.as_ref().map(|owner| &owner.owner_route),
+    )
+}
+
+/// A parent link names an identity, not its kind. Codemode admission and the
+/// flow-read describe check supply the verified parent before using its grants.
+pub(super) fn scope_grants_denial_for_parent(
+    identity: &RouteIdentity,
+    parent: Option<&RouteIdentity>,
+) -> Option<crate::access_policy::ScopeGrantsDenial> {
+    use crate::access_policy::ScopeGrantsDenial;
+    use subc_protocol::scope::ScopeKind;
+    let Some(stamp) = identity.scope.as_ref() else {
+        return Some(ScopeGrantsDenial::UnknownScopeKind);
+    };
+    if stamp.attributes.flow_id.is_some() {
+        return Some(ScopeGrantsDenial::Flow);
+    }
+    if !alfonso(stamp) {
+        return Some(ScopeGrantsDenial::UnknownScopeKind);
+    }
+    // Codemode retains the run's stamp but substitutes the owner's sandbox
+    // principal. Saved-grant eligibility must still check the original carrier.
+    let principal = identity
+        .run_owner
+        .as_ref()
+        .map_or(&identity.spawn_principal, |owner| &owner.run_principal);
+    let principal = match principal {
+        AuthenticatedPrincipal::RouteBind { principal_id, .. } => principal_id.as_deref(),
+        _ => None,
+    };
+    match stamp.kind {
+        ScopeKind::Head | ScopeKind::Worker => (!principal
+            .is_some_and(|id| SAVED_GRANT_SESSION_HOSTS.contains(&id)))
+        .then_some(ScopeGrantsDenial::NotSessionHost),
+        ScopeKind::Ephemeral => {
+            if principal != Some("reserved:basal") {
+                return Some(ScopeGrantsDenial::NotSessionHost);
+            }
+            let head_parent = parent
+                .and_then(|route| route.scope.as_ref())
+                .is_some_and(|head| {
+                    alfonso(head)
+                        && head.kind == ScopeKind::Head
+                        && head.attributes.flow_id.is_none()
+                        && stamp.parent.as_ref().is_some_and(|link| {
+                            link.owner == head.owner
+                                && link.scope_ref == head.scope_ref
+                                && link.scope_epoch == head.scope_epoch
+                        })
+                });
+            (!head_parent).then_some(ScopeGrantsDenial::UnknownScopeKind)
+        }
+    }
+}
+
 pub(super) fn register(
     identity: &RouteIdentity,
     ctx: &AppContext,
@@ -291,9 +358,11 @@ pub(super) fn alfonso_worker(identity: &RouteIdentity) -> bool {
 /// to Cingulate, the consent service, never to a plugin prompt. Other routes
 /// use their plugin UI or reverse elicitation, never the consent service.
 pub(super) fn ask_route(identity: &RouteIdentity) -> crate::access_policy::AskRoute {
-    // A rich-UI read has nobody to answer a permission question. Existing
-    // grants still apply, but access requiring a new approval must be denied.
-    if super::carrier_read_only::restricted(identity) {
+    // A carrier cannot create an approval card that saves authority into the
+    // agent's scope, even when it carries that scope's authenticated stamp.
+    if (identity.scope.is_some() && scope_grants_denial(identity).is_some())
+        || super::carrier_read_only::restricted(identity)
+    {
         return crate::access_policy::AskRoute::Deny;
     }
     // No path yet carries a codemode call's question to anyone who could
