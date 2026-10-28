@@ -1516,7 +1516,11 @@ fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admissi
                 .refresh(budget, &mut |texts| model.embed(texts))
                 .unwrap();
             embedded_keys += report.embedded_keys;
-            assert_eq!(report.embedded_keys, usize::from(i == 0));
+            assert_eq!(
+                report.embedded_keys,
+                usize::from(i == 0),
+                "round={round} worktree={i} report={report:?}"
+            );
             assert_eq!(report.model_calls, usize::from(i == 0));
             assert_eq!(
                 model.texts() - before,
