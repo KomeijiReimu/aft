@@ -622,6 +622,8 @@ pub struct AccessPolicy {
     pub shell_write_floor: Vec<PathBuf>,
     pub private_stores: SandboxDataPolicy,
     pub grants: Vec<AccessGrant>,
+    /// Built-in worker library reads are ordinary policy, not saved approvals.
+    worker_read_grants: Vec<AccessGrant>,
     pub scope_grants_denial: Option<ScopeGrantsDenial>,
     /// Shell-only configured write exceptions; they do not grant access to private stores.
     pub shell_write_allow: Vec<PathBuf>,
@@ -795,6 +797,7 @@ impl AccessPolicy {
             floor_rules,
             shell_write_floor,
             grants: Vec::new(),
+            worker_read_grants: Vec::new(),
             scope_grants_denial: scope_grants_denial(),
             shell_write_allow: config
                 .sandbox
@@ -809,9 +812,9 @@ impl AccessPolicy {
         }
     }
 
-    /// Installs the grants a scope's policy holds: the ones stored for the scope,
-    /// plus the built-in Rust library read grants when the scope is a live
-    /// worker. Every policy built for a scope comes through here, so the
+    /// Installs saved scope grants and, separately, the built-in Rust library
+    /// read policy when the scope is a live worker. Every scoped policy comes
+    /// through here, so the
     /// in-process tool checks and the subc consent and launch checks cannot
     /// disagree about what a worker may read.
     pub(crate) fn install_scope_grants(&mut self, stored: Vec<AccessGrant>, worker: bool) {
@@ -826,15 +829,17 @@ impl AccessPolicy {
     ) {
         // Policies captured by a handler's off-thread work must also carry no
         // agent grants; a thread-local decision check alone would not do that.
+        self.worker_read_grants = if worker {
+            rust_sources.grants()
+        } else {
+            Vec::new()
+        };
         self.scope_grants_denial = self.scope_grants_denial.or(scope_grants_denial());
         if self.scope_grants_denial.is_some() {
             self.grants.clear();
             return;
         }
         self.grants = stored;
-        if worker {
-            self.grants.extend(rust_sources.grants());
-        }
     }
 
     pub fn decide(
@@ -915,6 +920,10 @@ impl AccessPolicy {
                     .any(|root| path.starts_with(root)))
             || exceptions.iter().any(|root| path.starts_with(root))
             || (operation == AccessOperation::Read && owned_artifact)
+            || self
+                .worker_read_grants
+                .iter()
+                .any(|grant| grant.covers(operation, path))
             || (self.scope_grants_denial.or(scope_grants_denial()).is_none()
                 && self
                     .grants
@@ -1118,6 +1127,7 @@ impl AccessPolicy {
     pub(crate) fn shell_grants(&self, operation: AccessOperation) -> Vec<PathBuf> {
         self.grants
             .iter()
+            .chain(&self.worker_read_grants)
             .filter(|grant| {
                 grant.covers(operation, &grant.path)
                     && match operation {

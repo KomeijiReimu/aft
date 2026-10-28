@@ -83,8 +83,8 @@ pub(super) fn scope_grants_denial(
     )
 }
 
-/// A parent link names an identity, not its kind. Codemode admission and the
-/// flow-read describe check supply the verified parent before using its grants.
+/// A parent link names an identity, not its kind. Codemode admission supplies
+/// the head or worker parent; flow-read admission supplies its verified head.
 pub(super) fn scope_grants_denial_for_parent(
     identity: &RouteIdentity,
     parent: Option<&RouteIdentity>,
@@ -118,19 +118,20 @@ pub(super) fn scope_grants_denial_for_parent(
             if principal != Some("reserved:basal") {
                 return Some(ScopeGrantsDenial::NotSessionHost);
             }
-            let head_parent = parent
-                .and_then(|route| route.scope.as_ref())
-                .is_some_and(|head| {
-                    alfonso(head)
-                        && head.kind == ScopeKind::Head
-                        && head.attributes.flow_id.is_none()
-                        && stamp.parent.as_ref().is_some_and(|link| {
-                            link.owner == head.owner
-                                && link.scope_ref == head.scope_ref
-                                && link.scope_epoch == head.scope_epoch
-                        })
-                });
-            (!head_parent).then_some(ScopeGrantsDenial::UnknownScopeKind)
+            let session_parent =
+                parent
+                    .and_then(|route| route.scope.as_ref())
+                    .is_some_and(|session| {
+                        alfonso(session)
+                            && matches!(session.kind, ScopeKind::Head | ScopeKind::Worker)
+                            && session.attributes.flow_id.is_none()
+                            && stamp.parent.as_ref().is_some_and(|link| {
+                                link.owner == session.owner
+                                    && link.scope_ref == session.scope_ref
+                                    && link.scope_epoch == session.scope_epoch
+                            })
+                    });
+            (!session_parent).then_some(ScopeGrantsDenial::UnknownScopeKind)
         }
     }
 }
@@ -358,11 +359,8 @@ pub(super) fn alfonso_worker(identity: &RouteIdentity) -> bool {
 /// to Cingulate, the consent service, never to a plugin prompt. Other routes
 /// use their plugin UI or reverse elicitation, never the consent service.
 pub(super) fn ask_route(identity: &RouteIdentity) -> crate::access_policy::AskRoute {
-    // A carrier cannot create an approval card that saves authority into the
-    // agent's scope, even when it carries that scope's authenticated stamp.
-    if (identity.scope.is_some() && scope_grants_denial(identity).is_some())
-        || super::carrier_read_only::restricted(identity)
-    {
+    // A rich UI read has nobody to answer a permission question.
+    if super::carrier_read_only::restricted(identity) {
         return crate::access_policy::AskRoute::Deny;
     }
     // No path yet carries a codemode call's question to anyone who could

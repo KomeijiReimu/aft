@@ -181,8 +181,8 @@ fn saved_scope_grants_direct_broca_and_runner_hosts_keep_grants() {
     }
 }
 
-fn basal_head_run(head: &RouteIdentity) -> RouteIdentity {
-    let mut run = copied_identity(head);
+fn basal_session_run(parent: &RouteIdentity, worker: bool) -> RouteIdentity {
+    let mut run = copied_identity(parent);
     let stamp = run.scope.as_mut().unwrap();
     stamp.kind = subc_protocol::scope::ScopeKind::Ephemeral;
     stamp.parent = Some(
@@ -191,28 +191,44 @@ fn basal_head_run(head: &RouteIdentity) -> RouteIdentity {
         }))
         .unwrap(),
     );
-    stamp.scope_ref = "codemode/head-run".into();
-    stamp.attributes.run_id = Some("head-run".into());
+    let run_id = if worker { "worker-run" } else { "head-run" };
+    stamp.scope_ref = format!("codemode/{run_id}");
+    stamp.attributes.run_id = Some(run_id.into());
+    stamp.attributes.agent_id = (!worker).then(|| "head".into());
+    stamp.attributes.on_behalf_of_agent = worker.then(|| "head".into());
     run.run_owner = Some(Arc::new(codemode::RunOwner {
-        kind: codemode::RunKind::Agent {
-            agent_id: "head".into(),
+        kind: if worker {
+            codemode::RunKind::Worker {
+                on_behalf_of_agent: "head".into(),
+            }
+        } else {
+            codemode::RunKind::Agent {
+                agent_id: "head".into(),
+            }
         },
-        run_id: "head-run".into(),
-        owner_route: head.clone(),
+        run_id: run_id.into(),
+        owner_route: parent.clone(),
         run_route: route_key(42, 1),
-        run_principal: with_carrier(head, "reserved:basal").spawn_principal.clone(),
+        run_principal: with_carrier(parent, "reserved:basal")
+            .spawn_principal
+            .clone(),
     }));
     RouteIdentity(Arc::new(run))
 }
 
 #[test]
 fn saved_scope_grants_basal_codemode_keeps_grants_but_flow_id_loses_them() {
-    let (dir, ctx, head, _) = fixture();
+    let (dir, ctx, head, worker) = fixture();
     let outside = dir.path().join("outside.txt");
     std::fs::write(&outside, "saved authority").unwrap();
-    let run = basal_head_run(&head);
+    let run = basal_session_run(&head, false);
     assert_saved_scope_grants(&ctx, &run, &outside, None);
+    let worker_run = basal_session_run(&worker, true);
+    assert_eq!(policy_scope_key(&worker_run), scope_key(&worker));
+    assert_ne!(policy_scope_key(&worker_run), scope_key(&head));
+    assert_saved_scope_grants(&ctx, &worker_run, &outside, None);
     let mut flow = copied_identity(&run);
+    flow.run_owner = run.run_owner.clone();
     flow.scope.as_mut().unwrap().attributes.flow_id = Some("flow-target-lease".into());
     assert_saved_scope_grants(
         &ctx,
