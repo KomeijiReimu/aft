@@ -80,9 +80,9 @@ impl SubcRelayTransport {
             .map_err(|_| Refusal::new(Code::PolicyDenied, "payload_denied"))?;
         let body = RequestBody::new(bytes)
             .map_err(|_| Refusal::new(Code::PolicyDenied, "payload_denied"))?;
-        let consumer = self
-            .consumer()
+        let consumer = tokio::time::timeout_at(deadline, self.consumer())
             .await
+            .map_err(|_| unavailable("reservation_timeout"))?
             .map_err(|_| unavailable("relay_unavailable"))?;
         let target = subc_protocol::RouteTarget::ToolProvider {
             module_id: PLEXUS_MODULE_ID.into(),
@@ -99,17 +99,10 @@ impl SubcRelayTransport {
             .clone()
             .try_acquire_owned()
             .map_err(|_| unavailable("dispatch_queue_full"))?;
-        let mut options = subc_client_rs::CallOptions {
-            consumer_identity: crate::launch_nonce::consumer_identity(),
-            ..Default::default()
-        };
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
+        if tokio::time::Instant::now() >= deadline {
             return Err(unavailable("reservation_timeout"));
         }
-        let open_limit = self.route_open_deadline.unwrap_or(remaining).min(remaining);
-        options.timeout = open_limit;
-        options.route_retry_deadline = open_limit;
+        let route_open_deadline = self.route_open_deadline;
         let leases = self.leases.clone();
         let slot = self.consumer.clone();
         let (result, receiver) = tokio::sync::oneshot::channel();
@@ -125,6 +118,18 @@ impl SubcRelayTransport {
                     key: key.clone(),
                     _operation: operation,
                 }),
+            };
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if result.is_closed() || remaining.is_zero() {
+                let _ = result.send(Err(unavailable("reservation_timeout")));
+                return;
+            }
+            let open_limit = route_open_deadline.unwrap_or(remaining).min(remaining);
+            let options = subc_client_rs::CallOptions {
+                consumer_identity: crate::launch_nonce::consumer_identity(),
+                timeout: open_limit,
+                route_retry_deadline: open_limit,
+                ..Default::default()
             };
             let route = match consumer
                 .open_route_scoped(target, identity, selector.clone(), options.clone())
@@ -208,8 +213,11 @@ impl SubcRelayTransport {
             // A dropped receiver drops an unsent SDK reservation and its lease.
             let _ = result.send(Ok(reserved));
         });
-        receiver
+        // Bound the caller, not the owner of a possibly successful route open.
+        // That owner must finish registration and cleanup even after timeout.
+        tokio::time::timeout_at(deadline, receiver)
             .await
+            .map_err(|_| unavailable("reservation_timeout"))?
             .map_err(|_| unavailable("relay_unavailable"))?
     }
 }

@@ -1153,6 +1153,15 @@ struct DaemonLog {
     closes: Vec<Value>,
     /// Every request body sent on an open route.
     requests: Vec<Value>,
+    connections_closed: usize,
+}
+
+struct DaemonConnection(Arc<Mutex<DaemonLog>>);
+
+impl Drop for DaemonConnection {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().connections_closed += 1;
+    }
 }
 
 pub(crate) struct FakeDaemon {
@@ -1247,6 +1256,7 @@ async fn fake_daemon(script: DaemonScript) -> FakeDaemon {
             let log = Arc::clone(&server_log);
             let script = script.clone();
             tokio::spawn(async move {
+                let _connection = DaemonConnection(log.clone());
                 if subc_transport::authenticate_server(
                     &mut stream,
                     &key,
@@ -2519,7 +2529,10 @@ async fn published_sdk_reservation_deadline_bounds_waiting_for_the_consumer_slot
         .expect("the reservation deadline must bound consumer-slot contention")
         .err()
         .expect("no reservation is possible while the consumer slot is locked");
-    assert_eq!(refusal.code, crate::gh_shim_speech::Code::AuthorityUnavailable);
+    assert_eq!(
+        refusal.code,
+        crate::gh_shim_speech::Code::AuthorityUnavailable
+    );
     assert_eq!(refusal.reason, "reservation_timeout");
     assert!(daemon.opens().is_empty());
     assert!(daemon.requests().is_empty());
@@ -2592,7 +2605,20 @@ async fn published_sdk_reservation_deadline_during_open_retains_cleanup_ownershi
         .err()
         .expect("the paused open must not produce a reservation before the deadline");
     assert_eq!(refusal.reason, "reservation_timeout");
-    assert_eq!(daemon.closes(1).await.len(), 1);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let cleaned = {
+                let log = daemon.log.lock().unwrap();
+                !log.closes.is_empty() || log.connections_closed > 0
+            };
+            if cleaned {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the timed-out open must release its route or close its original connection");
     assert!(daemon.requests().is_empty());
 }
 
