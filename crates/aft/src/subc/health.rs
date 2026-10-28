@@ -9572,7 +9572,6 @@ mod observability_retention_tests {
 
 #[cfg(test)]
 mod watch_gap_tests {
-    use super::*;
 
     #[test]
     fn retry_overflow_health_keeps_evictions_separate_and_clears_after_ack() {
@@ -9591,7 +9590,7 @@ mod watch_gap_tests {
             version: Some(5),
             ..Default::default()
         };
-        let mut row = BashPatternWatchRow {
+        let row = BashPatternWatchRow {
             harness: "opencode".into(),
             session_id: "session".into(),
             task_id: "task".into(),
@@ -9611,7 +9610,7 @@ mod watch_gap_tests {
             match_offset: Some(5),
             match_context: None,
         };
-        upsert_bash_pattern_watch(&conn, &row).unwrap();
+        upsert_delivery_gap(&conn, &row).unwrap();
         let (gaps, missing, uncertain) = watch_gap_health_for_path(&path);
         assert_eq!((gaps, missing, uncertain), (1, 1, false));
         let health = super::super::watch_delivery::health_from_census(gaps, missing, uncertain, 0);
@@ -9630,8 +9629,7 @@ mod watch_gap_tests {
             batch.retry_gap.as_ref(),
         )
         .unwrap();
-        row.pending_match = false;
-        upsert_bash_pattern_watch(&conn, &row).unwrap();
+        delete_delivery_gap(&conn, "opencode", "session", "task", "watch").unwrap();
         let (gaps, missing, uncertain) = watch_gap_health_for_path(&path);
         let cleared = super::super::watch_delivery::health_from_census(gaps, missing, uncertain, 0);
         assert_eq!(cleared["status"], "ok");

@@ -61,6 +61,19 @@ test("retry gap-only batches are admitted once while newer gap versions remain v
   expect(watchBatchHasContent(progress.unseen(next))).toBe(false);
 });
 
+test("legacy scalar output retained beside a retry gap is not repeated", () => {
+  const progress = new WatchBatchProgress();
+  const batch = snapshot();
+  batch.lines[0].stream = "output";
+  batch.retry_gap = {
+    reason: "retry_overflow",
+    dropped_notifications: 1,
+    known_missing_occurrences: 0,
+  };
+  progress.admit(batch);
+  expect(watchBatchHasContent(progress.unseen(batch))).toBe(false);
+});
+
 test("watch progress does not reserve rows before admission or across pending generations", () => {
   const progress = new WatchBatchProgress();
   expect(progress.unseen(snapshot()).lines).toHaveLength(1);

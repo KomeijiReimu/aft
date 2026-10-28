@@ -7,6 +7,19 @@ static PENDING_CHECKS: AtomicUsize = AtomicUsize::new(0);
 static NEXT_EVICTION: AtomicU64 = AtomicU64::new(1);
 static EVICTION_EPOCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+pub(crate) fn eviction_epoch() -> &'static str {
+    EVICTION_EPOCH.get_or_init(|| {
+        format!(
+            "{}:{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        )
+    })
+}
+
 #[derive(Clone)]
 pub(crate) struct Candidate {
     pub eviction_epoch: String,
@@ -61,18 +74,7 @@ impl Candidate {
             batch.lines = Vec::new();
         }
         Self {
-            eviction_epoch: EVICTION_EPOCH
-                .get_or_init(|| {
-                    format!(
-                        "{}:{}",
-                        std::process::id(),
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_nanos()
-                    )
-                })
-                .clone(),
+            eviction_epoch: eviction_epoch().to_string(),
             last_eviction: NEXT_EVICTION.fetch_add(1, Ordering::Relaxed),
             fingerprint,
             frame,
@@ -160,12 +162,17 @@ impl WatchDelivery {
     }
 
     pub(super) fn health(&self) -> serde_json::Value {
-        let (gaps, missing, uncertain) = if self.executor.lock().unwrap().upgrade().is_some() {
+        let attached = self.executor.lock().unwrap().upgrade().is_some();
+        let (gaps, missing, uncertain) = if attached {
             crate::db::bash_watches::watch_gap_health()
         } else {
             (0, 0, false)
         };
-        let pending = PENDING_CHECKS.load(Ordering::Relaxed);
+        let pending = if attached {
+            PENDING_CHECKS.load(Ordering::Relaxed)
+        } else {
+            0
+        };
         health_from_census(gaps, missing, uncertain, pending)
     }
 

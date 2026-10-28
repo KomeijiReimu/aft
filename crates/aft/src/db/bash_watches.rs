@@ -192,9 +192,9 @@ pub fn count_pending_bash_pattern_watches_for_session(
     session_id: &str,
 ) -> rusqlite::Result<usize> {
     conn.query_row(
-        "SELECT COUNT(*)
+        "SELECT (SELECT COUNT(*)
          FROM bash_pattern_watches
-         WHERE harness = ?1 AND session_id = ?2 AND pending_match = 1",
+         WHERE harness = ?1 AND session_id = ?2 AND pending_match = 1) + (SELECT COUNT(*) FROM bash_watch_delivery_gaps WHERE harness=?1 AND session_id=?2)",
         params![harness, session_id],
         |row| row.get(0),
     )
@@ -205,9 +205,9 @@ pub fn count_pending_bash_pattern_watches(
     harness: &str,
 ) -> rusqlite::Result<usize> {
     conn.query_row(
-        "SELECT COUNT(*)
+        "SELECT (SELECT COUNT(*)
          FROM bash_pattern_watches
-         WHERE harness = ?1 AND pending_match = 1",
+         WHERE harness = ?1 AND pending_match = 1) + (SELECT COUNT(*) FROM bash_watch_delivery_gaps WHERE harness=?1)",
         params![harness],
         |row| row.get(0),
     )
@@ -293,7 +293,7 @@ pub(crate) fn refresh_watch_gap_health(conn: &Connection) {
         .map(str::to_owned)
         .unwrap_or_else(|| format!("memory:{:p}", conn));
     let census = (|| -> rusqlite::Result<GapCensus> {
-        let mut stmt = conn.prepare("SELECT match_batch FROM bash_pattern_watches WHERE pending_match = 1 AND match_batch IS NOT NULL")?;
+        let mut stmt = conn.prepare("SELECT match_batch FROM bash_pattern_watches WHERE pending_match = 1 AND match_batch IS NOT NULL UNION ALL SELECT batch FROM bash_watch_delivery_gaps")?;
         let batches = stmt.query_map([], |row| row.get::<_, String>(0))?;
         let (mut outstanding, mut missing) = (0u64, 0u64);
         let mut uncertain = false;
@@ -363,14 +363,14 @@ pub(crate) fn acknowledge_delivery(
 ) -> rusqlite::Result<()> {
     let epoch = gap
         .map(|gap| gap.eviction_epoch.as_str())
-        .unwrap_or_default();
+        .unwrap_or(crate::subc::watch_delivery::eviction_epoch());
     let through = gap.map(|gap| gap.evicted_through).unwrap_or_default();
-    conn.execute("INSERT INTO bash_watch_delivery_acks(harness, session_id, task_id, watch_id, version, acknowledged_at, eviction_epoch, evicted_through) VALUES(?1,?2,?3,?4,?5,unixepoch(),?6,?7) ON CONFLICT(harness, session_id, task_id, watch_id) DO UPDATE SET version=MAX(version,excluded.version), acknowledged_at=excluded.acknowledged_at, eviction_epoch=CASE WHEN excluded.eviction_epoch != '' THEN excluded.eviction_epoch ELSE eviction_epoch END, evicted_through=CASE WHEN excluded.eviction_epoch != '' THEN excluded.evicted_through ELSE evicted_through END", params![harness, session, task, watch, version as i64, epoch, through as i64])?;
-    // Retry queues are process-local. A month-old acknowledgement cannot still
-    // have a transport copy waiting in the daemon that wrote it.
+    conn.execute("INSERT INTO bash_watch_delivery_acks(harness, session_id, task_id, watch_id, version, acknowledged_at, eviction_epoch, evicted_through) VALUES(?1,?2,?3,?4,?5,unixepoch(),?6,?7) ON CONFLICT(harness, session_id, task_id, watch_id) DO UPDATE SET version=MAX(version,excluded.version), acknowledged_at=excluded.acknowledged_at, eviction_epoch=CASE WHEN excluded.eviction_epoch != '' THEN excluded.eviction_epoch ELSE eviction_epoch END, evicted_through=CASE WHEN eviction_epoch = excluded.eviction_epoch THEN MAX(evicted_through,excluded.evicted_through) WHEN excluded.eviction_epoch != '' THEN excluded.evicted_through ELSE evicted_through END", params![harness, session, task, watch, version as i64, epoch, through as i64])?;
+    // Only prune old acknowledgements from an earlier daemon: its process-local
+    // retry copies no longer exist, even if the current daemon is long-lived.
     conn.execute(
-        "DELETE FROM bash_watch_delivery_acks WHERE acknowledged_at < unixepoch() - 2592000",
-        [],
+        "DELETE FROM bash_watch_delivery_acks WHERE acknowledged_at < unixepoch() - 2592000 AND eviction_epoch != ?1",
+        [crate::subc::watch_delivery::eviction_epoch()],
     )?;
     Ok(())
 }
@@ -384,4 +384,101 @@ pub(crate) fn watch_gap_health_for_path(path: &std::path::Path) -> GapCensus {
         .get(&path.to_string_lossy().into_owned())
         .copied()
         .unwrap_or_default()
+}
+
+pub(crate) fn list_delivery_gaps(
+    conn: &Connection,
+    harness: &str,
+    session: Option<&str>,
+) -> rusqlite::Result<Vec<BashPatternWatchRow>> {
+    let mut statement = conn.prepare("SELECT session_id, task_id, watch_id, batch FROM bash_watch_delivery_gaps WHERE harness=?1 AND (?2 IS NULL OR session_id=?2)")?;
+    let rows = statement.query_map(params![harness, session], |row| {
+        let session_id = row.get(0)?;
+        let task_id: String = row.get(1)?;
+        let watch_id = row.get(2)?;
+        let saved: String = row.get(3)?;
+        let batch = serde_json::from_str::<crate::bash_background::watch_lines::LineBatch>(&saved)
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+        Ok(BashPatternWatchRow {
+            harness: harness.into(),
+            session_id,
+            task_id: task_id.clone(),
+            watch_id,
+            pattern_kind: "substring".into(),
+            pattern: String::new(),
+            once: true,
+            each_line: false,
+            match_batch: Some(saved),
+            created_at: 0,
+            stdout_offset: 0,
+            stderr_offset: 0,
+            pty_offset: 0,
+            scanning: false,
+            pending_match: true,
+            match_text: Some("watch delivery gap".into()),
+            match_offset: batch.version.map(|version| version as i64),
+            match_context: Some(crate::subc_format::format_watch_line_batch(
+                &task_id, &batch,
+            )),
+        })
+    })?;
+    rows.collect()
+}
+
+pub(crate) fn upsert_delivery_gap(
+    conn: &Connection,
+    row: &BashPatternWatchRow,
+) -> rusqlite::Result<()> {
+    conn.execute("INSERT INTO bash_watch_delivery_gaps(harness,session_id,task_id,watch_id,batch) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(harness,session_id,task_id,watch_id) DO UPDATE SET batch=excluded.batch", params![row.harness,row.session_id,row.task_id,row.watch_id,row.match_batch])?;
+    refresh_watch_gap_health(conn);
+    Ok(())
+}
+
+pub(crate) fn delete_delivery_gap(
+    conn: &Connection,
+    harness: &str,
+    session: &str,
+    task: &str,
+    watch: &str,
+) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM bash_watch_delivery_gaps WHERE harness=?1 AND session_id=?2 AND task_id=?3 AND watch_id=?4", params![harness,session,task,watch])?;
+    refresh_watch_gap_health(conn);
+    Ok(())
+}
+
+#[cfg(test)]
+mod delivery_ack_tests {
+    use super::*;
+
+    #[test]
+    fn retry_overflow_ack_tombstones_survive_a_long_lived_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        acknowledge_delivery(&conn, "opencode", "session", "task", "live", 5, None).unwrap();
+        conn.execute(
+            "UPDATE bash_watch_delivery_acks SET acknowledged_at=unixepoch()-2592001",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO bash_watch_delivery_acks VALUES('opencode','session','task','old',5,unixepoch()-2592001,'earlier-daemon',0)", []).unwrap();
+        acknowledge_delivery(&conn, "opencode", "session", "task", "another", 6, None).unwrap();
+        assert_eq!(
+            delivery_ack_version(&conn, "opencode", "session", "task", "live")
+                .unwrap()
+                .unwrap()
+                .0,
+            5
+        );
+        assert!(
+            delivery_ack_version(&conn, "opencode", "session", "task", "old")
+                .unwrap()
+                .is_none()
+        );
+    }
 }

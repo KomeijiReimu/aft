@@ -3858,7 +3858,19 @@ impl BgTaskRegistry {
             match crate::db::bash_watches::list_bash_pattern_watches_for_session(
                 &conn, &harness, session_id,
             ) {
-                Ok(rows) => rows,
+                Ok(mut rows) => {
+                    match crate::db::bash_watches::list_delivery_gaps(
+                        &conn,
+                        &harness,
+                        Some(session_id),
+                    ) {
+                        Ok(gaps) => rows.extend(gaps),
+                        Err(error) => crate::slog_warn!(
+                            "failed to load retained watch gaps for session {session_id}: {error}"
+                        ),
+                    }
+                    rows
+                }
                 Err(error) => {
                     crate::slog_warn!(
                         "failed to load pending bash watches for session {session_id}: {error}"
@@ -4191,6 +4203,16 @@ impl BgTaskRegistry {
             &frame.watch_id,
         )
         .map_err(|e| e.to_string())?;
+        let registered = found.is_some();
+        let found = match found {
+            Some(row) => Some(row),
+            None => {
+                crate::db::bash_watches::list_delivery_gaps(&conn, harness, Some(&frame.session_id))
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .find(|row| row.task_id == frame.task_id && row.watch_id == frame.watch_id)
+            }
+        };
         let mut row =
             found
                 .clone()
@@ -4270,7 +4292,7 @@ impl BgTaskRegistry {
         // A superseded scalar has one identifiable occurrence. Overlapping
         // snapshots and uncertain persistence never imply a lost-line count.
         let known = u64::from(
-            found.is_some()
+            registered
                 && frame.batch.is_none()
                 && candidate.same_occurrence
                 && acknowledged
@@ -4350,8 +4372,12 @@ impl BgTaskRegistry {
             &batch,
         ));
         row.match_batch = Some(serde_json::to_string(&batch).map_err(|e| e.to_string())?);
-        crate::db::bash_watches::upsert_bash_pattern_watch(&conn, &row)
-            .map_err(|e| e.to_string())?;
+        if registered {
+            crate::db::bash_watches::upsert_bash_pattern_watch(&conn, &row)
+                .map_err(|e| e.to_string())?;
+        } else {
+            crate::db::bash_watches::upsert_delivery_gap(&conn, &row).map_err(|e| e.to_string())?;
+        }
         drop(conn);
         if let Some(sender) = self
             .inner
@@ -4586,11 +4612,20 @@ impl BgTaskRegistry {
             .ok_or_else(|| "watch persistence unavailable".to_string())?;
         let (removed, settled) = {
             let conn = pool.lock().map_err(|error| error.to_string())?;
-            let Some(mut row) = crate::db::bash_watches::get_bash_pattern_watch(
+            let registered = crate::db::bash_watches::get_bash_pattern_watch(
                 &conn, &harness, session_id, task_id, watch_id,
             )
-            .map_err(|error| error.to_string())?
-            else {
+            .map_err(|error| error.to_string())?;
+            let retained = registered.is_none();
+            let Some(mut row) = (match registered {
+                Some(row) => Some(row),
+                None => {
+                    crate::db::bash_watches::list_delivery_gaps(&conn, &harness, Some(session_id))
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .find(|row| row.task_id == task_id && row.watch_id == watch_id)
+                }
+            }) else {
                 return Ok(None);
             };
             if !row.pending_match
@@ -4616,10 +4651,17 @@ impl BgTaskRegistry {
             )
             .map_err(|error| error.to_string())?;
             if removed {
-                crate::db::bash_watches::delete_bash_pattern_watch(
-                    &conn, &harness, session_id, task_id, watch_id,
-                )
-                .map_err(|error| error.to_string())?;
+                if retained {
+                    crate::db::bash_watches::delete_delivery_gap(
+                        &conn, &harness, session_id, task_id, watch_id,
+                    )
+                    .map_err(|e| e.to_string())?;
+                } else {
+                    crate::db::bash_watches::delete_bash_pattern_watch(
+                        &conn, &harness, session_id, task_id, watch_id,
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
             } else {
                 row.pending_match = false;
                 if let Some(mut batch) = row
@@ -4642,7 +4684,11 @@ impl BgTaskRegistry {
                 )
                 .map_err(|error| error.to_string())?
                 .iter()
-                .any(|row| row.pending_match);
+                .any(|row| row.pending_match)
+                && !crate::db::bash_watches::list_delivery_gaps(&conn, &harness, Some(session_id))
+                    .map_err(|e| e.to_string())?
+                    .iter()
+                    .any(|row| row.task_id == task_id);
             (removed, settled)
         };
         self.sync_memory_watches_from_persistence(task_id);
@@ -10751,6 +10797,14 @@ impl BgTaskRegistry {
         for harness in &harnesses {
             if let Ok(rows) = crate::db::bash_watches::list_bash_pattern_watches(&conn, harness) {
                 keys.extend(rows.into_iter().filter(|row| row.pending_match).map(|row| {
+                    format!(
+                        "match\0{}\0{}\0{}",
+                        row.session_id, row.task_id, row.watch_id
+                    )
+                }));
+            }
+            if let Ok(rows) = crate::db::bash_watches::list_delivery_gaps(&conn, harness, None) {
+                keys.extend(rows.into_iter().map(|row| {
                     format!(
                         "match\0{}\0{}\0{}",
                         row.session_id, row.task_id, row.watch_id
@@ -27970,6 +28024,60 @@ mod tests {
             .pending_pattern_matches_for_session("session")
             .iter()
             .any(|f| f.watch_id == "retired-watch"));
+    }
+
+    #[test]
+    fn retry_overflow_missing_task_keeps_a_session_gap_until_exact_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, _) = registry_with_db_and_frames(dir.path());
+        let frame = BashPatternMatchFrame::new(
+            "missing-task",
+            "session",
+            "missing-watch",
+            "match",
+            10,
+            "match",
+            false,
+        );
+        let candidate = crate::subc::watch_delivery::stalled_route_eviction(frame).unwrap();
+        registry.retain_retry_gap("opencode", &candidate).unwrap();
+        let (restarted, _, _) = registry_with_db_and_frames(dir.path());
+        let notice = restarted
+            .pending_pattern_matches_for_session("session")
+            .pop()
+            .unwrap();
+        assert_eq!(notice.task_id, "missing-task");
+        assert!(!notice.once);
+        assert!(restarted.has_unacked_wakes_for_session("session"));
+        assert!(restarted
+            .unacked_wake_keys()
+            .contains("match\0session\0missing-task\0missing-watch"));
+        assert!(restarted
+            .ack_pattern_match_for_session(
+                "session",
+                "missing-task",
+                "missing-watch",
+                notice.match_offset - 1
+            )
+            .unwrap()
+            .is_none());
+        restarted
+            .ack_pattern_match_for_session(
+                "session",
+                "missing-task",
+                "missing-watch",
+                notice.match_offset,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(restarted
+            .pending_pattern_matches_for_session("session")
+            .is_empty());
+        assert!(!restarted.has_unacked_wakes_for_session("session"));
+        restarted.retain_retry_gap("opencode", &candidate).unwrap();
+        assert!(restarted
+            .pending_pattern_matches_for_session("session")
+            .is_empty());
     }
 
     fn each_line_running_fixture(

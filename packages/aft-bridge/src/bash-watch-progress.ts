@@ -1,17 +1,17 @@
 import type { BashAckTarget } from "./bash-pattern-ack.js";
 import type { BashWatchLineBatch } from "./bridge.js";
 
-type Stream = "stdout" | "stderr" | "pty";
+type Stream = "stdout" | "stderr" | "pty" | "output";
 
 function knownStream(stream: string): stream is Stream {
-  return stream === "stdout" || stream === "stderr" || stream === "pty";
+  return stream === "stdout" || stream === "stderr" || stream === "pty" || stream === "output";
 }
 
 /** Admission watermarks for one pending watch generation; no line text is retained. */
 export class WatchBatchProgress {
   private pendingID: string | undefined;
   private version: number | undefined;
-  private ends: Record<Stream, number> = { stdout: 0, stderr: 0, pty: 0 };
+  private ends: Record<Stream, number> = { stdout: 0, stderr: 0, pty: 0, output: 0 };
   private dropped = 0;
   private skipped = 0;
   private gapNotices = 0;
@@ -74,7 +74,7 @@ export class WatchBatchProgress {
     if (this.pendingID !== pendingID) {
       this.pendingID = pendingID;
       this.version = undefined;
-      this.ends = { stdout: 0, stderr: 0, pty: 0 };
+      this.ends = { stdout: 0, stderr: 0, pty: 0, output: 0 };
       this.dropped = 0;
       this.skipped = 0;
       this.gapNotices = 0;
