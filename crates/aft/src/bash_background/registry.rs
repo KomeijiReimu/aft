@@ -27306,13 +27306,15 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let (registry, task, _, watch) = each_line_running_fixture(dir.path());
             let _reap = KillTasksOnDrop(registry.clone());
-            {
+            let metadata = {
                 let mut state = task.lock_state().unwrap();
                 state.metadata.completion_has_env_secrets = Some(secrets);
                 state.metadata.completion_has_non_ticket_env_secrets = Some(secrets);
                 state.metadata.completion_ticket_digest = None;
-                write_task(&task.paths.json, &state.metadata).unwrap();
-            }
+                state.metadata.clone()
+            };
+            // Both the task file and its aft.db row carry the launch record.
+            registry.persist_task(&task.paths, &metadata).unwrap();
             registry.clear_task_watch_state(&task.task_id);
             let (replayed, _, frames) = registry_with_db_and_frames(dir.path());
             replayed

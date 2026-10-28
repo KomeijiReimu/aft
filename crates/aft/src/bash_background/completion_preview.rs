@@ -65,10 +65,11 @@ pub(super) fn restart_watch_notice(output_file: Option<&std::path::Path>) -> Str
     notice
 }
 
-/// `masked`, the masked form of the output line `raw`, with every occurrence of
-/// `needle` (a substring watch's own pattern) visible. Masking can swallow the
-/// pattern into a placeholder when it is part of a credential, or is one; the
-/// agent supplied it, so showing it reveals nothing the agent does not have.
+/// `masked`, the masked form of the output line `raw`, with `needle` (a
+/// substring watch's own pattern) shown wherever masking hid it, at most once
+/// per placeholder. Masking can swallow the pattern into a placeholder when
+/// it is part of a credential, or is one; the agent supplied it, so showing
+/// it reveals nothing the agent does not have.
 ///
 /// The result is built only from `masked`'s own text, its placeholders and
 /// parts of `needle`, so no other raw byte can reach it. Each placeholder is
@@ -78,7 +79,11 @@ pub(super) fn restart_watch_notice(output_file: Option<&std::path::Path>) -> Str
 /// the alignment fails, `masked` is returned unchanged.
 pub(super) fn keep_pattern_visible(raw: &str, masked: &str, needle: &str) -> String {
     use crate::log_redact::{SECRET_PLACEHOLDER, URL_CREDENTIAL_PLACEHOLDER};
-    if needle.is_empty() || masked.matches(needle).count() >= raw.matches(needle).count() {
+    // Without a placeholder nothing was hidden. (A pattern can itself appear
+    // inside placeholder text, so occurrences are not compared by count.)
+    if needle.is_empty()
+        || (!masked.contains(SECRET_PLACEHOLDER) && !masked.contains(URL_CREDENTIAL_PLACEHOLDER))
+    {
         return masked.to_string();
     }
     // Split `masked` into visible text and placeholders, in order.
