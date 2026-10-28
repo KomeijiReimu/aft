@@ -5903,13 +5903,21 @@ mod storage_retention_tests {
             .unwrap()
             .unwrap()
             .path();
-        let alias = fs::canonicalize(entry.join("nested")).unwrap();
+        // The identity seam is keyed by path, and the census may see the
+        // alias in its plain or canonical form (macOS /private/var, Windows
+        // verbatim prefixes), so the injected identity covers both.
+        let aliases = [
+            entry.join("nested"),
+            fs::canonicalize(entry.join("nested")).unwrap(),
+        ];
         let task_id = PinnedDir::open(&task)
             .unwrap()
             .directory_identity()
             .unwrap();
         REPAIR_IDENTITIES.with(|ids| {
-            ids.borrow_mut().insert(alias.clone(), task_id);
+            for alias in &aliases {
+                ids.borrow_mut().insert(alias.clone(), task_id);
+            }
         });
         let mut report = TrashReport::default();
         let result = reap_trash_with_snapshot_budget(
@@ -5922,7 +5930,9 @@ mod storage_retention_tests {
             NO_TIME_BOUND,
         );
         REPAIR_IDENTITIES.with(|ids| {
-            ids.borrow_mut().remove(&alias);
+            for alias in &aliases {
+                ids.borrow_mut().remove(alias);
+            }
         });
         assert!(result.unwrap());
         assert_eq!(report.removed_entries, 0, "{report:?}");
