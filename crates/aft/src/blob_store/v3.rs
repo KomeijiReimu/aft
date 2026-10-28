@@ -1275,7 +1275,7 @@ fn encode_root(root: &Path) -> Option<Vec<u8>> {
     }
 }
 
-/// No production caller uses this publication boundary. The read-only preflight
+/// V3 publication boundary for plane rows. The read-only preflight
 /// counts live reservations; final admission follows locked recovery and counts
 /// every remaining reservation.
 #[doc(hidden)]

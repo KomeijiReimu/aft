@@ -13461,12 +13461,13 @@ mod v3_collector_tests {
         }
     }
 
-    /// Views-off configure must leave a v0.60.0 reader floor alone. Views-on
-    /// configure may promote the root, but both v3 floor domains must be durable
-    /// before its first v3 publication. Maintenance must preserve that boundary.
+    /// Views-off configure must not promote a v0.60.0 root to v3. Views-on
+    /// configure may promote it, but both v3 floor domains must be durable before
+    /// its first v3 publication. Maintenance must preserve that boundary.
     #[test]
     fn no_production_path_writes_v3_over_a_v0_60_0_floor() {
         use crate::migration::prune_legacy::{prune_legacy, PruneOptions};
+        use crate::persisted_format::PersistedStore;
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let temp = tempfile::tempdir().unwrap();
         let temp = fs::canonicalize(temp.path()).unwrap();
@@ -13495,12 +13496,41 @@ mod v3_collector_tests {
             assert!(output.status.success(), "git {args:?}: {output:?}");
         }
         fs::write(storage.join("reader-floor.json"), V0_60_0_FLOOR).unwrap();
+        let stores = |text: &str| -> BTreeMap<String, u64> {
+            serde_json::from_value(
+                serde_json::from_str::<serde_json::Value>(text).unwrap()["stores"].take(),
+            )
+            .unwrap()
+        };
+        let before = stores(V0_60_0_FLOOR);
+        let check_baseline = |after: &BTreeMap<String, u64>| {
+            for (name, version) in after {
+                let store = PersistedStore::from_name(name)
+                    .unwrap_or_else(|| panic!("unknown store {name} in the floor: {after:?}"));
+                assert!(
+                    before.get(name) == Some(version) || u64::from(store.written()) == *version,
+                    "{name} at {version} is neither v0.60.0's value nor this build's: {after:?}"
+                );
+            }
+            for name in before.keys() {
+                assert!(after.contains_key(name), "{name} left the floor: {after:?}");
+            }
+        };
         let first_publication = Arc::new(Mutex::new(None));
+        let publication_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::clone(&publication_calls);
         let observed = Arc::clone(&first_publication);
         let observed_storage = storage.clone();
         let _hook = observe_test_hook(
             &storage,
             Arc::new(move |step| {
+                if step == "v3-floor-raising" {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // Isolate syncs performed by this floor raise, not earlier
+                    // configure work on the same worker thread.
+                    crate::durability::take();
+                    return;
+                }
                 if step != "v3-floor-raised" {
                     return;
                 }
@@ -13571,10 +13601,18 @@ mod v3_collector_tests {
                 assert!(!storage.join("blobs/v3").exists());
                 assert!(first_publication.lock().unwrap().is_none());
                 assert_eq!(
-                    fs::read_to_string(storage.join("reader-floor.json")).unwrap(),
-                    V0_60_0_FLOOR,
-                    "views-off configure must not promote the reader floor"
+                    publication_calls.load(std::sync::atomic::Ordering::SeqCst),
+                    0
                 );
+                let after = stores(&fs::read_to_string(storage.join("reader-floor.json")).unwrap());
+                check_baseline(&after);
+                for v3 in [
+                    PersistedStore::ViewsV3Registry,
+                    PersistedStore::ViewsV3Store,
+                ] {
+                    assert_eq!(after.get(v3.name()), before.get(v3.name()));
+                    assert!(!after.contains_key(v3.name()), "views-off promoted {v3:?}");
+                }
             }
         }
         for _ in 0..2 {
@@ -13604,16 +13642,9 @@ mod v3_collector_tests {
         assert!(storage.join("blobs/v3").exists(), "views-on never ran");
         // Non-v3 stores may advance to this build's baseline, but publication
         // must never invent a store key or remove an older reader requirement.
-        use crate::persisted_format::PersistedStore;
-        let stores = |text: &str| -> BTreeMap<String, u64> {
-            serde_json::from_value(
-                serde_json::from_str::<serde_json::Value>(text).unwrap()["stores"].take(),
-            )
-            .unwrap()
-        };
-        let before = stores(V0_60_0_FLOOR);
         let floor = fs::read_to_string(storage.join("reader-floor.json")).unwrap();
         let after = stores(&floor);
+        check_baseline(&after);
         let first = first_publication.lock().unwrap();
         let (published_floor, v3_existed, syncs) = first.as_ref().expect("v3 publication observed");
         assert!(!v3_existed, "v3 data existed before the floor boundary");
@@ -13624,23 +13655,18 @@ mod v3_collector_tests {
         );
         #[cfg(not(unix))]
         let _ = syncs;
-        for v3 in [
-            PersistedStore::ViewsV3Registry,
-            PersistedStore::ViewsV3Store,
+        for (v3, first_version) in [
+            (
+                PersistedStore::ViewsV3Registry,
+                crate::blob_store::v3::REGISTRY_BASE_REFS_VERSION,
+            ),
+            (
+                PersistedStore::ViewsV3Store,
+                crate::blob_store::v3::FORMAT_VERSION,
+            ),
         ] {
-            assert_eq!(published_floor.get(v3), Some(u64::from(v3.written())));
+            assert_eq!(published_floor.get(v3), Some(u64::from(first_version)));
             assert_eq!(after.get(v3.name()), Some(&u64::from(v3.written())));
-        }
-        for (name, version) in &after {
-            let store = PersistedStore::from_name(name)
-                .unwrap_or_else(|| panic!("unknown store {name} in the floor: {floor}"));
-            assert!(
-                before.get(name) == Some(version) || u64::from(store.written()) == *version,
-                "{name} at {version} is neither v0.60.0's value nor this build's: {floor}"
-            );
-        }
-        for name in before.keys() {
-            assert!(after.contains_key(name), "{name} left the floor: {floor}");
         }
     }
 

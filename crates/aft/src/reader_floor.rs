@@ -270,6 +270,8 @@ pub fn publish_v3_with_floor<T>(
     store_version: u32,
     write: impl FnOnce() -> T,
 ) -> Result<T, FloorError> {
+    #[cfg(test)]
+    crate::storage_retention::test_hook(storage_root, "v3-floor-raising");
     raise(
         storage_root,
         &[
