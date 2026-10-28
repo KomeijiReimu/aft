@@ -104,6 +104,15 @@ impl ManifestBlobReader for BlobReader {
 
 /// Reads callgraph blobs from the family's v3 callgraph plane store.
 pub struct V3BlobReader(pub crate::blob_store::v3::PlaneReader);
+
+pub(super) fn v3_error(error: crate::blob_store::v3::Error) -> PlaneError {
+    if error.is_busy() {
+        self::error(format!("{V3_STORE_BUSY}: {error}"))
+    } else {
+        self::error(error)
+    }
+}
+
 impl ManifestBlobReader for V3BlobReader {
     fn read_callgraph_blob(&self, key: &str) -> Result<Option<Vec<u8>>, ManifestJoinError> {
         let bytes = parse_hex32(key)
@@ -358,9 +367,9 @@ impl PlaneAdapter for CallgraphPlane {
         }
     }
 }
-/// Why a checkout view could not supply a reader. `busy` marks a transient
-/// SQLite lock on the view's database: the graph exists and the caller should
-/// retry, which is reported as building rather than unavailable.
+/// Why a checkout view could not supply a reader. `busy` marks transient
+/// contention on a view database or its family ledger, so callers can retry
+/// rather than reporting a permanently unavailable graph.
 #[derive(Clone, Debug)]
 pub(crate) struct CallgraphViewError {
     pub reason: String,
@@ -372,6 +381,16 @@ impl From<String> for CallgraphViewError {
         Self {
             reason,
             busy: false,
+        }
+    }
+}
+
+impl From<PlaneError> for CallgraphViewError {
+    fn from(error: PlaneError) -> Self {
+        Self {
+            busy: error.reason.starts_with(DERIVED_STORE_BUSY)
+                || error.reason.starts_with(V3_STORE_BUSY),
+            reason: error.to_string(),
         }
     }
 }
@@ -391,6 +410,7 @@ impl std::fmt::Display for CallgraphViewError {
 /// Prefix of the plane error for a derived database that a SQLite lock kept
 /// from opening.
 pub(crate) const DERIVED_STORE_BUSY: &str = "callgraph derived store is busy";
+const V3_STORE_BUSY: &str = "callgraph v3 store is busy";
 
 /// Supplies a checkout's verified call graph to one request, without
 /// exposing its storage layout. Implementations never publish v1/v2 data and
@@ -457,7 +477,7 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
         let (mut snapshot, revision) = self
             .driver
             .verified_bind(&self.access, seed)
-            .map_err(|error| error.to_string())?;
+            .map_err(CallgraphViewError::from)?;
         if has_unpublished_changes(&snapshot) {
             // Publish the edits as a new worker generation (a donor clone
             // patched with the diff) before the single install, as a fresh
@@ -471,7 +491,7 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
                     &snapshot,
                     super::first_load::DERIVED_CALLGRAPH_SEEDING,
                 )
-                .map_err(|error| error.to_string())?;
+                .map_err(CallgraphViewError::from)?;
             let cut = snapshot
                 .install_cut()
                 .cloned()
@@ -492,7 +512,7 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
         }
         self.driver
             .install(&self.access, &snapshot, revision)
-            .map_err(|error| error.to_string())?;
+            .map_err(CallgraphViewError::from)?;
         // Read the installed cut directly: `installed_snapshot` would mark a
         // checkout without a steady watcher subscription overflowed at once.
         // That mark only decides how the next bind reconciles; this cut was
@@ -528,10 +548,7 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
                 self.bridge
                     .adapter
                     .open_generation(&self.access, snapshot.generation())
-                    .map_err(|error| CallgraphViewError {
-                        busy: error.reason.starts_with(DERIVED_STORE_BUSY),
-                        reason: error.to_string(),
-                    })?;
+                    .map_err(CallgraphViewError::from)?;
                 self.bridge
                     .adapter
                     .reader(&self.access, &snapshot)
@@ -759,6 +776,51 @@ mod tests {
 
     fn events(dir: &Path) -> Vec<super::super::donor::DonorEvent> {
         super::super::donor::events_under(dir)
+    }
+
+    #[test]
+    fn v3_checkpoint_contention_reaches_checkout_reader_as_busy() {
+        use crate::blob_store::v3;
+        use crate::db::file_identity::IdentityConnection;
+        let _serial = v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let root = checkout(&temp.path().join("checkout"));
+        let graph = view(&root, &storage);
+        assert_eq!(callers(&graph.reader().unwrap(), "a.ts", "target").len(), 1);
+        let plane = v3::plane_path(&storage, "donor-reuse", FamilyPlane::Callgraph).unwrap();
+        let blocker = IdentityConnection::open_with_flags(
+            &plane,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            "callgraph-v3-checkpoint-blocker",
+        )
+        .unwrap();
+        // Pin a real WAL snapshot before the next publication appends frames.
+        blocker
+            .execute_batch("BEGIN; SELECT * FROM sqlite_schema;")
+            .unwrap();
+        let added = root.join("c.ts");
+        std::fs::write(
+            &added,
+            "import { caller } from './b';\nexport function top() { return caller(); }\n",
+        )
+        .unwrap();
+        graph.record_change(&added);
+        let error = match graph.reader() {
+            Ok(_) => panic!("a pinned WAL reader should prevent the truncating checkpoint"),
+            Err(error) => error,
+        };
+        assert!(error.busy, "{error}");
+        assert!(error.reason.contains(V3_STORE_BUSY), "{error}");
+        assert!(error.reason.contains("checkpoint WAL"), "{error}");
+        assert!(error.reason.contains("callgraph.sqlite"), "{error}");
+        assert!(
+            error.reason.contains("wal_checkpoint(TRUNCATE): busy=1"),
+            "{error}"
+        );
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+        assert_eq!(callers(&graph.reader().unwrap(), "b.ts", "caller").len(), 1);
     }
 
     #[test]

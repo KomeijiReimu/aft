@@ -120,6 +120,112 @@ fn db(storage: &Path, family: &str) -> PathBuf {
     family_dir(storage, family).unwrap().join("members.sqlite")
 }
 
+type RecheckHook = Box<dyn FnMut() -> Result<()>>;
+thread_local! {
+    static RECHECK_HOOK: std::cell::RefCell<Option<RecheckHook>> = const { std::cell::RefCell::new(None) };
+}
+pub(super) fn measurement_recheck_hook() -> Result<()> {
+    RECHECK_HOOK.with(|hook| match &mut *hook.borrow_mut() {
+        Some(hook) => hook(),
+        None => Ok(()),
+    })
+}
+
+#[test]
+fn checkpoint_contention_is_busy_and_preserves_sqlite_cause() {
+    let _guard = serial();
+    let root = tempdir().unwrap();
+    seed(root.path(), A);
+    let path = db(root.path(), A);
+    let lock = ReservationLock::acquire(root.path()).unwrap();
+    let mut writer = RegistryWriter::open_for_barrier(root.path(), A, &lock).unwrap();
+    writer
+        .connection()
+        .unwrap()
+        .busy_timeout(std::time::Duration::ZERO)
+        .unwrap();
+    let reader = IdentityConnection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+        "v3-checkpoint-blocker",
+    )
+    .unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT * FROM accounting;")
+        .unwrap();
+    writer
+        .with_barrier(|tx| {
+            tx.execute("UPDATE accounting SET watermark=watermark+1", [])?;
+            Ok(())
+        })
+        .unwrap();
+
+    let error = writer.covering_measurement().unwrap_err();
+    assert!(error.is_busy(), "{error}");
+    let detail = error.to_string();
+    assert!(
+        detail.starts_with("reservation_ledger_busy: checkpoint WAL"),
+        "{detail}"
+    );
+    assert!(detail.contains("members.sqlite"), "{detail}");
+    assert!(
+        detail.contains("wal_checkpoint(TRUNCATE): busy=1"),
+        "{detail}"
+    );
+    assert!(matches!(error, Error::Ledger { source, .. }
+        if matches!(*source, Error::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+            if code.code == rusqlite::ErrorCode::DatabaseBusy)));
+
+    reader.execute_batch("ROLLBACK").unwrap();
+    writer.covering_measurement().unwrap();
+    assert_eq!(writer.accounting().unwrap().reserved_bytes, 0);
+}
+
+#[test]
+fn changing_derived_database_reports_busy_then_measurement_recovers() {
+    let _guard = serial();
+    let root = tempdir().unwrap();
+    seed(root.path(), A);
+    let derived_dir = view_dir(root.path(), A, "churning-view").unwrap();
+    fs::create_dir_all(&derived_dir).unwrap();
+    let derived = IdentityConnection::open(
+        derived_dir.join("derived-generation.sqlite"),
+        "v3-measurement-churn",
+    )
+    .unwrap();
+    derived
+        .execute_batch("CREATE TABLE growing(payload BLOB)")
+        .unwrap();
+    let lock = ReservationLock::acquire(root.path()).unwrap();
+    let mut writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
+    let writes = std::rc::Rc::new(std::cell::Cell::new(0));
+    let count = writes.clone();
+    // A derived graph can commit outside the root reservation lock. Place one
+    // real SQLite commit between each inventory walk and its confirmation.
+    RECHECK_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            derived.execute("INSERT INTO growing VALUES(zeroblob(16384))", [])?;
+            count.set(count.get() + 1);
+            Ok(())
+        }))
+    });
+    let result = writer.covering_measurement();
+    RECHECK_HOOK.with(|hook| *hook.borrow_mut() = None);
+    let error = result.unwrap_err();
+    assert_eq!(writes.get(), 8);
+    assert!(error.is_busy(), "{error}");
+    let detail = error.to_string();
+    assert!(
+        detail.starts_with("reservation_ledger_busy: measure registry"),
+        "{detail}"
+    );
+    assert!(detail.contains("8 measurements"), "{detail}");
+
+    let measured = writer.covering_measurement().unwrap();
+    assert_eq!(measured, allocated_bytes(writer.family_dir()).unwrap());
+    assert_eq!(writer.accounting().unwrap().reserved_bytes, 0);
+}
+
 #[test]
 fn floor_refusal_before_creation_and_budget_recheck_leave_no_plane_or_row() {
     let _guard = serial();
@@ -219,7 +325,14 @@ fn unreadable_peer_ledger_refuses_instead_of_ignoring_reserved_bytes() {
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("members.sqlite"), b"not sqlite").unwrap();
     let error = publish(root.path(), B, 100, None, |_| Ok(())).unwrap_err();
-    assert_eq!(error.to_string(), "reservation_ledger_unreadable");
+    let detail = error.to_string();
+    assert!(!error.is_busy(), "{detail}");
+    assert!(
+        detail.starts_with("reservation_ledger_unreadable: recover registry"),
+        "{detail}"
+    );
+    assert!(detail.contains("members.sqlite"), "{detail}");
+    assert!(detail.contains("file is not a database"), "{detail}");
     assert!(!db(root.path(), B).exists());
 }
 
@@ -1477,7 +1590,14 @@ fn incomplete_marker_with_application_data_is_not_reset() {
     let root = tempdir().unwrap();
     legacy_bootstrap(root.path(), Kind::Registry, 2, true);
     let error = publish(root.path(), B, 1, None, |_| Ok(())).unwrap_err();
-    assert_eq!(error.to_string(), "reservation_ledger_unreadable");
+    let detail = error.to_string();
+    assert!(!error.is_busy(), "{detail}");
+    assert!(
+        detail.starts_with("reservation_ledger_unreadable: recover registry"),
+        "{detail}"
+    );
+    assert!(detail.contains("members.sqlite"), "{detail}");
+    assert!(detail.contains("schema_drift"), "{detail}");
     let path = db(root.path(), A);
     assert_eq!(crate::db::file_identity::open_connections(&path), 0);
     let c = IdentityConnection::open_with_flags(

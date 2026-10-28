@@ -156,6 +156,7 @@ pub enum Error {
     Sqlite(rusqlite::Error),
     Incompatible(UnsupportedPersistedFormat),
     Refused(&'static str),
+    Busy(&'static str),
     Ledger {
         path: PathBuf,
         operation: &'static str,
@@ -171,13 +172,19 @@ impl fmt::Display for Error {
             Self::Sqlite(e) => write!(f, "{e}"),
             Self::Incompatible(e) => write!(f, "{e}"),
             Self::Refused(reason) => f.write_str(reason),
+            Self::Busy(reason) => write!(f, "v3 store busy: {reason}"),
             Self::Ledger {
                 path,
                 operation,
                 source,
             } => write!(
                 f,
-                "reservation_ledger_unreadable: {operation} {}: {source}",
+                "{}: {operation} {}: {source}",
+                if self.is_busy() {
+                    "reservation_ledger_busy"
+                } else {
+                    "reservation_ledger_unreadable"
+                },
                 path.display()
             ),
             Self::InvalidIdentity => f.write_str("invalid v3 family, scope or lock identity"),
@@ -185,8 +192,35 @@ impl fmt::Display for Error {
         }
     }
 }
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Sqlite(error) => Some(error),
+            Self::Ledger { source, .. } => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
 impl Error {
+    /// Contention is retryable; unreadable or incompatible ledgers are not
+    /// treated as empty accounting or as transient contention.
+    pub fn is_busy(&self) -> bool {
+        match self {
+            Self::Busy(_) => true,
+            Self::Sqlite(rusqlite::Error::SqliteFailure(error, _)) => matches!(
+                error.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ),
+            Self::Io(error) => {
+                error.kind() == std::io::ErrorKind::WouldBlock
+                    || cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33))
+            }
+            Self::Ledger { source, .. } => source.is_busy(),
+            _ => false,
+        }
+    }
+
     fn ledger(path: &Path, operation: &'static str, source: impl Into<Error>) -> Self {
         Self::Ledger {
             path: path.to_path_buf(),
@@ -1122,6 +1156,8 @@ impl<'a> RegistryWriter<'a> {
             // walk did not count, so only a complete recheck that finds the
             // same total confirms it. A recheck the deadline stops is not a
             // confirmation.
+            #[cfg(test)]
+            tests::measurement_recheck_hook()?;
             match allocated_bytes_until(&self.dir, deadline)? {
                 Some(again) if again == bytes => return Ok(Measurement::Recorded(bytes)),
                 Some(_) => {}
@@ -1131,7 +1167,7 @@ impl<'a> RegistryWriter<'a> {
         Err(Error::ledger(
             &self.dir,
             "measure registry",
-            std::io::Error::other("namespace size did not stabilize after 8 measurements"),
+            Error::Busy("namespace size did not stabilize after 8 measurements"),
         ))
     }
     pub fn with_barrier<T>(
@@ -1297,7 +1333,7 @@ fn settle_registry_growth(
     Err(Error::ledger(
         dir,
         "settle registry growth",
-        std::io::Error::other("registry size did not stabilize after 8 corrections"),
+        Error::Busy("registry size did not stabilize after 8 corrections"),
     ))
 }
 
@@ -1322,7 +1358,7 @@ fn checkpoint(c: &Connection) -> Result<()> {
     if busy != 0 {
         return Err(Error::ledger(
             Path::new(c.path().unwrap_or("<unknown>")),
-            "checkpoint registry",
+            "checkpoint WAL",
             rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
                 Some(format!(
