@@ -7562,15 +7562,17 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
         1,
         901,
         "subc_test_emit_bash_completed_burst",
-        json!({ "prefix": flood_prefix, "count": flood_count }),
+        json!({ "prefix": flood_prefix, "count": 1 }),
     )
     .await;
-    // Confirm flood pressure before holding the loop. The independent ACK lane
-    // may overtake proxied frames once configure completes, and the held batch
-    // need not be visible on the socket until the loop resumes.
+    // Drain one marker and its response before holding the loop. The
+    // bind-ACK path queues synchronously only when the raw writer has capacity;
+    // otherwise its off-loop waiter can observe later reliable batches even
+    // when the route-bind completion was drained first. Isolate loop priority from
+    // writer backpressure by queuing the entire reliable flood during the hold.
     let mut flood_seen = 0_u64;
     let mut flood_response_seen = false;
-    while flood_seen == 0 {
+    while flood_seen == 0 || !flood_response_seen {
         let frame =
             read_any_frame_timeout(&mut stream, "flood pressure before bind completion").await;
         match frame.header.ty {
@@ -7608,6 +7610,13 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
         &ctx,
         bash_completed_push(ready_task, "session-1")
     ));
+    for seq in 0..flood_count {
+        assert!(emit_push_frame(
+            &ctx,
+            bash_completed_push(&format!("{flood_prefix}-held-{seq}"), "session-1")
+        ));
+    }
+    let expected_flood_count = 1 + flood_count;
     // Fill the 1024-slot lossy funnel and put an update in overflow while the
     // loop is held. Overflow drains a reliable batch before the biased select,
     // so only the pre-turn bind drain can put the ready ACK ahead of that batch.
@@ -7648,7 +7657,7 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
     let mut after_ack_seen = false;
     let deadline = Instant::now() + Duration::from_secs(30);
     while !ack_seen
-        || flood_seen < flood_count
+        || flood_seen < expected_flood_count
         || !flood_response_seen
         || !ready_seen
         || !after_ack_seen
@@ -7697,7 +7706,7 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
         }
     }
     assert_eq!(
-        flood_seen, flood_count,
+        flood_seen, expected_flood_count,
         "every reliable flood frame must arrive"
     );
     state.wait_for_slow_configure_finished(slow_bind_base + 1);
