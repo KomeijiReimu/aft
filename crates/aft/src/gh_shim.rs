@@ -859,6 +859,12 @@ fn run_with(
     }
 
     let target = TargetRepository::from_invocation(args);
+    // Probing can publish captured context after the initial check. Recheck at
+    // every later passthrough boundary without changing unprovisioned fallback.
+    let captured_now = || {
+        crate::gh_shim_speech::start_view::protected(args)
+            .then(|| run_captured_protected(args, &paths, &target, &cwd, now))
+    };
     // A write aimed at a repository no signed binding covers cannot be spoken
     // by any bot, and upstream `gh` would run it under the operator's own
     // login. Decide that before the rung probe: the answer does not depend on
@@ -925,6 +931,9 @@ fn run_with(
                 "destructive GitHub operations are not available through the shim",
             ),
             GovernanceDisposition::Delegate | GovernanceDisposition::Ready => {
+                if let Some(status) = captured_now() {
+                    return status;
+                }
                 match invalid_manifest_problem.as_ref() {
                     Some(problem) => {
                         delegate_after_invalid_manifest_notice(args, problem, delegate)
@@ -942,22 +951,40 @@ fn run_with(
     let manifest = match resolve_manifest(&paths, now) {
         ManifestResolution::Active(manifest) => manifest,
         ManifestResolution::Regressed { manifest, problem } => {
+            if let Some(status) = captured_now() {
+                return status;
+            }
             return match regressed_disposition(args, &manifest, current_platform(), &problem) {
                 RegressedDisposition::Passthrough => {
                     delegate_after_invalid_manifest_notice(args, &problem, delegate)
                 }
                 RegressedDisposition::Refuse { code, text } => refuse(code, &text),
-            }
+            };
         }
         ManifestResolution::Invalid(problem) => {
-            return delegate_after_invalid_manifest_notice(args, &problem, delegate)
+            if let Some(status) = captured_now() {
+                return status;
+            }
+            return delegate_after_invalid_manifest_notice(args, &problem, delegate);
         }
-        ManifestResolution::Dormant => return delegate(args),
+        ManifestResolution::Dormant => {
+            if let Some(status) = captured_now() {
+                return status;
+            }
+            return delegate(args);
+        }
     };
     let classification = classify(args, &manifest, current_platform());
     let Some(agent_binding) = governing_binding(&classification, &manifest, &target, &cwd) else {
+        if let Some(status) = captured_now() {
+            return status;
+        }
         return delegate(args);
     };
+
+    if let Some(status) = captured_now() {
+        return status;
+    }
 
     dispatch_r3(
         args,
