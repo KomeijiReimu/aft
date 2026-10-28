@@ -4096,6 +4096,7 @@ mod grant_path_tests {
             json!({"command": "echo hello; while [ ! -f release ]; do sleep 0.1; done", "wait": true}),
             crate::subc_format::FormatContext::default(),
             BashWaitCancel {
+                speech_seed: None,
                 run_scope: None,
                 scope: None,
                 late_results: false,
