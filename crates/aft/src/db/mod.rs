@@ -1082,7 +1082,7 @@ mod tests {
             apply_migration(&mut conn, version).unwrap();
         }
         assert_eq!(current_schema_version(&conn).unwrap(), 21);
-        assert_eq!(run_migrations(&mut conn).unwrap(), 23);
+        assert_eq!(run_migrations(&mut conn).unwrap(), CURRENT_SCHEMA_VERSION);
         for table in [
             "gh_speech_authorities",
             "gh_speech_task_revocations",
@@ -1101,7 +1101,7 @@ mod tests {
                 .unwrap();
             assert!(present, "missing {table}");
         }
-        assert_eq!(MIGRATION_VERSIONS, (1..=23).collect::<Vec<_>>());
+        assert_eq!(MIGRATION_VERSIONS, (1..=24).collect::<Vec<_>>());
     }
 
     #[test]
@@ -1118,7 +1118,7 @@ mod tests {
             absent,
             "schema 22 must not silently acquire schema 23 tables"
         );
-        assert_eq!(run_migrations(&mut conn).unwrap(), 23);
+        assert_eq!(run_migrations(&mut conn).unwrap(), CURRENT_SCHEMA_VERSION);
         let reason: String = conn
             .query_row(
                 "SELECT reason FROM gh_speech_task_revocations WHERE incarnation='old-task'",
@@ -1136,6 +1136,52 @@ mod tests {
             .unwrap();
         assert_eq!(count, 0);
     }
+    #[test]
+    fn schema_twenty_three_upgrade_adds_watch_gap_state_after_speech_authority() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)")
+            .unwrap();
+        for version in 1..=23 {
+            apply_migration(&mut conn, version).unwrap();
+        }
+        conn.execute("INSERT INTO gh_speech_task_revocations(incarnation,reason,recorded_at_ms) VALUES('old-task','cancelled',1)", []).unwrap();
+        assert!(!migration_already_applied(&conn, 24).unwrap());
+        let count: u32 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('bash_watch_delivery_acks','bash_watch_delivery_gaps')", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(run_migrations(&mut conn).unwrap(), 24);
+        assert!(migration_already_applied(&conn, 24).unwrap());
+        bash_watches::acknowledge_delivery(&conn, "opencode", "session", "task", "watch", 7, None)
+            .unwrap();
+        assert_eq!(
+            bash_watches::delivery_ack_version(&conn, "opencode", "session", "task", "watch")
+                .unwrap()
+                .unwrap()
+                .0,
+            7
+        );
+        assert!(
+            bash_watches::list_delivery_gaps(&conn, "opencode", Some("session"))
+                .unwrap()
+                .is_empty()
+        );
+        let reason: String = conn
+            .query_row(
+                "SELECT reason FROM gh_speech_task_revocations WHERE incarnation='old-task'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, "cancelled");
+        let dispatch_count: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM gh_speech_legacy_dispatch",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dispatch_count, 0);
+    }
+
     use rusqlite::params;
     use tempfile::tempdir;
 

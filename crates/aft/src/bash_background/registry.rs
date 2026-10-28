@@ -27830,6 +27830,7 @@ mod tests {
             context: "READY first".into(),
             once: false,
             batch: None,
+            literal_pattern: false,
         };
         registry.persist_watch_match("session", &task.task_id, &mut first, 20, 0, 0);
         let mut second = first.clone();
@@ -27858,9 +27859,7 @@ mod tests {
         assert_eq!(gap.dropped_notifications, 1);
         assert_eq!(gap.known_missing_occurrences, 1);
         assert_eq!(gap.first_offset, Some(10));
-        assert!(pending
-            .context
-            .contains("The dropped notices cannot be recovered."));
+        assert!(pending.context.contains("they cannot be recovered."));
         for terminal in [false, true] {
             registry.ack_persisted_watches_for_task("session", &task.task_id, terminal);
             assert!(registry

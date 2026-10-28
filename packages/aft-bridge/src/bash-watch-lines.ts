@@ -88,8 +88,14 @@ export function formatWatchLineBatch(
     const taskKey = camelCase ? "taskId" : "task_id";
     const cursor = gap.stream === "stderr" ? "stderr" : "output";
     const offsetKey = camelCase ? `${cursor}Offset` : `${cursor}_offset`;
+    const missing =
+      gap.known_missing_occurrences === 0
+        ? "Some matches may be missing."
+        : gap.known_missing_occurrences === 1
+          ? "At least 1 match is missing."
+          : `At least ${gap.known_missing_occurrences} matches are missing.`;
     lines.push(
-      `Watch delivery gap: a stalled connection dropped ${gap.dropped_notifications} watch ${gap.dropped_notifications === 1 ? "notice" : "notices"}; matches may be missing. The dropped notices cannot be recovered.${gap.known_missing_occurrences > 0 ? ` Known missing occurrences: ${gap.known_missing_occurrences}.` : ""} Inspect retained task output with bash_status({ ${taskKey}: ${JSON.stringify(taskId)}, ${offsetKey}: ${gap.first_offset ?? 0} }).`,
+      `Some watch notices were lost: a stalled connection dropped ${gap.dropped_notifications} of them, and they cannot be recovered. ${missing} Read the task output with bash_status({ ${taskKey}: ${JSON.stringify(taskId)}, ${offsetKey}: ${gap.first_offset ?? 0} }).`,
     );
   }
   return lines.join("\n");

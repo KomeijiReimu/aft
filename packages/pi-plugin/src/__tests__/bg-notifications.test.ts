@@ -1439,7 +1439,28 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-test("retry gap-only reminder reports unrecoverable notices and an output offset", () => {
+test.each([
+  [
+    2,
+    1,
+    'Some watch notices were lost: a stalled connection dropped 2 of them, and they cannot be recovered. At least 1 match is missing. Read the task output with bash_status({ task_id: "bash-gap", stderr_offset: 16 }).',
+  ],
+  [
+    1,
+    0,
+    'Some watch notices were lost: a stalled connection dropped 1 of them, and they cannot be recovered. Some matches may be missing. Read the task output with bash_status({ task_id: "bash-gap", stderr_offset: 16 }).',
+  ],
+  [
+    1,
+    1,
+    'Some watch notices were lost: a stalled connection dropped 1 of them, and they cannot be recovered. At least 1 match is missing. Read the task output with bash_status({ task_id: "bash-gap", stderr_offset: 16 }).',
+  ],
+  [
+    2,
+    3,
+    'Some watch notices were lost: a stalled connection dropped 2 of them, and they cannot be recovered. At least 3 matches are missing. Read the task output with bash_status({ task_id: "bash-gap", stderr_offset: 16 }).',
+  ],
+] as const)("retry gap-only reminder pins wording (%i notices, %i missing)", (notices, missing, expected) => {
   const reminder = formatPatternMatchReminder([
     {
       task_id: "bash-gap",
@@ -1457,8 +1478,8 @@ test("retry gap-only reminder reports unrecoverable notices and an output offset
         first_dropped_stream: null,
         retry_gap: {
           reason: "retry_overflow",
-          dropped_notifications: 2,
-          known_missing_occurrences: 1,
+          dropped_notifications: notices,
+          known_missing_occurrences: missing,
           first_offset: 16,
           last_offset: 24,
           stream: "stderr",
@@ -1467,9 +1488,7 @@ test("retry gap-only reminder reports unrecoverable notices and an output offset
     },
   ]);
   expect(reminder).toContain("[BG BASH NOTIFY]");
-  expect(reminder).toContain(
-    'Watch delivery gap: a stalled connection dropped 2 watch notices; matches may be missing. The dropped notices cannot be recovered. Known missing occurrences: 1. Inspect retained task output with bash_status({ task_id: "bash-gap", stderr_offset: 16 }).',
-  );
+  expect(reminder).toContain(expected);
 });
 
 test("each_line reminder keeps bounded rows and drop recovery hint", () => {
@@ -1759,8 +1778,8 @@ for (const route of ["in-turn", "wake"] as const) {
       return sent.at(-1)!;
     };
     const old = await deliver();
-    expect(old).toContain("a stalled connection dropped 2 watch notices; matches may be missing.");
-    expect(old).toContain("Known missing occurrences: 1.");
+    expect(old).toContain("a stalled connection dropped 2 of them, and they cannot be recovered.");
+    expect(old).toContain("At least 1 match is missing.");
     current = {
       ...first,
       match_offset: 1,
@@ -1778,9 +1797,9 @@ for (const route of ["in-turn", "wake"] as const) {
       },
     };
     const next = await deliver();
-    expect(next).toContain("a stalled connection dropped 1 watch notice; matches may be missing.");
-    expect(next).not.toContain("dropped 3 watch notices");
-    expect(next).toContain("Known missing occurrences: 1.");
+    expect(next).toContain("a stalled connection dropped 1 of them, and they cannot be recovered.");
+    expect(next).not.toContain("dropped 3 of them");
+    expect(next).toContain("At least 1 match is missing.");
     expect(acknowledgements.at(-1)).toEqual({
       session_id: "s1",
       matches: [{ task_id: "task-batch", watch_id: "watch-batch", match_offset: 1 }],
