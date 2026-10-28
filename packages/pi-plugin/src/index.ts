@@ -1133,4 +1133,5 @@ export const __test__ = {
   handleConfigureWarningsForSession,
   shouldPrepareOnnxRuntime,
   createVersionMismatchHandler,
+  announcementVersion: ANNOUNCEMENT_VERSION,
 };
