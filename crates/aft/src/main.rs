@@ -135,10 +135,14 @@ fn storage_lease_exit_probe() {
 fn initialize_global_rayon_pool() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        rayon::ThreadPoolBuilder::new()
+        // Names only help profiling, so never fail startup over them: if
+        // something already used Rayon, its unnamed pool keeps working.
+        if let Err(error) = rayon::ThreadPoolBuilder::new()
             .thread_name(|index| format!("aft-rayon-{index}"))
             .build_global()
-            .expect("initialize AFT's named Rayon pool before parallel work");
+        {
+            eprintln!("aft: Rayon pool already started; its threads stay unnamed: {error}");
+        }
     });
 }
 
