@@ -127,6 +127,7 @@ type BashLongRunningPayload = {
 };
 
 type BashPatternMatchPayload = {
+  batch?: import("@cortexkit/aft-bridge").BashWatchLineBatch;
   session_id: string;
   task_id: string;
   watch_id: string;

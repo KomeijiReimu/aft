@@ -134,6 +134,8 @@ pub struct BashPatternMatchFrame {
     pub context: String,
     pub once: bool,
     pub reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<crate::bash_background::watch_lines::LineBatch>,
 }
 
 /// Pushed after configure has completed, when the deferred file walk and
@@ -409,6 +411,7 @@ impl BashPatternMatchFrame {
     ) -> Self {
         Self {
             frame_type: "bash_pattern_match",
+            batch: None,
             task_id: task_id.into(),
             session_id: session_id.into(),
             watch_id: watch_id.into(),
@@ -428,6 +431,7 @@ impl BashPatternMatchFrame {
     ) -> Self {
         Self {
             frame_type: "bash_pattern_match",
+            batch: None,
             task_id: task_id.into(),
             session_id: session_id.into(),
             watch_id: "exit".to_string(),
@@ -450,6 +454,7 @@ impl BashPatternMatchFrame {
         // reason because clients only accept pattern_match and task_exit.
         Self {
             frame_type: "bash_pattern_match",
+            batch: None,
             task_id: task_id.into(),
             session_id: session_id.into(),
             watch_id: watch_id.into(),

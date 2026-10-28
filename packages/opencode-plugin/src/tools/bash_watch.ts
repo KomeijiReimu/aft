@@ -12,6 +12,7 @@ import {
   TERMINAL_SCAN_INCOMPLETE_TEXT,
   taskKillDeadlineText,
   taskKillDeadlineWithinHandoffMargin,
+  WATCH_EACH_LINE_NEEDS_BACKGROUND,
   WATCH_SYNC_DEFAULTS_DESCRIPTION,
   WATCH_TIMEOUT_PARAM_DESCRIPTION,
   WATCH_UNAVAILABLE_GIVE_UP_MS,
@@ -145,6 +146,12 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
           "When true, register an async watch and return immediately. Defaults to false (sync wait).",
         ),
       timeoutMs: optionalInt(1, 1800000).describe(WATCH_TIMEOUT_PARAM_DESCRIPTION),
+      deliver: z
+        .literal("each_line")
+        .optional()
+        .describe(
+          "Async-only: batch every matching complete line, fold consecutive duplicates, and report cap drops with byte offsets.",
+        ),
       once: z
         .boolean()
         .optional()
@@ -168,6 +175,12 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
         requestedAsync && subagentStatus !== false && !bashCfg.subagent_background;
       const isSubagent = subagentStatus === true;
       const asyncMode = requestedAsync && !subagentForcedSync;
+      if (args.deliver !== undefined && !asyncMode) {
+        throw new Error(WATCH_EACH_LINE_NEEDS_BACKGROUND);
+      }
+      if (args.deliver !== undefined && args.deliver !== "each_line") {
+        throw new Error("invalid_request: bash_watch deliver must be each_line");
+      }
 
       if (asyncMode) {
         if (!waitFor) {
@@ -179,6 +192,7 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
           task_id: taskId,
           once: coerceBoolean(args.once, true),
         };
+        if (args.deliver !== undefined) notifyParams.deliver = args.deliver;
         if (waitFor.kind === "regex") notifyParams.regex = waitFor.source;
         else notifyParams.pattern = waitFor.value;
         markExplicitControl(context.sessionID, taskId, false);

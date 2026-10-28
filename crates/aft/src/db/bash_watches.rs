@@ -15,6 +15,8 @@ pub struct BashPatternWatchRow {
     pub pattern_kind: String,
     pub pattern: String,
     pub once: bool,
+    pub each_line: bool,
+    pub match_batch: Option<String>,
     pub created_at: i64,
     pub stdout_offset: i64,
     pub stderr_offset: i64,
@@ -35,11 +37,11 @@ pub fn upsert_bash_pattern_watch(
         "INSERT INTO bash_pattern_watches (
             harness, session_id, task_id, watch_id, pattern_kind, pattern, once,
             created_at, stdout_offset, stderr_offset, pty_offset, scanning,
-            pending_match, match_text, match_offset, match_context
+            pending_match, match_text, match_offset, match_context, each_line, match_batch
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7,
             ?8, ?9, ?10, ?11, ?12,
-            ?13, ?14, ?15, ?16
+            ?13, ?14, ?15, ?16, ?17, ?18
          )
          ON CONFLICT(harness, session_id, task_id, watch_id) DO UPDATE SET
             pattern_kind = excluded.pattern_kind,
@@ -53,7 +55,7 @@ pub fn upsert_bash_pattern_watch(
             pending_match = excluded.pending_match,
             match_text = excluded.match_text,
             match_offset = excluded.match_offset,
-            match_context = excluded.match_context",
+            match_context = excluded.match_context, each_line = excluded.each_line, match_batch = excluded.match_batch",
         params![
             row.harness,
             row.session_id,
@@ -71,6 +73,8 @@ pub fn upsert_bash_pattern_watch(
             row.match_text,
             row.match_offset,
             row.match_context,
+            row.each_line,
+            row.match_batch,
         ],
     )?;
     Ok(())
@@ -112,7 +116,7 @@ pub fn list_bash_pattern_watches_for_task(
     let mut stmt = conn.prepare(
         "SELECT harness, session_id, task_id, watch_id, pattern_kind, pattern, once,
                 created_at, stdout_offset, stderr_offset, pty_offset, scanning,
-                pending_match, match_text, match_offset, match_context
+                pending_match, match_text, match_offset, match_context, each_line, match_batch
          FROM bash_pattern_watches
          WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3
          ORDER BY created_at ASC, watch_id ASC",
@@ -131,7 +135,7 @@ pub fn list_bash_pattern_watches_for_session(
     let mut stmt = conn.prepare(
         "SELECT harness, session_id, task_id, watch_id, pattern_kind, pattern, once,
                 created_at, stdout_offset, stderr_offset, pty_offset, scanning,
-                pending_match, match_text, match_offset, match_context
+                pending_match, match_text, match_offset, match_context, each_line, match_batch
          FROM bash_pattern_watches
          WHERE harness = ?1 AND session_id = ?2
          ORDER BY created_at ASC, task_id ASC, watch_id ASC",
@@ -149,7 +153,7 @@ pub fn list_bash_pattern_watches(
     let mut stmt = conn.prepare(
         "SELECT harness, session_id, task_id, watch_id, pattern_kind, pattern, once,
                 created_at, stdout_offset, stderr_offset, pty_offset, scanning,
-                pending_match, match_text, match_offset, match_context
+                pending_match, match_text, match_offset, match_context, each_line, match_batch
          FROM bash_pattern_watches
          WHERE harness = ?1
          ORDER BY created_at ASC, task_id ASC, watch_id ASC",
@@ -166,7 +170,7 @@ pub fn list_bash_pattern_watches_by_task_id(
     let mut stmt = conn.prepare(
         "SELECT harness, session_id, task_id, watch_id, pattern_kind, pattern, once,
                 created_at, stdout_offset, stderr_offset, pty_offset, scanning,
-                pending_match, match_text, match_offset, match_context
+                pending_match, match_text, match_offset, match_context, each_line, match_batch
          FROM bash_pattern_watches
          WHERE harness = ?1 AND task_id = ?2
          ORDER BY created_at ASC, session_id ASC, watch_id ASC",
@@ -214,7 +218,7 @@ pub fn get_bash_pattern_watch(
     conn.query_row(
         "SELECT harness, session_id, task_id, watch_id, pattern_kind, pattern, once,
                 created_at, stdout_offset, stderr_offset, pty_offset, scanning,
-                pending_match, match_text, match_offset, match_context
+                pending_match, match_text, match_offset, match_context, each_line, match_batch
          FROM bash_pattern_watches
          WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3 AND watch_id = ?4",
         params![harness, session_id, task_id, watch_id],
@@ -265,5 +269,7 @@ fn map_watch_row(row: &Row<'_>) -> rusqlite::Result<BashPatternWatchRow> {
         match_text: row.get(13)?,
         match_offset: row.get(14)?,
         match_context: row.get(15)?,
+        each_line: row.get(16)?,
+        match_batch: row.get(17)?,
     })
 }

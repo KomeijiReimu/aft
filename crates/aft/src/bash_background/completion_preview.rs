@@ -12,7 +12,29 @@ pub(super) const TRUNCATED_PREVIEW_WITHHELD: &str =
 const WATCH_SECRET_HALO_BYTES: usize = 1024;
 /// A watch preview is masked over whole lines (see `watch_mask_region`). When
 /// those lines exceed this many bytes, the preview is withheld instead.
-pub(super) const WATCH_PREVIEW_LINE_CAP_BYTES: usize = 8 * 1024;
+pub(super) const WATCH_PREVIEW_LINE_CAP_BYTES: usize =
+    super::super::watch_lines::MASKING_LINE_CAP_BYTES;
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct UnavailablePreview {
+    pub line_limit: bool,
+    pub reason: &'static str,
+}
+
+impl UnavailablePreview {
+    pub(super) fn context(reason: &'static str) -> Self {
+        Self {
+            line_limit: false,
+            reason,
+        }
+    }
+    pub(super) fn line_limit() -> Self {
+        Self {
+            line_limit: true,
+            reason: TRUNCATED_PREVIEW_WITHHELD,
+        }
+    }
+}
 /// Bytes read beyond the largest maskable region on each side, so a JSON field
 /// or private-key block that crosses a line break into the region can be seen
 /// whole and the region widened to include it.
@@ -101,6 +123,29 @@ impl BgTaskRegistry {
         starts_capture: bool,
         ends_capture: bool,
     ) -> (String, String) {
+        self.render_watch_preview_window_checked(
+            task_id,
+            bytes,
+            range,
+            starts_capture,
+            ends_capture,
+        )
+        .unwrap_or_else(|unavailable| {
+            (
+                crate::log_redact::SECRET_PLACEHOLDER.to_string(),
+                unavailable.reason.to_string(),
+            )
+        })
+    }
+
+    pub(super) fn render_watch_preview_window_checked(
+        &self,
+        task_id: &str,
+        bytes: &[u8],
+        range: std::ops::Range<usize>,
+        starts_capture: bool,
+        ends_capture: bool,
+    ) -> Result<(String, String), UnavailablePreview> {
         let text = String::from_utf8_lossy(bytes);
         // A scan window can end inside a character that is intact in the full
         // capture. Decode the expanded source neighborhood rather than separate
@@ -120,17 +165,21 @@ impl BgTaskRegistry {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         });
         let Some(secrets) = guard.as_deref().and_then(Option::as_ref) else {
-            return (
-                crate::log_redact::SECRET_PLACEHOLDER.to_string(),
-                RESTART_PREVIEW_WITHHELD.to_string(),
-            );
+            return Err(UnavailablePreview::context(RESTART_PREVIEW_WITHHELD));
         };
         if secrets.longest_value_len() > WATCH_SECRET_HALO_BYTES {
-            return withheld_watch_preview();
+            return Err(UnavailablePreview::context(TRUNCATED_PREVIEW_WITHHELD));
+        }
+        // A range can fit the byte window while its complete line exceeds the
+        // audited masking bound. Report that separately from a detected secret.
+        if whole_lines(&text, range.clone(), starts_capture, ends_capture)
+            .is_none_or(|line| line.len() > WATCH_PREVIEW_LINE_CAP_BYTES)
+        {
+            return Err(UnavailablePreview::line_limit());
         }
         let Some(region) = watch_mask_region(&text, &range, secrets, starts_capture, ends_capture)
         else {
-            return withheld_watch_preview();
+            return Err(UnavailablePreview::context(TRUNCATED_PREVIEW_WITHHELD));
         };
         let mut range = range.start - region.start..range.end - region.start;
         let text = &text[region];
@@ -163,19 +212,16 @@ impl BgTaskRegistry {
             &mut range,
             ticket_digest.as_deref(),
         ) else {
-            return withheld_watch_preview();
+            return Err(UnavailablePreview::context(TRUNCATED_PREVIEW_WITHHELD));
         };
         align_watch_range(&masked, &mut range);
         let Some(matched) = masked.get(range.clone()) else {
-            return (
-                crate::log_redact::SECRET_PLACEHOLDER.to_string(),
-                TRUNCATED_PREVIEW_WITHHELD.to_string(),
-            );
+            return Err(UnavailablePreview::context(TRUNCATED_PREVIEW_WITHHELD));
         };
-        (
+        Ok((
             matched.to_string(),
             super::super::watches::context_snippet(&masked, range.start, range.end),
-        )
+        ))
     }
 
     pub(super) fn completion_preview_for_notice(
@@ -491,6 +537,7 @@ fn whole_lines(
     Some(start..end.max(start))
 }
 
+#[cfg(test)]
 fn withheld_watch_preview() -> (String, String) {
     (
         crate::log_redact::SECRET_PLACEHOLDER.to_string(),

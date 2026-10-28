@@ -16,8 +16,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "6acd0f55a7e0a3cb5f35b19ba4d844ee8f646cf9ef2dd2f55f1bfceb84811569",
-      "catalog_digest": "6acd0f55a7e0a3cb5f35b19ba4d844ee8f646cf9ef2dd2f55f1bfceb84811569",
+      "generation": "c621e6a29d07b643da41d02373808e183753d3e4d6137bce1c3a05f1e9ad3755",
+      "catalog_digest": "c621e6a29d07b643da41d02373808e183753d3e4d6137bce1c3a05f1e9ad3755",
       "tools": [
         {
           "name": "status",
@@ -1040,7 +1040,7 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -1058,6 +1058,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -1217,8 +1229,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "87374a7245a828f9e1d849c44602031b906a6e945a43eb20ff7824e70e65e46a",
-      "catalog_digest": "87374a7245a828f9e1d849c44602031b906a6e945a43eb20ff7824e70e65e46a",
+      "generation": "1b3ece74b8988a4b946169e8a3c765f9b093814ed8c8d7640cc64a21b904c580",
+      "catalog_digest": "1b3ece74b8988a4b946169e8a3c765f9b093814ed8c8d7640cc64a21b904c580",
       "tools": [
         {
           "name": "status",
@@ -2241,7 +2253,7 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -2259,6 +2271,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -2420,8 +2444,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "5542ce3275d21530752c6d5a3a547c00844557f25f6e7a26c9d7f34b87c4a9f6",
-      "catalog_digest": "5542ce3275d21530752c6d5a3a547c00844557f25f6e7a26c9d7f34b87c4a9f6",
+      "generation": "1ad048c2ff6adbe3ffa9c7bc9f789d4b5fc86e6a5eb1d9de7e8040162eb85f35",
+      "catalog_digest": "1ad048c2ff6adbe3ffa9c7bc9f789d4b5fc86e6a5eb1d9de7e8040162eb85f35",
       "tools": [
         {
           "name": "status",
@@ -3363,7 +3387,7 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -3381,6 +3405,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -3541,8 +3577,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "a425afdd1b84c4d0b4c7485cc4e4ea887107d38061fee51ddc2a3b82c357eb11",
-      "catalog_digest": "a425afdd1b84c4d0b4c7485cc4e4ea887107d38061fee51ddc2a3b82c357eb11",
+      "generation": "90b7a2729864ce8f7dffc0b3c1ab3613755b6b76dd50950bacb01fc92edaf5a8",
+      "catalog_digest": "90b7a2729864ce8f7dffc0b3c1ab3613755b6b76dd50950bacb01fc92edaf5a8",
       "tools": [
         {
           "name": "status",
@@ -4519,7 +4555,7 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -4537,6 +4573,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -4697,8 +4745,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "f6243c9b40734e773acae9fe3cb59386bd1e43edfea3d2bd08ab96925787bc25",
-      "catalog_digest": "f6243c9b40734e773acae9fe3cb59386bd1e43edfea3d2bd08ab96925787bc25",
+      "generation": "e1c063e9bc26a653697afc6c257010ec570dd63c560e7a8bbc9d3c23d504ee74",
+      "catalog_digest": "e1c063e9bc26a653697afc6c257010ec570dd63c560e7a8bbc9d3c23d504ee74",
       "tools": [
         {
           "name": "status",
@@ -5672,7 +5720,7 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -5690,6 +5738,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -5851,8 +5911,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "406e9a1163332ade930a2cfea82791d1f08bc21465151eb436fb73afed097d15",
-      "catalog_digest": "406e9a1163332ade930a2cfea82791d1f08bc21465151eb436fb73afed097d15",
+      "generation": "a22c252064e236f622232985f3fe96fb6c1043165209a4b79e63e49098b1f449",
+      "catalog_digest": "a22c252064e236f622232985f3fe96fb6c1043165209a4b79e63e49098b1f449",
       "tools": [
         {
           "name": "status",
@@ -6769,7 +6829,7 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -6787,6 +6847,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -6947,8 +7019,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "9bb8e82f9dd24ddd00fb5d22b7786da7858a8a7f2ed48e0e867d474872b85d48",
-      "catalog_digest": "9bb8e82f9dd24ddd00fb5d22b7786da7858a8a7f2ed48e0e867d474872b85d48",
+      "generation": "7fe28a424ad3ba01136b69644285a7674e001d7fc57521a72bf67790609d8a26",
+      "catalog_digest": "7fe28a424ad3ba01136b69644285a7674e001d7fc57521a72bf67790609d8a26",
       "tools": [
         {
           "name": "status",
@@ -7862,7 +7934,7 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -7880,6 +7952,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -8040,8 +8124,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "394423c042beffc88e0fa1d60d3087300e5a5a975d08ffa4b1620f7737415a7c",
-      "catalog_digest": "394423c042beffc88e0fa1d60d3087300e5a5a975d08ffa4b1620f7737415a7c",
+      "generation": "9d0c2c1e4c88456e228d3c60957362c0c4ef37c0248a5f915038692b2247f8b0",
+      "catalog_digest": "9d0c2c1e4c88456e228d3c60957362c0c4ef37c0248a5f915038692b2247f8b0",
       "tools": [
         {
           "name": "status",
@@ -8952,7 +9036,7 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -8970,6 +9054,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -9130,8 +9226,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "63694ae3b86048b3122363f99b4444ad68bc04ba9868eb1f9863000d9abb47ec",
-      "catalog_digest": "63694ae3b86048b3122363f99b4444ad68bc04ba9868eb1f9863000d9abb47ec",
+      "generation": "2cef50c1c131899ed951a620e0ff8311e74c339e2a97f33bcfe24a04adfdd460",
+      "catalog_digest": "2cef50c1c131899ed951a620e0ff8311e74c339e2a97f33bcfe24a04adfdd460",
       "tools": [
         {
           "name": "status",
@@ -10039,7 +10135,7 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -10057,6 +10153,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -10214,8 +10322,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "2dcdf552ec7c32271dea1c5ad8fd52d907804ad9272f5cf8a3f787f15df26c01",
-      "catalog_digest": "2dcdf552ec7c32271dea1c5ad8fd52d907804ad9272f5cf8a3f787f15df26c01",
+      "generation": "2b3c5656f572647d340078589532de676a8a71938305ad7ae02380d0f2ec921d",
+      "catalog_digest": "2b3c5656f572647d340078589532de676a8a71938305ad7ae02380d0f2ec921d",
       "tools": [
         {
           "name": "status",
@@ -11312,7 +11420,7 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -11330,6 +11438,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -11490,8 +11610,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "479daf2c2b3aa387b64ed1d7ee54d7345908f26cbf4e0b80d0c9a49fc5405d6f",
-      "catalog_digest": "479daf2c2b3aa387b64ed1d7ee54d7345908f26cbf4e0b80d0c9a49fc5405d6f",
+      "generation": "762051e55fed01e192c15a1c46c624ab624ad10e6b6f62f681c30d9a7125364f",
+      "catalog_digest": "762051e55fed01e192c15a1c46c624ab624ad10e6b6f62f681c30d9a7125364f",
       "tools": [
         {
           "name": "status",
@@ -12588,7 +12708,7 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -12606,6 +12726,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -12768,8 +12900,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "8e3aea4beca3ff63cdb2637ca808cfc8613885008f844048912935b13a6e91d2",
-      "catalog_digest": "8e3aea4beca3ff63cdb2637ca808cfc8613885008f844048912935b13a6e91d2",
+      "generation": "16b786700d65c0a8cf5d85f391175635dde44667e5e3a3296f44cd72c77ad269",
+      "catalog_digest": "16b786700d65c0a8cf5d85f391175635dde44667e5e3a3296f44cd72c77ad269",
       "tools": [
         {
           "name": "status",
@@ -13785,7 +13917,7 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -13803,6 +13935,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -13964,8 +14108,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "8ff9764cbed7cd00435451ab9150acfac21a10dbb0a681bbb1ed2f27dd68ca56",
-      "catalog_digest": "8ff9764cbed7cd00435451ab9150acfac21a10dbb0a681bbb1ed2f27dd68ca56",
+      "generation": "7a268824e9c7b27ad062a87368944391e45434eeddbcac435b19d54dd52737ba",
+      "catalog_digest": "7a268824e9c7b27ad062a87368944391e45434eeddbcac435b19d54dd52737ba",
       "tools": [
         {
           "name": "status",
@@ -15016,7 +15160,7 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -15034,6 +15178,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -15195,8 +15351,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "ab7c34727ff1cc050a07dde48ec92b187a24de148d1b7660046414397a5edc4b",
-      "catalog_digest": "ab7c34727ff1cc050a07dde48ec92b187a24de148d1b7660046414397a5edc4b",
+      "generation": "87d80fc4163856625d6e5f24729dc120ead10c5d8d598958331f18a04fddf4d4",
+      "catalog_digest": "87d80fc4163856625d6e5f24729dc120ead10c5d8d598958331f18a04fddf4d4",
       "tools": [
         {
           "name": "status",
@@ -16244,7 +16400,7 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -16262,6 +16418,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -16424,8 +16592,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "8dd19a2bb406911fa77fe14be366be5dde1a717179cba188f564696691a8ae83",
-      "catalog_digest": "8dd19a2bb406911fa77fe14be366be5dde1a717179cba188f564696691a8ae83",
+      "generation": "5ce1f0b73d818cc8ab742ffdb48feec3c50562e6983431cb894898112e4de92a",
+      "catalog_digest": "5ce1f0b73d818cc8ab742ffdb48feec3c50562e6983431cb894898112e4de92a",
       "tools": [
         {
           "name": "status",
@@ -17416,7 +17584,7 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -17434,6 +17602,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -17595,8 +17775,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "f53ef55b3e18e15b6d13ecdd464e7da13fc741f2dc9ee004ae0e8b4fca3946fc",
-      "catalog_digest": "f53ef55b3e18e15b6d13ecdd464e7da13fc741f2dc9ee004ae0e8b4fca3946fc",
+      "generation": "404493cd9d2a9e68b5a396740fd39db1cab540f1d6d96ec595b51c20175d23cf",
+      "catalog_digest": "404493cd9d2a9e68b5a396740fd39db1cab540f1d6d96ec595b51c20175d23cf",
       "tools": [
         {
           "name": "status",
@@ -18584,7 +18764,7 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -18602,6 +18782,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -18763,8 +18955,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "23091932d963f35204727d96b2d56a0e015142b799439215db08f948bead1b44",
-      "catalog_digest": "23091932d963f35204727d96b2d56a0e015142b799439215db08f948bead1b44",
+      "generation": "e4d7a59eed06c1146b53260b7ca2c4b3309dacde65ee49d7ca7a9e9f5a2d90f4",
+      "catalog_digest": "e4d7a59eed06c1146b53260b7ca2c4b3309dacde65ee49d7ca7a9e9f5a2d90f4",
       "tools": [
         {
           "name": "status",
@@ -19749,7 +19941,7 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -19767,6 +19959,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -19928,8 +20132,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "6953a382e27b9b9398e8db83e554c4205aeaf162c6f05f3692fbfb700a809ee9",
-      "catalog_digest": "6953a382e27b9b9398e8db83e554c4205aeaf162c6f05f3692fbfb700a809ee9",
+      "generation": "411b938e273cda011b8808cc6551e6c12ce9bfdf66c91e85e0bd740fe02cfc1e",
+      "catalog_digest": "411b938e273cda011b8808cc6551e6c12ce9bfdf66c91e85e0bd740fe02cfc1e",
       "tools": [
         {
           "name": "status",
@@ -20911,7 +21115,7 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -20929,6 +21133,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",

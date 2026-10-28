@@ -384,7 +384,7 @@ export function buildSubcToolPresets(
  * The worker preset's `bash_watch`: the OpenCode tool's arguments with the
  * worker description. The module serves this tool itself and always waits
  * synchronously, because a catalog consumer has no channel that would deliver
- * an async watch's notification; the two async-only arguments say so.
+ * an async watch's notification; the async-only arguments say so.
  */
 function workerBashWatchSchema(
   schema: Record<string, unknown>,
@@ -400,6 +400,11 @@ function workerBashWatchSchema(
   properties.once = {
     ...properties.once,
     description: "Accepted for compatibility; only an async watch reads it.",
+  };
+  properties.deliver = {
+    ...properties.deliver,
+    description:
+      "Rejected: this watch always waits synchronously; deliver requires background:true with an async notification channel.",
   };
   return { ...clone, description };
 }
