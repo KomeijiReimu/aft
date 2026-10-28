@@ -1592,7 +1592,7 @@ fn speech_launch_seed(
         })
     };
     let launch = if let Some(owner) = &identity.run_owner {
-        if owner.kind == codemode::RunKind::Worker {
+        if matches!(owner.kind, codemode::RunKind::Worker { .. }) {
             Err(crate::gh_shim_speech::Refusal::new(
                 crate::gh_shim_speech::Code::AuthorityUnavailable,
                 "owner_unresolved",
