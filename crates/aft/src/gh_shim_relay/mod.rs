@@ -1844,6 +1844,9 @@ impl RelayTransport for SubcRelayTransport {
 }
 
 #[cfg(test)]
+#[path = "../gh_shim/plexus_bindings_contract.rs"]
+pub(crate) mod bindings_contract;
+#[cfg(test)]
 pub(crate) mod tests;
 
 fn route_lease_key(

@@ -78,9 +78,25 @@ fn wire_owner(owner: &subc_protocol::Principal) -> String {
 impl FakePlex {
     fn bindings(&self) -> Value {
         let state = self.state.lock().unwrap();
-        json!({"repo_binding_generation":state.generation,"bindings":[{
-            "repository":state.repo,"agent_id":state.agent,"app_handle_id":state.handle
-        }]})
+        crate::gh_shim_relay::bindings_contract::agent_reply(
+            &state.repo,
+            &state.agent,
+            &state.handle,
+            state.generation,
+        )["result"]
+            .clone()
+    }
+
+    fn bindings_reply(&self, arguments: &Value) -> Option<Value> {
+        let state = self.state.lock().unwrap();
+        crate::gh_shim_relay::bindings_contract::stand_in_reply(
+            arguments,
+            &state.repo,
+            &state.agent,
+            &state.handle,
+            state.generation,
+            true,
+        )
     }
 
     fn describe(
@@ -419,23 +435,13 @@ impl Fixture {
                 crate::gh_shim_relay::tests::fake_daemon_with_reply(Arc::new(
                     move |body, scope| {
                         let args = &body["arguments"];
-                        if args["op"] == "bindings.read_for_agent" {
-                            if args.as_object().unwrap().len() != 2 || !args["agent_id"].is_string() {
-                                return json!({"error":{"code":"invalid_request"}});
-                            }
-                            let reply = server.bindings();
-                            return if args["agent_id"] == reply["bindings"][0]["agent_id"] {
-                                json!({"result":reply})
-                            } else {
-                                json!({"result":{"repo_binding_generation":reply["repo_binding_generation"],"bindings":[]}})
-                            };
-                        }
-                        if args["op"] == "bindings.read" {
-                            let mut reply = server.bindings();
-                            if args["connection_id"] != format!("github-handle-{}", reply["bindings"][0]["app_handle_id"].as_str().unwrap()) {
-                                reply["bindings"] = json!([]);
-                            }
-                            return json!({"result":reply});
+                        if args["op"]
+                            .as_str()
+                            .is_some_and(|op| op.starts_with("bindings."))
+                        {
+                            return server
+                                .bindings_reply(args)
+                                .expect("bindings request must match the real Plexus contract");
                         }
                         let expected = serde_json::to_value(subc_client_rs::ScopeSelector::new(
                             server.head.owner.clone(),

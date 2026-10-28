@@ -98,6 +98,60 @@ fn no_binding_row_preserves_main_refusal_wording_and_structured_detail() {
 }
 
 #[test]
+fn real_plexus_binding_replies_preserve_authority_and_refuse_missing_or_wrong_agents() {
+    use crate::gh_shim_relay::bindings_contract::{vector, CASES};
+    let desired = BTreeMap::from([
+        ("o/x".into(), "agent-x".into()),
+        ("o/a".into(), "agent-y".into()),
+        ("o/z".into(), "agent-y".into()),
+    ]);
+    for name in CASES {
+        let (_, reply) = vector(name);
+        let parsed = parse_bindings(&desired, &reply, "agent-x");
+        match name {
+            "agent" | "connection" => {
+                let bindings = parsed.unwrap();
+                assert_eq!(bindings.len(), 1, "{name}");
+                assert_eq!(bindings["o/x"].app_handle_id, "app-x");
+                assert_eq!(bindings["o/x"].repo_binding_generation, 3);
+            }
+            "other-agent" => {
+                let refusal = parsed.unwrap_err();
+                assert_eq!(refusal.code, Code::IdentityConflict);
+                assert_eq!(refusal.reason, "binding_changed");
+            }
+            "none" | "no-grant" => {
+                let refusal = parsed.unwrap_err();
+                assert_eq!(refusal.code, Code::AuthorityUnavailable, "{name}");
+                assert_eq!(refusal.reason, "binding_unverifiable", "{name}");
+                assert!(
+                    refusal
+                        .detail
+                        .as_deref()
+                        .unwrap()
+                        .starts_with("no_binding_row:"),
+                    "{name}: {refusal:?}"
+                );
+            }
+            _ => {
+                assert_eq!(reply["error"]["code"], "invalid_request", "{name}");
+                let refusal = parsed.unwrap_err();
+                assert_eq!(refusal.code, Code::AuthorityUnavailable, "{name}");
+                assert_eq!(refusal.reason, "binding_unverifiable", "{name}");
+            }
+        }
+    }
+    let bindings = parse_bindings(&desired, &vector("other-agent").1, "agent-y").unwrap();
+    assert_eq!(
+        bindings.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["o/a", "o/z"]
+    );
+    assert!(bindings
+        .values()
+        .all(|binding| binding.app_handle_id == "app-y" && binding.repo_binding_generation == 3));
+}
+
+#[test]
 fn binding_reply_diagnostics_name_both_agents_without_accepting_mismatches() {
     use serde_json::json;
     let desired = BTreeMap::from([("cortexkit/subconscious".into(), "agent-subc".into())]);

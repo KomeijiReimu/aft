@@ -475,6 +475,17 @@ fn bindings_read_is_relayed_under_the_same_ticket_gate() {
 }
 
 #[test]
+fn agent_bindings_request_matches_the_real_plexus_contract() {
+    let (request, _) = bindings_contract::vector("agent");
+    let actual = agent_bindings_call("agent-x");
+    assert_eq!(actual["arguments"], request);
+    assert_eq!(
+        actual,
+        serde_json::json!({"name":"github", "arguments":request})
+    );
+}
+
+#[test]
 fn relay_log_line_carries_session_task_and_nonce_but_no_ticket_or_scope() {
     let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-log", "call-log-7", "/p");
     let ticket = live.value().unwrap().to_string();
