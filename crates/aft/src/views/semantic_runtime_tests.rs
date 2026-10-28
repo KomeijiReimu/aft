@@ -2574,6 +2574,15 @@ fn semantic_fill_inflight_memory_is_bounded_before_large_source_preparation() {
 
 #[test]
 fn semantic_fill_chunk_gate_waiter_yields_cold_slot_to_returning_backend() {
+    semantic_fill_waiter_yields_cold_slot(false);
+}
+
+#[test]
+fn semantic_fill_file_claim_waiter_yields_cold_slot_to_returning_backend() {
+    semantic_fill_waiter_yields_cold_slot(true);
+}
+
+fn semantic_fill_waiter_yields_cold_slot(shared_content: bool) {
     let storage = tempfile::tempdir().unwrap();
     let roots: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
     let cold = crate::cold_build_limiter::isolated_limiter(1);
@@ -2588,8 +2597,11 @@ fn semantic_fill_chunk_gate_waiter_yields_cold_slot_to_returning_backend() {
             write_tree(
                 root.path(),
                 &[(
-                    &format!("file_{file}.rs"),
-                    &format!("pub fn sibling_{i}() {{}}\n"),
+                    &format!("file_{i}_{file}.rs"),
+                    &format!(
+                        "pub fn sibling_{}() {{}}\n",
+                        if shared_content { 0 } else { i }
+                    ),
                 )],
             );
         }
@@ -2655,7 +2667,7 @@ fn semantic_fill_chunk_gate_waiter_yields_cold_slot_to_returning_backend() {
     for worker in workers {
         worker.join().unwrap();
     }
-    assert!(yielded, "chunk-gate waiter retained the only cold slot");
+    assert!(yielded, "shared-work waiter retained the only cold slot");
     assert_eq!(first_done.unwrap(), true);
     assert_eq!(second_done.unwrap(), true);
     assert!(lanes

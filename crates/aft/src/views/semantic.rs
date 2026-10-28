@@ -1901,9 +1901,13 @@ impl SemanticPlane {
         }
 
         for (item, relative, key) in waiting {
+            // The claim owner may need cold admission after its backend returns.
+            // Do not keep that admission occupied while waiting for its run.
+            before_embed(FillAdmission::SuspendCold).map_err(plane_error)?;
             let wait_started = Instant::now();
             arena.wait_released(&key, budget.shared_wait);
             report.timing.shared_wait += wait_started.elapsed();
+            before_embed(FillAdmission::ResumeCold).map_err(plane_error)?;
             let lookup_started = Instant::now();
             let run = match arena.get(&key) {
                 Some(run) => Some(run),
@@ -4285,7 +4289,7 @@ mod tests {
                 vec![text.into()],
                 &mut |_| Ok(vec![vector.clone()]),
                 &mut FillReport::default(),
-                &mut || Ok(()),
+                &mut |_| Ok(()),
                 &mut Vec::new(),
             )
             .unwrap();
@@ -4382,7 +4386,7 @@ mod tests {
                 vec![text.into()],
                 &mut |texts| Model::default().embed("model-a", texts),
                 &mut report,
-                &mut || Ok(()),
+                &mut |_| Ok(()),
                 &mut Vec::new(),
             )
             .unwrap();

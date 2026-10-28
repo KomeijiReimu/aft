@@ -2097,7 +2097,9 @@ where
                     .refresh_with_admission(budget, &mut embedding, &mut |phase| {
                         if phase == FillAdmission::SuspendCold {
                             cold_permit.borrow_mut().take();
-                            crate::cold_build_limiter::progress::stage("waiting for chunk batch");
+                            crate::cold_build_limiter::progress::stage(
+                                "waiting for shared semantic work",
+                            );
                             return Ok(());
                         }
                         if phase == FillAdmission::ResumeCold && inflight_permit.is_none() {
