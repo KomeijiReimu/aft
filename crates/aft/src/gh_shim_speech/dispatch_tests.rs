@@ -11,8 +11,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp, ScopeStatus};
 
+#[path = "admission_tests.rs"]
+mod admission;
 #[path = "audit_proof_tests.rs"]
 mod audit_proofs;
+#[cfg(unix)]
+#[path = "cold_redemption_tests.rs"]
+mod cold;
 #[path = "crash_dispatch_tests.rs"]
 mod crash;
 #[path = "pty_dispatch_tests.rs"]
@@ -283,6 +288,7 @@ struct Fixture {
 
 #[derive(Default)]
 struct LaunchOptions {
+    foreground: bool,
     sdk_daemon: bool,
     pty: bool,
     command: Option<String>,
@@ -487,6 +493,7 @@ impl Fixture {
         let spawn_session = session.clone();
         let lifecycle = seed.lifecycle.clone();
         let pty = options.pty;
+        let background = !options.foreground;
         let command = options.command.take().unwrap_or_else(|| "sleep 120".into());
         let (ticket, started, incarnation) = tokio::task::spawn_blocking(move || {
             std::thread::spawn(move || {
@@ -506,7 +513,7 @@ impl Fixture {
                         .incarnation
                         .clone();
                     let _guard = crate::gh_shim_ticket::spawn_ticket_guard(Some(&raw));
-                    crate::gh_shim_ticket::mark_spawn_background(true);
+                    crate::gh_shim_ticket::mark_spawn_background(background);
                     let mut environment = HashMap::new();
                     environment.insert(
                         crate::gh_shim_ticket::GH_SHIM_TICKET_ENV.into(),

@@ -105,3 +105,35 @@ pub(crate) fn remember(path: &std::path::Path, body: &str) -> Result<(), String>
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invocation_rejects_unknown_fields_and_malformed_types() {
+        for value in [
+            serde_json::json!({"args":[],"body_inputs":{},"extra":true}),
+            serde_json::json!({"args":"issue comment","body_inputs":{}}),
+            serde_json::json!({"args":[],"body_inputs":{"file":7}}),
+        ] {
+            assert!(serde_json::from_value::<Invocation>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn invocation_limit_counts_arguments_body_keys_and_body_values() {
+        let mut invocation = Invocation {
+            args: vec!["a".repeat(MAX_INPUT_BYTES - 2)],
+            body_inputs: [("k".into(), "v".into())].into(),
+        };
+        invocation.validate().unwrap();
+        invocation.body_inputs.get_mut("k").unwrap().push('x');
+        let refusal = invocation.validate().unwrap_err();
+        assert_eq!(refusal.code, Code::PolicyDenied);
+        assert_eq!(refusal.reason, "payload_denied");
+        invocation.body_inputs.clear();
+        invocation.args[0].push_str("abc");
+        assert_eq!(invocation.validate().unwrap_err().reason, "payload_denied");
+    }
+}

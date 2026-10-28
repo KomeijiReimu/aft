@@ -276,6 +276,35 @@ fn protected_dormant_invalid_regressed_and_operator_arms_never_delegate_ambient(
             "protected {mode} must not reach native gh"
         );
     }
+    for invalid_view in ["missing", "corrupt", "wrong-ticket"] {
+        match invalid_view {
+            "missing" => std::fs::remove_file(&view).unwrap(),
+            "corrupt" => std::fs::write(&view, b"not JSON").unwrap(),
+            "wrong-ticket" => std::fs::write(&view, serde_json::to_vec(&json!({
+                "ticket_digest": crate::gh_shim_ticket::speech_digest("22222222222222222222222222222222").unwrap().to_vec(),
+                "policy": snapshot(&manifest),
+            })).unwrap()).unwrap(),
+            _ => unreachable!(),
+        }
+        assert!(
+            crate::gh_shim_speech::start_view::protected(&args),
+            "{invalid_view}"
+        );
+        let delegated = std::cell::Cell::new(false);
+        let exit = run_with(
+            &args,
+            |_| {
+                delegated.set(true);
+                0
+            },
+            |_, _, _, _| Ok(None),
+        );
+        assert_ne!(exit, 0, "{invalid_view}");
+        assert!(
+            !delegated.get(),
+            "{invalid_view} start view must not delegate to ambient gh"
+        );
+    }
     assert!(!crate::gh_shim_speech::start_view::protected(&[
         "--version".into()
     ]));
