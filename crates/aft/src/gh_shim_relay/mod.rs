@@ -314,7 +314,7 @@ pub async fn relay<T: RelayTransport>(
 }
 
 // This fixture exercises the existing awaited scoped transport, not posting
-// admission or the unpublished reserved-send API. Authority tests use relay.
+// admission or the SDK reserved-send API. Authority tests use relay.
 #[cfg(test)]
 async fn relay_transport_contract<T: RelayTransport>(
     transport: &T,
@@ -1799,7 +1799,7 @@ impl RelayTransport for SubcRelayTransport {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 fn route_lease_key(
     consumer: &Arc<subc_client_rs::SubcConsumer>,

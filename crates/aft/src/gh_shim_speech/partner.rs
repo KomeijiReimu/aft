@@ -27,6 +27,7 @@ pub(crate) fn require_plex_guards(codemode: bool) -> Result<(), Refusal> {
 }
 
 pub(crate) fn require_reserved_send() -> Result<(), Refusal> {
+    log::trace!("SUBC reserved writer API is available in client {SUBC_RESERVATION_LAST_CHECKED}");
     Ok(())
 }
 

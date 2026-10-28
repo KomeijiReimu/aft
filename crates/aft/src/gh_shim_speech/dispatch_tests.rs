@@ -275,10 +275,13 @@ struct Fixture {
     params: Value,
     incarnation: String,
     startup_error: Option<String>,
+    _relay: Arc<crate::gh_shim_relay::GhRelay>,
+    sdk: Option<crate::gh_shim_relay::tests::FakeDaemon>,
 }
 
 #[derive(Default)]
 struct LaunchOptions {
+    sdk_daemon: bool,
     pty: bool,
     command: Option<String>,
     seal_failure: Option<Refusal>,
@@ -373,7 +376,39 @@ impl Fixture {
                 nonces: HashMap::new(),
             })),
         };
-        let relay = crate::gh_shim_relay::GhRelay::new(dir.path().join("unused-connection.json"));
+        let sdk = if options.sdk_daemon {
+            let server = plex.clone();
+            Some(
+                crate::gh_shim_relay::tests::fake_daemon_with_reply(Arc::new(
+                    move |body, scope| {
+                        let args = &body["arguments"];
+                        if args["op"] == "bindings.read" {
+                            return server.bindings();
+                        }
+                        let expected = serde_json::to_value(subc_client_rs::ScopeSelector::new(
+                            server.head.owner.clone(),
+                            server.head.scope_ref.clone(),
+                            Some(server.head.scope_epoch),
+                        ))
+                        .unwrap();
+                        if args["op"] != "bot_request" || scope != Some(&expected) {
+                            return refused("scope_unverifiable", "route");
+                        }
+                        server.send(&server.head, args.clone(), true)
+                    },
+                ))
+                .await,
+            )
+        } else {
+            None
+        };
+        let relay = if let Some(daemon) = &sdk {
+            Arc::new(crate::gh_shim_relay::GhRelay {
+                transport: daemon.transport().await,
+            })
+        } else {
+            crate::gh_shim_relay::GhRelay::new(dir.path().join("unused-connection.json"))
+        };
         let describe = plex.clone();
         let service = crate::gh_shim_speech::service::start(
             &root,
@@ -387,17 +422,19 @@ impl Fixture {
         );
         let read = plex.clone();
         let reserve = plex.clone();
-        service.install_test_partners(Arc::new(TestPartners {
-            seal_failure: options.seal_failure.clone(),
-            expect_placed: Some("fake-atomic-expect"),
-            run_placed: Some("fake-atomic-run"),
-            reserved_send_placed: true,
-            bindings: Arc::new(move |_, _| Ok(read.bindings())),
-            reserve: Arc::new(move |_, _, scope, body| reserve.reserve(scope, body)),
-            before_final_gate: None,
-            on_bound_enqueue: None,
-            after_bound_commit: None,
-        }));
+        if !options.sdk_daemon {
+            service.install_test_partners(Arc::new(TestPartners {
+                seal_failure: options.seal_failure.clone(),
+                expect_placed: Some("fake-atomic-expect"),
+                run_placed: Some("fake-atomic-run"),
+                reserved_send_placed: true,
+                bindings: Arc::new(move |_, _| Ok(read.bindings())),
+                reserve: Arc::new(move |_, _, scope, body| reserve.reserve(scope, body)),
+                before_final_gate: None,
+                on_bound_enqueue: None,
+                after_bound_commit: None,
+            }));
+        }
         let mut config = crate::config::Config::default();
         config.project_root = Some(project.clone());
         config.storage_dir = Some(root.clone());
@@ -600,6 +637,8 @@ impl Fixture {
             params,
             incarnation,
             startup_error,
+            _relay: relay,
+            sdk,
         }
     }
 
@@ -1091,4 +1130,85 @@ async fn typed_reservation_route_end_fences_captured_background_without_describe
     assert!(fixture.service.store.scope_ended(&fixture.head).unwrap());
     assert_eq!(fixture.plex.state.lock().unwrap().describes, 1);
     assert_eq!(fixture.plex.state.lock().unwrap().sends, 0);
+}
+
+#[tokio::test]
+async fn captured_dispatch_survives_unscoped_head_reconnect_via_sdk_without_test_partners() {
+    let _lock = crate::test_env::process_env_lock();
+    let fixture = Fixture::new_with_options(
+        false,
+        LaunchOptions {
+            sdk_daemon: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        fixture.startup_error.is_none(),
+        "{:?}",
+        fixture.startup_error
+    );
+    assert!(
+        fixture.service.test_partners().is_none(),
+        "the real service/reserve delegation must be exercised"
+    );
+    let mut routes = RouteScopes::default();
+    routes.speech = Some(fixture.service.clone());
+    routes.push(&fixture.session, None);
+    let mut params = fixture.params.clone();
+    params["request_nonce"] = json!("sdk-head-reconnect");
+    params["for_session"] = json!("cannot-replace-the-launch-owner");
+    let answer = crate::gh_shim_relay::relay(
+        &fixture.plex,
+        RelayCall {
+            operation: BOT_REQUEST_OPERATION,
+            params: &params,
+            first_party: true,
+            route_scopes: &routes,
+        },
+        &|_| {},
+    )
+    .await;
+    assert!(answer.ok, "{:?}", answer.data);
+    let daemon = fixture.sdk.as_ref().unwrap();
+    let writes = daemon
+        .requests()
+        .into_iter()
+        .filter(|request| request["arguments"]["op"] == "bot_request")
+        .collect::<Vec<_>>();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(
+        writes[0]["arguments"]["expect"],
+        json!({"app_handle_id":"app-original","repo_binding_generation":4})
+    );
+    assert!(writes[0]["arguments"].get("for_session").is_none());
+    assert!(daemon
+        .opens()
+        .iter()
+        .filter(|open| !open["scope"].is_null())
+        .all(|open| open["scope"]["scope_epoch"] == 7));
+    assert_eq!(fixture.plex.state.lock().unwrap().posts.len(), 1);
+    fixture
+        .plex
+        .state
+        .lock()
+        .unwrap()
+        .unknown
+        .insert(ScopeKey::from_stamp(&fixture.head));
+    fixture.service.invalidate(&fixture.head);
+    params["request_nonce"] = json!("sdk-head-unsynced");
+    let refused = crate::gh_shim_relay::relay(
+        &fixture.plex,
+        RelayCall {
+            operation: BOT_REQUEST_OPERATION,
+            params: &params,
+            first_party: true,
+            route_scopes: &routes,
+        },
+        &|_| {},
+    )
+    .await;
+    assert_eq!(refused.data["refusal_code"], "task_gh_scope_unknown");
+    assert_eq!(refused.data["reason"], "not_synced");
+    assert_eq!(fixture.plex.state.lock().unwrap().posts.len(), 1);
 }

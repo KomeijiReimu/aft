@@ -1120,6 +1120,7 @@ fn route_scopes_answer_only_when_the_sessions_routes_agree() {
 /// reply to every request.
 #[derive(Clone, Default)]
 struct DaemonScript {
+    reply: Option<Arc<dyn Fn(&Value, Option<&Value>) -> Value + Send + Sync>>,
     /// Refuse every route.open that carries a scope with this code.
     refuse_scoped_opens: Option<String>,
     /// Before writing each scoped route.open refusal, wait this long in real
@@ -1153,14 +1154,14 @@ struct DaemonLog {
     requests: Vec<Value>,
 }
 
-struct FakeDaemon {
+pub(crate) struct FakeDaemon {
     log: Arc<Mutex<DaemonLog>>,
     connection_file: std::path::PathBuf,
     _dir: tempfile::TempDir,
 }
 
 impl FakeDaemon {
-    fn opens(&self) -> Vec<Value> {
+    pub(crate) fn opens(&self) -> Vec<Value> {
         self.log.lock().unwrap().opens.clone()
     }
 
@@ -1177,11 +1178,11 @@ impl FakeDaemon {
         self.log.lock().unwrap().closes.clone()
     }
 
-    fn requests(&self) -> Vec<Value> {
+    pub(crate) fn requests(&self) -> Vec<Value> {
         self.log.lock().unwrap().requests.clone()
     }
 
-    async fn transport(&self) -> SubcRelayTransport {
+    pub(crate) async fn transport(&self) -> SubcRelayTransport {
         self.transport_with_deadline(None).await
     }
 
@@ -1259,6 +1260,7 @@ async fn fake_daemon(script: DaemonScript) -> FakeDaemon {
                 }
                 let mut next_channel: u16 = 40;
                 let mut scoped_channels = Vec::new();
+                let mut route_scopes = std::collections::HashMap::new();
                 let mut scope_ended = false;
                 let mut held = None;
                 let mut deferred = Vec::new();
@@ -1303,13 +1305,12 @@ async fn fake_daemon(script: DaemonScript) -> FakeDaemon {
                                 let scoped = scoped_channels.contains(&header.channel);
                                 let seen = {
                                     let mut log = log.lock().unwrap();
-                                    log.requests.push(body);
+                                    log.requests.push(body.clone());
                                     log.requests.len()
                                 };
-                                let reply = respond(json!({
-                                    "repo_binding_generation": 1,
-                                    "result": {"status": "completed"},
-                                }));
+                                let response = script.reply.as_ref().map(|reply| reply(&body,route_scopes.get(&header.channel)))
+                                    .unwrap_or_else(|| json!({"repo_binding_generation":1,"result":{"status":"completed"}}));
+                                let reply = respond(response);
                                 if script.hold_first_request && seen == 1 {
                                     held = Some(reply);
                                     continue;
@@ -1398,6 +1399,10 @@ async fn fake_daemon(script: DaemonScript) -> FakeDaemon {
                                                 next_channel += 1;
                                                 if scoped {
                                                     scoped_channels.push(next_channel);
+                                                    route_scopes.insert(
+                                                        next_channel,
+                                                        body["scope"].clone(),
+                                                    );
                                                 }
                                                 replies.push(respond(json!({
                                                     "op": "route.open",
@@ -2327,7 +2332,7 @@ async fn published_sdk_reservation_does_not_send_until_committed_and_releases_on
     assert!(daemon.requests().is_empty());
     let queued = sent.send().unwrap();
     let reply = queued.response().await.unwrap();
-    assert_eq!(facade_reply(&reply)["status"], "completed");
+    assert_eq!(facade_reply(&reply)["result"]["status"], "completed");
     assert_eq!(daemon.requests().len(), 1);
     assert_eq!(
         daemon.requests()[0]["arguments"]["request_nonce"],
@@ -2363,4 +2368,120 @@ async fn published_sdk_reservation_names_scoped_route_end_before_any_send() {
     );
     assert!(daemon.requests().is_empty());
     assert!(daemon.opens().iter().all(|open| !open["scope"].is_null()));
+}
+
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
+pub(crate) async fn fake_daemon_with_reply(
+    reply: Arc<dyn Fn(&Value, Option<&Value>) -> Value + Send + Sync>,
+) -> FakeDaemon {
+    fake_daemon(DaemonScript {
+        reply: Some(reply),
+        ..Default::default()
+    })
+    .await
+}
+
+#[tokio::test]
+async fn published_sdk_reservation_expired_budget_names_timeout_without_enqueuing() {
+    let daemon = fake_daemon(DaemonScript::default()).await;
+    let relay = GhRelay {
+        transport: daemon.transport().await,
+    };
+    let error = relay
+        .reserve_bot(
+            "/project",
+            "reserved-timeout",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request","request_nonce":"expired"})),
+            tokio::time::Instant::now() - Duration::from_millis(1),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.reason, "reservation_timeout");
+    assert_eq!(error.text(),"bot writes from background commands are briefly unavailable (reservation_timeout); retry in a few seconds.");
+    assert!(daemon.requests().is_empty());
+    assert!(daemon.opens().is_empty());
+}
+
+#[tokio::test]
+async fn published_sdk_reservation_reply_drop_releases_its_scoped_lease_after_enqueue() {
+    let daemon = fake_daemon(DaemonScript {
+        hold_first_request: true,
+        ..Default::default()
+    })
+    .await;
+    let relay = GhRelay {
+        transport: daemon.transport().await,
+    };
+    let slot = relay
+        .reserve_bot(
+            "/project",
+            "reserved-cancel",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request","request_nonce":"cancel-after-send"})),
+            tokio::time::Instant::now() + RELAY_CALL_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    let queued = slot.send().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while daemon.requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(queued);
+    assert_eq!(daemon.closes(1).await.len(), 1);
+    assert_eq!(
+        daemon.requests().len(),
+        1,
+        "dropping a reply cannot turn an already-dequeued mutation into a zero-send claim"
+    );
+}
+
+#[tokio::test]
+async fn published_sdk_reservation_old_connection_cleanup_cannot_close_a_replacement_slot() {
+    let daemon = fake_daemon(DaemonScript::default()).await;
+    let relay = GhRelay {
+        transport: daemon.transport().await,
+    };
+    let old = relay
+        .reserve_bot(
+            "/project",
+            "same-session",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request","request_nonce":"old-unsent"})),
+            tokio::time::Instant::now() + RELAY_CALL_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    let replacement = daemon.transport().await;
+    let consumer = replacement.consumer.lock().await.clone().unwrap();
+    *relay.transport.consumer.lock().await = Some(consumer);
+    let current = relay
+        .reserve_bot(
+            "/project",
+            "same-session",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request","request_nonce":"new-send"})),
+            tokio::time::Instant::now() + RELAY_CALL_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    drop(old);
+    assert_eq!(
+        daemon.closes(1).await.len(),
+        1,
+        "the old generation is released without waiting for the new one"
+    );
+    let reply = current.send().unwrap().response().await.unwrap();
+    assert_eq!(facade_reply(&reply)["result"]["status"], "completed");
+    assert_eq!(daemon.requests().len(), 1);
+    assert_eq!(
+        daemon.requests()[0]["arguments"]["request_nonce"],
+        "new-send"
+    );
+    assert_eq!(daemon.closes(2).await.len(), 2);
 }
