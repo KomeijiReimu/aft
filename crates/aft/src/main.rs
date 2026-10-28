@@ -936,6 +936,9 @@ fn main() {
         if let Err(error) = write_response(registry.current(), &resolved.response) {
             aft::slog_error!("stdout write error while emitting shutdown terminal: {error}");
         }
+        registry
+            .current()
+            .clear_request_handles_progress(&resolved.response.id);
     });
     aft::slog_info!("shutdown phase=pending_responses_drained");
     // Everything from here to exit fits in the exit budget measured from this
