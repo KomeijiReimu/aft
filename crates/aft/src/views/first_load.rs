@@ -663,6 +663,8 @@ impl SiblingLoader {
 
     /// Refresh an already installed owner without reopening sibling manifests.
     /// Membership is still strictly reconciled, including unreported edits.
+    /// Only v2 drivers use it, and production no longer runs one.
+    #[cfg(test)]
     pub(crate) fn refresh(
         &self,
         access: &ViewAccess,
@@ -1256,6 +1258,14 @@ pub trait CompositePlane: Send + Sync {
         false
     }
 
+    /// Whether this plane's base entries are completed later by the base's
+    /// owner rather than during the bind that bootstraps or verifies the
+    /// base. A bind neither claims the base for such a plane nor refuses
+    /// while another owner is completing it.
+    fn defers_base_completion(&self) -> bool {
+        false
+    }
+
     /// Completes this plane's pending entries of the claimed base from the
     /// attachments the bootstrap's strict reconciliation computed for the
     /// same bytes, and publishes the result as a readiness successor.
@@ -1736,7 +1746,14 @@ impl CheckoutDriver {
         {
             return Err(FreshBootstrapRefusal::NonLexicalPlane(plane));
         }
-        if self.producers.semantic.is_some() {
+        // A registered semantic producer needs a registered semantic plane
+        // that takes part in a fresh base (its owner fills the base later).
+        if self.producers.semantic.is_some()
+            && !self
+                .planes
+                .iter()
+                .any(|plane| plane.plane() == FamilyPlane::Semantic && plane.completes_fresh_base())
+        {
             return Err(FreshBootstrapRefusal::NonLexicalPlane(
                 FamilyPlane::Semantic,
             ));
@@ -2061,7 +2078,7 @@ impl CheckoutDriver {
         let completing: Vec<_> = self
             .planes
             .iter()
-            .filter(|plane| plane.completes_fresh_base())
+            .filter(|plane| plane.completes_fresh_base() && !plane.defers_base_completion())
             .filter(|plane| {
                 base.manifest().entries().any(|(_, entry)| {
                     entry
@@ -2771,163 +2788,7 @@ impl FirstLoadDriver for CheckoutDriver {
         snapshot: &Snapshot,
         _revision: u64,
     ) -> Result<(), PlaneError> {
-        self.check_owner(access)?;
-        let cut = snapshot
-            .install_cut()
-            .ok_or_else(|| SiblingLoader::error("missing installed bundle identity"))?;
-        let old_bundle = self.installed_bundle();
-        let previously_owned = old_bundle.own_installed
-            && old_bundle.composed.resident_key() == snapshot.generation().resident_key();
-        drop(old_bundle);
-        let prepared = self
-            .prepared_readers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(snapshot.generation().name())
-            .map(|prepared| prepared.readers.clone());
-        let from_prepared = prepared.is_some();
-        let own_installed = prepared.is_some() || previously_owned;
-        let readers = match prepared {
-            Some(readers) => readers,
-            None => {
-                let old = self
-                    .installed
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if Arc::ptr_eq(&old.composed, snapshot.generation()) {
-                    old.readers.clone()
-                } else {
-                    drop(old);
-                    let adapters: Vec<_> = self
-                        .adapters
-                        .iter()
-                        .filter(|adapter| {
-                            snapshot.generation().name() != "empty"
-                                && (adapter.plane() != FamilyPlane::Callgraph || own_installed)
-                        })
-                        .cloned()
-                        .collect();
-                    PlaneReaders::open(access, snapshot.generation().clone(), &adapters)?
-                }
-            }
-        };
-        let publication_guard = self
-            .publication_transition
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut live = self
-            .live
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let install_error = |error: PlaneError| {
-            if from_prepared {
-                self.retry.store(true, std::sync::atomic::Ordering::Release);
-                SiblingLoader::error(format!(
-                    "{CHECKOUT_CHANGED_BEFORE_INSTALL}: published installation refused: {}",
-                    error.reason
-                ))
-            } else {
-                error
-            }
-        };
-        let mut successor = live.replay_onto(snapshot, cut).map_err(|error| {
-            install_error(SiblingLoader::error(format!(
-                "{CHECKOUT_CHANGED_BEFORE_INSTALL}: {error:?}"
-            )))
-        })?;
-        let mut installed = self
-            .installed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.validate_install_identity(snapshot, cut, &live, &installed)
-            .map_err(install_error)?;
-        let seq = installed.seq + 1;
-        successor.set_watcher(super::snapshot::WatcherState::Healthy);
-        let published = snapshot
-            .generation()
-            .published()
-            .cloned()
-            .unwrap_or_default();
-        let mut installed_snapshot = successor
-            .snapshot()
-            .with_readers(readers.clone())
-            .with_install_cut(InstallCut {
-                seq,
-                resident: snapshot.generation().clone(),
-                epoch: successor.epoch(),
-                version: successor.version(),
-                intent_version: successor.snapshot().intent_version(),
-                verification: cut.verification.clone(),
-            });
-        if snapshot.reconciled_epoch().is_some() {
-            if let Some(base) = snapshot.publication_base() {
-                installed_snapshot = installed_snapshot.with_publication_base(base.clone());
-            }
-        }
-        let coverage = FamilyPlane::ALL
-            .into_iter()
-            .map(|plane| {
-                (
-                    plane,
-                    if installed_snapshot.pending_intent().any(|path| {
-                        self.planes
-                            .iter()
-                            .any(|driver| driver.plane() == plane && driver.applies_to(path))
-                    }) {
-                        super::readiness::PlaneReadiness::Building
-                    } else {
-                        super::readiness::plane_readiness(
-                            plane,
-                            Some(snapshot.generation()),
-                            &installed_snapshot,
-                            &Default::default(),
-                            &|path| {
-                                self.planes.iter().any(|bridge| {
-                                    bridge.plane() == plane && bridge.applies_to(path)
-                                })
-                            },
-                        )
-                    },
-                )
-            })
-            .collect();
-        let replacement = Arc::new(InstalledBundle {
-            seq,
-            composed: snapshot.generation().clone(),
-            coverage,
-            readers,
-            published,
-            revision: installed.revision,
-            snapshot: installed_snapshot,
-            uncertain_paths: Default::default(),
-            own_installed,
-        });
-        let retired_bundle = std::mem::replace(&mut *installed, replacement);
-        let retired_delta = std::mem::replace(&mut *live, successor);
-        drop(installed);
-        drop(live);
-        drop(publication_guard);
-        // Last-drop reader close and residency-pin cleanup can perform I/O.
-        // Keep displaced owners alive until both root locks are released.
-        drop(retired_bundle);
-        drop(retired_delta);
-        let mut retired_prepared = Vec::new();
-        {
-            let mut prepared = self
-                .prepared_readers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            prepared.retain(|_, entry| {
-                if entry.seq < seq {
-                    retired_prepared.push(entry.readers.clone());
-                    false
-                } else {
-                    true
-                }
-            });
-        }
-        drop(retired_prepared);
-        Ok(())
+        self.install_bundle(access, snapshot, true)
     }
     fn build_own_generation(
         &self,
@@ -3068,7 +2929,7 @@ impl FirstLoadDriver for CheckoutDriver {
                         published = true;
                         self.owner.registry().note_publish(self.owner.scope()).map_err(|error| SiblingLoader::error(error.to_string()))?;
                         for adapter in &self.adapters {
-                            adapter.generation_published(access, &generation, &|| self.installed_snapshot())?;
+                            adapter.generation_published(access, &generation, &|| self.installed_cut().0)?;
                         }
                         let rebound = readers.rebind(access)?;
                         let retired = self.prepared_readers.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3355,9 +3216,12 @@ impl CheckoutDriver {
         match outcome {
             Ok(super::base_refs::WorkerOutcome::Published { composed, .. }) => {
                 let readers = PlaneReaders::open(access, composed.clone(), &self.adapters)?;
+                // The installed cut, read without the subscription check:
+                // `installed_snapshot` would mark a checkout without a steady
+                // watcher subscription overflowed in the middle of this
+                // publication, and the install that follows would refuse it.
                 for adapter in &self.adapters {
-                    adapter
-                        .generation_published(access, &composed, &|| self.installed_snapshot())?;
+                    adapter.generation_published(access, &composed, &|| self.installed_cut().0)?;
                 }
                 let retired = self
                     .prepared_readers
@@ -5858,15 +5722,26 @@ impl CompositePlane for TrigramBridge {
         if delta.header().producers.trigram != self.policy.fingerprint_hex() {
             return Err(SiblingLoader::error("trigram producer mismatch"));
         }
+        let entries: Vec<_> = delta
+            .entries()
+            .filter_map(|(path, entry)| match entry {
+                super::manifest_v2::EntryV2::Regular { content, .. } => {
+                    Some((path.clone(), *content, self.key(path, *content).unwrap()))
+                }
+                _ => None,
+            })
+            .collect();
+        // Every key is protected before any is checked against the store, so
+        // a sweep cannot remove a row between the check and the publication.
+        // One call writes the live pin's key list once; protecting key by key
+        // rewrote the whole growing list per entry, quadratic in the entries.
+        live.protect(&entries.iter().map(|(_, _, key)| *key).collect::<Vec<_>>())
+            .map_err(|e| SiblingLoader::error(e.to_string()))?;
         let mut keys = Vec::new();
         let mut payloads = Vec::new();
-        for (path, entry) in delta.entries() {
-            let super::manifest_v2::EntryV2::Regular { content, .. } = entry else {
-                continue;
-            };
-            let key = self.key(path, *content).unwrap();
-            live.protect(&[key])
-                .map_err(|e| SiblingLoader::error(e.to_string()))?;
+        for (path, content, key) in entries {
+            let path = &path;
+            let content = &content;
             if !v3_contains(route, &key) {
                 let attachment = observed
                     .get(path)
@@ -5909,6 +5784,197 @@ impl CompositePlane for TrigramBridge {
 }
 
 impl CheckoutDriver {
+    /// Installs a snapshot whose cut this driver took without reading the
+    /// installed bundle through the subscription check first.
+    ///
+    /// `install` reads the installed bundle through that check. On a checkout
+    /// without a steady watcher subscription, a healthy installed bundle is
+    /// marked overflowed by the check, which bumps the live epoch under the
+    /// cut being installed, so a second install after a verified one (a
+    /// view folding completions into the generation it just installed)
+    /// always refuses. A caller that already applied the check once for the
+    /// work this install finishes uses this instead; the next read that
+    /// vouches for the checkout applies the check again.
+    pub(crate) fn install_without_subscription_check(
+        &self,
+        access: &ViewAccess,
+        snapshot: &Snapshot,
+    ) -> Result<(), PlaneError> {
+        self.install_bundle(access, snapshot, false)
+    }
+
+    fn install_bundle(
+        &self,
+        access: &ViewAccess,
+        snapshot: &Snapshot,
+        check_subscription: bool,
+    ) -> Result<(), PlaneError> {
+        self.check_owner(access)?;
+        let cut = snapshot
+            .install_cut()
+            .ok_or_else(|| SiblingLoader::error("missing installed bundle identity"))?;
+        let old_bundle = if check_subscription {
+            self.installed_bundle()
+        } else {
+            self.installed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
+        let previously_owned = old_bundle.own_installed
+            && old_bundle.composed.resident_key() == snapshot.generation().resident_key();
+        drop(old_bundle);
+        let prepared = self
+            .prepared_readers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(snapshot.generation().name())
+            .map(|prepared| prepared.readers.clone());
+        let from_prepared = prepared.is_some();
+        let own_installed = prepared.is_some() || previously_owned;
+        let readers = match prepared {
+            Some(readers) => readers,
+            None => {
+                let old = self
+                    .installed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if Arc::ptr_eq(&old.composed, snapshot.generation()) {
+                    old.readers.clone()
+                } else {
+                    drop(old);
+                    let adapters: Vec<_> = self
+                        .adapters
+                        .iter()
+                        .filter(|adapter| {
+                            snapshot.generation().name() != "empty"
+                                && (adapter.plane() != FamilyPlane::Callgraph || own_installed)
+                        })
+                        .cloned()
+                        .collect();
+                    PlaneReaders::open(access, snapshot.generation().clone(), &adapters)?
+                }
+            }
+        };
+        let publication_guard = self
+            .publication_transition
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut live = self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let install_error = |error: PlaneError| {
+            if from_prepared {
+                self.retry.store(true, std::sync::atomic::Ordering::Release);
+                SiblingLoader::error(format!(
+                    "{CHECKOUT_CHANGED_BEFORE_INSTALL}: published installation refused: {}",
+                    error.reason
+                ))
+            } else {
+                error
+            }
+        };
+        let mut successor = live.replay_onto(snapshot, cut).map_err(|error| {
+            install_error(SiblingLoader::error(format!(
+                "{CHECKOUT_CHANGED_BEFORE_INSTALL}: {error:?}"
+            )))
+        })?;
+        let mut installed = self
+            .installed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.validate_install_identity(snapshot, cut, &live, &installed)
+            .map_err(install_error)?;
+        let seq = installed.seq + 1;
+        successor.set_watcher(super::snapshot::WatcherState::Healthy);
+        let published = snapshot
+            .generation()
+            .published()
+            .cloned()
+            .unwrap_or_default();
+        let mut installed_snapshot = successor
+            .snapshot()
+            .with_readers(readers.clone())
+            .with_install_cut(InstallCut {
+                seq,
+                resident: snapshot.generation().clone(),
+                epoch: successor.epoch(),
+                version: successor.version(),
+                intent_version: successor.snapshot().intent_version(),
+                verification: cut.verification.clone(),
+            });
+        if snapshot.reconciled_epoch().is_some() {
+            if let Some(base) = snapshot.publication_base() {
+                installed_snapshot = installed_snapshot.with_publication_base(base.clone());
+            }
+        }
+        let coverage = FamilyPlane::ALL
+            .into_iter()
+            .map(|plane| {
+                (
+                    plane,
+                    if installed_snapshot.pending_intent().any(|path| {
+                        self.planes
+                            .iter()
+                            .any(|driver| driver.plane() == plane && driver.applies_to(path))
+                    }) {
+                        super::readiness::PlaneReadiness::Building
+                    } else {
+                        super::readiness::plane_readiness(
+                            plane,
+                            Some(snapshot.generation()),
+                            &installed_snapshot,
+                            &Default::default(),
+                            &|path| {
+                                self.planes.iter().any(|bridge| {
+                                    bridge.plane() == plane && bridge.applies_to(path)
+                                })
+                            },
+                        )
+                    },
+                )
+            })
+            .collect();
+        let replacement = Arc::new(InstalledBundle {
+            seq,
+            composed: snapshot.generation().clone(),
+            coverage,
+            readers,
+            published,
+            revision: installed.revision,
+            snapshot: installed_snapshot,
+            uncertain_paths: Default::default(),
+            own_installed,
+        });
+        let retired_bundle = std::mem::replace(&mut *installed, replacement);
+        let retired_delta = std::mem::replace(&mut *live, successor);
+        drop(installed);
+        drop(live);
+        drop(publication_guard);
+        // Last-drop reader close and residency-pin cleanup can perform I/O.
+        // Keep displaced owners alive until both root locks are released.
+        drop(retired_bundle);
+        drop(retired_delta);
+        let mut retired_prepared = Vec::new();
+        {
+            let mut prepared = self
+                .prepared_readers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            prepared.retain(|_, entry| {
+                if entry.seq < seq {
+                    retired_prepared.push(entry.readers.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        drop(retired_prepared);
+        Ok(())
+    }
+
     fn check_subscription(&self) {
         let stale = {
             let installed = self

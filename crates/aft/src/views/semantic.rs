@@ -1187,6 +1187,67 @@ impl SemanticPlane {
             && !state.failed.contains_key(&(path.clone(), content))
     }
 
+    /// The base entries `snapshot` inherits whose semantic plane the base
+    /// still has pending. Only the base's owner may complete them, by
+    /// publishing a readiness successor; a worker never overrides them.
+    pub(crate) fn inherited_pending(&self, snapshot: &Snapshot) -> Vec<(RelPath, ContentHash)> {
+        let generation = snapshot.generation();
+        if generation.base_header().is_none() {
+            return Vec::new();
+        }
+        generation
+            .entries()
+            .filter_map(|(path, entry)| {
+                let EntryV2::Regular {
+                    content, planes, ..
+                } = entry
+                else {
+                    return None;
+                };
+                (applies_to(path)
+                    && !matches!(snapshot.source(path), Source::Live(_))
+                    && !generation.owns_work(path, FamilyPlane::Semantic)
+                    && planes.semantic.as_ref().is_some_and(PlaneState::is_pending))
+                .then(|| (path.clone(), *content))
+            })
+            .collect()
+    }
+
+    /// The keys this view's fills completed for `paths` (at the content
+    /// given) whose rows the family's store holds, as `(path, content, key)`.
+    pub(crate) fn completed_keys(
+        &self,
+        owner: &ViewRegistration,
+        snapshot: &Snapshot,
+        paths: &[(RelPath, ContentHash)],
+    ) -> Result<Vec<(RelPath, ContentHash, FamilyKey)>, PlaneError> {
+        let candidates = {
+            let view = self.view(&ViewAccess::Owner(owner.clone()));
+            let state = lock(&view);
+            paths
+                .iter()
+                .filter_map(|(path, content)| {
+                    state
+                        .fill
+                        .get(path, content, FamilyPlane::Semantic)
+                        .map(|key| (path.clone(), *content, *key))
+                })
+                .collect::<Vec<_>>()
+        };
+        let store = SemanticStore::for_generation(owner, snapshot.generation())?;
+        let mut stored = Vec::new();
+        for (path, content, key) in candidates {
+            if store
+                .get(&key)
+                .map_err(|error| plane_error(error.to_string()))?
+                .is_some()
+            {
+                stored.push((path, content, key));
+            }
+        }
+        Ok(stored)
+    }
+
     /// Missing vectors and owner-only summary repairs are separate work:
     /// a queued repair must not withdraw the file's published vectors.
     fn work_items(
@@ -2608,6 +2669,18 @@ impl SemanticPlane {
 impl super::first_load::CompositePlane for SemanticPlane {
     fn plane(&self) -> FamilyPlane {
         FamilyPlane::Semantic
+    }
+
+    /// A fresh base may carry the semantic plane: its entries start pending
+    /// and the checkout holding the base's build claim fills them later,
+    /// publishing readiness successors (see `CheckoutSemantic::fill_base`).
+    /// Nothing is embedded during the bind, so completion here is a no-op.
+    fn completes_fresh_base(&self) -> bool {
+        true
+    }
+
+    fn defers_base_completion(&self) -> bool {
+        true
     }
 
     fn applies_to(&self, rel_path: &RelPath) -> bool {
