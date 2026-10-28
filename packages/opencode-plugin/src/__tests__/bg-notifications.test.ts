@@ -2204,7 +2204,11 @@ describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
               },
             ],
           }
-        : { success: true, acked_task_ids: ["task-pattern"] },
+        : {
+            success: true,
+            acked_task_ids: [],
+            acked_matches: [{ task_id: "task-pattern", watch_id: "watch-1", match_offset: 42 }],
+          },
     );
     const { ctx } = harness(send);
     const promptAsync = mock(async () => {});
@@ -2224,7 +2228,7 @@ describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
     expect(prompt.body.parts[0].text).toContain('task task-pattern matched "READY"');
     expect(send.mock.calls.find((call) => call[0] === "bash_ack_completions")?.[1]).toEqual({
       session_id: "s1",
-      task_ids: ["task-pattern"],
+      matches: [{ task_id: "task-pattern", watch_id: "watch-1", match_offset: 42 }],
     });
   });
 
@@ -2700,4 +2704,207 @@ function preAdmissionRejection(message: string) {
     error: { name: "BadRequest", data: { message, kind: "Body" } },
     response: { status: 400 },
   };
+}
+
+test("each_line reminder keeps bounded rows and drop recovery hint", () => {
+  const reminder = formatPatternMatchReminder([
+    {
+      task_id: "bash-lines",
+      session_id: "s1",
+      watch_id: "watch-lines",
+      match_text: "matching lines",
+      match_offset: 0,
+      context:
+        'stdout byte 0 ×2: ERROR a\n3 matching lines dropped. Read them with bash_status({ taskId: "bash-lines", outputOffset: 16 }).',
+      once: false,
+      batch: {
+        lines: [{ stream: "stdout", offset: 0, end_offset: 8, text: "ERROR a", count: 2 }],
+        dropped_lines: 3,
+        first_dropped_offset: 16,
+        first_dropped_stream: "stdout",
+        skipped_long_lines: 0,
+      },
+    },
+  ]);
+  expect(reminder).toContain("task bash-lines matching lines:");
+  expect(reminder).toContain("stdout byte 0 ×2: ERROR a");
+  expect(reminder).toContain(
+    '3 matching lines dropped. Read them with bash_status({ taskId: "bash-lines", outputOffset: 16 }).',
+  );
+});
+
+test("each_line queue replaces snapshots without discarding another watch", async () => {
+  markTaskWaiting("s-lines", "bash-lines");
+  const { ctx } = harness(() => ({ success: true, acked_task_ids: [] }));
+  const base = {
+    task_id: "bash-lines",
+    session_id: "s-lines",
+    watch_id: "watch-a",
+    match_text: "matching lines",
+    match_offset: 0,
+    context: "rows",
+    once: false,
+  };
+  const batch = {
+    lines: [{ stream: "stdout", offset: 0, end_offset: 8, text: "ERROR a", count: 1 }],
+    dropped_lines: 0,
+    first_dropped_offset: null,
+    first_dropped_stream: null,
+    skipped_long_lines: 0,
+  };
+  const drain = { ctx, directory: "/tmp/project", sessionID: "s-lines", client: {} };
+  await handlePushedPatternMatch(drain, { ...base, batch });
+  await handlePushedPatternMatch(drain, {
+    ...base,
+    batch: {
+      ...batch,
+      snapshot: true,
+      dropped_lines: 3,
+      first_dropped_offset: 8,
+      first_dropped_stream: "stdout",
+    },
+  });
+  await handlePushedPatternMatch(drain, { ...base, watch_id: "watch-b", batch });
+  const pending = sessionBgStates.get("s-lines")?.pendingPatternMatches;
+  expect(pending).toHaveLength(2);
+  expect(pending?.find((entry) => entry.watch_id === "watch-a")?.batch?.dropped_lines).toBe(3);
+});
+
+test("exact pattern ack retries keep sibling watches and newer versions deliverable", async () => {
+  const old = {
+    task_id: "task-pattern",
+    session_id: "s1",
+    watch_id: "watch-one",
+    match_offset: 40,
+    match_text: "READY",
+    context: "READY old",
+    once: false,
+    reason: "pattern_match",
+  };
+  let pending = [old];
+  let confirm = false;
+  const calls: Array<{ command: string; params: Record<string, unknown> }> = [];
+  const { ctx } = harness((command, params) => {
+    calls.push({ command, params });
+    if (command === "bash_drain_completions")
+      return { success: true, bg_completions: [], pending_matches: pending };
+    return { success: true, acked_matches: confirm ? (params.matches ?? []) : [] };
+  });
+  const context = { ctx, directory: "/tmp/project", sessionID: "s1" };
+  const deliver = async () => {
+    const output = { output: "tool" };
+    await appendInTurnBgCompletions(context, output);
+    return output.output;
+  };
+  expect(await deliver()).toContain("READY old");
+  expect(await deliver()).not.toContain("READY old");
+  pending = [
+    { ...old, watch_id: "watch-two", context: "READY sibling" },
+    { ...old, match_offset: 41, context: "READY newer" },
+  ];
+  confirm = true;
+  const next = await deliver();
+  expect(next).toContain("READY sibling");
+  expect(next).toContain("READY newer");
+  expect(next).not.toContain("READY old");
+  const acks = calls.filter((call) => call.command === "bash_ack_completions");
+  expect(
+    acks.some(
+      (call) =>
+        JSON.stringify(call.params.matches) ===
+        JSON.stringify([{ task_id: "task-pattern", watch_id: "watch-one", match_offset: 40 }]),
+    ),
+  ).toBe(true);
+  expect(
+    acks.some((call) => Array.isArray(call.params.matches) && call.params.matches.length === 2),
+  ).toBe(true);
+  for (const call of acks) expect(call.params.task_ids ?? []).not.toContain("task-pattern");
+});
+
+for (const route of ["in-turn", "wake"] as const) {
+  test(`admitted each_line snapshot rows and counters are not repeated after a failed ack (${route})`, async () => {
+    const first = {
+      task_id: "task-batch",
+      session_id: "s1",
+      watch_id: "watch-batch",
+      match_offset: 0,
+      match_text: "matching lines",
+      context: "batch",
+      once: false,
+      reason: "pattern_match",
+      batch: {
+        pending_id: "pending-a",
+        version: 0,
+        snapshot: true,
+        lines: [{ stream: "stdout", offset: 0, end_offset: 8, text: "ERROR A", count: 1 }],
+        dropped_lines: 3,
+        skipped_long_lines: 1,
+        first_dropped_offset: 20,
+        first_dropped_stream: "stdout",
+      },
+    };
+    let current = first;
+    let failAck = true;
+    const acknowledgements: Record<string, unknown>[] = [];
+    const { ctx } = harness((command, params) => {
+      if (command === "bash_drain_completions")
+        return { success: true, bg_completions: [], pending_matches: [current] };
+      if (command === "bash_ack_completions") {
+        acknowledgements.push(params);
+        if (failAck) {
+          failAck = false;
+          return { success: false, message: "ack response lost" };
+        }
+        return { success: true, acked_matches: params.matches ?? [] };
+      }
+      return { success: true };
+    });
+    const sent: string[] = [];
+    const client = makeClient(
+      mock(async (input: unknown) => {
+        sent.push((input as { body: { parts: { text: string }[] } }).body.parts[0].text);
+      }),
+    );
+    const context = { ctx, directory: "/tmp/project", sessionID: "s1", client };
+    const deliver = async () => {
+      if (route === "in-turn") {
+        const output = { output: "tool" };
+        await appendInTurnBgCompletions(context, output);
+        return output.output;
+      }
+      const wanted = sent.length + 1;
+      await handleSubcBgEventsNudge(context);
+      await waitUntil(() => sent.length === wanted && acknowledgements.length >= wanted);
+      return sent.at(-1)!;
+    };
+    const old = await deliver();
+    expect(old).toContain("stdout byte 0: ERROR A");
+    expect(old).toContain("3 matching lines dropped.");
+    expect(old).toContain("1 lines longer than 64 KiB");
+    current = {
+      ...first,
+      match_offset: 1,
+      batch: {
+        ...first.batch,
+        version: 1,
+        lines: [
+          { ...first.batch.lines[0] },
+          { stream: "stderr", offset: 0, end_offset: 8, text: "ERROR B", count: 1 },
+        ],
+        dropped_lines: 5,
+        skipped_long_lines: 2,
+      },
+    };
+    const next = await deliver();
+    expect(next).toContain("stderr byte 0: ERROR B");
+    expect(next).not.toContain("ERROR A");
+    expect(next).toContain("2 matching lines dropped.");
+    expect(next).not.toContain("5 matching lines dropped.");
+    expect(next).toContain("1 lines longer than 64 KiB");
+    expect(next).not.toContain("2 lines longer than 64 KiB");
+    expect(acknowledgements.at(-1)).toEqual({
+      session_id: "s1",
+      matches: [{ task_id: "task-batch", watch_id: "watch-batch", match_offset: 1 }],
+    });
+  });
 }

@@ -9,6 +9,7 @@ import {
   classifyBashHostFallbackError,
   coerceBoolean,
   escalationAskText,
+  formatBashOutputPages,
   groupBashPermissionAsks,
   isLiveBackgroundTaskReply,
   LONGEST_TIMER_DELAY_MS,
@@ -806,6 +807,12 @@ export function createBashStatusTool(ctx: PluginContext): ToolDefinition {
         .describe(
           "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
         ),
+      outputOffset: optionalInt(0, Number.MAX_SAFE_INTEGER).describe(
+        "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+      ),
+      stderrOffset: optionalInt(0, Number.MAX_SAFE_INTEGER).describe(
+        "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+      ),
       outputMode: z
         .enum(["screen", "raw", "both"])
         .optional()
@@ -819,7 +826,27 @@ export function createBashStatusTool(ctx: PluginContext): ToolDefinition {
       // bash_status is snapshot-only as of bash_watch landing. waitFor/exit/
       // timeoutMs moved to bash_watch — if the agent passes them here, they're
       // silently ignored at the Zod schema layer (extra keys stripped).
-      const data = await bashStatusSnapshot(ctx, context, taskId, outputMode);
+      const paging = args.outputOffset !== undefined || args.stderrOffset !== undefined;
+      const data = paging
+        ? await callBashBridge(ctx, context, "bash_status", {
+            task_id: taskId,
+            output_mode: outputMode,
+            output_offset: coerceOptionalInt(
+              args.outputOffset,
+              "outputOffset",
+              0,
+              Number.MAX_SAFE_INTEGER,
+            ),
+            stderr_offset: coerceOptionalInt(
+              args.stderrOffset,
+              "stderrOffset",
+              0,
+              Number.MAX_SAFE_INTEGER,
+            ),
+          })
+        : await bashStatusSnapshot(ctx, context, taskId, outputMode);
+      if (data.success === false) throw new Error(String(data.message ?? "bash_status failed"));
+      if (paging) return formatBashOutputPages(data, true);
       const isSubagent = await resolveIsSubagent(ctx.client, context.sessionID, context.directory);
       return await formatBashStatusText(
         context,

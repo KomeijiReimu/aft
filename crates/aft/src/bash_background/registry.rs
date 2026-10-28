@@ -3822,7 +3822,7 @@ impl BgTaskRegistry {
                     return None;
                 };
                 let context = row.match_context.unwrap_or_else(|| match_text.clone());
-                Some(if match_text == WATCH_TARGET_ERASED_TEXT {
+                let mut frame = if match_text == WATCH_TARGET_ERASED_TEXT {
                     BashPatternMatchFrame::watch_target_erased(
                         row.task_id,
                         session_id,
@@ -3840,9 +3840,14 @@ impl BgTaskRegistry {
                         match_text,
                         row.match_offset.unwrap_or_default().max(0) as u64,
                         context,
-                        row.once,
+                        row.once && !row.scanning,
                     )
-                })
+                };
+                frame.batch = row
+                    .match_batch
+                    .as_deref()
+                    .and_then(|batch| serde_json::from_str(batch).ok());
+                Some(frame)
             })
             .collect()
     }
@@ -3993,6 +3998,11 @@ impl BgTaskRegistry {
                 &spec.watch_id,
                 &spec.pattern,
                 spec.once,
+                self.inner
+                    .watch_registry
+                    .lock()
+                    .map(|registry| registry.is_each_line(&spec.watch_id))
+                    .unwrap_or(false),
                 stdout_offset,
                 stderr_offset,
                 pty_offset,
@@ -4007,6 +4017,7 @@ impl BgTaskRegistry {
         watch_id: &str,
         pattern: &WatchPattern,
         once: bool,
+        each_line: bool,
         stdout_offset: u64,
         stderr_offset: u64,
         pty_offset: u64,
@@ -4025,6 +4036,8 @@ impl BgTaskRegistry {
             pattern_kind: pattern.kind_name().to_string(),
             pattern: pattern.pattern_text().to_string(),
             once,
+            each_line,
+            match_batch: None,
             created_at: unix_millis() as i64,
             stdout_offset: stdout_offset as i64,
             stderr_offset: stderr_offset as i64,
@@ -4074,13 +4087,15 @@ impl BgTaskRegistry {
         &self,
         session_id: &str,
         task_id: &str,
-        pattern_match: &PatternMatch,
+        pattern_match: &mut PatternMatch,
         stdout_offset: u64,
         stderr_offset: u64,
         pty_offset: u64,
     ) {
         // The scanner masks the intact capture before constructing this match.
         // Save that presentation verbatim so replay does not need task secrets.
+        let (stdout_offset, stderr_offset, pty_offset) =
+            self.watch_replay_cursors(task_id, (stdout_offset, stderr_offset, pty_offset));
         let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return;
         };
@@ -4096,6 +4111,35 @@ impl BgTaskRegistry {
         ) else {
             return;
         };
+        if let Some(batch) = pattern_match.batch.as_mut() {
+            let previous = row.match_batch.as_deref().and_then(|value| {
+                serde_json::from_str::<super::watch_lines::LineBatch>(value).ok()
+            });
+            let last_version = previous
+                .as_ref()
+                .and_then(|batch| batch.version)
+                .or_else(|| row.match_offset.map(|offset| offset.max(0) as u64));
+            if row.pending_match {
+                if let Some(mut pending) = previous {
+                    pending.merge(batch.clone());
+                    *batch = pending;
+                }
+            } else {
+                batch.pending_id = None;
+            }
+            // Streams can share a byte offset, and a final partial-line flush
+            // need not advance a cursor. Source offsets stay in lines; the
+            // outer offset is a durable, unique acknowledgement version.
+            let version = last_version
+                .map(|last| last.saturating_add(1).max(pattern_match.match_offset))
+                .unwrap_or(pattern_match.match_offset);
+            batch.version = Some(version);
+            if batch.pending_id.is_none() {
+                batch.pending_id = Some(format!("{}:{version}", pattern_match.watch_id));
+            }
+            pattern_match.match_offset = version;
+            pattern_match.context = crate::subc_format::format_watch_line_batch(task_id, batch);
+        }
         row.stdout_offset = stdout_offset as i64;
         row.stderr_offset = stderr_offset as i64;
         row.pty_offset = pty_offset as i64;
@@ -4103,6 +4147,14 @@ impl BgTaskRegistry {
         row.match_text = Some(pattern_match.match_text.clone());
         row.match_offset = Some(pattern_match.match_offset as i64);
         row.match_context = Some(pattern_match.context.clone());
+        row.match_batch = pattern_match.batch.as_ref().and_then(|batch| {
+            let mut saved = batch.clone();
+            // Replay keeps all pending matching rows; the live notification
+            // at task exit contains only a one-line summary of dropped lines.
+            saved.terminal_summary = false;
+            saved.snapshot = true;
+            serde_json::to_string(&saved).ok()
+        });
         if pattern_match.once {
             // Once-watches stop scanning after the first hit but stay durable
             // until ack so a lost push can be re-delivered after restart.
@@ -4125,6 +4177,8 @@ impl BgTaskRegistry {
         stderr_offset: u64,
         pty_offset: u64,
     ) {
+        let (stdout_offset, stderr_offset, pty_offset) =
+            self.watch_replay_cursors(task_id, (stdout_offset, stderr_offset, pty_offset));
         let offsets = (stdout_offset, stderr_offset, pty_offset);
         if self
             .inner
@@ -4175,6 +4229,20 @@ impl BgTaskRegistry {
         }
     }
 
+    fn watch_replay_cursors(&self, task_id: &str, offsets: (u64, u64, u64)) -> (u64, u64, u64) {
+        self.inner
+            .watch_registry
+            .lock()
+            .map(|registry| {
+                (
+                    registry.replay_cursor(task_id, "stdout", offsets.0),
+                    registry.replay_cursor(task_id, "stderr", offsets.1),
+                    registry.replay_cursor(task_id, "pty", offsets.2),
+                )
+            })
+            .unwrap_or(offsets)
+    }
+
     fn watch_stream_cursors(&self, task_id: &str) -> (u64, u64, u64) {
         let Ok(registry) = self.inner.watch_registry.lock() else {
             return (0, 0, 0);
@@ -4218,7 +4286,7 @@ impl BgTaskRegistry {
             {
                 return Ok(None);
             }
-            let removed = row.once || terminal;
+            let removed = (row.once && !row.scanning) || terminal;
             if removed {
                 crate::db::bash_watches::delete_bash_pattern_watch(
                     &conn, &harness, session_id, task_id, watch_id,
@@ -4281,7 +4349,7 @@ impl BgTaskRegistry {
             return;
         };
         for mut row in rows {
-            if row.once && (!row.scanning || row.pending_match) {
+            if row.once && !row.scanning {
                 let _ = crate::db::bash_watches::delete_bash_pattern_watch(
                     &conn,
                     &harness,
@@ -5682,6 +5750,10 @@ impl BgTaskRegistry {
         writer
             .flush()
             .map_err(|error| format!("failed to flush PTY writer: {error}"))?;
+        // Record that typed input reached the terminal, so a task that later
+        // seems to ignore its input can be told apart from one that never got
+        // it. Only the size is logged: the input can contain secrets.
+        crate::slog_info!("bash_write task={task_id} bytes={}", input.len());
         Ok(input.len())
     }
 
@@ -7460,6 +7532,16 @@ impl BgTaskRegistry {
         pattern: WatchPattern,
         once: bool,
     ) -> Result<String, &'static str> {
+        self.register_watch_delivery(task_id, pattern, once, false)
+    }
+
+    pub fn register_watch_delivery(
+        &self,
+        task_id: String,
+        pattern: WatchPattern,
+        once: bool,
+        each_line: bool,
+    ) -> Result<String, &'static str> {
         let task = self.task(&task_id).ok_or("task_not_found")?;
         self.record_live_delivery_session(&task.session_id);
         validate_task_id(&task_id).map_err(|_| "invalid_task_id")?;
@@ -7503,6 +7585,9 @@ impl BgTaskRegistry {
                 .lock()
                 .map_err(|_| "watch_registry_poisoned")?;
             let watch_id = registry.register(task_id.clone(), pattern.clone(), once)?;
+            if each_line {
+                registry.enable_each_line(&watch_id);
+            }
             match &mode {
                 BgMode::Pipes => {
                     let stdout_key = format!("{task_id}:stdout");
@@ -7555,6 +7640,9 @@ impl BgTaskRegistry {
             }
         }
 
+        if terminal_at_registration {
+            terminal_matches.extend(self.take_watch_line_batches(&task_id, true));
+        }
         let (stdout_offset, stderr_offset, pty_offset) = self.watch_stream_cursors(&task_id);
         // The watch row references the task row. A running task's row can be
         // missing (spawned before this registry had its aft.db handle, or a
@@ -7568,6 +7656,7 @@ impl BgTaskRegistry {
             &watch_id,
             &pattern,
             once,
+            each_line,
             stdout_offset,
             stderr_offset,
             pty_offset,
@@ -7621,6 +7710,9 @@ impl BgTaskRegistry {
                 }
             }
 
+            if !scanned_terminal {
+                terminal_matches.extend(self.take_watch_line_batches(&task_id, true));
+            }
             let (stdout_offset, stderr_offset, pty_offset) = self.watch_stream_cursors(&task_id);
             let (watch_controlled, watch_matched) = self.task_watch_state(&task_id);
             if terminal_matches.is_empty() && (!watch_controlled || watch_matched) {
@@ -7638,7 +7730,8 @@ impl BgTaskRegistry {
                     self.record_bash_watch_exit(completion, true);
                 }
             } else {
-                for pattern_match in &terminal_matches {
+                for pattern_match in &mut terminal_matches {
+                    let mut fresh = pattern_match.clone();
                     self.persist_watch_match(
                         &task.session_id,
                         &task_id,
@@ -7647,7 +7740,8 @@ impl BgTaskRegistry {
                         stderr_offset,
                         pty_offset,
                     );
-                    self.emit_bash_pattern_match(&task.session_id, pattern_match.clone());
+                    fresh.copy_delivery_identity(pattern_match);
+                    self.emit_bash_pattern_match(&task.session_id, fresh);
                 }
             }
             self.clear_task_watch_state(&task_id);
@@ -7797,6 +7891,218 @@ impl BgTaskRegistry {
         matches
     }
 
+    pub fn masked_status_page(
+        &self,
+        task_id: &str,
+        artifact: TaskArtifact,
+        from: u64,
+        bytes: &[u8],
+    ) -> String {
+        const MASK_CHUNK_BYTES: usize = 4 * 1024;
+        let mut text = String::new();
+        let mut unavailable_lines = 0_u64;
+        let mut last_unavailable_line = None;
+        let mut context_notice = false;
+        let mut append =
+            |start: usize, rendered: Result<String, completion_preview::UnavailablePreview>| {
+                match rendered {
+                    Ok(part) => text.push_str(&part),
+                    Err(unavailable) if unavailable.line_limit => {
+                        let line = bytes[..start]
+                            .iter()
+                            .rposition(|byte| *byte == b'\n')
+                            .map_or(0, |index| index + 1);
+                        if last_unavailable_line != Some(line) {
+                            unavailable_lines = unavailable_lines.saturating_add(1);
+                            last_unavailable_line = Some(line);
+                        }
+                    }
+                    Err(unavailable) if !context_notice => {
+                        if !text.is_empty() && !text.ends_with('\n') {
+                            text.push('\n');
+                        }
+                        text.push_str(unavailable.reason);
+                        text.push('\n');
+                        context_notice = true;
+                    }
+                    Err(_) => {}
+                }
+            };
+        let mut start = 0;
+        while start < bytes.len() {
+            let limit = (start + MASK_CHUNK_BYTES).min(bytes.len());
+            let mut end = bytes[start..limit]
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map(|index| start + index + 1)
+                .unwrap_or(limit);
+            if end < bytes.len() {
+                let mut boundary = end;
+                for _ in 0..3 {
+                    if boundary > start && bytes[boundary] & 0xc0 == 0x80 {
+                        boundary -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                let width = bytes[boundary].leading_ones() as usize;
+                if (2..=4).contains(&width)
+                    && boundary < end
+                    && boundary + width <= bytes.len()
+                    && end < boundary + width
+                    && std::str::from_utf8(&bytes[boundary..boundary + width]).is_ok()
+                {
+                    end = boundary;
+                }
+            }
+            // Source boundaries must not bisect a character: the mask renderer
+            // deliberately widens ranges, which would otherwise repeat it.
+            let rendered = self.masked_watch_range_checked(
+                task_id,
+                artifact,
+                from + start as u64,
+                from + end as u64,
+            );
+            let split = bytes[start..end]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|index| start + index + 1);
+            if matches!(&rendered, Err(unavailable) if unavailable.line_limit)
+                && split.is_some_and(|split| split < end)
+            {
+                let split = split.unwrap();
+                // A chunk may include the tail of an over-limit line and short
+                // complete lines. Preserve the short lines instead of discarding
+                // them with the unavailable tail; each read retains its halo.
+                append(
+                    start,
+                    self.masked_watch_range_checked(
+                        task_id,
+                        artifact,
+                        from + start as u64,
+                        from + split as u64,
+                    ),
+                );
+                append(
+                    split,
+                    self.masked_watch_range_checked(
+                        task_id,
+                        artifact,
+                        from + split as u64,
+                        from + end as u64,
+                    ),
+                );
+            } else {
+                append(start, rendered);
+            }
+            start = end;
+        }
+        if unavailable_lines > 0 {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&super::watch_lines::unavailable_page_text(
+                unavailable_lines,
+            ));
+        }
+        text
+    }
+
+    pub fn masked_watch_range(
+        &self,
+        task_id: &str,
+        artifact: TaskArtifact,
+        from: u64,
+        to: u64,
+    ) -> String {
+        self.masked_watch_range_checked(task_id, artifact, from, to)
+            .unwrap_or_else(|unavailable| unavailable.reason.to_string())
+    }
+
+    fn masked_watch_range_checked(
+        &self,
+        task_id: &str,
+        artifact: TaskArtifact,
+        from: u64,
+        to: u64,
+    ) -> Result<String, completion_preview::UnavailablePreview> {
+        if to.saturating_sub(from) > completion_preview::WATCH_PREVIEW_LINE_CAP_BYTES as u64 {
+            return Err(completion_preview::UnavailablePreview::line_limit());
+        }
+        let rendered = self.task(task_id).and_then(|task| {
+            let mut file = open_task_artifact(&task.paths, artifact).ok()?;
+            let len = file.len().ok()?;
+            if len >= super::buffer::DISK_LIMIT_BYTES || to > len || from > to {
+                return None;
+            }
+            let source = completion_preview::watch_preview_source_range(
+                from as usize..to as usize,
+                len as usize,
+            )?;
+            let bytes = file
+                .read_range(source.start as u64, source.len() as u64)
+                .ok()?;
+            if bytes.len() != source.len() {
+                return None;
+            }
+            Some(
+                self.render_watch_preview_window_checked(
+                    task_id,
+                    &bytes,
+                    from as usize - source.start..to as usize - source.start,
+                    source.start == 0,
+                    source.end == len as usize,
+                )
+                .map(|preview| preview.0),
+            )
+        });
+        rendered.unwrap_or_else(|| {
+            Err(completion_preview::UnavailablePreview::context(
+                completion_preview::TRUNCATED_PREVIEW_WITHHELD,
+            ))
+        })
+    }
+
+    fn take_watch_line_batches(&self, task_id: &str, terminal: bool) -> Vec<PatternMatch> {
+        let mut batches = self
+            .inner
+            .watch_registry
+            .lock()
+            .map(|mut registry| registry.take_line_batches(task_id, terminal))
+            .unwrap_or_default();
+        for matched in &mut batches {
+            if let Some(batch) = matched.batch.as_mut() {
+                for line in &mut batch.lines {
+                    let artifact = match line.stream.as_str() {
+                        "stderr" => TaskArtifact::Stderr,
+                        "pty" => TaskArtifact::Pty,
+                        _ => TaskArtifact::Stdout,
+                    };
+                    // Render only retained rows, after releasing the scanner lock. The
+                    // preview reader supplies the secret halo before redacting a line.
+                    match self.masked_watch_range_checked(
+                        task_id,
+                        artifact,
+                        line.offset,
+                        line.end_offset,
+                    ) {
+                        Ok(text) => line.text = text.trim_end_matches('\n').to_string(),
+                        Err(unavailable) if unavailable.line_limit => {
+                            line.unavailable = true;
+                            let limit = completion_preview::WATCH_PREVIEW_LINE_CAP_BYTES;
+                            batch.masking_limit_bytes = Some(limit as u64);
+                            line.text =
+                                super::watch_lines::unavailable_match_text(line.count, limit);
+                        }
+                        Err(unavailable) => line.text = unavailable.reason.to_string(),
+                    }
+                }
+                matched.context = crate::subc_format::format_watch_line_batch(task_id, batch);
+            }
+        }
+        batches
+    }
+
     pub(crate) fn scan_task_watch_output(&self, task: &Arc<BgTask>) {
         if self.active_watch_count(&task.task_id) == 0 {
             return;
@@ -7863,6 +8169,7 @@ impl BgTaskRegistry {
                 break;
             }
         }
+        matches.extend(self.take_watch_line_batches(&task.task_id, drain));
         let (stdout_offset, stderr_offset, pty_offset) = self.watch_stream_cursors(&task.task_id);
         if matches.is_empty() {
             // Advance durable cursors even when nothing matched so a restart
@@ -7878,16 +8185,18 @@ impl BgTaskRegistry {
             }
             return;
         }
-        for pattern_match in matches {
+        for mut pattern_match in matches {
+            let mut fresh = pattern_match.clone();
             self.persist_watch_match(
                 &task.session_id,
                 &task.task_id,
-                &pattern_match,
+                &mut pattern_match,
                 stdout_offset,
                 stderr_offset,
                 pty_offset,
             );
-            self.emit_bash_pattern_match(&task.session_id, pattern_match);
+            fresh.copy_delivery_identity(&pattern_match);
+            self.emit_bash_pattern_match(&task.session_id, fresh);
         }
         self.persist_task_watch_cursors(
             &task.session_id,
@@ -10217,7 +10526,16 @@ impl BgTaskRegistry {
         ) else {
             return;
         };
-        let has_pending_match = rows.iter().any(|row| row.pending_match);
+        let has_pending_match = rows.iter().any(|row| {
+            row.pending_match
+                && row
+                    .match_batch
+                    .as_deref()
+                    .and_then(|value| {
+                        serde_json::from_str::<super::watch_lines::LineBatch>(value).ok()
+                    })
+                    .is_none_or(|batch| batch.has_matches())
+        });
         let remaining: HashSet<String> = rows.into_iter().map(|row| row.watch_id).collect();
         if let Ok(mut registry) = self.inner.watch_registry.lock() {
             registry.reconcile_watch_ids(task_id, &remaining, has_pending_match);
@@ -11982,6 +12300,9 @@ impl BgTaskRegistry {
                     );
                     continue;
                 }
+                if row.each_line && row.scanning {
+                    registry.enable_each_line(&row.watch_id);
+                }
                 if row.pending_match {
                     if let (Some(match_text), Some(match_offset), Some(context)) = (
                         row.match_text.clone(),
@@ -11994,7 +12315,11 @@ impl BgTaskRegistry {
                             match_text,
                             match_offset: match_offset.max(0) as u64,
                             context,
-                            once: row.once,
+                            once: row.once && !row.scanning,
+                            batch: row
+                                .match_batch
+                                .as_deref()
+                                .and_then(|batch| serde_json::from_str(batch).ok()),
                         });
                     }
                 }
@@ -12036,7 +12361,8 @@ impl BgTaskRegistry {
         }
 
         let (stdout_offset, stderr_offset, pty_offset) = self.watch_stream_cursors(&task.task_id);
-        for pattern_match in &gap_matches {
+        gap_matches.extend(self.take_watch_line_batches(&task.task_id, terminal));
+        for pattern_match in &mut gap_matches {
             self.persist_watch_match(
                 &task.session_id,
                 &task.task_id,
@@ -12056,6 +12382,10 @@ impl BgTaskRegistry {
             );
         }
 
+        for fresh in gap_matches.iter().filter(|matched| matched.batch.is_some()) {
+            pending_to_emit.retain(|pending| pending.watch_id != fresh.watch_id);
+            pending_to_emit.push(fresh.clone());
+        }
         // Prefer a single delivery: pending re-push first, else fresh gap matches.
         let emitted_pending = !pending_to_emit.is_empty();
         let to_emit = if emitted_pending {
@@ -13252,7 +13582,28 @@ impl BgTaskRegistry {
             return;
         };
         if let Some(sender) = progress_sender.as_ref() {
-            let frame = if pattern_match.match_text == WATCH_TASK_EXIT_TEXT {
+            if let Some(batch) = pattern_match
+                .batch
+                .as_ref()
+                .filter(|batch| batch.terminal_summary)
+            {
+                let mut summary = batch.clone();
+                summary.lines.clear();
+                let mut frame = BashPatternMatchFrame::new(
+                    &pattern_match.task_id,
+                    session_id,
+                    &pattern_match.watch_id,
+                    &pattern_match.match_text,
+                    pattern_match.match_offset,
+                    crate::subc_format::format_watch_line_batch(&pattern_match.task_id, &summary),
+                    pattern_match.once,
+                );
+                frame.batch = Some(summary);
+                sender(PushFrame::BashPatternMatch(frame));
+                return;
+            }
+            let batch = pattern_match.batch.clone();
+            let mut frame = if pattern_match.match_text == WATCH_TASK_EXIT_TEXT {
                 BashPatternMatchFrame::task_exit(
                     pattern_match.task_id,
                     session_id.to_string(),
@@ -13270,6 +13621,7 @@ impl BgTaskRegistry {
                     pattern_match.once,
                 )
             };
+            frame.batch = batch;
             sender(PushFrame::BashPatternMatch(frame));
         }
     }
@@ -25484,6 +25836,8 @@ mod tests {
                     match_text: Some("(fail)".into()),
                     match_offset: Some(756_237),
                     match_context: Some("release output ... (fail)".into()),
+                    each_line: false,
+                    match_batch: None,
                 },
             )
             .unwrap();
@@ -26718,6 +27072,549 @@ mod tests {
     }
 
     #[test]
+    fn each_line_pending_snapshots_merge_and_partial_line_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path();
+        let (registry, db, frames) = registry_with_db_and_frames(storage);
+        let task_id = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                LONG_RUNNING_COMMAND,
+                "session".to_string(),
+                storage.to_path_buf(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
+                storage.to_path_buf(),
+                10,
+                true,
+                false,
+                Some(storage.to_path_buf()),
+            )
+            .unwrap();
+        let watch_id = registry
+            .register_watch_delivery(
+                task_id.clone(),
+                WatchPattern::Substring("ERROR".into()),
+                false,
+                true,
+            )
+            .unwrap();
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+        let mut output = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&task.paths.stdout)
+            .unwrap();
+        output.write_all(b"ERROR a\nER").unwrap();
+        registry.scan_task_watch_output(&task);
+        let row = crate::db::bash_watches::get_bash_pattern_watch(
+            &db.lock().unwrap(),
+            "opencode",
+            "session",
+            &task_id,
+            &watch_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(row.each_line);
+        assert_eq!(row.stdout_offset, 8, "resume before the unfinished line");
+        registry.clear_task_watch_state(&task_id);
+        registry
+            .inner
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        output.write_all(b"ROR b\n").unwrap();
+        let (replayed, _, replay_frames) = registry_with_db_and_frames(storage);
+        replayed
+            .replay_session_inner(storage, "session", None)
+            .unwrap();
+        let matches = pattern_match_frames(&replay_frames);
+        let latest = matches
+            .iter()
+            .rev()
+            .find(|frame| frame.task_id == task_id && frame.batch.is_some())
+            .unwrap();
+        let batch = latest.batch.as_ref().unwrap();
+        assert_eq!(
+            batch.lines.len(),
+            2,
+            "{batch:?}; original pushes: {:?}",
+            pattern_match_frames(&frames)
+        );
+        assert_eq!(batch.lines[0].text, "ERROR a");
+        assert_eq!(batch.lines[1].text, "ERROR b");
+        assert_eq!(batch.lines[1].offset, 8);
+        let mut page = b"page text\n".repeat(6000);
+        page.extend_from_slice(b"page final\n");
+        let from = output.metadata().unwrap().len();
+        output.write_all(&page).unwrap();
+        let masked = registry.masked_status_page(&task_id, TaskArtifact::Stdout, from, &page);
+        assert_eq!(masked.lines().count(), 6001);
+        assert!(masked.ends_with("page final\n"));
+    }
+
+    fn each_line_running_fixture(
+        storage: &Path,
+    ) -> (
+        BgTaskRegistry,
+        Arc<BgTask>,
+        Arc<Mutex<Vec<PushFrame>>>,
+        String,
+    ) {
+        each_line_running_fixture_with_once(storage, false)
+    }
+
+    fn each_line_running_fixture_with_once(
+        storage: &Path,
+        once: bool,
+    ) -> (
+        BgTaskRegistry,
+        Arc<BgTask>,
+        Arc<Mutex<Vec<PushFrame>>>,
+        String,
+    ) {
+        let (registry, _, frames) = registry_with_db_and_frames(storage);
+        let task_id = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                LONG_RUNNING_COMMAND,
+                "session".into(),
+                storage.to_path_buf(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
+                storage.to_path_buf(),
+                10,
+                true,
+                false,
+                Some(storage.to_path_buf()),
+            )
+            .unwrap();
+        registry
+            .inner
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let watch = registry
+            .register_watch_delivery(
+                task_id.clone(),
+                WatchPattern::Substring("READY".into()),
+                once,
+                true,
+            )
+            .unwrap();
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+        (registry, task, frames, watch)
+    }
+
+    fn append_each_line_output(path: &Path, bytes: &[u8]) {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+    }
+
+    #[test]
+    fn each_line_once_warning_stays_armed_through_ack_and_restart() {
+        for restart in [false, true] {
+            for acknowledge_warning in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let (registry, task, frames, watch) =
+                    each_line_running_fixture_with_once(dir.path(), true);
+                let _reap = KillTasksOnDrop(registry.clone());
+                let mut noise = vec![b'x'; super::super::watch_lines::MAX_LINE_BYTES + 1];
+                noise.push(b'\n');
+                append_each_line_output(&task.paths.stdout, &noise);
+                registry.scan_task_watch_output(&task);
+                let warning = pattern_match_frames(&frames).pop().unwrap();
+                assert_eq!(
+                    registry.active_watch_count(&task.task_id),
+                    1,
+                    "a warning is not a proven pattern match"
+                );
+                assert!(!warning.once);
+                assert_eq!(warning.batch.as_ref().unwrap().skipped_long_lines, 1);
+                assert!(warning.context.contains("the scan is incomplete"));
+                let row = || {
+                    let (_, pool) = registry.db_harness_and_pool_for_session("session").unwrap();
+                    let conn = pool.lock().unwrap();
+                    crate::db::bash_watches::get_bash_pattern_watch(
+                        &conn,
+                        "opencode",
+                        "session",
+                        &task.task_id,
+                        &watch,
+                    )
+                    .unwrap()
+                    .unwrap()
+                };
+                assert!(row().scanning);
+                if acknowledge_warning {
+                    let ack = registry
+                        .ack_pattern_match_for_session(
+                            "session",
+                            &task.task_id,
+                            &watch,
+                            warning.match_offset,
+                        )
+                        .unwrap()
+                        .unwrap();
+                    assert!(!ack.watch_removed);
+                    assert!(row().scanning);
+                }
+                let (live, live_frames) = if restart {
+                    registry.clear_task_watch_state(&task.task_id);
+                    let (replayed, _, replay_frames) = registry_with_db_and_frames(dir.path());
+                    replayed
+                        .replay_session_inner(dir.path(), "session", None)
+                        .unwrap();
+                    replayed
+                        .inner
+                        .shutdown
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    assert_eq!(replayed.active_watch_count(&task.task_id), 1);
+                    for frame in pattern_match_frames(&replay_frames) {
+                        assert!(!frame.once);
+                    }
+                    (replayed, replay_frames)
+                } else {
+                    (registry.clone(), frames.clone())
+                };
+                let _reap_live = KillTasksOnDrop(live.clone());
+                append_each_line_output(&task.paths.stdout, b"READY after warning\n");
+                let live_task = live.task_for_session(&task.task_id, "session").unwrap();
+                live.scan_task_watch_output(&live_task);
+                let matched = pattern_match_frames(&live_frames).pop().unwrap();
+                assert_eq!(
+                    matched.batch.as_ref().unwrap().lines[0].text,
+                    "READY after warning"
+                );
+                assert!(matched.once);
+                assert_eq!(live.active_watch_count(&task.task_id), 0);
+                let (_, pool) = live.db_harness_and_pool_for_session("session").unwrap();
+                let conn = pool.lock().unwrap();
+                assert!(
+                    !crate::db::bash_watches::get_bash_pattern_watch(
+                        &conn,
+                        "opencode",
+                        "session",
+                        &task.task_id,
+                        &watch
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .scanning
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn each_line_over_mask_limit_is_counted_unavailable_without_false_secret_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, task, frames, _) = each_line_running_fixture(dir.path());
+        let _reap = KillTasksOnDrop(registry.clone());
+        let line = format!(
+            "{{\"status\":\"READY\",\"payload\":\"{}\"}}\n",
+            "x".repeat(10 * 1024)
+        );
+        append_each_line_output(&task.paths.stdout, line.as_bytes());
+        registry.scan_task_watch_output(&task);
+        let first = pattern_match_frames(&frames).pop().unwrap();
+        assert!(
+            !first
+                .context
+                .contains(crate::log_redact::SECRET_PLACEHOLDER),
+            "nonsecret text must not be represented as a secret"
+        );
+        let batch = serde_json::to_value(first.batch.as_ref().unwrap()).unwrap();
+        assert_eq!(batch["lines"][0]["unavailable"], true);
+        assert_eq!(batch["lines"][0]["offset"], 0);
+        assert_eq!(batch["lines"][0]["stream"], "stdout");
+        assert_eq!(first.context, "stdout byte 0: 1 matching line over 8 KiB was not shown; AFT can check lines only up to 8 KiB for secrets.");
+        assert_eq!(registry.masked_status_page(&task.task_id, TaskArtifact::Stdout, 0, line.as_bytes()),
+            "1 line in this page over 8 KiB was not shown; AFT can check lines only up to 8 KiB for secrets.");
+        append_each_line_output(&task.paths.stdout, line.as_bytes());
+        let both = line.repeat(2);
+        assert_eq!(registry.masked_status_page(&task.task_id, TaskArtifact::Stdout, 0, both.as_bytes()),
+            "2 lines in this page over 8 KiB were not shown; AFT can check lines only up to 8 KiB for secrets.");
+    }
+
+    #[test]
+    fn masked_status_page_utf8_internal_boundary_renders_character_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, task, _, _) = each_line_running_fixture(dir.path());
+        let _reap = KillTasksOnDrop(registry.clone());
+        let line = format!("{}€{}\n", "x".repeat(4095), "y".repeat(1024));
+        append_each_line_output(&task.paths.stdout, line.as_bytes());
+        let page =
+            registry.masked_status_page(&task.task_id, TaskArtifact::Stdout, 0, line.as_bytes());
+        assert_eq!(
+            page.matches('€').count(),
+            1,
+            "an internal byte split must not duplicate a character"
+        );
+        assert_eq!(page, line);
+    }
+
+    #[test]
+    fn masked_status_page_unavailable_line_is_counted_once_and_neighbors_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, task, _, _) = each_line_running_fixture(dir.path());
+        let _reap = KillTasksOnDrop(registry.clone());
+        let input = format!(
+            "plain before\n{{\"payload\":\"{}\"}}\nplain after\n",
+            "x".repeat(10 * 1024)
+        );
+        append_each_line_output(&task.paths.stdout, input.as_bytes());
+        assert_eq!(registry.masked_status_page(&task.task_id, TaskArtifact::Stdout, 0, input.as_bytes()),
+            "plain before\nplain after\n1 line in this page over 8 KiB was not shown; AFT can check lines only up to 8 KiB for secrets.");
+    }
+
+    #[test]
+    fn masked_status_page_keeps_real_secret_redaction_across_chunk_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, task, _, _) = each_line_running_fixture(dir.path());
+        let _reap = KillTasksOnDrop(registry.clone());
+        let secret = "actual-secret-crossing-the-internal-boundary";
+        let fixed = "{\"padding\":\"\",\"password\":\"".len();
+        let input = format!(
+            "{{\"padding\":\"{}\",\"password\":\"{secret}\",\"tail\":\"{}\"}}\n",
+            "x".repeat(4090 - fixed),
+            "y".repeat(1000)
+        );
+        let start = input.find(secret).unwrap();
+        assert!(start < 4096 && start + secret.len() > 4096);
+        append_each_line_output(&task.paths.stdout, input.as_bytes());
+        let page =
+            registry.masked_status_page(&task.task_id, TaskArtifact::Stdout, 0, input.as_bytes());
+        assert!(!page.contains(secret));
+        assert!(!page.contains("actual-secret"));
+        assert!(!page.contains("internal-boundary"));
+        assert!(page.contains(crate::log_redact::SECRET_PLACEHOLDER));
+    }
+
+    #[test]
+    fn each_line_stream_offsets_do_not_collide_as_ack_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, task, frames, watch) = each_line_running_fixture(dir.path());
+        let _reap = KillTasksOnDrop(registry.clone());
+        append_each_line_output(&task.paths.stdout, b"READY a\n");
+        registry.scan_task_watch_output(&task);
+        append_each_line_output(&task.paths.stderr, b"READY b\n");
+        registry.scan_task_watch_output(&task);
+        let frames = pattern_match_frames(&frames);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].batch.as_ref().unwrap().lines[0].offset, 0);
+        assert_eq!(frames[1].batch.as_ref().unwrap().lines[0].offset, 0);
+        assert!(
+            frames[1].match_offset > frames[0].match_offset,
+            "different streams must not share an acknowledgement version"
+        );
+        assert!(registry
+            .ack_pattern_match_for_session("session", &task.task_id, &watch, frames[0].match_offset)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            registry
+                .pending_pattern_matches_for_session("session")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn each_line_final_partial_flush_advances_version_without_cursor_movement() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, task, frames, watch) = each_line_running_fixture(dir.path());
+        let _reap = KillTasksOnDrop(registry.clone());
+        append_each_line_output(&task.paths.stdout, b"READY tail");
+        append_each_line_output(&task.paths.stderr, b"READY other\n");
+        registry.scan_task_watch_output(&task);
+        let first = pattern_match_frames(&frames).pop().unwrap();
+        let cursors = registry.watch_stream_cursors(&task.task_id);
+        let mut final_match = registry
+            .take_watch_line_batches(&task.task_id, true)
+            .pop()
+            .unwrap();
+        assert_eq!(
+            final_match.batch.as_ref().unwrap().lines[0].text,
+            "READY tail"
+        );
+        registry.persist_watch_match(
+            "session",
+            &task.task_id,
+            &mut final_match,
+            cursors.0,
+            cursors.1,
+            cursors.2,
+        );
+        assert_eq!(registry.watch_stream_cursors(&task.task_id), cursors);
+        assert!(
+            final_match.match_offset > first.match_offset,
+            "a final partial line needs a new acknowledgement version even without another read"
+        );
+        assert!(registry
+            .ack_pattern_match_for_session("session", &task.task_id, &watch, first.match_offset)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn each_line_ack_version_survives_daemon_restart_before_and_after_ack() {
+        for acknowledge_first in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (registry, task, frames, watch) = each_line_running_fixture(dir.path());
+            let _reap = KillTasksOnDrop(registry.clone());
+            append_each_line_output(&task.paths.stdout, b"READY a\n");
+            registry.scan_task_watch_output(&task);
+            let first = pattern_match_frames(&frames).pop().unwrap();
+            let pending_id = first.batch.as_ref().unwrap().pending_id.clone().unwrap();
+            if acknowledge_first {
+                assert!(registry
+                    .ack_pattern_match_for_session(
+                        "session",
+                        &task.task_id,
+                        &watch,
+                        first.match_offset
+                    )
+                    .unwrap()
+                    .is_some());
+            }
+            registry.clear_task_watch_state(&task.task_id);
+            let (replayed, _, replay_frames) = registry_with_db_and_frames(dir.path());
+            let _reap_replayed = KillTasksOnDrop(replayed.clone());
+            replayed
+                .replay_session_inner(dir.path(), "session", None)
+                .unwrap();
+            replayed
+                .inner
+                .shutdown
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if !acknowledge_first {
+                let replay = pattern_match_frames(&replay_frames).pop().unwrap();
+                assert_eq!(replay.match_offset, first.match_offset);
+            }
+            let replayed_task = replayed.task_for_session(&task.task_id, "session").unwrap();
+            append_each_line_output(&task.paths.stderr, b"READY b\n");
+            replayed.scan_task_watch_output(&replayed_task);
+            let newest = pattern_match_frames(&replay_frames).pop().unwrap();
+            assert!(
+                newest.match_offset > first.match_offset,
+                "acknowledged first: {acknowledge_first}"
+            );
+            assert_eq!(
+                newest.batch.as_ref().unwrap().lines.last().unwrap().offset,
+                0
+            );
+            if acknowledge_first {
+                assert_ne!(
+                    newest.batch.as_ref().unwrap().pending_id.as_ref().unwrap(),
+                    &pending_id
+                );
+            } else {
+                assert_eq!(
+                    newest.batch.as_ref().unwrap().pending_id.as_ref().unwrap(),
+                    &pending_id
+                );
+            }
+            assert!(replayed
+                .ack_pattern_match_for_session("session", &task.task_id, &watch, first.match_offset)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn each_line_default_push_frame_stays_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, frames) = registry_with_db_and_frames(dir.path());
+        registry.record_live_delivery_session("session-v2");
+        registry.emit_bash_pattern_match(
+            "session-v2",
+            PatternMatch {
+                watch_id: "watch-ready".into(),
+                task_id: "bash-running".into(),
+                match_text: "READY".into(),
+                match_offset: 42,
+                context: "READY".into(),
+                once: false,
+                batch: None,
+            },
+        );
+        assert_eq!(
+            serde_json::to_string(&pattern_match_frames(&frames)[0]).unwrap(),
+            r#"{"type":"bash_pattern_match","task_id":"bash-running","session_id":"session-v2","watch_id":"watch-ready","match_text":"READY","match_offset":42,"context":"READY","once":false,"reason":"pattern_match"}"#
+        );
+    }
+
+    fn each_line_terminal_frame() -> BashPatternMatchFrame {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, frames) = registry_with_db_and_frames(dir.path());
+        registry.record_live_delivery_session("session-v2");
+        let batch = super::super::watch_lines::LineBatch {
+            terminal_summary: true,
+            dropped_lines: 7,
+            first_dropped_stream: Some("stderr".into()),
+            first_dropped_offset: Some(123),
+            lines: vec![super::super::watch_lines::WatchLine {
+                stream: "stdout".into(),
+                offset: 0,
+                end_offset: 8,
+                count: 1,
+                text: "ERROR a".into(),
+                unavailable: false,
+            }],
+            ..Default::default()
+        };
+        registry.emit_bash_pattern_match(
+            "session-v2",
+            PatternMatch {
+                watch_id: "watch-ready".into(),
+                task_id: "bash-running".into(),
+                match_text: "matching lines".into(),
+                match_offset: 123,
+                context: "ignored".into(),
+                once: false,
+                batch: Some(batch),
+            },
+        );
+        let mut frames = pattern_match_frames(&frames);
+        assert_eq!(frames.len(), 1);
+        frames.remove(0)
+    }
+
+    #[test]
+    fn each_line_terminal_rate_exemption_is_one_summary_line() {
+        let frame = each_line_terminal_frame();
+        assert_eq!(frame.reason, "pattern_match");
+        assert_eq!(frame.watch_id, "watch-ready");
+        assert_eq!(frame.match_offset, 123);
+        assert!(frame.batch.as_ref().unwrap().lines.is_empty());
+        assert_eq!(frame.context.lines().count(), 1);
+        assert!(frame.context.contains("7 matching lines dropped"));
+        assert!(frame.context.contains("stderr_offset: 123"));
+        assert!(!frame.context.contains("ERROR a"));
+    }
+
+    #[test]
+    fn each_line_terminal_summary_frame_fixture() {
+        // Host integration tests consume the checked-in native emitter frame
+        // (packages/opencode-plugin/src/__tests__/fixtures/each-line-terminal-frame.json),
+        // not a reconstruction that could hide a disagreement in durable identity.
+        // Spawning cargo from a host test hangs offline builders, so the frame
+        // lives in the file and this test pins it: if the emitter changes,
+        // update the fixture to the new live frame printed below.
+        let live = serde_json::to_value(&each_line_terminal_frame()).unwrap();
+        let pinned: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../packages/opencode-plugin/src/__tests__/fixtures/each-line-terminal-frame.json"
+        ))
+        .unwrap();
+        assert_eq!(live, pinned);
+    }
+
+    #[test]
     fn pattern_watch_acked_match_does_not_redeliver_after_restart() {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path();
@@ -26921,6 +27818,8 @@ mod tests {
                     match_text: None,
                     match_offset: None,
                     match_context: None,
+                    each_line: false,
+                    match_batch: None,
                 },
             )
             .unwrap();

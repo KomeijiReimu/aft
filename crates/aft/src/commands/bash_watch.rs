@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 
 use crate::bash_background::persistence::{BgMode, TaskArtifact};
 use crate::bash_background::registry::BgTaskSnapshot;
+use crate::bash_background::watch_lines::EACH_LINE_NEEDS_BACKGROUND;
 use crate::bash_background::{BgTaskRegistry, BgTaskStatus};
 use crate::commands::bash_orchestrate::{
     format_wait_limit, kill_deadline_sentence, worker_kill_deadline_within_handoff_margin,
@@ -52,6 +53,8 @@ const PREVIEW_BYTES: usize = crate::bash_background::output::RUNNING_OUTPUT_PREV
 
 #[derive(Debug, Default, Deserialize)]
 struct BashWatchParams {
+    #[serde(default)]
+    deliver: Option<Value>,
     #[serde(default)]
     task_id: Option<String>,
     #[serde(default)]
@@ -305,6 +308,13 @@ pub(crate) fn handle_deferred_with_observation_only(
             "bash_watch: missing taskId",
         ));
     };
+    if params.deliver.is_some() {
+        return DispatchOutcome::Immediate(Response::error(
+            &id,
+            "invalid_request",
+            EACH_LINE_NEEDS_BACKGROUND,
+        ));
+    }
     let pattern = match parse_pattern(params.pattern.as_ref()) {
         Ok(pattern) => pattern,
         Err(response) => return DispatchOutcome::Immediate(with_id(response, &id)),
@@ -894,6 +904,20 @@ fn output_tail(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn each_line_sync_watch_refuses_delivery() {
+        let project = tempfile::tempdir().unwrap();
+        let ctx = context(project.path(), project.path());
+        let req = serde_json::from_value(json!({"id":"sync-delivery", "command":"bash_watch", "task_id":"task", "deliver":"each_line"})).unwrap();
+        let DispatchOutcome::Immediate(response) = handle_deferred(&req, ctx) else {
+            panic!("sync delivery must refuse immediately")
+        };
+        assert!(!response.success);
+        assert_eq!(
+            serde_json::to_value(&response).unwrap()["message"],
+            r#"bash_watch: deliver: "each_line" needs background: true."#
+        );
+    }
     use crate::bash_background::persistence::{create_task_layout, write_task_at, PersistedTask};
     use crate::config::Config;
     use crate::harness::Harness;
