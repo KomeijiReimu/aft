@@ -61,7 +61,23 @@ pub struct WatchLine {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RetryGap {
+    pub reason: String,
+    pub dropped_notifications: u64,
+    pub known_missing_occurrences: u64,
+    pub first_offset: Option<u64>,
+    pub last_offset: Option<u64>,
+    pub stream: Option<String>,
+    #[serde(default)]
+    pub evicted_through: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LineBatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledged_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_gap: Option<RetryGap>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub masking_limit_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -85,6 +101,9 @@ impl LineBatch {
     }
 
     pub fn merge(&mut self, next: LineBatch) {
+        if next.retry_gap.is_some() {
+            self.retry_gap = next.retry_gap.clone();
+        }
         self.masking_limit_bytes = next.masking_limit_bytes.or(self.masking_limit_bytes);
         self.terminal_summary = next.terminal_summary;
         let mut retained = self.lines.iter().map(|line| line.count).sum::<u64>();

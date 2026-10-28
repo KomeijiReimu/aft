@@ -2706,6 +2706,39 @@ function preAdmissionRejection(message: string) {
   };
 }
 
+test("retry gap-only reminder reports unrecoverable notices and an output offset", () => {
+  const reminder = formatPatternMatchReminder([
+    {
+      task_id: "bash-gap",
+      session_id: "s1",
+      watch_id: "watch-gap",
+      match_text: "watch delivery gap",
+      match_offset: 9,
+      context: "",
+      once: false,
+      batch: {
+        lines: [],
+        dropped_lines: 0,
+        skipped_long_lines: 0,
+        first_dropped_offset: null,
+        first_dropped_stream: null,
+        retry_gap: {
+          reason: "retry_overflow",
+          dropped_notifications: 2,
+          known_missing_occurrences: 1,
+          first_offset: 16,
+          last_offset: 24,
+          stream: "stderr",
+        },
+      },
+    },
+  ]);
+  expect(reminder).toContain("[BG BASH NOTIFY]");
+  expect(reminder).toContain(
+    'Watch delivery gap: a stalled connection dropped 2 watch notices; matches may be missing. The dropped notices cannot be recovered. Known missing occurrences: 1. Inspect retained task output with bash_status({ taskId: "bash-gap", stderrOffset: 16 }).',
+  );
+});
+
 test("each_line reminder keeps bounded rows and drop recovery hint", () => {
   const reminder = formatPatternMatchReminder([
     {

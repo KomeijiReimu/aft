@@ -558,6 +558,7 @@ struct FrameOperation {
 }
 
 pub(super) struct DispatchPathMetrics {
+    pub(super) watch_delivery: Arc<super::watch_delivery::WatchDelivery>,
     unanswered_tools: StdMutex<HashMap<(super::RouteChannel, u64), UnansweredTool>>,
     pub(super) origin: Instant,
     pub(super) frame_loop_last_tick_ms: AtomicU64,
@@ -620,6 +621,7 @@ pub(super) struct DispatchPathMetrics {
 impl DispatchPathMetrics {
     pub(super) fn new() -> Self {
         Self {
+            watch_delivery: Arc::default(),
             unanswered_tools: StdMutex::new(HashMap::new()),
             origin: Instant::now(),
             frame_loop_last_tick_ms: AtomicU64::new(0),
@@ -1423,6 +1425,7 @@ impl DispatchPathMetrics {
                 "oldest_age_ms": oldest_pending_age_ms,
             },
             "bind_acks": self.bind_ack_snapshot(),
+            "reliable_push": self.watch_delivery.health(),
             "tool_call_presets": self.tool_call_preset_snapshot(),
             "completion_channels": {
                 "control": self.control_completion_queued.load(Ordering::Relaxed),
@@ -3971,7 +3974,14 @@ fn build_health_report_with_snapshots(
     metrics.insert("headline".to_string(), json!(headline));
     budget_health_metrics(&mut metrics);
 
-    let warning = if scheduler_busy {
+    let gap_health = dispatch_path_metrics.watch_delivery.health();
+    let watch_gap_unresolved = gap_health["status"] != "ok";
+    let warning = if watch_gap_unresolved {
+        Some(format!(
+            "watch delivery is degraded: {}",
+            gap_health["reason"].as_str().unwrap_or("retry_overflow")
+        ))
+    } else if scheduler_busy {
         Some(EXECUTOR_SCHEDULER_CONTENTION_DETAIL.to_string())
     } else {
         rollup.detail.clone()
@@ -3984,7 +3994,7 @@ fn build_health_report_with_snapshots(
         (None, warning) => warning,
     };
     HealthReport {
-        status: if scheduler_busy {
+        status: if scheduler_busy || watch_gap_unresolved {
             HealthStatus::Degraded
         } else {
             rollup.status.clone()

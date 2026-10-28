@@ -77,6 +77,7 @@ pub fn upsert_bash_pattern_watch(
             row.match_batch,
         ],
     )?;
+    refresh_watch_gap_health(conn);
     Ok(())
 }
 
@@ -87,11 +88,13 @@ pub fn delete_bash_pattern_watch(
     task_id: &str,
     watch_id: &str,
 ) -> rusqlite::Result<usize> {
-    conn.execute(
+    let deleted = conn.execute(
         "DELETE FROM bash_pattern_watches
          WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3 AND watch_id = ?4",
         params![harness, session_id, task_id, watch_id],
-    )
+    )?;
+    refresh_watch_gap_health(conn);
+    Ok(deleted)
 }
 
 pub fn delete_bash_pattern_watches_for_task(
@@ -100,11 +103,13 @@ pub fn delete_bash_pattern_watches_for_task(
     session_id: &str,
     task_id: &str,
 ) -> rusqlite::Result<usize> {
-    conn.execute(
+    let deleted = conn.execute(
         "DELETE FROM bash_pattern_watches
          WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3",
         params![harness, session_id, task_id],
-    )
+    )?;
+    refresh_watch_gap_health(conn);
+    Ok(deleted)
 }
 
 pub fn list_bash_pattern_watches_for_task(
@@ -272,4 +277,95 @@ fn map_watch_row(row: &Row<'_>) -> rusqlite::Result<BashPatternWatchRow> {
         each_line: row.get(16)?,
         match_batch: row.get(17)?,
     })
+}
+
+// Keep the last census for every opened database, even after its actor retires.
+// Health reads only this compact cache, never SQLite on the frame loop.
+type GapCensus = (u64, u64, bool);
+static WATCH_GAP_CENSUS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, GapCensus>>,
+> = std::sync::OnceLock::new();
+
+pub(crate) fn refresh_watch_gap_health(conn: &Connection) {
+    let key = conn
+        .path()
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("memory:{:p}", conn));
+    let census = (|| -> rusqlite::Result<GapCensus> {
+        let mut stmt = conn.prepare("SELECT match_batch FROM bash_pattern_watches WHERE pending_match = 1 AND match_batch IS NOT NULL")?;
+        let batches = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let (mut outstanding, mut missing) = (0u64, 0u64);
+        let mut uncertain = false;
+        for batch in batches {
+            match serde_json::from_str::<crate::bash_background::watch_lines::LineBatch>(&batch?) {
+                Ok(batch) => {
+                    if let Some(gap) = batch.retry_gap {
+                        outstanding = outstanding.saturating_add(1);
+                        missing = missing.saturating_add(gap.known_missing_occurrences);
+                    }
+                }
+                Err(_) => uncertain = true,
+            }
+        }
+        Ok((outstanding, missing, uncertain))
+    })();
+    let mut cache = WATCH_GAP_CENSUS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap();
+    match census {
+        Ok((0, 0, false)) => {
+            cache.remove(&key);
+        }
+        Ok(value) => {
+            cache.insert(key, value);
+        }
+        Err(_) => {
+            cache.entry(key).or_default().2 = true;
+        }
+    }
+}
+
+pub(crate) fn watch_gap_health() -> GapCensus {
+    WATCH_GAP_CENSUS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .values()
+        .fold((0u64, 0u64, false), |(gaps, missing, uncertain), next| {
+            (
+                gaps.saturating_add(next.0),
+                missing.saturating_add(next.1),
+                uncertain || next.2,
+            )
+        })
+}
+
+pub(crate) fn delivery_ack_version(
+    conn: &Connection,
+    harness: &str,
+    session: &str,
+    task: &str,
+    watch: &str,
+) -> rusqlite::Result<Option<u64>> {
+    conn.query_row("SELECT version FROM bash_watch_delivery_acks WHERE harness=?1 AND session_id=?2 AND task_id=?3 AND watch_id=?4", params![harness, session, task, watch], |r| r.get::<_, i64>(0).map(|v| v.max(0) as u64)).optional()
+}
+
+pub(crate) fn acknowledge_delivery(
+    conn: &Connection,
+    harness: &str,
+    session: &str,
+    task: &str,
+    watch: &str,
+    version: u64,
+) -> rusqlite::Result<()> {
+    conn.execute("INSERT INTO bash_watch_delivery_acks(harness, session_id, task_id, watch_id, version, acknowledged_at) VALUES(?1,?2,?3,?4,?5,unixepoch()) ON CONFLICT(harness, session_id, task_id, watch_id) DO UPDATE SET version=MAX(version,excluded.version), acknowledged_at=excluded.acknowledged_at", params![harness, session, task, watch, version as i64])?;
+    // Retry queues are process-local. A month-old acknowledgement cannot still
+    // have a transport copy waiting in the daemon that wrote it.
+    conn.execute(
+        "DELETE FROM bash_watch_delivery_acks WHERE acknowledged_at < unixepoch() - 2592000",
+        [],
+    )?;
+    Ok(())
 }

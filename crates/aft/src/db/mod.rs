@@ -35,7 +35,7 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod wal_credit_probe;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 23;
+pub const CURRENT_SCHEMA_VERSION: u32 = 24;
 
 const MIGRATION_VERSIONS: &[u32] = &[
     1,
@@ -61,6 +61,7 @@ const MIGRATION_VERSIONS: &[u32] = &[
     21,
     22,
     23,
+    24,
 ];
 
 // Performance-only indexes do not change the table format or reader floor.
@@ -1024,6 +1025,11 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
         21 => apply_migration_v21(conn),
         22 => conn.execute_batch(gh_speech::MIGRATION),
         23 => conn.execute_batch(gh_speech::LEGACY_DISPATCH_MIGRATION),
+        24 => conn.execute_batch("CREATE TABLE bash_watch_delivery_acks (
+            harness TEXT NOT NULL, session_id TEXT NOT NULL, task_id TEXT NOT NULL, watch_id TEXT NOT NULL,
+            version INTEGER NOT NULL, acknowledged_at INTEGER NOT NULL,
+            PRIMARY KEY (harness, session_id, task_id, watch_id)
+        )"),
         _ => Ok(()),
     }
 }
@@ -1131,6 +1137,7 @@ mod tests {
         "schema_version",
         "bash_tasks",
         "bash_pattern_watches",
+        "bash_watch_delivery_acks",
         "compression_events",
         "backups",
         "harness_state",

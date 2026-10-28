@@ -5502,6 +5502,27 @@ pub fn format_watch_line_batch(
         };
         text.push_str(&format!("{} matching lines dropped.{incomplete} Read them with bash_status({{ task_id: {}, {cursor}: {} }}).\n", batch.dropped_lines, serde_json::to_string(task_id).unwrap_or_default(), batch.first_dropped_offset.unwrap_or(0)));
     }
+    if let Some(gap) = &batch.retry_gap {
+        let notices = if gap.dropped_notifications == 1 {
+            "notice"
+        } else {
+            "notices"
+        };
+        let known = if gap.known_missing_occurrences > 0 {
+            format!(
+                " Known missing occurrences: {}.",
+                gap.known_missing_occurrences
+            )
+        } else {
+            String::new()
+        };
+        let cursor = if gap.stream.as_deref() == Some("stderr") {
+            "stderr_offset"
+        } else {
+            "output_offset"
+        };
+        text.push_str(&format!("Watch delivery gap: a stalled connection dropped {} watch {notices}; matches may be missing. The dropped notices cannot be recovered.{known} Inspect retained task output with bash_status({{ task_id: {}, {cursor}: {} }}).\n", gap.dropped_notifications, serde_json::to_string(task_id).unwrap_or_default(), gap.first_offset.unwrap_or(0)));
+    }
     text.trim_end().to_string()
 }
 

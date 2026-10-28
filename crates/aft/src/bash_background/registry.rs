@@ -2376,6 +2376,9 @@ impl BgTaskRegistry {
             .speech_db_path
             .write()
             .unwrap_or_else(|error| error.into_inner()) = path;
+        if let Ok(connection) = conn.lock() {
+            crate::db::bash_watches::refresh_watch_gap_health(&connection);
+        }
         if let Ok(mut slot) = self.inner.db_pool.write() {
             if slot.as_ref().is_none_or(|old| !Arc::ptr_eq(old, &conn)) {
                 if let Err(error) = crate::db::call_ledger::recover_pool_once(&conn) {
@@ -4138,6 +4141,193 @@ impl BgTaskRegistry {
         }
     }
 
+    pub(crate) fn retain_retry_gap(
+        &self,
+        harness: &str,
+        candidate: &crate::subc::watch_delivery::Candidate,
+    ) -> Result<(), String> {
+        use super::watch_lines::{LineBatch, RetryGap, WatchLine};
+        let frame = &candidate.frame;
+        let pool = self
+            .inner
+            .db_pool
+            .read()
+            .map_err(|e| e.to_string())?
+            .clone()
+            .ok_or_else(|| "watch persistence unavailable".to_string())?;
+        let conn = pool.lock().map_err(|e| e.to_string())?;
+        if crate::db::bash_watches::delivery_ack_version(
+            &conn,
+            harness,
+            &frame.session_id,
+            &frame.task_id,
+            &frame.watch_id,
+        )
+        .map_err(|e| e.to_string())?
+        .is_some_and(|v| v >= candidate.last_version)
+        {
+            return Ok(());
+        }
+        let found = crate::db::bash_watches::get_bash_pattern_watch(
+            &conn,
+            harness,
+            &frame.session_id,
+            &frame.task_id,
+            &frame.watch_id,
+        )
+        .map_err(|e| e.to_string())?;
+        let mut row =
+            found
+                .clone()
+                .unwrap_or_else(|| crate::db::bash_watches::BashPatternWatchRow {
+                    harness: harness.to_string(),
+                    session_id: frame.session_id.clone(),
+                    task_id: frame.task_id.clone(),
+                    watch_id: frame.watch_id.clone(),
+                    pattern_kind: "substring".to_string(),
+                    pattern: String::new(),
+                    once: true,
+                    each_line: false,
+                    match_batch: None,
+                    created_at: 0,
+                    stdout_offset: 0,
+                    stderr_offset: 0,
+                    pty_offset: 0,
+                    scanning: false,
+                    pending_match: false,
+                    match_text: None,
+                    match_offset: None,
+                    match_context: None,
+                });
+        let previous = row
+            .match_batch
+            .as_deref()
+            .and_then(|b| serde_json::from_str::<LineBatch>(b).ok());
+        if previous
+            .as_ref()
+            .and_then(|b| b.acknowledged_version)
+            .is_some_and(|v| v >= candidate.last_version)
+        {
+            return Ok(());
+        }
+        let recoverable_batch = candidate.same_generation
+            && row.pending_match
+            && frame.batch.as_ref().is_some_and(|evicted| {
+                previous.as_ref().is_some_and(|saved| {
+                    evicted.pending_id.is_some()
+                        && saved.pending_id == evicted.pending_id
+                        && saved.version.is_some_and(|v| v >= candidate.last_version)
+                })
+            });
+        let recoverable_scalar = frame.batch.is_none()
+            && row.pending_match
+            && candidate.first_version == candidate.last_version
+            && (row.match_offset == Some(candidate.first_version as i64)
+                || previous.as_ref().is_some_and(|b| {
+                    b.lines
+                        .iter()
+                        .any(|line| line.offset == candidate.first_version)
+                }));
+        if recoverable_batch || recoverable_scalar {
+            return Ok(());
+        }
+        let mut batch = if row.pending_match {
+            previous.clone().unwrap_or_default()
+        } else {
+            LineBatch::default()
+        };
+        if batch
+            .retry_gap
+            .as_ref()
+            .is_some_and(|g| g.evicted_through >= candidate.last_version)
+        {
+            return Ok(());
+        }
+        // A superseded scalar has one identifiable occurrence. Overlapping
+        // snapshots and uncertain persistence never imply a lost-line count.
+        let known = u64::from(
+            found.is_some()
+                && frame.batch.is_none()
+                && row.pending_match
+                && row
+                    .match_offset
+                    .is_some_and(|v| v > candidate.last_version as i64)
+                && candidate.first_version == candidate.last_version,
+        );
+        if row.pending_match && row.match_batch.is_none() {
+            if let Some(text) = &row.match_text {
+                let offset = row.match_offset.unwrap_or_default().max(0) as u64;
+                batch.lines.push(WatchLine {
+                    stream: "stdout".to_string(),
+                    offset,
+                    end_offset: offset.saturating_add(1),
+                    text: text.clone(),
+                    count: 1,
+                    unavailable: false,
+                });
+            }
+        }
+        let mut gap = batch.retry_gap.take().unwrap_or_else(|| RetryGap {
+            reason: "retry_overflow".to_string(),
+            ..RetryGap::default()
+        });
+        gap.dropped_notifications = gap
+            .dropped_notifications
+            .saturating_add(candidate.notifications);
+        gap.known_missing_occurrences = gap.known_missing_occurrences.saturating_add(known);
+        if gap.first_offset.is_none() {
+            gap.first_offset = candidate.first_offset;
+            gap.stream = candidate.stream.clone();
+        }
+        gap.last_offset = candidate.last_offset;
+        gap.evicted_through = candidate.last_version;
+        let version = previous
+            .as_ref()
+            .and_then(|b| b.version)
+            .unwrap_or_default()
+            .max(row.match_offset.unwrap_or_default().max(0) as u64)
+            .max(candidate.last_version)
+            .saturating_add(1);
+        batch.version = Some(version);
+        batch
+            .pending_id
+            .get_or_insert_with(|| format!("{}:{version}", frame.watch_id));
+        batch.snapshot = true;
+        batch.retry_gap = Some(gap);
+        row.pending_match = true;
+        row.match_offset = Some(version as i64);
+        row.match_text
+            .get_or_insert_with(|| "watch delivery gap".to_string());
+        row.match_context = Some(crate::subc_format::format_watch_line_batch(
+            &frame.task_id,
+            &batch,
+        ));
+        row.match_batch = Some(serde_json::to_string(&batch).map_err(|e| e.to_string())?);
+        crate::db::bash_watches::upsert_bash_pattern_watch(&conn, &row)
+            .map_err(|e| e.to_string())?;
+        drop(conn);
+        if let Some(sender) = self
+            .inner
+            .progress_sender
+            .lock()
+            .map_err(|e| e.to_string())?
+            .clone()
+        {
+            let mut notice = BashPatternMatchFrame::new(
+                &frame.task_id,
+                &frame.session_id,
+                &frame.watch_id,
+                row.match_text.unwrap_or_default(),
+                version,
+                row.match_context.unwrap_or_default(),
+                row.once && !row.scanning,
+            );
+            notice.batch = Some(batch);
+            sender(PushFrame::BashPatternMatch(notice));
+        }
+        Ok(())
+    }
+
     fn persist_watch_match(
         &self,
         session_id: &str,
@@ -4166,6 +4356,26 @@ impl BgTaskRegistry {
         ) else {
             return;
         };
+        if pattern_match.batch.is_none() {
+            if let Some(previous) = row
+                .match_batch
+                .as_deref()
+                .and_then(|b| serde_json::from_str::<super::watch_lines::LineBatch>(b).ok())
+                .filter(|b| b.version.is_some())
+            {
+                let mut batch = super::watch_lines::LineBatch::default();
+                batch.acknowledged_version = previous.acknowledged_version;
+                batch.lines = vec![super::watch_lines::WatchLine {
+                    stream: "output".to_string(),
+                    offset: pattern_match.match_offset,
+                    end_offset: pattern_match.match_offset.saturating_add(1),
+                    text: pattern_match.match_text.clone(),
+                    count: 1,
+                    unavailable: false,
+                }];
+                pattern_match.batch = Some(batch);
+            }
+        }
         if let Some(batch) = pattern_match.batch.as_mut() {
             let previous = row.match_batch.as_deref().and_then(|value| {
                 serde_json::from_str::<super::watch_lines::LineBatch>(value).ok()
@@ -4342,6 +4552,15 @@ impl BgTaskRegistry {
                 return Ok(None);
             }
             let removed = (row.once && !row.scanning) || terminal;
+            crate::db::bash_watches::acknowledge_delivery(
+                &conn,
+                &harness,
+                session_id,
+                task_id,
+                watch_id,
+                match_offset,
+            )
+            .map_err(|error| error.to_string())?;
             if removed {
                 crate::db::bash_watches::delete_bash_pattern_watch(
                     &conn, &harness, session_id, task_id, watch_id,
@@ -4349,6 +4568,14 @@ impl BgTaskRegistry {
                 .map_err(|error| error.to_string())?;
             } else {
                 row.pending_match = false;
+                if let Some(mut batch) = row
+                    .match_batch
+                    .as_deref()
+                    .and_then(|b| serde_json::from_str::<super::watch_lines::LineBatch>(b).ok())
+                {
+                    batch.acknowledged_version = Some(match_offset);
+                    row.match_batch = serde_json::to_string(&batch).ok();
+                }
                 row.match_text = None;
                 row.match_offset = None;
                 row.match_context = None;
@@ -27466,6 +27693,150 @@ mod tests {
         let masked = registry.masked_status_page(&task_id, TaskArtifact::Stdout, from, &page);
         assert_eq!(masked.lines().count(), 6001);
         assert!(masked.ends_with("page final\n"));
+    }
+
+    #[test]
+    fn retry_overflow_sticky_gap_survives_restart_and_exact_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, task, _, _) = each_line_running_fixture(dir.path());
+        let _reap = KillTasksOnDrop(registry.clone());
+        let watch = registry
+            .register_watch(
+                task.task_id.clone(),
+                WatchPattern::Substring("READY".into()),
+                false,
+            )
+            .unwrap();
+        let mut first = PatternMatch {
+            task_id: task.task_id.clone(),
+            watch_id: watch.clone(),
+            match_text: "READY first".into(),
+            match_offset: 10,
+            context: "READY first".into(),
+            once: false,
+            batch: None,
+        };
+        registry.persist_watch_match("session", &task.task_id, &mut first, 20, 0, 0);
+        let mut second = first.clone();
+        second.match_offset = 30;
+        second.match_text = "READY second".into();
+        registry.persist_watch_match("session", &task.task_id, &mut second, 40, 0, 0);
+        let frame = BashPatternMatchFrame::new(
+            &task.task_id,
+            "session",
+            &watch,
+            "READY first",
+            10,
+            "READY first",
+            false,
+        );
+        let candidate = crate::subc::watch_delivery::stalled_route_eviction(frame)
+            .expect("stalled FIFO overflow must retain a watch-gap candidate");
+        registry.retain_retry_gap("opencode", &candidate).unwrap();
+        let pending = registry
+            .pending_pattern_matches_for_session("session")
+            .into_iter()
+            .find(|f| f.watch_id == watch)
+            .unwrap();
+        let gap = pending.batch.as_ref().unwrap().retry_gap.as_ref().unwrap();
+        assert_eq!(gap.reason, "retry_overflow");
+        assert_eq!(gap.dropped_notifications, 1);
+        assert_eq!(gap.known_missing_occurrences, 1);
+        assert_eq!(gap.first_offset, Some(10));
+        assert!(pending
+            .context
+            .contains("The dropped notices cannot be recovered."));
+        assert!(registry
+            .ack_pattern_match_for_session("session", &task.task_id, &watch, 30)
+            .unwrap()
+            .is_none());
+        let (restarted, _, _) = registry_with_db_and_frames(dir.path());
+        let restored = restarted
+            .pending_pattern_matches_for_session("session")
+            .into_iter()
+            .find(|f| f.watch_id == watch)
+            .unwrap();
+        assert_eq!(restored.match_offset, pending.match_offset);
+        assert_eq!(
+            restored
+                .batch
+                .unwrap()
+                .retry_gap
+                .unwrap()
+                .dropped_notifications,
+            1
+        );
+        restarted
+            .ack_pattern_match_for_session("session", &task.task_id, &watch, pending.match_offset)
+            .unwrap()
+            .unwrap();
+        assert!(!restarted
+            .pending_pattern_matches_for_session("session")
+            .iter()
+            .any(|f| f.watch_id == watch));
+        // An evicted duplicate of the acknowledged frame must not reopen the gap.
+        restarted.retain_retry_gap("opencode", &candidate).unwrap();
+        assert!(!restarted
+            .pending_pattern_matches_for_session("session")
+            .iter()
+            .any(|f| f.watch_id == watch));
+    }
+
+    #[test]
+    fn retry_overflow_gap_only_does_not_consume_once_watch_and_recoverable_batches_are_not_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, task, _, watch) = each_line_running_fixture_with_once(dir.path(), true);
+        let _reap = KillTasksOnDrop(registry.clone());
+        let frame = BashPatternMatchFrame::new(
+            &task.task_id,
+            "session",
+            &watch,
+            "unpersisted",
+            10,
+            "unpersisted",
+            true,
+        );
+        let candidate = crate::subc::watch_delivery::stalled_route_eviction(frame).unwrap();
+        registry.retain_retry_gap("opencode", &candidate).unwrap();
+        let pending = registry
+            .pending_pattern_matches_for_session("session")
+            .pop()
+            .unwrap();
+        assert!(!pending.once);
+        assert!(!pending.batch.as_ref().unwrap().has_matches());
+        assert_eq!(
+            pending
+                .batch
+                .as_ref()
+                .unwrap()
+                .retry_gap
+                .as_ref()
+                .unwrap()
+                .known_missing_occurrences,
+            0
+        );
+        registry
+            .ack_pattern_match_for_session("session", &task.task_id, &watch, pending.match_offset)
+            .unwrap()
+            .unwrap();
+        assert_eq!(registry.active_watch_count(&task.task_id), 1);
+        append_each_line_output(&task.paths.stdout, b"READY after gap\n");
+        registry.scan_task_watch_output(&task);
+        let matched = registry
+            .pending_pattern_matches_for_session("session")
+            .pop()
+            .unwrap();
+        assert!(matched.once);
+        assert!(matched.batch.as_ref().unwrap().retry_gap.is_none());
+        let candidate =
+            crate::subc::watch_delivery::stalled_route_eviction(matched.clone()).unwrap();
+        registry.retain_retry_gap("opencode", &candidate).unwrap();
+        let recovered = registry
+            .pending_pattern_matches_for_session("session")
+            .pop()
+            .unwrap();
+        assert_eq!(recovered.match_offset, matched.match_offset);
+        assert!(recovered.batch.unwrap().retry_gap.is_none());
     }
 
     fn each_line_running_fixture(
