@@ -243,6 +243,12 @@ mod remote_policy;
 pub(crate) mod result_body;
 mod retained_result;
 mod rich_ui;
+// Drives the chunk queries and Occipital's route shapes through the real
+// frame loop, so it lives beside the chunk module but runs as a child of this
+// module to reach the loop and its test fixtures.
+#[cfg(test)]
+#[path = "rich_ui/chunks/route_tests.rs"]
+mod rich_ui_chunk_route_tests;
 mod run_scope;
 mod scope_describe;
 #[cfg(test)]
@@ -5764,6 +5770,22 @@ where
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies };
                         if let (Some(identity), Ok(body)) = (routes.get(&route), decoded.body()) {
+                            // Rich-UI chunk queries are provider reads that name no
+                            // session or tool, so they are answered here, before the
+                            // carrier gate and every tool-call admission step.
+                            if let Some((operation, query)) = chunk_query(body) {
+                                let db = shared_app.db();
+                                if let Err(error) = answer_chunk_query(&writer_tx, &dispatch_path_metrics, &decoded.frame, identity, operation, &query, db.as_deref()).await {
+                                    break Err(error);
+                                }
+                                continue;
+                            }
+                            if let Some(error) = occipital_session_refusal(identity, body) {
+                                if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
+                                    break Err(error);
+                                }
+                                continue;
+                            }
                             if let Err(error) = carrier_read_only::admit(identity, body) {
                                 if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
                                     break Err(error);
@@ -8175,6 +8197,21 @@ async fn handle_control_request(
                 )
                 .await;
             }
+            // Occipital reaches AFT only through tool-provider v1 routes: their
+            // provider reads and admitted carrier calls. The legacy grammar has
+            // neither the chunk queries nor carrier admission, so refuse it.
+            if route_role == tool_provider::RouteRole::Legacy
+                && principal_id(&principal).as_deref() == Some(rich_ui::chunks::OCCIPITAL_PRINCIPAL)
+            {
+                return send_route_bind_error(
+                    tx,
+                    frame,
+                    "route_refused",
+                    "reserved:occipital binds only tool-provider v1 routes",
+                    metrics,
+                )
+                .await;
+            }
 
             let bind_project_root = resolve_route_project_root(&identity, scope.as_ref());
             let mut bind_root_id = None;
@@ -9440,6 +9477,121 @@ async fn send_provider_error(
     send_reliable_writer_frame(tx, metrics, response, "v1 refusal").await
 }
 
+/// Whether the route was bound by the authenticated principal
+/// `reserved:occipital`. This reads the route's own bind principal, not a
+/// codemode run principal: routes in the route table never carry a run owner.
+fn occipital_route(identity: &RouteIdentity) -> bool {
+    matches!(&identity.spawn_principal, AuthenticatedPrincipal::RouteBind { principal_id: Some(id), .. }
+        if id == rich_ui::chunks::OCCIPITAL_PRINCIPAL)
+}
+
+/// Whether an Occipital route carries another principal's session: it is
+/// scoped, and its stamp's owner is not Occipital itself. Only such a route
+/// may take session calls.
+fn occipital_carrier_route(identity: &RouteIdentity) -> bool {
+    identity.scope.as_ref().is_some_and(|scope| {
+        principal_id(&Some(scope.owner.clone())).as_deref()
+            != Some(rich_ui::chunks::OCCIPITAL_PRINCIPAL)
+    })
+}
+
+/// Whether a route request is a tool call: either `op: "tool.call"`, or the
+/// bare form with no `op` whose `name` is not a provider operation.
+fn route_request_is_tool_call(envelope: &Value) -> bool {
+    match envelope.get("op").and_then(Value::as_str) {
+        Some(operation) => operation == "tool.call",
+        None => !envelope
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| {
+                tool_provider::recognized_operation(name)
+                    || rich_ui::chunks::is_chunk_operation(name)
+            }),
+    }
+}
+
+/// An Occipital route that carries no other session (unscoped, or scoped by a
+/// stamp Occipital owns) admits provider reads only. A tool call there has no
+/// session to run in, so it refuses `session_not_bound` before the carrier
+/// gate or any other tool-call admission step runs.
+fn occipital_session_refusal(
+    identity: &RouteIdentity,
+    envelope: &Value,
+) -> Option<subc_protocol::ErrorBody> {
+    (occipital_route(identity)
+        && !occipital_carrier_route(identity)
+        && route_request_is_tool_call(envelope))
+    .then(|| rich_ui::chunks::refusal("session_not_bound"))
+}
+
+/// The chunk query a route request names, either as `op` or, in the bare
+/// form, as `name`, with the request body that carries its digest and index.
+fn chunk_query(envelope: &Value) -> Option<(&str, Value)> {
+    match envelope.get("op").and_then(Value::as_str) {
+        Some(operation) if rich_ui::chunks::is_chunk_operation(operation) => {
+            let mut body = envelope.clone();
+            if let Some(body) = body.as_object_mut() {
+                body.remove("op");
+            }
+            Some((operation, body))
+        }
+        Some(_) => None,
+        None => {
+            let name = envelope.get("name").and_then(Value::as_str)?;
+            rich_ui::chunks::is_chunk_operation(name).then(|| {
+                (
+                    name,
+                    envelope
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| json!({})),
+                )
+            })
+        }
+    }
+}
+
+/// Answer a rich-UI chunk query on the route it arrived on. Admission is by
+/// the route's authenticated principal alone, scoped or unscoped; the query
+/// names no session. A reply is a Response frame holding the chunk; every
+/// refusal is a typed Error frame through [`send_provider_error`].
+async fn answer_chunk_query(
+    tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    frame: &Frame,
+    identity: &RouteIdentity,
+    operation: &str,
+    body: &Value,
+    db: Option<&StdMutex<crate::db::TrackedConnection>>,
+) -> Result<(), SubcError> {
+    let principal = match &identity.spawn_principal {
+        AuthenticatedPrincipal::RouteBind { principal_id, .. } => principal_id.as_deref(),
+        AuthenticatedPrincipal::FirstParty => None,
+    };
+    let answer = rich_ui::chunks::admit_principal(principal).and_then(|()| {
+        if operation == rich_ui::chunks::MANIFEST_CHUNK {
+            rich_ui::chunks::manifest_chunk(body)
+        } else {
+            rich_ui::chunks::template_chunk(body, db)
+        }
+    });
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(error) => return send_provider_error(tx, metrics, frame, error).await,
+    };
+    let response = Frame::build_with_version(
+        frame.header.ver,
+        FrameType::Response,
+        frame.header.flags,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+        serde_json::to_vec(&answer).map_err(SubcError::Json)?,
+    )
+    .map_err(SubcError::FrameBuild)?;
+    send_reliable_writer_frame(tx, metrics, response, "rich-ui chunk").await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn submit_provider_read(
     tx: &WriterSender,
@@ -10111,6 +10263,9 @@ async fn handle_tool_call(
         phase_trace.received_at(),
         &envelope,
     );
+    if let Some(error) = occipital_session_refusal(&identity, &envelope) {
+        return send_provider_error(tx, metrics, frame, error).await;
+    }
     if let Err(error) = carrier_read_only::admit(&identity, &envelope) {
         return send_provider_error(tx, metrics, frame, error).await;
     }
