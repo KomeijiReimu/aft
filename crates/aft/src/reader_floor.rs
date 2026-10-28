@@ -807,6 +807,24 @@ pub(crate) mod tests {
         assert!(wrote);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn replaced_root_cannot_reuse_a_floor_proof_even_for_the_same_floor_inode() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("storage");
+        let retired = temp.path().join("retired");
+        fs::create_dir(&root).unwrap();
+        let requirements = [(PersistedStore::ViewsV3Store, 1)];
+        raise(&root, &requirements).unwrap();
+        fs::rename(&root, &retired).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::hard_link(floor_path(&retired), floor_path(&root)).unwrap();
+        fail_directory_sync(&root, Some(libc::EIO));
+        let result = raise(&root, &requirements);
+        assert!(matches!(result, Err(FloorError::Io { .. })), "{result:?}");
+        raise(&root, &requirements).unwrap();
+    }
+
     #[test]
     fn uninterpretable_floor_is_untouched_by_raise() {
         for bytes in [b"not json".as_slice(), br#"{"floor_schema":2,"stores":{}}"#] {

@@ -1683,12 +1683,42 @@ enum StableRead {
 #[derive(Clone)]
 struct CachedAttachment(crate::blob_store::v2::FamilyKey);
 
-fn v3_contains(route: &super::snapshot::V3Route, key: &crate::blob_store::v2::FamilyKey) -> bool {
-    #[cfg(test)]
-    let _profile = crate::blob_store::v3::work_profile::span("firstload_contains");
-    crate::blob_store::v3::PlaneReader::open_existing(&route.storage, &route.family, key.plane())
-        .and_then(|reader| reader.contains(key))
-        .unwrap_or(false)
+/// Readers live for one reconcile or materialization pass, not across binds.
+/// Opening validates the database's identity and full schema; doing that for
+/// every file repeats schema construction thousands of times. Presence is
+/// still queried afresh for every key, including keys missing earlier in the
+/// pass. Failed opens are not retained, so a newly created plane can be used.
+struct V3PlaneReaders<'a> {
+    route: &'a super::snapshot::V3Route,
+    readers: BTreeMap<FamilyPlane, crate::blob_store::v3::PlaneReader>,
+}
+
+impl<'a> V3PlaneReaders<'a> {
+    fn new(route: &'a super::snapshot::V3Route) -> Self {
+        Self {
+            route,
+            readers: BTreeMap::new(),
+        }
+    }
+
+    fn contains(&mut self, key: &crate::blob_store::v2::FamilyKey) -> bool {
+        #[cfg(test)]
+        let _profile = crate::blob_store::v3::work_profile::span("firstload_contains");
+        let reader = match self.readers.entry(key.plane()) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let Ok(reader) = crate::blob_store::v3::PlaneReader::open_existing(
+                    &self.route.storage,
+                    &self.route.family,
+                    key.plane(),
+                ) else {
+                    return false;
+                };
+                entry.insert(reader)
+            }
+        };
+        reader.contains(key).unwrap_or(false)
+    }
 }
 
 struct PreparedReaders {
@@ -2483,6 +2513,7 @@ impl FirstLoadDriver for CheckoutDriver {
         } else {
             None
         };
+        let mut v3_readers = V3PlaneReaders::new(&route);
         let persisted = durable
             .as_ref()
             .and_then(|generation| {
@@ -2621,7 +2652,7 @@ impl FirstLoadDriver for CheckoutDriver {
                         });
                     let keys_present = old.attachments.values().all(|a| {
                         a.downcast_ref::<CachedAttachment>()
-                            .is_none_or(|cached| v3_contains(&route, &cached.0))
+                            .is_none_or(|cached| v3_readers.contains(&cached.0))
                     });
                     if cached.reusable(current)
                         && delivered <= cached.delivery_seq
@@ -2658,7 +2689,7 @@ impl FirstLoadDriver for CheckoutDriver {
                             record.key(p.plane()).is_some_and(|key| {
                                 matches!(generation.plane_readiness(&path, p.plane()), Some(super::readiness::PlaneState::Ready { key: ready }) if *ready == key.to_hex())
                                     && record.content().is_some_and(|content| p.key(&path, content).is_none_or(|expected| expected == key))
-                                    && v3_contains(&route, &key)
+                                    && v3_readers.contains(&key)
                             })
                         })
                         && self
@@ -2724,7 +2755,7 @@ impl FirstLoadDriver for CheckoutDriver {
             for plane in &self.planes {
                 if plane.applies_to(&path) {
                     let key = plane.key(&path, content);
-                    if v3 && key.is_some_and(|key| v3_contains(&route, &key)) {
+                    if v3 && key.is_some_and(|key| v3_readers.contains(&key)) {
                         let key = key.unwrap();
                         keys.insert(format!("{:?}", plane.plane()), key.to_hex());
                         entry
@@ -4616,6 +4647,7 @@ impl CompositePlane for CallgraphBridge {
         let base = super::base_refs::resolve_base(claim.storage(), claim.family(), claim.scope())
             .map_err(|e| error(e.to_string()))?;
         let route = super::base_refs::route(claim.storage(), claim.family(), claim.scope());
+        let mut v3_readers = V3PlaneReaders::new(&route);
         let mut keys = Vec::new();
         let mut payloads = Vec::new();
         for (path, entry) in base.manifest().entries() {
@@ -4690,7 +4722,7 @@ impl CompositePlane for CallgraphBridge {
             .map_err(|e| error(e.to_string()))?;
         }
         for (_, key) in &keys {
-            if !v3_contains(&route, key) {
+            if !v3_readers.contains(key) {
                 return Err(error(
                     "base callgraph row disappeared before publication".into(),
                 ));
@@ -4910,6 +4942,7 @@ impl CompositePlane for CallgraphBridge {
         };
         #[cfg(test)]
         let _profile = crate::blob_store::v3::work_profile::span("callgraph_materialize");
+        let mut v3_readers = V3PlaneReaders::new(route);
         let mut attachments = Vec::new();
         for (path, entry) in observed {
             if entry.disk == super::snapshot::DiskState::Absent || !self.applies_to(path) {
@@ -4929,7 +4962,7 @@ impl CompositePlane for CallgraphBridge {
             {
                 live.protect(&[cached.0])
                     .map_err(|e| error(e.to_string()))?;
-                if !v3_contains(route, &cached.0) {
+                if !v3_readers.contains(&cached.0) {
                     return Err(error(
                         "cached callgraph row disappeared before protection".into(),
                     ));
@@ -5726,6 +5759,7 @@ impl CompositePlane for TrigramBridge {
         if delta.header().producers.trigram != self.policy.fingerprint_hex() {
             return Err(SiblingLoader::error("trigram producer mismatch"));
         }
+        let mut v3_readers = V3PlaneReaders::new(route);
         let entries: Vec<_> = delta
             .entries()
             .filter_map(|(path, entry)| match entry {
@@ -5746,7 +5780,7 @@ impl CompositePlane for TrigramBridge {
         for (path, content, key) in entries {
             let path = &path;
             let content = &content;
-            if !v3_contains(route, &key) {
+            if !v3_readers.contains(&key) {
                 let attachment = observed
                     .get(path)
                     .filter(|e| e.disk == super::snapshot::DiskState::in_generation(delta, path))
@@ -6367,6 +6401,53 @@ mod checkout_kind_tests {
 
 #[cfg(test)]
 mod v3_bootstrap_tests {
+    #[test]
+    fn v3_presence_batch_validates_once_and_rechecks_rows_and_later_schema_drift() {
+        use super::*;
+        use crate::blob_store::v2::FamilyKey;
+        use crate::blob_store::v3;
+        let storage = tempfile::tempdir().unwrap();
+        let family = "0123456789abcdef";
+        let route = super::super::base_refs::route(storage.path(), family, "member");
+        let keys: Vec<_> = (0..16)
+            .map(|i| FamilyKey::new(FamilyPlane::Semantic, [i; 32]))
+            .collect();
+        v3::publish(storage.path(), family, 1 << 20, None, |p| {
+            for key in &keys {
+                p.put(key, b"payload", FamilyPlane::Semantic.payload_schema())?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let before = v3::work_profile::count("validate_database");
+        let mut readers = V3PlaneReaders::new(&route);
+        for key in &keys {
+            assert!(readers.contains(key));
+        }
+        assert_eq!(
+            v3::work_profile::count("validate_database") - before,
+            1,
+            "schema validation belongs to the plane's batch open, not each key"
+        );
+        let next = FamilyKey::new(FamilyPlane::Semantic, [99; 32]);
+        assert!(!readers.contains(&next));
+        v3::publish(storage.path(), family, 1 << 20, None, |p| {
+            p.put(&next, b"next", FamilyPlane::Semantic.payload_schema())
+        })
+        .unwrap();
+        assert!(readers.contains(&next), "a row miss must not be cached");
+        drop(readers);
+        let path = v3::plane_path(storage.path(), family, FamilyPlane::Semantic).unwrap();
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch("CREATE TABLE unexpected(value TEXT)")
+            .unwrap();
+        assert!(
+            !V3PlaneReaders::new(&route).contains(&keys[0]),
+            "the next pass must validate the schema again"
+        );
+    }
+
     use super::*;
 
     struct NamedPlane(FamilyPlane);
