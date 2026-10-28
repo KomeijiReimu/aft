@@ -29,6 +29,7 @@ pub const NAMESPACE_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
 /// ages them out by epoch instead of by marking.
 pub const SYMBOL_RETENTION_SWEEPS: i64 = 8;
 const TIMEOUT_MS: i64 = 5_000;
+pub(crate) const BUSY_PREFIX: &str = "v3 store busy: ";
 mod connections;
 mod copy;
 mod initialization;
@@ -172,7 +173,7 @@ impl fmt::Display for Error {
             Self::Sqlite(e) => write!(f, "{e}"),
             Self::Incompatible(e) => write!(f, "{e}"),
             Self::Refused(reason) => f.write_str(reason),
-            Self::Busy(reason) => write!(f, "v3 store busy: {reason}"),
+            Self::Busy(reason) => write!(f, "{BUSY_PREFIX}{reason}"),
             Self::Ledger {
                 path,
                 operation,

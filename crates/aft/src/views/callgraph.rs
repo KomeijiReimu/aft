@@ -387,9 +387,16 @@ impl From<String> for CallgraphViewError {
 
 impl From<PlaneError> for CallgraphViewError {
     fn from(error: PlaneError) -> Self {
+        // Base-reference errors enter through the loader's driver stage,
+        // whereas plane materializers return their reason without a stage.
+        let reason = error
+            .reason
+            .strip_prefix("[driver]: ")
+            .unwrap_or(&error.reason);
         Self {
-            busy: error.reason.starts_with(DERIVED_STORE_BUSY)
-                || error.reason.starts_with(V3_STORE_BUSY),
+            busy: reason.starts_with(DERIVED_STORE_BUSY)
+                || reason.starts_with(V3_STORE_BUSY)
+                || reason.starts_with(crate::blob_store::v3::BUSY_PREFIX),
             reason: error.to_string(),
         }
     }
@@ -613,7 +620,7 @@ impl CallgraphView {
         storage: crate::root_cache::StoragePaths,
         family: String,
         policy: crate::blob_store::v2::TrigramPolicy,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, CallgraphViewError> {
         let scope = view_scope(&root);
         let producers = super::manifest_v2::Producers {
             trigram: policy.fingerprint_hex(),
@@ -636,7 +643,7 @@ impl CallgraphView {
                 Arc::new(super::first_load::ConfiguredMembershipWalker),
                 vec![trigram, bridge.clone()],
             )
-            .map_err(|error| error.to_string())?
+            .map_err(CallgraphViewError::from)?
             .with_adapters(vec![adapter]),
         );
         driver.register_write_intent();
@@ -821,6 +828,107 @@ mod tests {
         blocker.execute_batch("ROLLBACK").unwrap();
         drop(blocker);
         assert_eq!(callers(&graph.reader().unwrap(), "b.ts", "caller").len(), 1);
+    }
+
+    #[test]
+    fn v3_busy_ledger_survives_driver_error_wrapping() {
+        use crate::blob_store::v3;
+        use crate::db::file_identity::IdentityConnection;
+        let _serial = v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let family = "driver-busy";
+        v3::publish(temp.path(), family, 1024, None, |_| Ok(())).unwrap();
+        let path = v3::family_dir(temp.path(), family)
+            .unwrap()
+            .join("members.sqlite");
+        let lock = v3::ReservationLock::acquire(temp.path()).unwrap();
+        let mut writer = v3::RegistryWriter::open_for_barrier(temp.path(), family, &lock).unwrap();
+        let blocker = IdentityConnection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            "callgraph-v3-ledger-blocker",
+        )
+        .unwrap();
+        blocker
+            .execute_batch("BEGIN; SELECT * FROM accounting;")
+            .unwrap();
+        writer
+            .with_barrier(|tx| {
+                tx.execute("UPDATE accounting SET watermark=watermark+1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let ledger_error = writer.covering_measurement().unwrap_err();
+        let driver_error = |error| {
+            PlaneError::loader(
+                super::super::contracts::LoaderStage::Driver,
+                super::super::base_refs::BaseRefError::from(error).to_string(),
+            )
+        };
+        let error = CallgraphViewError::from(driver_error(ledger_error));
+        assert!(error.busy, "{error}");
+        assert!(
+            error
+                .reason
+                .starts_with("view loader [driver]: v3 store busy: "),
+            "{error}"
+        );
+        assert!(error.reason.contains("members.sqlite"), "{error}");
+        assert!(
+            error.reason.contains("wal_checkpoint(TRUNCATE): busy=1"),
+            "{error}"
+        );
+        let permanent = CallgraphViewError::from(driver_error(v3::Error::Refused(
+            "reservation_ledger_unreadable",
+        )));
+        assert!(!permanent.busy, "{permanent}");
+        blocker.execute_batch("ROLLBACK").unwrap();
+        writer.covering_measurement().unwrap();
+    }
+
+    #[test]
+    fn v3_busy_ledger_during_view_construction_is_retryable() {
+        use crate::blob_store::v3;
+        use crate::db::file_identity::IdentityConnection;
+        let _serial = v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let root = checkout(&temp.path().join("checkout"));
+        v3::publish(&storage, "donor-reuse", 1024, None, |_| Ok(())).unwrap();
+        let path = v3::family_dir(&storage, "donor-reuse")
+            .unwrap()
+            .join("members.sqlite");
+        let blocker = IdentityConnection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            "callgraph-v3-open-blocker",
+        )
+        .unwrap();
+        // SQLite's exclusive locking mode prevents a second connection from
+        // opening the ledger until this transaction and connection are gone.
+        blocker.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; UPDATE accounting SET watermark=watermark+1;").unwrap();
+        let construct = || {
+            CallgraphView::new(
+                root.clone(),
+                crate::root_cache::StoragePaths::same(&storage),
+                "donor-reuse".into(),
+                crate::blob_store::v2::TrigramPolicy {
+                    max_file_size: 1 << 20,
+                },
+            )
+        };
+        let error = match construct() {
+            Ok(_) => panic!("view construction must not open an exclusively held ledger"),
+            Err(error) => error,
+        };
+        assert!(error.busy, "{error}");
+        assert!(error.reason.contains("v3 store busy: "), "{error}");
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+        assert_eq!(
+            callers(&construct().unwrap().reader().unwrap(), "a.ts", "target").len(),
+            1
+        );
     }
 
     #[test]
