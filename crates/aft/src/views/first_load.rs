@@ -4921,7 +4921,13 @@ impl CompositePlane for CallgraphBridge {
                 });
             }
             crate::db::file_identity::guard_replacement(&staging_path, "first-load derived rename");
-            std::fs::rename(&staging_path, &published_path).map_err(|e| error(e.into()))?;
+            std::fs::rename(&staging_path, &published_path).map_err(|e| {
+                error(super::ViewError::io_at(
+                    "renaming derived database to",
+                    &published_path,
+                    super::io::at("from", &staging_path, e),
+                ))
+            })?;
         }
         super::sync_directory(owner.view_dir()).map_err(|e| error(e.into()))?;
         Ok(())
@@ -5126,7 +5132,13 @@ impl CompositePlane for CallgraphBridge {
                 });
             }
             crate::db::file_identity::guard_replacement(&staging_path, "v3 derived rename");
-            std::fs::rename(&staging_path, &published_path).map_err(|e| error(e.into()))?;
+            std::fs::rename(&staging_path, &published_path).map_err(|e| {
+                error(super::ViewError::io_at(
+                    "renaming derived database to",
+                    &published_path,
+                    super::io::at("from", &staging_path, e),
+                ))
+            })?;
         }
         super::sync_directory(&dir).map_err(|e| error(e.into()))?;
         Ok(())
@@ -6053,7 +6065,9 @@ impl CheckoutDriver {
             }
             Ok(_) => Ok(None),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(SiblingLoader::error(error.to_string())),
+            Err(error) => Err(SiblingLoader::error(
+                super::io::at("reading checkout metadata", path, error).to_string(),
+            )),
         }
     }
 

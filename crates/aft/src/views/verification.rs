@@ -346,7 +346,8 @@ impl Policy {
                         reusable = false;
                         continue;
                     }
-                    let path = path_from_bytes(bytes)?;
+                    let path = path_from_bytes(bytes)
+                        .map_err(|e| at("decoding Git attribute source for", root, e))?;
                     let path = if path.is_absolute() {
                         path
                     } else {
@@ -362,7 +363,8 @@ impl Policy {
         // Hash their bytes as well as the effective values, including empty files.
         for item in config.split(|b| *b == 0) {
             if let Some(path) = item.strip_prefix(b"file:") {
-                let path = path_from_bytes(path)?;
+                let path = path_from_bytes(path)
+                    .map_err(|e| at("decoding Git config origin for", root, e))?;
                 metadata_source(
                     &if path.is_absolute() {
                         path
@@ -384,20 +386,26 @@ impl Policy {
                 (b"core.excludesfile\n".as_slice(), false),
             ] {
                 if let Some(path) = item.strip_prefix(key) {
-                    let path = path_from_bytes(path)?;
-                    let path =
-                        if let Some(suffix) = path.to_str().and_then(|p| p.strip_prefix("~/")) {
-                            std::env::var_os("HOME")
-                                .or_else(|| std::env::var_os("USERPROFILE"))
-                                .map(|home| PathBuf::from(home).join(suffix))
-                                .ok_or_else(|| {
-                                    io::Error::other("cannot resolve Git policy home directory")
-                                })?
-                        } else if path.is_absolute() {
-                            path
-                        } else {
-                            root.join(path)
-                        };
+                    let path = path_from_bytes(path)
+                        .map_err(|e| at("decoding Git policy path for", root, e))?;
+                    let path = if let Some(suffix) =
+                        path.to_str().and_then(|p| p.strip_prefix("~/"))
+                    {
+                        std::env::var_os("HOME")
+                            .or_else(|| std::env::var_os("USERPROFILE"))
+                            .map(|home| PathBuf::from(home).join(suffix))
+                            .ok_or_else(|| {
+                                at(
+                                    "resolving Git policy path",
+                                    &path,
+                                    io::Error::other("cannot resolve Git policy home directory"),
+                                )
+                            })?
+                    } else if path.is_absolute() {
+                        path
+                    } else {
+                        root.join(path)
+                    };
                     metadata_source(&path, &mut hash)?;
                     reusable &= !conversion;
                 }
@@ -488,7 +496,8 @@ pub(crate) fn policy_inputs(root: &Path) -> io::Result<Vec<PathBuf>> {
         let common_marker = gitdir.join("commondir");
         match fs::read(&common_marker) {
             Ok(bytes) => {
-                let common = path_from_bytes(bytes.trim_ascii())?;
+                let common = path_from_bytes(bytes.trim_ascii())
+                    .map_err(|e| at("decoding Git common directory marker", &common_marker, e))?;
                 let common = if common.is_absolute() {
                     common
                 } else {
@@ -518,10 +527,15 @@ pub(crate) fn gitdir(root: &Path) -> io::Result<PathBuf> {
         return fs::canonicalize(&marker).map_err(|e| at("resolving Git directory", &marker, e));
     }
     let bytes = fs::read(&marker).map_err(|e| at("reading Git directory marker", &marker, e))?;
-    let path = bytes
-        .strip_prefix(b"gitdir: ")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid gitdir marker"))?;
-    let path = path_from_bytes(path.trim_ascii())?;
+    let path = bytes.strip_prefix(b"gitdir: ").ok_or_else(|| {
+        at(
+            "decoding Git directory marker",
+            &marker,
+            io::Error::new(io::ErrorKind::InvalidData, "invalid gitdir marker"),
+        )
+    })?;
+    let path = path_from_bytes(path.trim_ascii())
+        .map_err(|e| at("decoding Git directory marker", &marker, e))?;
     let path = if path.is_absolute() {
         path
     } else {
@@ -639,8 +653,10 @@ impl BindGuard {
     pub fn validate(&self, root: &Path) -> io::Result<()> {
         let current = Self::capture(root, None)?;
         if &current != self {
-            return Err(io::Error::other(
-                "checkout Git, root identity or conversion policy changed",
+            return Err(at(
+                "validating checkout",
+                root,
+                io::Error::other("checkout Git, root identity or conversion policy changed"),
             ));
         }
         Ok(())
