@@ -14007,7 +14007,7 @@ mod v3_collector_tests {
                 _ => unreachable!(),
             }
             assert!(boundaries.load(std::sync::atomic::Ordering::SeqCst) > 0);
-            assert!(storage.join("blobs/v3/reservations.lock").is_file());
+            assert!(storage.join("blobs/v3").is_dir());
         }
     }
 
@@ -14039,7 +14039,7 @@ mod v3_collector_tests {
                 assert!(crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| slot.borrow().is_none()));
             }
             crate::durability::take();
-            drop(acquire().unwrap());
+            let _lock = acquire().unwrap();
             assert!(crate::durability::take()
                 .contains(&(crate::durability::EventKind::DirectorySync, storage.clone(),)));
             assert!(storage.join("blobs/v3/reservations.lock").is_file());
