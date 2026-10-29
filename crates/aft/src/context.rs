@@ -4983,8 +4983,8 @@ pub(crate) fn checkout_view_callgraph_access(
     }
 }
 
-/// Acquisition diagnostics for the checkout callgraph view. Busy errors become
-/// `Building` at the query boundary, but retain their full cause here.
+/// Acquisition diagnostics for the checkout callgraph view, including the full
+/// cause of retryable SQLite contention and time spent acquiring readers.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CallgraphViewReadDiagnostics {
     pub attempts: u64,
@@ -12307,8 +12307,8 @@ impl AppContext {
         ));
     }
 
-    /// Passive diagnostic state, including the last busy error hidden by a
-    /// `Building` access result. A successful retry does not erase that error.
+    /// Passive diagnostic state, including the last acquisition error. A
+    /// successful retry does not erase that error.
     pub fn callgraph_view_read_diagnostics(&self) -> CallgraphViewReadDiagnostics {
         self.callgraph_view_read_diagnostics.lock().clone()
     }
@@ -18693,16 +18693,24 @@ mod callgraph_store_for_ops_tests {
         )
         .unwrap();
         blocker.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; UPDATE accounting SET watermark=watermark+1;").unwrap();
-        assert!(matches!(
-            ctx.callgraph_store_for_ops(),
-            CallgraphStoreAccess::Building
-        ));
+        let CallgraphStoreAccess::Error(error) = ctx.callgraph_store_for_ops() else {
+            panic!("a locked view must retain the SQLite busy verdict");
+        };
+        assert!(
+            matches!(
+                &error,
+                CallGraphStoreError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+                    if code.extended_code == rusqlite::ffi::SQLITE_BUSY
+            ),
+            "{error}"
+        );
+        assert!(error.is_transient_lock_contention(), "{error}");
         let busy = ctx.callgraph_view_read_diagnostics();
         assert_eq!(busy.attempts, 2);
         let detail = busy
             .last_error
             .as_deref()
-            .expect("Building must retain its busy cause");
+            .expect("SQLite busy must retain its acquisition cause");
         assert!(detail.contains("reservation_ledger_busy"), "{detail}");
         assert!(detail.contains("read initialization marker"), "{detail}");
         assert!(detail.contains("members.sqlite"), "{detail}");

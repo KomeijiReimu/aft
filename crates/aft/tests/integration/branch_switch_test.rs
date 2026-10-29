@@ -471,7 +471,7 @@ fn wait_until_ready_observed(
             }
             // The view reader opens without a busy wait, so a publication
             // checkpointing the derived database can briefly lock it. Commands
-            // report that as a retryable `callgraph_building`; wait it out too.
+            // expose a retryable SQLite busy error; wait it out too.
             CallgraphStoreAccess::Error(error) => {
                 diagnostics
                     .last_error
