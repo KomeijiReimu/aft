@@ -537,7 +537,13 @@ fn audited_operator_write_rechecks_manifest_before_native_delegation() {
     assert_eq!(lookups, 1);
     assert_eq!(exit, 86);
     assert_eq!(delegated, 0);
-    assert!(fixture.paths.bypass_audit.is_file());
+    // The audited operator bypass exists only where the fixture manifest
+    // governs writes (macOS, Linux). Elsewhere the write is not governed, so
+    // nothing is audited, but the missing manifest must still refuse it.
+    assert_eq!(
+        fixture.paths.bypass_audit.is_file(),
+        current_platform() != "unsupported"
+    );
     assert_eq!(*lines.lock().unwrap(), vec!["gh-shim: gh_shim_manifest_unavailable: GitHub writes are refused because this machine's signed routing manifest is missing or invalid; without it the write would run as the operator's own account. Ask the operator to repair the manifest. Reads still work.".to_string()]);
 }
 
