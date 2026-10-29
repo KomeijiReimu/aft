@@ -9110,7 +9110,12 @@ mod tests {
         std::os::unix::fs::symlink(retargeted.path(), &link).expect("retarget standing symlink");
 
         let metrics = DispatchPathMetrics::new();
-        let report = test_health_report(&executor, &HashMap::new(), &metrics, &app);
+        // A loaded runner can report scheduler contention instead of the root
+        // rows; wait that out like the other health tests do.
+        let report = health_report_after_scheduler_contention(
+            "standing_health_names_resolved_path_drift_without_re_recording",
+            || test_health_report(&executor, &HashMap::new(), &metrics, &app),
+        );
         assert_eq!(report.status, HealthStatus::Degraded);
         let metrics = report.metrics.expect("health metrics");
         let root_row = metrics["roots"]
