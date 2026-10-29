@@ -13997,7 +13997,8 @@ mod v3_collector_tests {
             // publisher has won the race to raise the floor first.
             match entry {
                 "registration" => {
-                    crate::views::base_refs::with_base_barrier(&storage, FAMILY, |_| Ok(())).unwrap();
+                    crate::views::base_refs::with_base_barrier(&storage, FAMILY, |_| Ok(()))
+                        .unwrap();
                 }
                 "lock" => drop(ReservationLock::acquire(&storage).unwrap()),
                 "deadline-lock" => {
@@ -14006,6 +14007,41 @@ mod v3_collector_tests {
                 _ => unreachable!(),
             }
             assert!(boundaries.load(std::sync::atomic::Ordering::SeqCst) > 0);
+            assert!(storage.join("blobs/v3/reservations.lock").is_file());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v3_first_lock_sync_failure_leaves_no_namespace_and_retry_must_sync() {
+        for timed in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = fs::canonicalize(temp.path()).unwrap();
+            fs::write(storage.join("reader-floor.json"), V0_60_0_FLOOR).unwrap();
+            let acquire = || {
+                if timed {
+                    ReservationLock::acquire_until(&storage, Instant::now())
+                } else {
+                    ReservationLock::acquire(&storage)
+                }
+            };
+            // The first failure leaves a replaced but unsynced floor. A retry
+            // must not mistake its covering versions for a durability proof.
+            for _ in 0..2 {
+                crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| {
+                    *slot.borrow_mut() = Some(storage.clone());
+                });
+                assert!(
+                    acquire().is_err(),
+                    "floor sync failure must refuse the lock"
+                );
+                assert!(!storage.join("blobs/v3").exists());
+                assert!(crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| slot.borrow().is_none()));
+            }
+            crate::durability::take();
+            drop(acquire().unwrap());
+            assert!(crate::durability::take()
+                .contains(&(crate::durability::EventKind::DirectorySync, storage.clone(),)));
             assert!(storage.join("blobs/v3/reservations.lock").is_file());
         }
     }
