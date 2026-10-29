@@ -180,10 +180,16 @@ async fn session_reads_media_refused_before_native_handlers() {
     access_grants::register(&f.policy, &f.ctx).unwrap();
     std::fs::write(f.dir.path().join("main.rs"), SOURCE).unwrap();
     // Misleading extensions ensure admission inspects bytes, not file names.
+    let mut invalid_utf8 = vec![b'a'; 9000];
+    invalid_utf8.push(0xff);
     for (file, bytes) in [
-        ("image.txt", b"GIF89a".as_slice()),
-        ("pdf.txt", b"%PDF-1.7\n".as_slice()),
-        ("binary.txt", b"binary\0data".as_slice()),
+        ("gif.txt", b"GIF89a".to_vec()),
+        ("png.txt", b"\x89PNG\r\n\x1a\n".to_vec()),
+        ("jpeg.txt", b"\xff\xd8\xff".to_vec()),
+        ("webp.txt", b"RIFFxxxxWEBP".to_vec()),
+        ("pdf.txt", b"%PDF-1.7\n".to_vec()),
+        ("binary.txt", b"binary\0data".to_vec()),
+        ("invalid-utf8.txt", invalid_utf8),
     ] {
         std::fs::write(f.dir.path().join(file), bytes).unwrap();
         for (name, args) in [
@@ -205,4 +211,77 @@ async fn session_reads_media_refused_before_native_handlers() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn session_reads_outside_grants_and_asks_are_denied_on_the_outer_route() {
+    let _manifest =
+        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    for kind in ["head", "worker"] {
+        for restrict in [false, true] {
+            let f = Fixture::with_config(kind, |config| config.restrict_to_project_root = restrict);
+            access_grants::register(&f.policy, &f.ctx).unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let allowed = outside.path().join("allowed.txt");
+            std::fs::write(&allowed, "outside grant\n").unwrap();
+            // This is the scope grant materialized by allow_paths. An agent
+            // can use it; the carrier's forced root restriction must still win.
+            let grant = crate::access_policy::AccessGrant {
+                path: crate::access_policy::policy_path(&allowed),
+                kind: crate::access_policy::GrantKind::File,
+                operation: crate::access_policy::AccessOperation::Read,
+            };
+            crate::db::access_grants::insert(
+                &f.ctx.db().unwrap().lock().unwrap(),
+                &access_grants::scope_key(&f.policy),
+                &grant,
+            )
+            .unwrap();
+            assert!(read_under_policy(&f, &allowed, false).success);
+            let ungranted = outside.path().join("ask.txt");
+            std::fs::write(&ungranted, "would ask\n").unwrap();
+            for path in [&allowed, &ungranted] {
+                let body = query_with(&f, "read", json!({"path":path}), dispatch).await;
+                assert_eq!(
+                    body,
+                    super::super::super::carrier::error_body("path_outside_root"),
+                    "{kind} restrict={restrict}"
+                );
+            }
+            let inside = f.dir.path().join("inside.txt");
+            // A multibyte character crossing the sniffed prefix is still text.
+            std::fs::write(&inside, format!("{}é\n", "a".repeat(8191))).unwrap();
+            let body = query_with(&f, "read", json!({"path":inside}), dispatch).await;
+            assert_eq!(body["isError"], false, "{body}");
+            assert!(body["structuredContent"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("1:"));
+            assert!(
+                read_under_policy(&f, &allowed, false).success,
+                "carrier restriction must not leak to the agent"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn session_reads_confined_worker_keeps_native_fence_code() {
+    let _manifest =
+        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let f = Fixture::new("worker");
+    remote_policy::catalog(
+        json!({"preset":"worker", "params":{"confine":"root"}}),
+        &f.policy,
+        &f.ctx,
+    )
+    .unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let path = outside.path().join("outside.txt");
+    std::fs::write(&path, "outside\n").unwrap();
+    let body = query_with(&f, "read", json!({"path":path}), dispatch).await;
+    assert_eq!(
+        body,
+        super::super::super::carrier::error_body("path_outside_confined_root")
+    );
 }

@@ -379,6 +379,15 @@ pub(in crate::subc) async fn submit(
             let result = log_ctx::with_session(Some(identity.session.clone()), || {
                 session
                     .with_policy(ctx, &job_id, &name, args, |args| {
+                        if let Err(response) = super::session_reads::preflight(
+                            ctx,
+                            &job_id,
+                            &identity.session,
+                            &name,
+                            &args,
+                        ) {
+                            return crate::bounded_io::finish_response(response);
+                        }
                         let observe = |request: RawRequest, ctx: &AppContext| {
                             if entry["id"] == "bash_output" {
                                 super::bash_output::handle(
