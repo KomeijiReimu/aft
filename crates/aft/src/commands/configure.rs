@@ -8121,15 +8121,6 @@ impl ConfigureMaintenanceContinuation {
     }
 }
 
-fn lexical_bind_is_busy(reason: &str) -> bool {
-    // The lexical snapshot boundary carries strings. Match only the explicit
-    // retry markers preserved by the v3 registry and base builder, including
-    // markers nested beneath a driver or registry diagnostic.
-    reason.contains(crate::blob_store::v3::BUSY_PREFIX)
-        || reason.contains("v3 store busy: ")
-        || reason.contains("v3 base build busy; retain direct-scan coverage and retry")
-}
-
 #[derive(Debug, Default)]
 pub(crate) struct ConfigureMaintenanceState {
     jobs: VecDeque<ConfigureMaintenanceContinuation>,
@@ -9023,7 +9014,7 @@ fn run_configure_maintenance_unit_inner(
                     ctx.clear_view_runtime();
                 }
                 match ctx.lexical_view_snapshot("bind") {
-                    Some(Err(error)) if lexical_bind_is_busy(&error) => {
+                    Some(Err(error)) if crate::views::trigram::bind_is_busy(&error) => {
                         if !retrying {
                             slog_warn!(
                                 "lexical checkout view busy; configure maintenance will retry: {}",
@@ -17064,14 +17055,14 @@ mod tests {
             "[driver]: v3 store busy: reservation lock timeout",
             "[driver]: v3 base build busy; retain direct-scan coverage and retry",
         ] {
-            assert!(super::lexical_bind_is_busy(reason), "{reason}");
+            assert!(crate::views::trigram::bind_is_busy(reason), "{reason}");
         }
         for reason in [
             "reservation_ledger_unreadable: permission denied",
             "live_sqlite_file_replaced",
             "a file named busy.rs is unreadable",
         ] {
-            assert!(!super::lexical_bind_is_busy(reason), "{reason}");
+            assert!(!crate::views::trigram::bind_is_busy(reason), "{reason}");
         }
     }
 
@@ -17195,6 +17186,14 @@ mod tests {
         );
         blocker.execute_batch("ROLLBACK").unwrap();
         drop(blocker);
+        assert!(session.wait_rounds(session.rounds() + 1, Duration::from_secs(30)));
+        let pending = crate::views::parent::route(&query, &parent).unwrap();
+        assert_eq!(pending.data["complete"], false, "{pending:?}");
+        let text = pending.data["text"].as_str().unwrap();
+        assert!(
+            text.contains("alpha") && text.contains("busy"),
+            "{pending:?}"
+        );
         state.replay_retry_cutoff = state.jobs[0].retry_at();
         assert!(state.has_ready_job());
         assert!(super::drain_deferred_configure_maintenance_unit(
