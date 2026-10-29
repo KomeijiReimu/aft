@@ -1186,7 +1186,10 @@ fn failed_read_only_upgrade_preserves_busy_and_existing_reader_recovers() {
     };
     assert!(error.is_busy(), "{error}");
     let error = ledger.accounting().unwrap_err();
-    assert!(error.is_busy(), "existing reader lost the busy cause: {error}");
+    assert!(
+        error.is_busy(),
+        "existing reader lost the busy cause: {error}"
+    );
     let detail = error.to_string();
     assert!(detail.contains("members.sqlite"), "{detail}");
     assert!(detail.contains("read format version"), "{detail}");
