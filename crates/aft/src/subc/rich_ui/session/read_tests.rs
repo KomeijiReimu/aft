@@ -227,8 +227,9 @@ async fn session_reads_outside_grants_and_asks_are_denied_on_the_outer_route() {
             let outside = tempfile::tempdir().unwrap();
             let allowed = outside.path().join("allowed.txt");
             std::fs::write(&allowed, "outside grant\n").unwrap();
-            // This is the scope grant materialized by allow_paths. An agent
-            // can use it; the carrier's forced root restriction must still win.
+            // This grant represents an allow_paths entry. A native agent can
+            // read it when restrict_to_project_root is false; a carrier route
+            // rejects the outside-root path under either setting.
             let grant = crate::access_policy::AccessGrant {
                 path: crate::access_policy::policy_path(outside.path()),
                 kind: crate::access_policy::GrantKind::Subtree,
@@ -241,7 +242,11 @@ async fn session_reads_outside_grants_and_asks_are_denied_on_the_outer_route() {
             )
             .unwrap();
             let own = read_under_policy(&f, &allowed, false);
-            assert!(own.success, "{kind} restrict={restrict}: {own:?}");
+            if restrict {
+                assert_eq!(own.data["code"], "path_outside_root", "{own:?}");
+            } else {
+                assert!(own.success, "{kind}: {own:?}");
+            }
             let ungranted_dir = tempfile::tempdir().unwrap();
             let ungranted = ungranted_dir.path().join("ask.txt");
             std::fs::write(&ungranted, "would ask\n").unwrap();
@@ -262,10 +267,12 @@ async fn session_reads_outside_grants_and_asks_are_denied_on_the_outer_route() {
                 .as_str()
                 .unwrap()
                 .contains("1:"));
-            assert!(
-                read_under_policy(&f, &allowed, false).success,
-                "carrier restriction must not leak to the agent"
-            );
+            if !restrict {
+                assert!(
+                    read_under_policy(&f, &allowed, false).success,
+                    "carrier restriction must not leak to the agent"
+                );
+            }
         }
     }
 }
