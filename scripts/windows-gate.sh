@@ -176,8 +176,8 @@ fi
 print_job() {
   local kind=$1 target=$2 test_filter=$3
   local -a args=(test --locked -j 4 -p agent-file-tools "--$kind")
-  [[ -z "$features" ]] || args+=(--features "$features")
   [[ -z "$target" ]] || args+=("$target")
+  [[ -z "$features" ]] || args+=(--features "$features")
   [[ -z "$test_filter" ]] || args+=("$test_filter")
   args+=(-- --test-threads 4)
   printf '  cargo'; printf ' %q' "${args[@]}"; printf '\n'
@@ -238,8 +238,8 @@ started=$SECONDS
 run_job() {
   local kind=$1 target=$2 test_filter=$3 label=$4 remaining output code
   local -a args=(test --locked -j 4 -p agent-file-tools "--$kind")
-  [[ -z "$features" ]] || args+=(--features "$features")
   [[ -z "$target" ]] || args+=("$target")
+  [[ -z "$features" ]] || args+=(--features "$features")
   [[ -z "$test_filter" ]] || args+=("$test_filter")
   args+=(-- --test-threads 4)
   remaining=$((timeout_minutes * 60 - (SECONDS - started)))

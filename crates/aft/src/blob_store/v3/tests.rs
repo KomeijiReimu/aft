@@ -1163,6 +1163,44 @@ fn member_kind_constraint_and_v3_namespace_are_not_v2_registration() {
 }
 
 #[test]
+fn failed_read_only_upgrade_preserves_busy_and_existing_reader_recovers() {
+    let _guard = serial();
+    let root = tempdir().unwrap();
+    seed(root.path(), A);
+    let path = db(root.path(), A);
+    let blocker = IdentityConnection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE,
+        "v3-upgrade-blocker",
+    )
+    .unwrap();
+    // Rollback mode permits an exclusive lock while the idle read-only handle
+    // is still open, making a failed connection handoff deterministic.
+    blocker.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
+    let ledger = LedgerReader::open_existing(root.path(), A).unwrap();
+    blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let lock = ReservationLock::acquire(root.path()).unwrap();
+    let error = match RegistryWriter::open_existing(root.path(), A, &lock) {
+        Ok(_) => panic!("writer upgrade must be blocked by the exclusive transaction"),
+        Err(error) => error,
+    };
+    assert!(error.is_busy(), "{error}");
+    let error = ledger.accounting().unwrap_err();
+    assert!(error.is_busy(), "existing reader lost the busy cause: {error}");
+    let detail = error.to_string();
+    assert!(detail.contains("members.sqlite"), "{detail}");
+    assert!(detail.contains("read format version"), "{detail}");
+    assert!(detail.contains("database is locked"), "{detail}");
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+    assert_eq!(ledger.accounting().unwrap().reserved_bytes, 0);
+    assert_eq!(crate::db::file_identity::open_connections(&path), 1);
+    let writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
+    assert!(Arc::ptr_eq(&ledger.database, &writer.database));
+    assert_eq!(crate::db::file_identity::open_connections(&path), 1);
+}
+
+#[test]
 fn read_only_first_owner_upgrades_without_a_second_live_connection() {
     let _g = serial();
     let root = tempdir().unwrap();
