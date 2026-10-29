@@ -119,10 +119,3 @@ spikes/*/Cargo.lock
 
 # Isolated allocation-soak clones and profiler output must not be indexed or committed.
 /.malloc-experiment/
-
-# Local agent telemetry and scratch state
-.slim/
-.tokpulse/
-.tokpulse-writer-locks/
-.tokpulse-migrate-*/
-.opencode/oc-tps/
