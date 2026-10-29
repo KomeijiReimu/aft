@@ -6734,7 +6734,14 @@ mod v3_bootstrap_tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("reading Git index"), "{error}");
-        assert!(error.contains(&index_path.display().to_string()), "{error}");
+        // Windows reports the root in its verbatim `\\?\` spelling, so accept
+        // the canonical form as well as the path the test built.
+        let canonical = std::fs::canonicalize(&index_path).unwrap();
+        assert!(
+            error.contains(&index_path.display().to_string())
+                || error.contains(&canonical.display().to_string()),
+            "{error}"
+        );
         assert!(index_path.is_dir());
     }
 
