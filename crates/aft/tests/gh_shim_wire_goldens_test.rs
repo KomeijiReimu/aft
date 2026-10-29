@@ -2229,6 +2229,31 @@ fn v22_speech_rows_route_exactly_the_declared_requests_and_lookalikes_never_rout
     }
 }
 
+#[test]
+fn api_typed_patch_body_file_reaches_the_real_relay_as_contents() {
+    let temp = tempfile::tempdir().expect("body fixture");
+    let path = temp.path().join("ship-note.md");
+    let contents = "Ship note with **formatting**.\nSecond line.\n";
+    fs::write(&path, contents).expect("write body fixture");
+    let row = V22Row {
+        name: "api-typed-patch-body-file",
+        argv: vec![
+            "api",
+            "-X",
+            "PATCH",
+            "repos/cortexkit/aft/issues/comments/1",
+            "-F",
+            leak(format!("body=@{}", path.display())),
+        ],
+        expect: V22Expect::Routed(json!({})),
+    };
+    let run = run_v22_row(&row, &synthetic_v22_manifest(unix_seconds()), "alfonso-aft");
+    assert_eq!(run.upstream_invocations, None);
+    let request = run.routed_request.expect("PATCH reached the relay");
+    assert_eq!(request["body"], json!({"body": contents}));
+    assert_eq!(run.exit_code, Some(0), "{}", run.stderr);
+}
+
 /// The same rows against an unsigned v22 manifest payload (the bytes that
 /// will later be signed for production), signed here with the dev key byte
 /// for byte, to record each routed request before the production signing.
