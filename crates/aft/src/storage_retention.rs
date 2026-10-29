@@ -13955,6 +13955,61 @@ mod v3_collector_tests {
         }
     }
 
+    #[test]
+    fn v3_first_registration_and_lock_raise_floor_before_namespace() {
+        use crate::persisted_format::PersistedStore;
+
+        for entry in ["registration", "lock", "deadline-lock"] {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = fs::canonicalize(temp.path()).unwrap();
+            fs::write(storage.join("reader-floor.json"), V0_60_0_FLOOR).unwrap();
+            let boundaries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = Arc::clone(&boundaries);
+            let root = storage.clone();
+            let _hook = observe_test_hook(
+                &storage,
+                Arc::new(move |step| {
+                    if step == "v3-floor-raising" {
+                        crate::durability::take();
+                    } else if step.starts_with("v3-floor-raised:")
+                        && observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+                    {
+                        assert!(
+                            !root.join("blobs/v3").exists(),
+                            "{entry}: namespace created before the first durable floor boundary"
+                        );
+                        let floor = crate::reader_floor::read(&root).unwrap().unwrap();
+                        for domain in [
+                            PersistedStore::ViewsV3Registry,
+                            PersistedStore::ViewsV3Store,
+                        ] {
+                            assert!(floor.get(domain).is_some_and(|version| version >= 1));
+                        }
+                        #[cfg(unix)]
+                        assert!(crate::durability::take().contains(&(
+                            crate::durability::EventKind::DirectorySync,
+                            root.clone(),
+                        )));
+                    }
+                }),
+            );
+            // Registration must be safe even when no semantic or callgraph
+            // publisher has won the race to raise the floor first.
+            match entry {
+                "registration" => {
+                    crate::views::base_refs::with_base_barrier(&storage, FAMILY, |_| Ok(())).unwrap();
+                }
+                "lock" => drop(ReservationLock::acquire(&storage).unwrap()),
+                "deadline-lock" => {
+                    drop(ReservationLock::acquire_until(&storage, Instant::now()).unwrap());
+                }
+                _ => unreachable!(),
+            }
+            assert!(boundaries.load(std::sync::atomic::Ordering::SeqCst) > 0);
+            assert!(storage.join("blobs/v3/reservations.lock").is_file());
+        }
+    }
+
     /// Views-off configure must not promote a v0.60.0 root to v3. Views-on
     /// configure may promote it, but both v3 floor domains must be durable before
     /// its first v3 publication. Maintenance must preserve that boundary.
