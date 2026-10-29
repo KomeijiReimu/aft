@@ -57,10 +57,10 @@ fn file_kind(path: &Path) -> std::io::Result<Option<&'static str>> {
     if !metadata.is_file() {
         return Ok(None);
     }
-    let mut prefix = [0u8; 8192];
-    let len = metadata.len().min(prefix.len() as u64) as usize;
-    file.read_exact(&mut prefix[..len])?;
-    let prefix = &prefix[..len];
+    let mut bytes = [0u8; 8192];
+    let len = metadata.len().min(bytes.len() as u64) as usize;
+    file.read_exact(&mut bytes[..len])?;
+    let prefix = &bytes[..len];
     // Match the native read handler's content signatures, not extensions:
     // even a text-looking GIF or PDF must not become a text-only success.
     if prefix.starts_with(b"\x89PNG\r\n\x1a\n")
@@ -76,15 +76,23 @@ fn file_kind(path: &Path) -> std::io::Result<Option<&'static str>> {
     if content_inspector::inspect(prefix).is_binary() {
         return Ok(Some("binary"));
     }
-    // Native whole-file reads reject files above 50 MiB. Leave their size
-    // handling to the handler, but check all UTF-8 below that limit: an invalid
-    // byte beyond the sniffed prefix still produces a native binary summary.
-    if metadata.len() <= 50 * 1024 * 1024 {
-        let mut bytes = prefix.to_vec();
-        file.read_to_end(&mut bytes)?;
-        if std::str::from_utf8(&bytes).is_err() {
-            return Ok(Some("binary"));
+    // Invalid UTF-8 beyond the sniffed prefix must not become a binary summary
+    // or a lossy text success. Scan in fixed space under the call's I/O budget,
+    // carrying an incomplete character into the next read rather than refusing
+    // valid text whose character happens to cross a buffer boundary.
+    let mut len = len;
+    loop {
+        let carry = match std::str::from_utf8(&bytes[..len]) {
+            Ok(_) => 0,
+            Err(error) if error.error_len().is_some() => return Ok(Some("binary")),
+            Err(error) => len - error.valid_up_to(),
+        };
+        bytes.copy_within(len - carry..len, 0);
+        match file.read(&mut bytes[carry..]) {
+            Ok(0) => return Ok((carry != 0).then_some("binary")),
+            Ok(read) => len = carry + read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => len = carry,
+            Err(error) => return Err(error),
         }
     }
-    Ok(None)
 }

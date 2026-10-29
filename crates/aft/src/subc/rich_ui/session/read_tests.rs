@@ -134,7 +134,9 @@ async fn session_reads_serve_all_seven_from_heads_workers_and_flow_heads() {
                 json!({"path":"main.rs", "startLine":1, "endLine":2}),
                 "session_marker",
             ),
+            ("read", json!({"path":"."}), "main.rs"),
             ("outline", json!({"target":"main.rs"}), "session_marker"),
+            ("outline", json!({"target":".", "files":true}), "main.rs"),
             (
                 "zoom",
                 json!({"batch":[{"target":"main.rs", "symbols":["session_marker", "session_leaf"]}]}),
@@ -190,6 +192,7 @@ async fn session_reads_media_refused_before_native_handlers() {
         ("pdf.txt", b"%PDF-1.7\n".to_vec()),
         ("binary.txt", b"binary\0data".to_vec()),
         ("invalid-utf8.txt", invalid_utf8),
+        ("incomplete-utf8.txt", b"text\xe2\x82".to_vec()),
     ] {
         std::fs::write(f.dir.path().join(file), bytes).unwrap();
         for (name, args) in [
@@ -227,8 +230,8 @@ async fn session_reads_outside_grants_and_asks_are_denied_on_the_outer_route() {
             // This is the scope grant materialized by allow_paths. An agent
             // can use it; the carrier's forced root restriction must still win.
             let grant = crate::access_policy::AccessGrant {
-                path: crate::access_policy::policy_path(&allowed),
-                kind: crate::access_policy::GrantKind::File,
+                path: crate::access_policy::policy_path(outside.path()),
+                kind: crate::access_policy::GrantKind::Subtree,
                 operation: crate::access_policy::AccessOperation::Read,
             };
             crate::db::access_grants::insert(
@@ -237,8 +240,10 @@ async fn session_reads_outside_grants_and_asks_are_denied_on_the_outer_route() {
                 &grant,
             )
             .unwrap();
-            assert!(read_under_policy(&f, &allowed, false).success);
-            let ungranted = outside.path().join("ask.txt");
+            let own = read_under_policy(&f, &allowed, false);
+            assert!(own.success, "{kind} restrict={restrict}: {own:?}");
+            let ungranted_dir = tempfile::tempdir().unwrap();
+            let ungranted = ungranted_dir.path().join("ask.txt");
             std::fs::write(&ungranted, "would ask\n").unwrap();
             for path in [&allowed, &ungranted] {
                 let body = query_with(&f, "read", json!({"path":path}), dispatch).await;
