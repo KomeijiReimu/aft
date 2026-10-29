@@ -446,11 +446,20 @@ pub struct ReservationLock {
     storage: PathBuf,
 }
 impl ReservationLock {
+    fn prepare_path(storage: &Path) -> Result<PathBuf> {
+        // Registration and maintenance can acquire the lease before opening a
+        // registry. Even the namespace and lock file need a durable v3 floor;
+        // registry openers still raise any higher schema requirement themselves.
+        crate::reader_floor::publish_v3_with_floor(storage, FORMAT_VERSION, FORMAT_VERSION, || {
+            let dir = storage.join("blobs/v3");
+            fs::create_dir_all(&dir)
+                .map_err(|e| crate::views::io::at("creating v3 namespace", &dir, e))?;
+            Ok(dir.join("reservations.lock"))
+        })
+        .map_err(|e| Error::Io(std::io::Error::other(e)))?
+    }
     pub fn acquire(storage: &Path) -> Result<Self> {
-        let dir = storage.join("blobs/v3");
-        fs::create_dir_all(&dir)
-            .map_err(|e| crate::views::io::at("creating v3 namespace", &dir, e))?;
-        let path = dir.join("reservations.lock");
+        let path = Self::prepare_path(storage)?;
         let guard = crate::fs_lock::try_acquire(&path, Duration::from_secs(120))
             .map_err(|e| ReservationLockError::io(&path, e))?;
         Ok(Self {
@@ -460,10 +469,7 @@ impl ReservationLock {
     }
     /// Like [`Self::acquire`], but waits no later than `deadline`; a deadline already past makes exactly one attempt.
     pub fn acquire_until(storage: &Path, deadline: std::time::Instant) -> Result<Self> {
-        let dir = storage.join("blobs/v3");
-        fs::create_dir_all(&dir)
-            .map_err(|e| crate::views::io::at("creating v3 namespace", &dir, e))?;
-        let path = dir.join("reservations.lock");
+        let path = Self::prepare_path(storage)?;
         let guard = crate::fs_lock::try_acquire_until(&path, deadline)
             .map_err(|e| ReservationLockError::io(&path, e))?;
         Ok(Self {
