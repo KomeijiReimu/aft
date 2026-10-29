@@ -255,3 +255,65 @@ fn operation_query_translation_passes_served_schemas_without_bound_fields() {
         json!({"path":"x"})
     );
 }
+
+#[test]
+fn session_read_union_free_arguments_pass_served_schemas() {
+    for (name, args) in [
+        (
+            "read",
+            json!({"path":"src/lib.rs", "startLine":2, "endLine":8}),
+        ),
+        (
+            "outline",
+            json!({"target":"src/lib.rs", "includeTests":true}),
+        ),
+        ("outline", json!({"target":"src", "files":true})),
+        (
+            "zoom",
+            json!({"batch":[{"target":"src/lib.rs", "symbols":["one", "two"]}], "contextLines":2, "callgraph":true}),
+        ),
+        (
+            "search",
+            json!({"pattern":"one", "path":"src", "topK":3, "offset":0, "includeTests":true}),
+        ),
+        (
+            "grep",
+            json!({"pattern":"one", "path":"src", "include":"*.rs", "offset":0}),
+        ),
+        ("glob", json!({"pattern":"**/*.rs", "path":"src"})),
+        (
+            "callgraph",
+            json!({"op":"trace_to_symbol", "path":"src/lib.rs", "symbol":"one", "toPath":"src/lib.rs", "toSymbol":"two", "depth":2, "includeTests":true, "includeUnresolved":true}),
+        ),
+    ] {
+        let mut input = args.clone();
+        input["rich_ui_op"] = json!(format!("{name}@1"));
+        let operation = prepare(name, input).unwrap();
+        // The manifest's schemas accept these argument forms directly; do not
+        // coerce symbol lists to strings or wrap a target in an array.
+        assert_eq!(
+            operation.translate_query(None, 5000).unwrap(),
+            args,
+            "{name}"
+        );
+    }
+    for args in [
+        json!({"target":["src/lib.rs"]}),
+        json!({"target":"src/lib.rs", "ref":"HEAD"}),
+    ] {
+        let mut args = args;
+        args["rich_ui_op"] = json!("outline@1");
+        assert_eq!(prepare("outline", args).unwrap_err().code, "args_invalid");
+    }
+    for batch in [
+        json!([{"target":"src/lib.rs", "symbols":"one"}]),
+        json!([{"target":"src/lib.rs", "symbols":["one"], "ref":"HEAD"}]),
+    ] {
+        assert_eq!(
+            prepare("zoom", json!({"rich_ui_op":"zoom@1", "batch":batch}))
+                .unwrap_err()
+                .code,
+            "args_invalid"
+        );
+    }
+}
