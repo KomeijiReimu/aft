@@ -17024,6 +17024,104 @@ mod tests {
         lock
     }
 
+    #[test]
+    fn busy_lexical_bind_retries_until_parent_can_read_child_trigram() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(temp.path()).unwrap();
+        let projects = base.join("projects");
+        let root = projects.join("alpha");
+        let storage = base.join("storage");
+        init_git_fixture(&root);
+        let ctx = test_context();
+        let response = super::handle_configure(
+            &configure_request_with_params(json!({
+                "project_root": root,
+                "harness": "opencode",
+                "storage_dir": storage,
+                "config": [user_tier(json!({
+                    "indexes": { "trigram": true, "semantic": false, "callgraph": false },
+                    "views": { "enabled": true },
+                }))],
+            })),
+            &ctx,
+        );
+        assert!(response.success, "{response:?}");
+        assert!(ctx.artifact_identity_provisional_reason().is_none());
+        assert!(ctx.views_route_root());
+        let family = ctx.cached_artifact_cache_key(&root).unwrap();
+        let mut state = super::ConfigureMaintenanceState::default();
+        state.absorb_enqueued(&ctx);
+        while state.jobs.front().unwrap().stage != super::ConfigureMaintenanceStage::ViewLoad {
+            assert!(super::drain_deferred_configure_maintenance_unit(
+                &ctx, &mut state
+            ));
+        }
+
+        let parent = test_context();
+        parent.update_config(|config| {
+            config.project_root = Some(projects.clone());
+            config.views.enabled = true;
+        });
+        let planes = crate::views::parent::RequestedPlanes {
+            trigram: true,
+            semantic: false,
+            callgraph: false,
+        };
+        assert!(crate::views::parent::prepare(&projects, planes));
+        assert!(crate::views::parent::activate(
+            &parent,
+            &projects,
+            &storage,
+            &parent.config().semantic
+        ));
+        let session = crate::views::parent::session_for_root(&projects).unwrap();
+        assert!(session.wait_rounds(1, Duration::from_secs(30)));
+        assert!(!session.children()[0].trigram_ready());
+
+        {
+            let reservation = crate::blob_store::v3::ReservationLock::acquire(&storage).unwrap();
+            crate::blob_store::v3::open_base_refs_registry(&storage, &family, &reservation, None)
+                .unwrap();
+        }
+        let ledger = crate::blob_store::v3::family_dir(&storage, &family)
+            .unwrap()
+            .join("members.sqlite");
+        let blocker = rusqlite::Connection::open(ledger).unwrap();
+        blocker.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; UPDATE accounting SET watermark=watermark+1;").unwrap();
+        // Only the configure tail may publish the child; the parent never binds it.
+        while super::drain_deferred_configure_maintenance_unit(&ctx, &mut state) {}
+        assert!(!session.children()[0].trigram_ready());
+        assert_eq!(
+            state.jobs.len(),
+            1,
+            "busy lexical bind was dropped instead of parked"
+        );
+        assert_eq!(
+            state.jobs[0].stage,
+            super::ConfigureMaintenanceStage::ViewLoad
+        );
+        let retry_at = state.jobs[0]
+            .retry_at()
+            .expect("busy bind needs a retry deadline");
+        state.replay_retry_cutoff = Some(retry_at - Duration::from_nanos(1));
+        assert!(!state.has_ready_job());
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+        state.replay_retry_cutoff = Some(retry_at);
+        assert!(state.has_ready_job());
+        while super::drain_deferred_configure_maintenance_unit(&ctx, &mut state) {}
+        assert!(state.jobs.is_empty());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !session.children()[0].trigram_ready() {
+            assert!(
+                Instant::now() < deadline,
+                "parent never saw the retried lexical publication"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn trigram_bind_request(root: &std::path::Path, storage: &std::path::Path) -> RawRequest {
         configure_request_with_params(json!({
             "project_root": root,
