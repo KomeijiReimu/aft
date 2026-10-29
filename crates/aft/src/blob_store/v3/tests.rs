@@ -1267,7 +1267,12 @@ fn failed_upgrade_reader_rejects_a_replaced_database() {
     drop(blocker);
     let original = path.with_extension("original.sqlite");
     fs::rename(&path, &original).unwrap();
-    fs::copy(&original, &path).unwrap();
+    // Rebuild the file through SQLite itself: the source fence forbids copying
+    // file-set bytes, and VACUUM INTO gives the same content a new identity.
+    Connection::open(&original)
+        .unwrap()
+        .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+        .unwrap();
     assert!(matches!(
         ledger.accounting(),
         Err(Error::Refused("live_sqlite_file_replaced"))
