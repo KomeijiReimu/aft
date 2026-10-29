@@ -1,1 +1,0 @@
-- GitHub writes now refuse with repair guidance when a previously provisioned machine's routing manifest is missing or invalid; safe reads remain available.
