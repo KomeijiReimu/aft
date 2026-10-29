@@ -70,12 +70,77 @@ async fn query(f: &Fixture, id: &str, key: &str, extra: Value) -> Value {
     args["rich_ui_op"] = format!("{id}@1").into();
     args["task"] = key.into();
     let operation = super::super::super::admission::prepare(name, &args).unwrap();
-    let reply = exchange(f, name, args, "worker").await;
+    let reply = if id == "bash_watch" {
+        exchange_watch(f, args).await
+    } else {
+        exchange(f, name, args, "worker").await
+    };
     assert_eq!(reply.header.ty, FrameType::Response);
     let body: Value = serde_json::from_slice(&reply.body).unwrap();
     super::super::super::carrier::validate_body(Some(&operation.entry), &body).unwrap();
     assert_eq!(body.as_object().unwrap().len(), 3, "no session sidecars");
     body
+}
+
+// The shared route-test exchange has a three-second watchdog. Carrier watches
+// intentionally wait longer, so use the same outer route with a twenty-second one.
+async fn exchange_watch(f: &Fixture, args: Value) -> Frame {
+    let executor = Arc::new(Executor::new());
+    assert!(executor.register_actor(f.carrier.root.clone(), f.ctx.clone()));
+    let routes = HashMap::from([
+        (route_key(41, 9), f.carrier.clone()),
+        (route_key(43, 9), f.policy.clone()),
+    ]);
+    let decoded = decoded_request("bash_watch", args, "worker", None, 71);
+    let (writer, mut replies) = mpsc::channel(8);
+    let (bash_tx, _bash_rx) = mpsc::channel(8);
+    let (touch_tx, _touch_rx) = mpsc::channel(8);
+    let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
+    let deferred_tx = DeferredResponseSender {
+        entries: deferred_tx,
+        wake: crate::response_finalize::DeferredResponseWake::default(),
+    };
+    handle_tool_call_with_capabilities(
+        &writer,
+        &decoded.frame,
+        None,
+        decoded.confinement,
+        decoded.phase_trace,
+        &routes,
+        &HashMap::new(),
+        &ReclaimedRoutes::default(),
+        &mut HashMap::new(),
+        &executor,
+        &Arc::default(),
+        &Arc::new(PendingDeferredSetups::default()),
+        &Arc::new(Notify::new()),
+        &PersistentCancelSignal::new(),
+        &bash_tx,
+        &touch_tx,
+        &Arc::new(DispatchPathMetrics::new()),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut 1,
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        |_, _| panic!("carrier watch must use its observation-only handler"),
+        &deferred_tx,
+        false,
+        1024 * 1024,
+        &drain::ModuleDrainWindow::default(),
+        None,
+        PROOFS,
+    )
+    .await
+    .unwrap();
+    let mut reply = tokio::time::timeout(Duration::from_secs(20), replies.recv())
+        .await
+        .expect("carrier watch must reply within twenty seconds")
+        .unwrap();
+    reply.project_tool_result().unwrap();
+    reply.frame
 }
 
 fn reopen(f: &Fixture) {
@@ -138,7 +203,11 @@ async fn command_watch_polls_for_later_output_and_task_exit() {
                 task.mark_terminal(BgTaskStatus::Completed, Some(7), None);
                 persistence::write_task_at(&layout, &task).unwrap();
             } else {
-                std::fs::write(&layout.paths.stdout, b"later\n").unwrap();
+                let mut output = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&layout.paths.stdout)
+                    .unwrap();
+                std::io::Write::write_all(&mut output, b"later\n").unwrap();
             }
         });
         let body = query(
