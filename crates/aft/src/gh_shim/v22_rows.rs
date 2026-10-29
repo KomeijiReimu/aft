@@ -389,6 +389,7 @@ fn api_payload_items<R: Read>(
     let mut items = Vec::new();
     let mut document_seen = false;
     let mut field_seen = false;
+    let mut stdin_seen = false;
     let mut endpoint_seen = false;
     let mut index = 1;
     while index < args.len() {
@@ -459,6 +460,14 @@ fn api_payload_items<R: Read>(
             let (name, text) = pair.split_once('=').ok_or_else(|| {
                 CanonicalizeError::unclassified(format!("{value} takes name=value"))
             })?;
+            // File inputs are saved by path for policy validation. A second
+            // @- would reuse the first stdin contents rather than read stdin
+            // again, which would return EOF in gh.
+            if typed && text == "@-" && std::mem::replace(&mut stdin_seen, true) {
+                return Err(CanonicalizeError::unclassified(format!(
+                    "{name}: --field @- may read stdin only once on a governed write"
+                )));
+            }
             items.push(PayloadItem::Field {
                 name: name.to_string(),
                 value: api_field_value(name, text, typed, stdin)?,

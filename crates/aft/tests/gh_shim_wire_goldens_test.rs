@@ -2457,6 +2457,20 @@ fn api_other_governed_rows_keep_types_or_refuse_before_relay() {
             ],
             expect: V22Expect::Refused("gh_shim_unclassified"),
         },
+        V22Row {
+            name: "pull-edit-cannot-replay-stdin-twice",
+            argv: vec![
+                "api",
+                "-X",
+                "PATCH",
+                "repos/cortexkit/aft/pulls/1",
+                "-F",
+                "title=@-",
+                "--field",
+                "body=@-",
+            ],
+            expect: V22Expect::Refused("gh_shim_unclassified"),
+        },
     ];
     for (endpoint, action, target) in [
         (
@@ -2524,6 +2538,106 @@ fn api_other_governed_rows_keep_types_or_refuse_before_relay() {
     for row in rows {
         let run = run_v22_row(&row, &manifest, "alfonso-aft");
         check_v22_row(&row, &run, "alfonso-aft");
+    }
+}
+
+#[test]
+fn command_body_file_wire_goldens_read_paths_and_stdin_not_api_fields() {
+    let temp = tempfile::tempdir().expect("command body fixtures");
+    let path = temp.path().join("command-body.md");
+    let contents = "Command body from file or stdin.\n";
+    fs::write(&path, contents).expect("write command body");
+    let manifest = synthetic_v22_manifest(unix_seconds());
+    for (head, action, target, own, extra) in [
+        (
+            vec!["issue", "comment", "1"],
+            "issue comment",
+            json!({"number": "1"}),
+            false,
+            json!({}),
+        ),
+        (
+            vec!["pr", "comment", "1"],
+            "pr comment",
+            json!({"number": "1"}),
+            false,
+            json!({}),
+        ),
+        (
+            vec!["issue", "create", "--title", "probe"],
+            "issue create",
+            json!({}),
+            false,
+            json!({"title": "probe"}),
+        ),
+        (
+            vec!["issue", "edit", "1"],
+            "issue edit",
+            json!({"number": "1"}),
+            true,
+            json!({}),
+        ),
+        (
+            vec![
+                "pr", "create", "--title", "probe", "--base", "main", "--head", "topic",
+            ],
+            "pr create",
+            json!({}),
+            false,
+            json!({"title": "probe", "base": "main", "head": "topic", "draft": false}),
+        ),
+        (
+            vec!["pr", "edit", "1"],
+            "pr edit",
+            json!({"number": "1"}),
+            true,
+            json!({}),
+        ),
+        (
+            vec!["pr", "review", "1", "--comment"],
+            "pr review",
+            json!({"number": "1"}),
+            false,
+            json!({"event": "COMMENT"}),
+        ),
+    ] {
+        for (flag, source, input) in [
+            ("--body-file", path.to_str().unwrap(), ""),
+            ("-F", path.to_str().unwrap(), ""),
+            ("--body-file", "-", contents),
+            ("-F", "-", contents),
+        ] {
+            let mut argv = head.clone();
+            argv.extend([flag, leak(source.to_string())]);
+            let mut body = extra.clone();
+            body["body"] = json!(contents);
+            let row = V22Row {
+                name: leak(format!("{action}-{flag}-{source}")),
+                argv,
+                expect: routed(action, target.clone(), body, own),
+            };
+            let reply = fs::read(goldens_dir().join("responses/success-result.response.json"))
+                .expect("success response");
+            let run = run_v22_row_with_input(&row, &manifest, "alfonso-aft", reply, input);
+            check_v22_row(&row, &run, "alfonso-aft");
+        }
+        let mut argv = head.clone();
+        argv.extend([
+            "--body-file",
+            leak(temp.path().join("missing.md").display().to_string()),
+        ]);
+        let row = V22Row {
+            name: "missing-command-body-file",
+            argv,
+            expect: V22Expect::Refused("gh_shim_unclassified"),
+        };
+        let run = run_v22_row(&row, &manifest, "alfonso-aft");
+        check_v22_row(&row, &run, "alfonso-aft");
+        assert!(
+            run.stderr.contains("could not read body file"),
+            "{}",
+            run.stderr
+        );
     }
 }
 
