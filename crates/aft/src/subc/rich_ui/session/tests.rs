@@ -1043,3 +1043,6 @@ async fn unresolved_policy_is_typed_and_database_and_preset_errors_precede_mode(
 
 #[path = "bash_tests.rs"]
 mod bash_tests;
+
+#[path = "read_tests.rs"]
+mod read_tests;

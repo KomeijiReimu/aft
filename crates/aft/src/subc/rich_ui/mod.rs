@@ -40,5 +40,6 @@ pub(crate) mod operations;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod schema;
 pub(super) mod session;
+mod session_reads;
 #[cfg(test)]
 mod vectors;
