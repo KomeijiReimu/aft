@@ -30,7 +30,7 @@ fn identity(root: &Path, kind: &str, id: &str, channel: u16) -> RouteIdentity {
     RouteIdentity(Arc::new(RouteIdentityData {
         root: ProjectRootId::from_path(root).unwrap(),
         project_root: root.into(),
-        harness: "runner/raw harness".into(),
+        harness: "mcp:runner/raw harness".into(),
         session: "session".into(),
         role: tool_provider::RouteRole::ToolProviderV1,
         trust: BindTrust::FirstParty,
@@ -39,7 +39,7 @@ fn identity(root: &Path, kind: &str, id: &str, channel: u16) -> RouteIdentity {
             route_channel: channel,
             route_epoch: 9,
             project_root: root.into(),
-            harness: "runner/raw harness".into(),
+            harness: "mcp:runner/raw harness".into(),
             session_id: "session".into(),
             principal_id: Some(id.into()),
         },
@@ -612,32 +612,58 @@ fn worker_without_candidate_is_unbound_even_without_database() {
 const MANIFEST: &[u8] = include_bytes!("../../../../tests/fixtures/rich_ui/manifest.jcs.json");
 
 async fn exchange(f: &Fixture, name: &str, args: Value, preset: &str) -> Frame {
-    let executor = Arc::new(Executor::new());
-    assert!(executor.register_actor(f.carrier.root.clone(), f.ctx.clone()));
+    exchange_keyed(f, name, args, preset, None, 71).await
+}
+
+fn decoded_request(
+    name: &str,
+    args: Value,
+    preset: &str,
+    key: Option<&str>,
+    corr: u64,
+) -> DecodedFrame {
     let frame = Frame::build(
         FrameType::Request,
         control_flags(),
         41,
         9,
-        71,
-        serde_json::to_vec(
-            &json!({"op":"tool.call", "name":name, "arguments":args, "preset":preset}),
-        )
+        corr,
+        serde_json::to_vec(&{
+            let mut body =
+                json!({"op":"tool.call", "name":name, "arguments":args, "preset":preset});
+            if let Some(key) = key {
+                body["call_key"] = key.into();
+            }
+            body
+        })
         .unwrap(),
     )
     .unwrap();
-    let routes = HashMap::from([
-        (route_key(41, 9), f.carrier.clone()),
-        (route_key(43, 9), f.policy.clone()),
-    ]);
-    let decoded = DecodedFrame {
+    DecodedFrame {
         frame,
         parsed_body: Default::default(),
         confinement: None,
         launch_restore: None,
         codemode_policies: None,
         phase_trace: PhaseTrace::new(Instant::now()),
-    };
+    }
+}
+
+async fn exchange_keyed(
+    f: &Fixture,
+    name: &str,
+    args: Value,
+    preset: &str,
+    key: Option<&str>,
+    corr: u64,
+) -> Frame {
+    let executor = Arc::new(Executor::new());
+    assert!(executor.register_actor(f.carrier.root.clone(), f.ctx.clone()));
+    let routes = HashMap::from([
+        (route_key(41, 9), f.carrier.clone()),
+        (route_key(43, 9), f.policy.clone()),
+    ]);
+    let decoded = decoded_request(name, args, preset, key, corr);
     let reply = tool_provider::route_tests::exchange_decoded_with_capabilities(
         decoded,
         &routes,
@@ -1008,3 +1034,6 @@ async fn unresolved_policy_is_typed_and_database_and_preset_errors_precede_mode(
         );
     }
 }
+
+#[path = "bash_tests.rs"]
+mod bash_tests;
