@@ -4951,6 +4951,31 @@ pub enum CallgraphStoreAccess {
     Error(CallGraphStoreError),
 }
 
+pub(crate) fn checkout_view_callgraph_access(
+    reader: Option<
+        Result<Arc<ReadonlyCallGraphStore>, crate::views::callgraph::CallgraphViewError>,
+    >,
+) -> CallgraphStoreAccess {
+    match reader {
+        Some(Ok(store)) => CallgraphStoreAccess::Ready(store),
+        // Transient contention while opening a view—including another driver
+        // finishing shared artifacts or a derived-database checkpoint—is
+        // retryable, not evidence that the graph is unavailable.
+        Some(Err(error)) if error.busy => CallgraphStoreAccess::Building,
+        Some(Err(error))
+            if error
+                .reason
+                .contains(crate::views::read::CALLGRAPH_DISABLED) =>
+        {
+            CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(error.reason))
+        }
+        Some(Err(error)) => CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(format!(
+            "callgraph view unavailable: {error}"
+        ))),
+        None => CallgraphStoreAccess::Unavailable,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum CallgraphBackgroundWork {
     Ensure,
@@ -11055,29 +11080,7 @@ impl AppContext {
             if !demand {
                 return CallgraphStoreAccess::Building;
             }
-            return match self.callgraph_view_reader() {
-                Some(Ok(store)) => CallgraphStoreAccess::Ready(store),
-                // A lock held on the view's database says nothing about the
-                // graph: report SQLite's busy error, which callers present as
-                // building, retry shortly.
-                Some(Err(error)) if error.busy => CallgraphStoreAccess::Error(
-                    CallGraphStoreError::Sqlite(rusqlite::Error::SqliteFailure(
-                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-                        Some(error.reason),
-                    )),
-                ),
-                Some(Err(error))
-                    if error
-                        .reason
-                        .contains(crate::views::read::CALLGRAPH_DISABLED) =>
-                {
-                    CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(error.reason))
-                }
-                Some(Err(error)) => CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(
-                    format!("callgraph view unavailable: {error}"),
-                )),
-                None => CallgraphStoreAccess::Unavailable,
-            };
+            return checkout_view_callgraph_access(self.callgraph_view_reader());
         }
         if self.config().views.enabled && self.config().indexes.callgraph {
             let on_demand = self.callgraph_build_on_demand();

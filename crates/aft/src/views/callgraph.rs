@@ -399,7 +399,8 @@ impl From<PlaneError> for CallgraphViewError {
         Self {
             busy: reason.starts_with(DERIVED_STORE_BUSY)
                 || reason.starts_with(V3_STORE_BUSY)
-                || reason.starts_with(crate::blob_store::v3::BUSY_PREFIX),
+                || reason.starts_with(crate::blob_store::v3::BUSY_PREFIX)
+                || reason.starts_with(V3_BASE_COMPLETION_BUSY),
             reason: error.to_string(),
         }
     }
@@ -421,6 +422,7 @@ impl std::fmt::Display for CallgraphViewError {
 /// from opening.
 pub(crate) const DERIVED_STORE_BUSY: &str = "callgraph derived store is busy";
 const V3_STORE_BUSY: &str = "callgraph v3 store is busy";
+const V3_BASE_COMPLETION_BUSY: &str = "v3 base plane completion is owned elsewhere";
 
 /// Supplies a checkout's verified call graph to one request, without
 /// exposing its storage layout. Implementations never publish v1/v2 data and
@@ -932,6 +934,74 @@ mod tests {
             callers(&construct().unwrap().reader().unwrap(), "a.ts", "target").len(),
             1
         );
+    }
+
+    #[test]
+    fn v3_base_completion_owned_by_another_driver_answers_building_then_ready() {
+        use super::super::base_builder::{build_base, BaseBuild, BaseBuildInput};
+        use super::super::eviction::DiskBudget;
+
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let root = checkout(&temp.path().join("checkout"));
+        let paths: Vec<_> = FILES
+            .iter()
+            .map(|(name, _)| RelPath::new(name.as_bytes().to_vec()).unwrap())
+            .collect();
+        let BaseBuild::Published { claim, .. } = build_base(
+            BaseBuildInput {
+                storage: &storage,
+                family: "donor-reuse",
+                root: &root,
+                paths: &paths,
+                policy: crate::blob_store::v2::TrigramPolicy {
+                    max_file_size: 1 << 20,
+                },
+                semantic_producer: None,
+                callgraph_producer: PRODUCER.into(),
+                ignore_fingerprint: None,
+                history: None,
+                budget: DiskBudget::default(),
+            },
+            None,
+        )
+        .unwrap() else {
+            panic!("the fixture must own its fresh base")
+        };
+        let outcome =
+            super::super::base_builder::claim_base(&storage, "donor-reuse", claim.scope(), None)
+                .unwrap();
+        let owner_pid = match &outcome {
+            super::super::base_builder::ClaimOutcome::Busy { owner_pid, .. } => *owner_pid,
+            _ => panic!("the live base owner must fence another completion driver"),
+        };
+        assert_eq!(owner_pid, std::process::id());
+        let error = CallgraphViewError::from(PlaneError::loader(
+            super::super::contracts::LoaderStage::Driver,
+            format!("{V3_BASE_COMPLETION_BUSY}: {outcome:?}"),
+        ));
+        assert!(error.busy, "{error}");
+        assert!(error.reason.contains(V3_BASE_COMPLETION_BUSY), "{error}");
+        assert!(
+            error
+                .reason
+                .contains(&format!("owner_pid: {}", std::process::id())),
+            "{error}"
+        );
+        assert!(matches!(
+            crate::context::checkout_view_callgraph_access(Some(Err(error))),
+            crate::context::CallgraphStoreAccess::Building
+        ));
+
+        claim.release().unwrap();
+        let graph = view(&root, &storage);
+        let crate::context::CallgraphStoreAccess::Ready(ready) =
+            crate::context::checkout_view_callgraph_access(Some(graph.reader()))
+        else {
+            panic!("the completed base must serve a ready call graph")
+        };
+        assert_eq!(callers(&ready, "a.ts", "target").len(), 1);
     }
 
     #[test]
