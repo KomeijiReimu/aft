@@ -24,6 +24,20 @@ fn seed(storage: &Path, family: &str) {
 }
 
 #[test]
+fn directory_reservation_lock_error_names_operation_and_path() {
+    let storage = tempdir().unwrap();
+    let path = storage.path().join("blobs/v3").join("reservations.lock");
+    fs::create_dir_all(&path).unwrap();
+    let error = match ReservationLock::acquire_until(storage.path(), Instant::now()) {
+        Ok(_) => panic!("directory lock must not be accepted"),
+        Err(error) => crate::views::base_refs::BaseRefError::from(error).to_string(),
+    };
+    assert!(error.contains("acquiring v3 reservation lock"), "{error}");
+    assert!(error.contains(&path.display().to_string()), "{error}");
+    assert!(path.is_dir());
+}
+
+#[test]
 fn put_batch_keeps_conflict_winners_and_commits_other_rows_in_one_transaction() {
     let _guard = serial();
     let root = tempdir().unwrap();
@@ -129,6 +143,30 @@ pub(super) fn measurement_recheck_hook() -> Result<()> {
         Some(hook) => hook(),
         None => Ok(()),
     })
+}
+
+#[test]
+fn path_context_keeps_io_contention_classifiable() {
+    let path = Path::new("busy-ledger/members.sqlite");
+    let error = crate::views::io::at(
+        "checking v3 registry",
+        path,
+        std::io::Error::from(std::io::ErrorKind::WouldBlock),
+    );
+    let error = Error::Io(std::io::Error::other(error));
+    assert!(error.is_busy(), "{error}");
+    for code in [32, 33] {
+        let error = crate::views::io::at(
+            "resolving v3 database",
+            path,
+            std::io::Error::from_raw_os_error(code),
+        );
+        let error = Error::ledger(path, "open registry", error);
+        assert_eq!(error.is_busy(), cfg!(windows), "{error}");
+        let detail = error.to_string();
+        assert!(detail.contains("resolving v3 database"), "{detail}");
+        assert!(detail.contains("busy-ledger/members.sqlite"), "{detail}");
+    }
 }
 
 #[test]
