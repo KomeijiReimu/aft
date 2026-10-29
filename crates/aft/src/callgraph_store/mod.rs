@@ -16445,7 +16445,7 @@ fn resolve_rust_target<I: ResolverIndex>(
 
     for import in &caller_data.import_block.imports {
         if let Some((target_file, target_symbol)) =
-            rust_target_for_use(index, caller_file, import, short_name, caller_data)
+            rust_target_for_use(index, caller_file, import, short_name, caller_data, raw)
         {
             return Some(("resolved".to_string(), target_file, target_symbol));
         }
@@ -16719,6 +16719,7 @@ fn rust_target_for_use<I: ResolverIndex>(
     import: &ImportStatement,
     short_name: &str,
     caller_data: &FileCallData,
+    raw: &RawRef,
 ) -> Option<(String, String)> {
     let imports = &caller_data.import_block.imports;
     let path = rust_use_body(&import.raw_text)
@@ -16726,6 +16727,16 @@ fn rust_target_for_use<I: ResolverIndex>(
         .trim()
         .trim_end_matches(';');
     if let Some(module) = path.strip_suffix("::*") {
+        if let Some((file, symbol)) = rust_target_for_qualified(
+            index,
+            caller_file,
+            &format!("{module}::{short_name}"),
+            short_name,
+            caller_data,
+            raw,
+        ) {
+            return index.has_export(&file, &symbol).then_some((file, symbol));
+        }
         let segments = module.split("::").collect::<Vec<_>>();
         let file = rust_use_module_file(index, caller_file, &segments, imports)?;
         let (file, symbol) =
@@ -16740,6 +16751,16 @@ fn rust_target_for_use<I: ResolverIndex>(
                 .then(|| crate::imports::specifier_imported_name(name).to_string())
         });
         if let Some(imported) = imported {
+            if let Some(target) = rust_target_for_qualified(
+                index,
+                caller_file,
+                &format!("{prefix}::{imported}"),
+                &imported,
+                caller_data,
+                raw,
+            ) {
+                return Some(target);
+            }
             let prefix_segments: Vec<&str> = prefix.split("::").collect();
             let inline_segments = prefix_segments
                 .iter()
@@ -16771,6 +16792,16 @@ fn rust_target_for_use<I: ResolverIndex>(
     }
     if segments.len() < 2 {
         return None;
+    }
+    if let Some(target) = rust_target_for_qualified(
+        index,
+        caller_file,
+        path_without_alias,
+        segments.last().copied().unwrap_or(short_name),
+        caller_data,
+        raw,
+    ) {
+        return Some(target);
     }
     let module_segments = segments[..segments.len() - 1]
         .iter()

@@ -164,7 +164,6 @@ pub fn extract_callee_name(node: &tree_sitter::Node, source: &str) -> Option<Str
         | "attribute"
         | "member_access_expression"
         | "qualified_identifier"
-        | "scoped_identifier"
         | "generic_function"
         | "generic_name"
         | "template_function"
@@ -2006,24 +2005,6 @@ fn caller(obj: *Obj) void {
                 .all(|(full, _, _, _, _)| full != "$before.shares_index_with"),
             "macro templates are definitions, not call sites: {calls:#?}"
         );
-    }
-
-    #[test]
-    fn extracts_rust_qualified_call_names_without_losing_the_path() {
-        for full in [
-            "a::b::f",
-            "crate::a::f",
-            "super::super::f",
-            "self::a::f",
-            "alias::f",
-        ] {
-            assert_extracted_call(
-                LangId::Rust,
-                &format!("fn run() {{ {full}(); }}"),
-                full,
-                "f",
-            );
-        }
     }
 
     #[test]

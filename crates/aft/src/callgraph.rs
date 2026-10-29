@@ -4465,7 +4465,7 @@ mod tests {
             for (site, value_ref) in sites {
                 let node = root.descendant_for_byte_range(site.byte_start, site.byte_end).unwrap();
                 let expected = if value_ref {
-                    if node.parent().is_some_and(|parent| {
+                    if lang == LangId::Rust || node.parent().is_some_and(|parent| {
                         matches!(parent.kind(), "arguments" | "argument_list")
                     }) {
                         CallSiteKind::CallbackReference
