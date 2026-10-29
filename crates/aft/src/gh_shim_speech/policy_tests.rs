@@ -607,6 +607,9 @@ fn post_probe_policy_arms_recheck_protection_and_refuse_provisioned_writes() {
             );
             let expected = match (mode, protected) {
                 ("regressed", true) => "gh-shim: gh_shim_seam_refusal: task_gh_authority_unavailable: this command's bot-write permission cannot be verified (current_manifest_unverifiable); start the command again from a live session, and tell the operator if it repeats.",
+                // Where the last valid manifest governs nothing (Windows), the
+                // command was never declared, so it refuses as unclassified.
+                ("regressed", false) if current_platform() == "unsupported" => "gh-shim: gh_shim_unclassified: no manifest declaration for this invocation (manifest artifact fails validation)",
                 ("regressed", false) => "gh-shim: gh_shim_manifest_regressed: the manifest artifact fails validation; issue comment is refused until the manifest is repaired",
                 _ => "gh-shim: gh_shim_manifest_unavailable: GitHub writes are refused because this machine's signed routing manifest is missing or invalid; without it the write would run as the operator's own account. Ask the operator to repair the manifest. Reads still work.",
             };
