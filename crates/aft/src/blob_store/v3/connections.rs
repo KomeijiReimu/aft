@@ -56,7 +56,8 @@ impl Database {
             // existing readers can reopen read-only on demand. A still-held
             // SQLite lock returns its busy error; a later read retries after
             // the lock is released.
-            let connection = open_db(route, self.kind, false, true)?;
+            let connection = open_db(route, self.kind, false, true)
+                .map_err(|source| Error::ledger(route, "reopen shared reader", source))?;
             *slot = Slot::Open {
                 connection,
                 writable: false,

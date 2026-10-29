@@ -1197,6 +1197,10 @@ fn failed_read_only_upgrade_preserves_busy_and_existing_reader_recovers() {
         "existing reader lost the busy cause: {error}"
     );
     let detail = error.to_string();
+    assert!(
+        detail.starts_with("reservation_ledger_busy: reopen shared reader"),
+        "{detail}"
+    );
     assert!(detail.contains("members.sqlite"), "{detail}");
     assert!(detail.contains("read format version"), "{detail}");
     assert!(detail.contains("database is locked"), "{detail}");
