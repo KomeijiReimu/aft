@@ -4962,12 +4962,12 @@ pub(crate) fn checkout_view_callgraph_access(
         // database, or another driver finishing the shared base) says nothing
         // about the graph. Report SQLite's busy error, which every caller
         // already presents as busy/pending with a retry.
-        Some(Err(error)) if error.busy => CallgraphStoreAccess::Error(
-            CallGraphStoreError::Sqlite(rusqlite::Error::SqliteFailure(
+        Some(Err(error)) if error.busy => CallgraphStoreAccess::Error(CallGraphStoreError::Sqlite(
+            rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
                 Some(error.reason),
-            )),
-        ),
+            ),
+        )),
         Some(Err(error))
             if error
                 .reason
