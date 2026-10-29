@@ -403,6 +403,42 @@ pub enum Measurement {
     Owed,
 }
 
+/// A reservation-lock failure that names the lock file but keeps the typed
+/// [`crate::fs_lock::AcquireError`] reachable as its `source()`, so callers
+/// can still tell a busy lock (a timeout) from a real failure.
+#[derive(Debug)]
+pub struct ReservationLockError {
+    path: PathBuf,
+    source: crate::fs_lock::AcquireError,
+}
+impl ReservationLockError {
+    fn io(path: &Path, source: crate::fs_lock::AcquireError) -> Error {
+        Error::Io(std::io::Error::other(Self {
+            path: path.to_path_buf(),
+            source,
+        }))
+    }
+    /// Whether this is a lock that another holder kept past the wait.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self.source, crate::fs_lock::AcquireError::Timeout)
+    }
+}
+impl fmt::Display for ReservationLockError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "acquiring v3 reservation lock {}: {}",
+            self.path.display(),
+            self.source
+        )
+    }
+}
+impl std::error::Error for ReservationLockError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Owning capability for the non-reentrant storage-root lease. Pass this guard
 /// into nested writers rather than acquiring the same lease again.
 pub struct ReservationLock {
@@ -415,13 +451,8 @@ impl ReservationLock {
         fs::create_dir_all(&dir)
             .map_err(|e| crate::views::io::at("creating v3 namespace", &dir, e))?;
         let path = dir.join("reservations.lock");
-        let guard = crate::fs_lock::try_acquire(&path, Duration::from_secs(120)).map_err(|e| {
-            Error::Io(crate::views::io::at(
-                "acquiring v3 reservation lock",
-                &path,
-                std::io::Error::other(e),
-            ))
-        })?;
+        let guard = crate::fs_lock::try_acquire(&path, Duration::from_secs(120))
+            .map_err(|e| ReservationLockError::io(&path, e))?;
         Ok(Self {
             guard,
             storage: storage.to_path_buf(),
@@ -433,13 +464,8 @@ impl ReservationLock {
         fs::create_dir_all(&dir)
             .map_err(|e| crate::views::io::at("creating v3 namespace", &dir, e))?;
         let path = dir.join("reservations.lock");
-        let guard = crate::fs_lock::try_acquire_until(&path, deadline).map_err(|e| {
-            Error::Io(crate::views::io::at(
-                "acquiring v3 reservation lock",
-                &path,
-                std::io::Error::other(e),
-            ))
-        })?;
+        let guard = crate::fs_lock::try_acquire_until(&path, deadline)
+            .map_err(|e| ReservationLockError::io(&path, e))?;
         Ok(Self {
             guard,
             storage: storage.to_path_buf(),
