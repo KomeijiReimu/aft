@@ -367,6 +367,9 @@ impl IndexWaitDiagnostics {
         use aft::blob_store::v2::FamilyPlane;
         use aft::views::readiness::PlaneState;
 
+        if let Some(error) = ctx.callgraph_view_read_diagnostics().last_error {
+            self.last_error.insert("callgraph", error);
+        }
         if let Some(runtime) = ctx.checkout_semantic_runtime() {
             if let Some(error) = runtime.unavailable_reason() {
                 self.last_error.insert("semantic", error);
@@ -417,15 +420,16 @@ impl IndexWaitDiagnostics {
                     plane,
                     json!({
                         "final_status": self.status.get(plane),
-                        "view_readiness": self.view_status.get(plane),
+                        "semantic_member_readiness": self.view_status.get(plane),
                         "last_error": self.last_error.get(plane),
                     }),
                 )
             })
             .collect();
         format!(
-            "planes={:#}\nsemantic_slot={}\nlast_callgraph_reconcile={:#?}\nhealth={:#}",
+            "planes={:#}\ncallgraph_view_reads={:#}\nsemantic_slot={}\nlast_callgraph_reconcile={:#?}\nhealth={:#}",
             json!(planes),
+            json!(ctx.callgraph_view_read_diagnostics()),
             ctx.checkout_semantic().describe(),
             ctx.last_callgraph_reconcile(),
             json!(health),
