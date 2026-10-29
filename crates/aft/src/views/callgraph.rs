@@ -991,7 +991,8 @@ mod tests {
         );
         assert!(matches!(
             crate::context::checkout_view_callgraph_access(Some(Err(error))),
-            crate::context::CallgraphStoreAccess::Building
+            crate::context::CallgraphStoreAccess::Error(error)
+                if error.is_transient_lock_contention()
         ));
 
         claim.release().unwrap();
