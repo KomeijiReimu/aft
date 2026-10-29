@@ -10640,6 +10640,7 @@ async fn handle_tool_call_with_capabilities(
                     operation,
                     dispatch,
                     rich_ui_proofs,
+                    reply_budget,
                 )
                 .await;
             }

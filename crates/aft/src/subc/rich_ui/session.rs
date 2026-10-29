@@ -267,6 +267,7 @@ pub(in crate::subc) async fn submit(
     operation: super::admission::Operation,
     dispatch: DispatchFn,
     capabilities: ProofCapabilities,
+    reply_budget: crate::commands::blocking_wait::ReplyBudget,
 ) -> Result<(), SubcError> {
     let route = route_key(frame.header.channel, frame.header.epoch);
     let id = format!("subc-{}-{}", route.channel, frame.header.corr);
@@ -278,7 +279,7 @@ pub(in crate::subc) async fn submit(
         .to_owned();
     let entry = operation.entry.clone();
     let reply_entry = entry.clone();
-    let watch = Arc::new(super::bash_watch::Watch::new(frame));
+    let watch = Arc::new(super::bash_watch::Watch::new(reply_budget));
     let dispatched_watch = watch.clone();
     let watch_ctx = executor.actor_context(&carrier.root);
     let dispatch_watch_ctx = watch_ctx.clone();

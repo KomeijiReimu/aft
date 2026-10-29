@@ -85,13 +85,23 @@ async fn query(f: &Fixture, id: &str, key: &str, extra: Value) -> Value {
 // The shared route-test exchange has a three-second watchdog. Carrier watches
 // intentionally wait longer, so use the same outer route with a twenty-second one.
 async fn exchange_watch(f: &Fixture, args: Value) -> Frame {
+    exchange_watch_received_at(f, args, Instant::now(), Duration::from_secs(20)).await
+}
+
+async fn exchange_watch_received_at(
+    f: &Fixture,
+    args: Value,
+    received_at: Instant,
+    reply_window: Duration,
+) -> Frame {
     let executor = Arc::new(Executor::new());
     assert!(executor.register_actor(f.carrier.root.clone(), f.ctx.clone()));
     let routes = HashMap::from([
         (route_key(41, 9), f.carrier.clone()),
         (route_key(43, 9), f.policy.clone()),
     ]);
-    let decoded = decoded_request("bash_watch", args, "worker", None, 71);
+    let mut decoded = decoded_request("bash_watch", args, "worker", None, 71);
+    decoded.phase_trace = PhaseTrace::new(received_at);
     let (writer, mut replies) = mpsc::channel(8);
     let (bash_tx, _bash_rx) = mpsc::channel(8);
     let (touch_tx, _touch_rx) = mpsc::channel(8);
@@ -135,12 +145,49 @@ async fn exchange_watch(f: &Fixture, args: Value) -> Frame {
     )
     .await
     .unwrap();
-    let mut reply = tokio::time::timeout(Duration::from_secs(20), replies.recv())
+    let mut reply = tokio::time::timeout(reply_window, replies.recv())
         .await
-        .expect("carrier watch must reply within twenty seconds")
+        .expect("carrier watch must preserve its receipt-time reply budget")
         .unwrap();
     reply.project_tool_result().unwrap();
     reply.frame
+}
+
+#[tokio::test]
+async fn command_watch_late_admission_keeps_the_original_receipt_deadline() {
+    let _storage_env = crate::test_env::without_storage_override();
+    let _manifest =
+        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let f = Fixture::new("worker");
+    let requester = principal(&f.policy).unwrap();
+    seed(&f, TASK, &f.policy.session, requester, "call", true, false);
+    // Simulate time already spent in the frame/database queue. An admission-time
+    // budget would wait twenty more seconds and fail the short reply watchdog.
+    let received_at = Instant::now() - Duration::from_millis(19_900);
+    let reply = exchange_watch_received_at(
+        &f,
+        json!({"rich_ui_op":"bash_watch@1","task":"call","pattern":"absent"}),
+        received_at,
+        Duration::from_secs(2),
+    )
+    .await;
+    assert_eq!(reply.header.ty, FrameType::Response);
+    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    let operation = super::super::super::admission::prepare(
+        "bash_watch",
+        &json!({
+            "rich_ui_op":"bash_watch@1","task":"call","pattern":"absent"
+        }),
+    )
+    .unwrap();
+    super::super::super::carrier::validate_body(Some(&operation.entry), &body).unwrap();
+    assert_eq!(
+        body["structuredContent"],
+        json!({
+            "running":true,"exitCode":null,"waited":{"reason":"timeout","limit_ms":20_000}
+        }),
+        "{body}"
+    );
 }
 
 fn reopen(f: &Fixture) {

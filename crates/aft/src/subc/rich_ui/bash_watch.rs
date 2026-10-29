@@ -11,11 +11,10 @@ pub(super) struct Watch {
 }
 
 impl Watch {
-    pub(super) fn new(frame: &Frame) -> Self {
-        let received_at = Instant::now();
-        let envelope = serde_json::from_slice::<Value>(&frame.body).unwrap_or(Value::Null);
-        let mut budget = ReplyBudget::from_envelope(received_at, &envelope);
-        budget.deadline = budget.deadline.min(received_at + Duration::from_secs(20));
+    pub(super) fn new(mut budget: ReplyBudget) -> Self {
+        budget.deadline = budget
+            .deadline
+            .min(budget.received_at + Duration::from_secs(20));
         Self {
             budget,
             wake: DeferredResponseWake::default(),
@@ -62,6 +61,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn queued_carrier_watch_deadline_is_twenty_seconds_after_receipt() {
+        let received_at = Instant::now() - Duration::from_secs(19);
+        let watch = Watch::new(ReplyBudget::new(received_at, None));
+        assert_eq!(watch.budget.received_at, received_at);
+        assert_eq!(watch.budget.deadline, received_at + Duration::from_secs(20));
+    }
+
+    #[test]
     fn carrier_watch_budget_is_absolute_and_preserves_shorter_client_deadlines() {
         for window_ms in [None, Some(1000), Some(60_000)] {
             let mut envelope = json!({});
@@ -72,16 +79,9 @@ mod tests {
                     .as_millis() as u64;
                 envelope["deadline_ms"] = (now + ms).into();
             }
-            let frame = Frame::build(
-                FrameType::Request,
-                control_flags(),
-                41,
-                9,
-                1,
-                serde_json::to_vec(&envelope).unwrap(),
-            )
-            .unwrap();
-            let watch = Watch::new(&frame);
+            let received_at = Instant::now();
+            let watch = Watch::new(ReplyBudget::from_envelope(received_at, &envelope));
+            assert_eq!(watch.budget.received_at, received_at);
             let window = watch
                 .budget
                 .deadline
