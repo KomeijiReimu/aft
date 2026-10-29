@@ -50,7 +50,7 @@ pub(crate) fn bind_is_busy(reason: &str) -> bool {
     // markers preserved by the v3 registry and base builder, including markers
     // nested beneath a driver or registry diagnostic.
     reason.contains(crate::blob_store::v3::BUSY_PREFIX)
-        || reason.contains("v3 store busy: ")
+        || reason.contains("reservation_ledger_busy:")
         || reason.contains("v3 base build busy; retain direct-scan coverage and retry")
 }
 

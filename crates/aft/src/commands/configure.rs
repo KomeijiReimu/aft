@@ -8119,6 +8119,12 @@ impl ConfigureMaintenanceContinuation {
             .or(self.lexical_bind_retry_at)
             .or(self.replay_retry_at)
     }
+
+    fn defer_lexical_bind(&mut self, now: Instant) {
+        self.lexical_bind_retry_at = Some(now + self.lexical_bind_retry_delay);
+        self.lexical_bind_retry_delay =
+            (self.lexical_bind_retry_delay * 2).min(Duration::from_secs(30));
+    }
 }
 
 #[derive(Debug, Default)]
@@ -9023,11 +9029,7 @@ fn run_configure_maintenance_unit_inner(
                         }
                         // A parent only reads child publications; it cannot
                         // recover a dropped child bind by querying that child.
-                        continuation.lexical_bind_retry_at =
-                            Some(Instant::now() + continuation.lexical_bind_retry_delay);
-                        continuation.lexical_bind_retry_delay =
-                            (continuation.lexical_bind_retry_delay * 2)
-                                .min(Duration::from_secs(30));
+                        continuation.defer_lexical_bind(Instant::now());
                         return ConfigureMaintenanceUnitResult::Continue;
                     }
                     Some(Err(error)) => {
@@ -17155,16 +17157,15 @@ mod tests {
         );
         state.replay_retry_cutoff = Some(retry_at - Duration::from_nanos(1));
         assert!(!state.has_ready_job());
-        // Long-held locks must not keep taking a maintenance worker each second.
+        // Check every backoff step without spending SQLite's busy timeout on
+        // each attempt. The real locked bind above arms the same continuation.
         for seconds in [2, 4, 8, 16, 30, 30] {
-            state.replay_retry_cutoff = state.jobs[0].retry_at();
-            let before = Instant::now();
-            assert!(!super::drain_deferred_configure_maintenance_unit(
-                &ctx, &mut state
-            ));
+            let now = Instant::now();
+            state.jobs[0].defer_lexical_bind(now);
             let retry_at = state.jobs[0].retry_at().unwrap();
-            assert!(retry_at >= before + Duration::from_secs(seconds));
-            assert!(retry_at <= Instant::now() + Duration::from_secs(seconds));
+            assert_eq!(retry_at, now + Duration::from_secs(seconds));
+            state.replay_retry_cutoff = Some(retry_at - Duration::from_nanos(1));
+            assert!(!state.has_ready_job());
             assert_eq!(
                 state.jobs[0].stage,
                 super::ConfigureMaintenanceStage::ViewLoad
