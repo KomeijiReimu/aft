@@ -86,6 +86,195 @@ fn reopen(f: &Fixture) {
 }
 
 #[tokio::test]
+async fn command_watch_matches_literal_and_regex_and_reports_exit() {
+    let _storage_env = crate::test_env::without_storage_override();
+    let _manifest =
+        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    for kind in ["head", "worker"] {
+        let f = Fixture::new(kind);
+        let requester = principal(&f.policy).unwrap();
+        let (layout, mut task) = seed(&f, TASK, &f.policy.session, requester, "call", true, false);
+        for (pattern, regex) in [("one\n", false), ("^o.e\\n$", true)] {
+            let body = query(
+                &f,
+                "bash_watch",
+                "call",
+                json!({"pattern":pattern,"regex":regex}),
+            )
+            .await;
+            assert_eq!(
+                body["structuredContent"],
+                json!({
+                    "running":true,"exitCode":null,"waited":{"reason":"match","limit_ms":20_000}
+                }),
+                "{body}"
+            );
+        }
+        task.mark_terminal(BgTaskStatus::Completed, Some(3), None);
+        persistence::write_task_at(&layout, &task).unwrap();
+        save_row(&f, &layout, &task);
+        let body = query(&f, "bash_watch", "call", json!({"pattern":"absent"})).await;
+        assert_eq!(
+            body["structuredContent"],
+            json!({
+                "running":false,"exitCode":3,"waited":{"reason":"exit","limit_ms":20_000}
+            })
+        );
+    }
+}
+
+#[tokio::test]
+async fn command_watch_polls_for_later_output_and_task_exit() {
+    let _storage_env = crate::test_env::without_storage_override();
+    let _manifest =
+        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    for exits in [false, true] {
+        let f = Fixture::new("worker");
+        let requester = principal(&f.policy).unwrap();
+        let (layout, mut task) = seed(&f, TASK, &f.policy.session, requester, "call", true, false);
+        let update = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            if exits {
+                task.mark_terminal(BgTaskStatus::Completed, Some(7), None);
+                persistence::write_task_at(&layout, &task).unwrap();
+            } else {
+                std::fs::write(&layout.paths.stdout, b"later\n").unwrap();
+            }
+        });
+        let body = query(
+            &f,
+            "bash_watch",
+            "call",
+            json!({"pattern":"later","timeoutMs":1000}),
+        )
+        .await;
+        update.join().unwrap();
+        assert_eq!(
+            body["structuredContent"],
+            json!({
+                "running":!exits,"exitCode":if exits { json!(7) } else { Value::Null },
+                "waited":{"reason":if exits { "exit" } else { "match" },"limit_ms":1000}
+            }),
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn command_watch_clamps_timeout_and_does_not_recover_or_change_worker_window() {
+    let _storage_env = crate::test_env::without_storage_override();
+    let _manifest =
+        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let f = Fixture::with_config("worker", |config| config.bash.watch_sync_max_ms = 5000);
+    let requester = principal(&f.policy).unwrap();
+    let (layout, task) = seed(&f, TASK, &f.policy.session, requester, "call", true, false);
+    let before = std::fs::read(&layout.paths.json).unwrap();
+    assert!(f
+        .ctx
+        .bash_background()
+        .hard_kill_deadline(TASK, &f.policy.session)
+        .is_none());
+    let started = Instant::now();
+    let body = query(
+        &f,
+        "bash_watch",
+        "call",
+        json!({"pattern":"absent","timeoutMs":10_000}),
+    )
+    .await;
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert_eq!(
+        body["structuredContent"],
+        json!({
+            "running":true,"exitCode":null,"waited":{"reason":"timeout","limit_ms":5000}
+        }),
+        "{body}"
+    );
+    assert!(
+        f.ctx
+            .bash_background()
+            .hard_kill_deadline(TASK, &f.policy.session)
+            .is_none(),
+        "observation must not recover the task or set the recovery wait window"
+    );
+    assert_eq!(std::fs::read(&layout.paths.json).unwrap(), before);
+    assert_eq!(
+        persistence::read_task_at(&layout).unwrap().timeout_ms,
+        task.timeout_ms
+    );
+}
+
+#[tokio::test]
+async fn command_watch_near_worker_kill_handoff_does_not_extend_the_wait() {
+    let _storage_env = crate::test_env::without_storage_override();
+    let _manifest =
+        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let (dir, ctx, task) =
+        crate::bash_background::registry::default_kill_tests::wait_fixture(Some(1950));
+    let root = dir.path().canonicalize().unwrap();
+    ctx.set_db(Arc::new(std::sync::Mutex::new(
+        crate::db::open(&root.join("aft.db")).unwrap(),
+    )));
+    let mut carrier = identity(&root, "worker", "reserved:occipital", 41);
+    let mut policy = identity(&root, "worker", "reserved:broca", 43);
+    Arc::get_mut(&mut carrier.0).unwrap().trust = BindTrust::Untrusted;
+    for route in [&mut carrier, &mut policy] {
+        let data = Arc::get_mut(&mut route.0).unwrap();
+        data.session = task.session_id.clone();
+        if let AuthenticatedPrincipal::RouteBind { session_id, .. } = &mut data.spawn_principal {
+            *session_id = task.session_id.clone();
+        }
+    }
+    let f = Fixture {
+        dir,
+        ctx: Arc::new(ctx),
+        carrier,
+        policy,
+    };
+    f.record(&f.policy, "worker");
+    let mut metadata = persistence::read_task(&task.paths.json).unwrap();
+    metadata.call_key = Some(TaskCallKey {
+        requester: "reserved:broca".into(),
+        key: "call".into(),
+        minted: false,
+    });
+    let layout = persistence::resolve_task(f.dir.path(), &task.session_id, &task.task_id).unwrap();
+    save_row(&f, &layout, &metadata);
+    let before = std::fs::read(&task.paths.json).unwrap();
+    let limit = f
+        .ctx
+        .bash_background()
+        .hard_kill_deadline(&task.task_id, &task.session_id)
+        .unwrap()
+        .limit_ms;
+    let started = Instant::now();
+    let body = query(
+        &f,
+        "bash_watch",
+        "call",
+        json!({"pattern":"absent","timeoutMs":1}),
+    )
+    .await;
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert_eq!(
+        body["structuredContent"],
+        json!({
+            "running":true,"exitCode":null,"waited":{"reason":"timeout","limit_ms":1}
+        }),
+        "{body}"
+    );
+    assert_eq!(std::fs::read(&task.paths.json).unwrap(), before);
+    assert_eq!(
+        f.ctx
+            .bash_background()
+            .hard_kill_deadline(&task.task_id, &task.session_id)
+            .unwrap()
+            .limit_ms,
+        limit
+    );
+}
+
+#[tokio::test]
 async fn command_views_resolve_storage_segment_and_fresh_status_after_exit() {
     let _storage_env = crate::test_env::without_storage_override();
     let _manifest =
