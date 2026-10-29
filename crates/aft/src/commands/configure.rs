@@ -8093,6 +8093,7 @@ struct ConfigureMaintenanceContinuation {
     view_load: Option<crossbeam_channel::Receiver<Result<PreparedConfigureView, String>>>,
     replay_retry_at: Option<Instant>,
     lexical_bind_retry_at: Option<Instant>,
+    lexical_bind_retry_delay: Duration,
     callgraph_upgrade_retry_at: Option<Instant>,
     replay_error_logged: bool,
 }
@@ -8107,6 +8108,7 @@ impl ConfigureMaintenanceContinuation {
             view_load: None,
             replay_retry_at: None,
             lexical_bind_retry_at: None,
+            lexical_bind_retry_delay: Duration::from_secs(1),
             callgraph_upgrade_retry_at: None,
             replay_error_logged: false,
         }
@@ -9031,7 +9033,10 @@ fn run_configure_maintenance_unit_inner(
                         // A parent only reads child publications; it cannot
                         // recover a dropped child bind by querying that child.
                         continuation.lexical_bind_retry_at =
-                            Some(Instant::now() + Duration::from_secs(1));
+                            Some(Instant::now() + continuation.lexical_bind_retry_delay);
+                        continuation.lexical_bind_retry_delay =
+                            (continuation.lexical_bind_retry_delay * 2)
+                                .min(Duration::from_secs(30));
                         return ConfigureMaintenanceUnitResult::Continue;
                     }
                     Some(Err(error)) => {
@@ -9043,6 +9048,7 @@ fn run_configure_maintenance_unit_inner(
                     }
                     _ => {}
                 }
+                continuation.lexical_bind_retry_delay = Duration::from_secs(1);
             } else {
                 ctx.clear_view_runtime();
             }
@@ -17107,7 +17113,10 @@ mod tests {
         parent.update_config(|config| {
             config.project_root = Some(projects.clone());
             config.views.enabled = true;
+            config.indexes.semantic = false;
+            config.indexes.callgraph = false;
         });
+        parent.set_canonical_cache_root(projects.clone());
         let planes = crate::views::parent::RequestedPlanes {
             trigram: true,
             semantic: false,
@@ -17149,12 +17158,53 @@ mod tests {
         let retry_at = state.jobs[0]
             .retry_at()
             .expect("busy bind needs a retry deadline");
+        assert_eq!(
+            state.jobs[0].lexical_bind_retry_delay,
+            Duration::from_secs(2)
+        );
         state.replay_retry_cutoff = Some(retry_at - Duration::from_nanos(1));
         assert!(!state.has_ready_job());
+        // Long-held locks must not keep taking a maintenance worker each second.
+        for seconds in [2, 4, 8, 16, 30, 30] {
+            state.replay_retry_cutoff = state.jobs[0].retry_at();
+            let before = Instant::now();
+            assert!(!super::drain_deferred_configure_maintenance_unit(
+                &ctx, &mut state
+            ));
+            let retry_at = state.jobs[0].retry_at().unwrap();
+            assert!(retry_at >= before + Duration::from_secs(seconds));
+            assert!(retry_at <= Instant::now() + Duration::from_secs(seconds));
+            assert_eq!(
+                state.jobs[0].stage,
+                super::ConfigureMaintenanceStage::ViewLoad
+            );
+        }
+        assert!(session.wait_rounds(session.rounds() + 1, Duration::from_secs(30)));
+        let query: RawRequest = serde_json::from_value(json!({
+            "id": "parent-busy-lexical",
+            "command": "semantic_search",
+            "query": "tracked",
+        }))
+        .unwrap();
+        let pending = crate::views::parent::route(&query, &parent).unwrap();
+        assert_eq!(pending.data["complete"], false, "{pending:?}");
+        let text = pending.data["text"].as_str().unwrap();
+        assert!(
+            text.contains("alpha") && text.contains("busy"),
+            "{pending:?}"
+        );
         blocker.execute_batch("ROLLBACK").unwrap();
         drop(blocker);
-        state.replay_retry_cutoff = Some(retry_at);
+        state.replay_retry_cutoff = state.jobs[0].retry_at();
         assert!(state.has_ready_job());
+        assert!(super::drain_deferred_configure_maintenance_unit(
+            &ctx, &mut state
+        ));
+        assert!(state.jobs[0].lexical_bind_retry_at.is_none());
+        assert_eq!(
+            state.jobs[0].lexical_bind_retry_delay,
+            Duration::from_secs(1)
+        );
         while super::drain_deferred_configure_maintenance_unit(&ctx, &mut state) {}
         assert!(state.jobs.is_empty());
         let deadline = Instant::now() + Duration::from_secs(30);
