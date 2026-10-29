@@ -1162,12 +1162,9 @@ fn member_kind_constraint_and_v3_namespace_are_not_v2_registration() {
         .starts_with(family_dir(root.path(), A).unwrap()));
 }
 
-#[test]
-fn failed_read_only_upgrade_preserves_busy_and_existing_reader_recovers() {
-    let _guard = serial();
-    let root = tempdir().unwrap();
-    seed(root.path(), A);
-    let path = db(root.path(), A);
+fn blocked_read_only_upgrade(root: &Path) -> (LedgerReader, IdentityConnection, ReservationLock) {
+    seed(root, A);
+    let path = db(root, A);
     let blocker = IdentityConnection::open_with_flags(
         &path,
         OpenFlags::SQLITE_OPEN_READ_WRITE,
@@ -1177,14 +1174,23 @@ fn failed_read_only_upgrade_preserves_busy_and_existing_reader_recovers() {
     // Rollback mode permits an exclusive lock while the idle read-only handle
     // is still open, making a failed connection handoff deterministic.
     blocker.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
-    let ledger = LedgerReader::open_existing(root.path(), A).unwrap();
+    let ledger = LedgerReader::open_existing(root, A).unwrap();
     blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
-    let lock = ReservationLock::acquire(root.path()).unwrap();
-    let error = match RegistryWriter::open_existing(root.path(), A, &lock) {
+    let lock = ReservationLock::acquire(root).unwrap();
+    let error = match RegistryWriter::open_existing(root, A, &lock) {
         Ok(_) => panic!("writer upgrade must be blocked by the exclusive transaction"),
         Err(error) => error,
     };
     assert!(error.is_busy(), "{error}");
+    (ledger, blocker, lock)
+}
+
+#[test]
+fn failed_read_only_upgrade_preserves_busy_and_existing_reader_recovers() {
+    let _guard = serial();
+    let root = tempdir().unwrap();
+    let path = db(root.path(), A);
+    let (ledger, blocker, lock) = blocked_read_only_upgrade(root.path());
     let error = ledger.accounting().unwrap_err();
     assert!(
         error.is_busy(),
@@ -1197,10 +1203,34 @@ fn failed_read_only_upgrade_preserves_busy_and_existing_reader_recovers() {
     blocker.execute_batch("ROLLBACK").unwrap();
     drop(blocker);
     assert_eq!(ledger.accounting().unwrap().reserved_bytes, 0);
+    assert_eq!(
+        ledger
+            .read(|c| Ok(c.pragma_query_value(None, "query_only", |r| r.get::<_, i64>(0))?))
+            .unwrap(),
+        1
+    );
     assert_eq!(crate::db::file_identity::open_connections(&path), 1);
     let writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
     assert!(Arc::ptr_eq(&ledger.database, &writer.database));
     assert_eq!(crate::db::file_identity::open_connections(&path), 1);
+}
+
+#[test]
+fn failed_upgrade_reader_rejects_a_replaced_database() {
+    let _guard = serial();
+    let root = tempdir().unwrap();
+    let path = db(root.path(), A);
+    let (ledger, blocker, _lock) = blocked_read_only_upgrade(root.path());
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+    let original = path.with_extension("original.sqlite");
+    fs::rename(&path, &original).unwrap();
+    fs::copy(&original, &path).unwrap();
+    assert!(matches!(
+        ledger.accounting(),
+        Err(Error::Refused("live_sqlite_file_replaced"))
+    ));
+    assert_eq!(crate::db::file_identity::open_connections(&path), 0);
 }
 
 #[test]
