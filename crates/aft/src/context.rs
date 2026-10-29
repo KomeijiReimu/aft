@@ -18704,7 +18704,7 @@ mod callgraph_store_for_ops_tests {
             .as_deref()
             .expect("Building must retain its busy cause");
         assert!(detail.contains("reservation_ledger_busy"), "{detail}");
-        assert!(detail.contains("read format version"), "{detail}");
+        assert!(detail.contains("read initialization marker"), "{detail}");
         assert!(detail.contains("members.sqlite"), "{detail}");
         assert!(detail.contains("database is locked"), "{detail}");
         blocker.execute_batch("ROLLBACK").unwrap();
