@@ -8092,6 +8092,7 @@ struct ConfigureMaintenanceContinuation {
     semantic_waits_for_callgraph_start: bool,
     view_load: Option<crossbeam_channel::Receiver<Result<PreparedConfigureView, String>>>,
     replay_retry_at: Option<Instant>,
+    lexical_bind_retry_at: Option<Instant>,
     callgraph_upgrade_retry_at: Option<Instant>,
     replay_error_logged: bool,
 }
@@ -8105,14 +8106,26 @@ impl ConfigureMaintenanceContinuation {
             semantic_waits_for_callgraph_start: false,
             view_load: None,
             replay_retry_at: None,
+            lexical_bind_retry_at: None,
             callgraph_upgrade_retry_at: None,
             replay_error_logged: false,
         }
     }
 
     fn retry_at(&self) -> Option<Instant> {
-        self.callgraph_upgrade_retry_at.or(self.replay_retry_at)
+        self.callgraph_upgrade_retry_at
+            .or(self.lexical_bind_retry_at)
+            .or(self.replay_retry_at)
     }
+}
+
+fn lexical_bind_is_busy(reason: &str) -> bool {
+    // The lexical snapshot boundary carries strings. Match only the explicit
+    // retry markers preserved by the v3 registry and base builder, including
+    // markers nested beneath a driver or registry diagnostic.
+    reason.contains(crate::blob_store::v3::BUSY_PREFIX)
+        || reason.contains("v3 store busy: ")
+        || reason.contains("v3 base build busy; retain direct-scan coverage and retry")
 }
 
 #[derive(Debug, Default)]
@@ -8986,6 +8999,7 @@ fn run_configure_maintenance_unit_inner(
             continuation.stage = ConfigureMaintenanceStage::ViewLoad;
         }
         ConfigureMaintenanceStage::ViewLoad => {
+            let retrying = continuation.lexical_bind_retry_at.take().is_some();
             if crate::views::parent::held_by(ctx, &job.canonical_cache_root) {
                 // A parent folder owns no view; its session reads the children's.
                 ctx.clear_view_runtime();
@@ -9007,6 +9021,19 @@ fn run_configure_maintenance_unit_inner(
                     ctx.clear_view_runtime();
                 }
                 match ctx.lexical_view_snapshot("bind") {
+                    Some(Err(error)) if lexical_bind_is_busy(&error) => {
+                        if !retrying {
+                            slog_warn!(
+                                "lexical checkout view busy; configure maintenance will retry: {}",
+                                error
+                            );
+                        }
+                        // A parent only reads child publications; it cannot
+                        // recover a dropped child bind by querying that child.
+                        continuation.lexical_bind_retry_at =
+                            Some(Instant::now() + Duration::from_secs(1));
+                        return ConfigureMaintenanceUnitResult::Continue;
+                    }
                     Some(Err(error)) => {
                         slog_warn!("lexical checkout view unavailable: {}", error);
                     }
@@ -17022,6 +17049,24 @@ mod tests {
         lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
             .unwrap();
         lock
+    }
+
+    #[test]
+    fn lexical_bind_busy_markers_do_not_retry_terminal_failures() {
+        for reason in [
+            "family registry I/O error: reservation_ledger_busy: read format: database is locked",
+            "[driver]: v3 store busy: reservation lock timeout",
+            "[driver]: v3 base build busy; retain direct-scan coverage and retry",
+        ] {
+            assert!(super::lexical_bind_is_busy(reason), "{reason}");
+        }
+        for reason in [
+            "reservation_ledger_unreadable: permission denied",
+            "live_sqlite_file_replaced",
+            "a file named busy.rs is unreadable",
+        ] {
+            assert!(!super::lexical_bind_is_busy(reason), "{reason}");
+        }
     }
 
     #[test]

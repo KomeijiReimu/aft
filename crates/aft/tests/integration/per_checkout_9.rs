@@ -437,7 +437,10 @@ fn runtime_drains_retry_child_trigram_after_busy_identity() {
     lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
         .unwrap();
     let ctx = configure(&root, &storage, child_trigram_doc());
-    assert!(ctx.artifact_identity_provisional_reason().is_some());
+    assert!(ctx
+        .degraded_reasons()
+        .iter()
+        .any(|reason| reason.contains("aft.db was busy at bind")));
     assert!(ctx.cached_artifact_cache_key(&root).is_none());
     assert!(!ctx.config().indexes.trigram);
     lock.execute_batch("ROLLBACK").unwrap();
@@ -463,7 +466,10 @@ fn runtime_drains_retry_child_trigram_after_busy_identity() {
         );
         thread::sleep(Duration::from_millis(20));
     }
-    assert!(ctx.artifact_identity_provisional_reason().is_none());
+    assert!(!ctx
+        .degraded_reasons()
+        .iter()
+        .any(|reason| reason.contains("aft.db was busy at bind")));
     assert!(ctx.config().indexes.trigram);
     assert!(ctx.cached_artifact_cache_key(&root).is_some());
 }
