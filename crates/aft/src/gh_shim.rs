@@ -6233,127 +6233,16 @@ fn own_comment_patch_payload<R: Read>(
     body_field: &str,
     stdin: &mut R,
 ) -> Result<String, CanonicalizeError> {
-    let mut body = None;
-    let mut index = 1;
-    while index < args.len() {
-        let value = args[index].to_str().ok_or_else(|| {
-            CanonicalizeError::unclassified("non-UTF-8 governed arguments are undeclared")
-        })?;
-        // The method and the endpoint were both matched against the declared
-        // rule during classification, so they are skipped rather than reparsed.
-        if matches!(value, "--method" | "-X") {
-            index += 2;
-            continue;
-        }
-        if value.starts_with("--method=") {
-            index += 1;
-            continue;
-        }
-        let (supplied, consumed) = match api_payload_argument(value, args.get(index + 1))? {
-            Some(found) => found,
-            None => {
-                if value.starts_with('-') {
-                    return Err(CanonicalizeError::unclassified(format!(
-                        "undeclared flag {value}"
-                    )));
-                }
-                index += 1;
-                continue;
-            }
-        };
-        let text = match supplied {
-            ApiPayload::Field(text) => text,
-            ApiPayload::Document(source) => {
-                let document = read_body_file_from(Path::new(&source), stdin)
-                    .map_err(CanonicalizeError::unclassified)?;
-                json_body_only(&document, body_field)?
-            }
-        };
-        if body.replace(text).is_some() {
-            return Err(CanonicalizeError::unclassified(format!(
-                "the governed comment PATCH admits one {body_field} payload"
-            )));
-        }
-        index += consumed;
-    }
-    body.ok_or_else(|| {
-        CanonicalizeError::unclassified(format!(
-            "the governed comment PATCH requires a {body_field}"
-        ))
-    })
-}
-
-enum ApiPayload {
-    /// A `body=<text>` field supplied directly on the command line.
-    Field(String),
-    /// A JSON document behind `--input`, where `-` means standard input.
-    Document(String),
-}
-
-fn api_payload_argument(
-    value: &str,
-    next: Option<&OsString>,
-) -> Result<Option<(ApiPayload, usize)>, CanonicalizeError> {
-    let value_of = |flag: &str| -> Result<(String, usize), CanonicalizeError> {
-        next.and_then(|arg| arg.to_str())
-            .map(|supplied| (supplied.to_string(), 2))
-            .ok_or_else(|| CanonicalizeError::unclassified(format!("{flag} requires a value")))
-    };
-    if value == "--input" {
-        let (supplied, consumed) = value_of(value)?;
-        return Ok(Some((ApiPayload::Document(supplied), consumed)));
-    }
-    if let Some(supplied) = value.strip_prefix("--input=") {
-        return Ok(Some((ApiPayload::Document(supplied.to_string()), 1)));
-    }
-    for flag in ["--field", "--raw-field", "-f", "-F"] {
-        let (supplied, consumed) = if value == flag {
-            value_of(flag)?
-        } else if let Some(rest) = value
-            .strip_prefix(&format!("{flag}="))
-            .or_else(|| value.strip_prefix(flag).filter(|_| flag.len() == 2))
-        {
-            (rest.to_string(), 1)
-        } else {
-            continue;
-        };
-        let (name, text) = supplied
-            .split_once('=')
-            .ok_or_else(|| CanonicalizeError::unclassified(format!("{flag} takes name=value")))?;
-        if name != "body" {
-            return Err(CanonicalizeError::unclassified(format!(
-                "{name} is not declared; the governed comment PATCH is body-only"
-            )));
-        }
-        return Ok(Some((ApiPayload::Field(text.to_string()), consumed)));
-    }
-    Ok(None)
-}
-
-/// Read the one declared field out of a JSON payload. A document carrying
-/// anything besides that field is not the declared request, and forwarding it
-/// would mean routing bytes the shim never interpreted.
-fn json_body_only(document: &str, body_field: &str) -> Result<String, CanonicalizeError> {
-    let value: Value = serde_json::from_str(document).map_err(|error| {
-        CanonicalizeError::unclassified(format!("governed PATCH payload is not JSON: {error}"))
-    })?;
-    let object = value.as_object().ok_or_else(|| {
-        CanonicalizeError::unclassified("governed PATCH payload must be a JSON object")
-    })?;
-    let text = object
-        .get(body_field)
-        .and_then(Value::as_str)
+    let mut fields =
+        v22_rows::api_fields_payload(args, &[body_field], "the governed comment PATCH", stdin)?;
+    fields
+        .remove(body_field)
+        .and_then(|value| value.as_str().map(str::to_string))
         .ok_or_else(|| {
             CanonicalizeError::unclassified(format!(
-                "governed PATCH payload needs a string {body_field}"
+                "the governed comment PATCH requires a {body_field}"
             ))
-        })?;
-    if object.len() != 1 {
-        return Err(CanonicalizeError::unclassified(format!(
-            "governed PATCH payload admits only {body_field}"
-        )));
-    }
-    Ok(text.to_string())
+        })
 }
 
 fn declared_body_value<R: Read>(
